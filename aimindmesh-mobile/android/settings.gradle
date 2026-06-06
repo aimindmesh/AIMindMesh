@@ -1,0 +1,14 @@
+include ':app'
+
+include ':capacitor-cordova-android-plugins'
+project(':capacitor-cordova-android-plugins').projectDir = new File('./capacitor-cordova-android-plugins/')
+
+// v4.0.0 — FCM Capacitor Plugin
+include ':fcm-capacitor'
+project(':fcm-capacitor').projectDir = new File('../plugins/fcm-capacitor/android/')
+
+// LiteRT Capacitor Plugin
+include ':litert-capacitor'
+project(':litert-capacitor').projectDir = new File('../plugins/litert-capacitor/android/')
+
+apply from: 'capacitor.settings.gradle'

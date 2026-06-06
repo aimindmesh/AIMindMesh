@@ -1,0 +1,18 @@
+#!/bin/bash
+# Update FreeLLMAPI docker container with latest git version and fix vulnerabilities
+# Scheduled to run every night at 5:00 AM on the VPS.
+set -e
+
+echo "🔄 [$(date)] Starting FreeLLMAPI update..."
+
+# Make it generic by using the script's directory to navigate to aimindmesh-server root
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR/.."
+
+# Rebuild FreeLLMAPI container without cache to pull the latest git commits
+sudo -E docker compose build --no-cache freellmapi
+
+# Recreate and restart the container
+sudo -E docker compose up -d --force-recreate freellmapi
+
+echo "✅ [$(date)] FreeLLMAPI updated and restarted successfully!"

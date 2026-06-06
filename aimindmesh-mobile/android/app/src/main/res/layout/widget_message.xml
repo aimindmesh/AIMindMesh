@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="horizontal"
+    android:padding="8dp"
+    android:background="@drawable/widget_background">
+
+    <TextView
+        android:id="@+id/widget_message_input"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:gravity="center_vertical"
+        android:paddingStart="16dp"
+        android:paddingEnd="8dp"
+        android:text="@string/widget_message_hint"
+        android:textColor="#FFFFFF"
+        android:textColorHint="#B0C0D0"
+        android:textSize="14sp"
+        android:background="@drawable/widget_input_background" />
+
+    <ImageButton
+        android:id="@+id/widget_send_button"
+        android:layout_width="48dp"
+        android:layout_height="match_parent"
+        android:src="@android:drawable/ic_menu_send"
+        android:background="?android:attr/selectableItemBackgroundBorderless"
+        android:contentDescription="@string/widget_send_description"
+        android:scaleType="centerInside"
+        android:tint="#FF00FFFF" />
+
+</LinearLayout>

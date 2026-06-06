@@ -1,0 +1,30 @@
+#!/bin/bash
+# Script to establish SSH tunnels to VPS for accessing OpenClaw and Hermes dashboards locally
+
+SERVER="${VPS_HOST:-your-vps-host.example.com}"  # Set VPS_HOST env var or replace this placeholder
+
+# Colors for output
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+echo -e "${GREEN}AIMindMesh SSH Tunnel Link${NC}"
+echo "=================================="
+echo "Establishing tunnels to $SERVER..."
+echo ""
+echo -e "${YELLOW}Port Mappings:${NC}"
+echo -e "- OpenClaw Control/API   : ${GREEN}http://localhost:18789${NC}"
+echo -e "- Hermes Agent Dashboard : ${GREEN}http://localhost:9119${NC}"
+echo -e "- Hermes Agent API       : ${GREEN}http://localhost:8642${NC}"
+echo ""
+echo "Press Ctrl+C to close the connection and release the ports."
+echo "=================================="
+
+# Establish tunnel:
+# -N: Do not execute a remote command (only forward ports)
+# -L: Local port forwarding [local_port]:[remote_host]:[remote_port]
+ssh -N \
+  -L 18789:127.0.0.1:18789 \
+  -L 9119:127.0.0.1:9119 \
+  -L 8642:127.0.0.1:8642 \
+  "$SERVER"

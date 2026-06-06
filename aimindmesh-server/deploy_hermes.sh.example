@@ -1,0 +1,70 @@
+#!/bin/bash
+# Script to deploy only the aimindmesh-hermes (hermes-agent) container
+set -e
+
+SERVER="${VPS_HOST:-your-vps-host.example.com}"  # Set VPS_HOST env var or replace this placeholder
+REMOTE_DIR="~/aimindmesh-server"
+LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load .env if exists to get current tokens locally
+if [ -f "$LOCAL_DIR/.env" ]; then
+  export $(grep -v '^#' "$LOCAL_DIR/.env" | xargs)
+fi
+
+# Fallback defaults if not in .env
+GITEA_TOKEN=${GITEA_TOKEN:-""}
+GOOGLE_API_KEY=${GOOGLE_API_KEY:-""}
+FREELLMAPI_API_KEY=${FREELLMAPI_API_KEY:-""}
+TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-""}
+
+echo "🚀 Starting Deployment of Hermes Agent from Local PC to Cloud Server ($SERVER)..."
+
+echo "📦 Syncing files with rsync..."
+rsync -avz \
+  --rsync-path="sudo rsync" \
+  --exclude 'node_modules' \
+  --exclude 'dist' \
+  --exclude '.git' \
+  --exclude 'config.json' \
+  --exclude 'data' \
+  --exclude 'backups' \
+  --exclude 'openclaw-config/memory.md' \
+  --exclude 'openclaw-config/config.json' \
+  --exclude 'openclaw-workspace' \
+  --exclude 'hermes-data' \
+  "$LOCAL_DIR/" "$SERVER:$REMOTE_DIR/"
+
+ssh "$SERVER" "bash -s -- $GITEA_TOKEN $GOOGLE_API_KEY $FREELLMAPI_API_KEY $TELEGRAM_BOT_TOKEN" << 'EOF'
+  set -e
+  GITEA_TOKEN=$1
+  GOOGLE_API_KEY=$2
+  FREELLMAPI_API_KEY=$3
+  TELEGRAM_BOT_TOKEN=$4
+  
+  cd ~/aimindmesh-server
+  echo "🐳 Starting Deployment of Hermes Agent on VPS..."
+
+  # 1. Ensure directory and permissions exist
+  sudo mkdir -p ./hermes-data
+  sudo chown -R 1000:1000 ./hermes-data
+  sudo chmod -R 775 ./hermes-data
+
+  # 2. Cleanup legacy container
+  echo "🧹 Cleaning up old Hermes container..."
+  sudo docker stop hermes-agent 2>/dev/null || true
+  sudo docker rm hermes-agent 2>/dev/null || true
+  sudo fuser -k 9119/tcp 8642/tcp 2>/dev/null || true
+
+  # 3. Export credentials and start container
+  export GITEA_TOKEN="$GITEA_TOKEN"
+  export GOOGLE_API_KEY="$GOOGLE_API_KEY"
+  export FREELLMAPI_API_KEY="$FREELLMAPI_API_KEY"
+  export TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN"
+
+  echo "🚀 Launching hermes container..."
+  sudo -E docker compose build hermes
+  sudo -E docker compose up -d --no-deps hermes
+
+  echo "✅ Hermes Agent deployment complete!"
+  sudo docker compose ps hermes
+EOF

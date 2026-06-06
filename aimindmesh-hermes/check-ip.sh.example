@@ -1,0 +1,35 @@
+#!/bin/bash
+
+# Script to check if IP address is available in wirehole_private network
+# Run this script to verify the IP address is not already in use
+
+IP_ADDRESS="HERMES_HOST_PLACEHOLDER"
+NETWORK="wirehole_private_network"
+
+echo "Checking IP address $IP_ADDRESS in network $NETWORK (10.2.0.0/24)..."
+
+# Check if Docker is available
+if ! command -v docker &> /dev/null; then
+    echo "Docker is not available. Please check your Docker installation."
+    exit 1
+fi
+
+# Check if the network exists
+if ! docker network inspect $NETWORK &> /dev/null; then
+    echo "Network $NETWORK does not exist. Please check your network configuration."
+    exit 1
+fi
+
+# Check if the IP is already in use by any container
+if docker network inspect $NETWORK | grep -q "\"$IP_ADDRESS\""; then
+    echo "ERROR: IP address $IP_ADDRESS is already in use in network $NETWORK"
+    echo "Please choose a different IP address from the 10.2.0.x range."
+    exit 1
+else
+    echo "SUCCESS: IP address $IP_ADDRESS is available in network $NETWORK"
+fi
+
+# List containers in the network to show current IP assignments
+echo ""
+echo "Currently active containers in $NETWORK network:"
+docker network inspect $NETWORK | grep -A 10 -B 5 "IPv4Address" | grep -E "(Name|IPv4Address)" | paste - - | sed 's/.*"\([^"]*\)".*IP: \([^)]*\).*/\1: \2/' || docker network inspect $NETWORK | grep -A 10 -B 5 "IPv4Address" | grep -E "(Name|IPv4Address)" || echo "No containers found in the network."

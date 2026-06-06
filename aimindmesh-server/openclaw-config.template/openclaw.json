@@ -1,0 +1,153 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.5.6",
+    "lastTouchedAt": "2026-05-07T05:13:13.676Z"
+  },
+  "wizard": {
+    "lastRunAt": "2026-03-31T17:24:40.467Z",
+    "lastRunVersion": "2026.3.28",
+    "lastRunCommand": "onboard",
+    "lastRunMode": "local"
+  },
+  "auth": {
+    "profiles": {
+      "google:default": {
+        "provider": "google",
+        "mode": "api_key"
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "google/gemini-3.1-flash-lite-preview"
+      },
+      "models": {
+        "google/gemini-3.1-pro-preview": {},
+        "google/gemini-3.1-flash-lite-preview": {}
+      },
+      "workspace": "/home/node/.openclaw/workspace"
+    },
+    "list": [
+      {
+        "id": "main",
+        "model": "google/gemini-3.1-flash-lite-preview"
+      }
+    ]
+  },
+  "tools": {
+    "profile": "coding",
+    "web": {
+      "search": {
+        "enabled": true,
+        "provider": "searxng"
+      }
+    }
+  },
+  "media": {
+    "audio": {
+      "enabled": true,
+      "models": [
+        {
+          "type": "cli",
+          "command": "node",
+          "args": ["/home/node/.openclaw/transcribe-vosk.js", "{{MediaPath}}", "--model", "vosk-model-it-0.22", "--output_dir", "/tmp", "--output_format", "txt"],
+          "timeoutSeconds": 300
+        },
+        {
+          "type": "cli",
+          "command": "node",
+          "args": ["/home/node/.openclaw/transcribe-gemini.js", "{{MediaPath}}", "--model", "medium", "--output_dir", "/tmp", "--output_format", "txt"],
+          "timeoutSeconds": 300
+        }
+      ]
+    }
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto",
+    "restart": true,
+    "ownerDisplay": "raw"
+  },
+  "session": {
+    "dmScope": "per-channel-peer"
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "dmPolicy": "pairing",
+      "botToken": "YOUR_TELEGRAM_BOT_TOKEN",
+      "groups": {
+        "*": {
+          "requireMention": true
+        }
+      },
+      "groupPolicy": "allowlist",
+      "streaming": {
+        "mode": "partial"
+      }
+    }
+  },
+  "gateway": {
+    "port": 18789,
+    "mode": "local",
+    "bind": "custom",
+    "controlUi": {
+      "allowedOrigins": [
+        "*"
+      ],
+      "allowInsecureAuth": false,
+      "enabled": true
+    },
+    "auth": {
+      "mode": "token",
+      "token": "YOUR_GATEWAY_AUTH_TOKEN"
+    },
+    "tailscale": {
+      "mode": "off",
+      "resetOnExit": false
+    },
+    "nodes": {
+      "denyCommands": [
+        "camera.snap",
+        "camera.clip",
+        "screen.record",
+        "contacts.add",
+        "calendar.add",
+        "reminders.add",
+        "sms.send"
+      ]
+    },
+    "customBindHost": "0.0.0.0"
+  },
+  "skills": {
+    "install": {
+      "nodeManager": "npm"
+    },
+    "entries": {
+      "vosk-stt": {
+        "enabled": true
+      }
+    }
+  },
+  "plugins": {
+    "entries": {
+      "duckduckgo": {
+        "enabled": true,
+        "config": {}
+      },
+      "acpx": {
+        "enabled": true
+      },
+      "google": {
+        "enabled": true
+      },
+      "bonjour": {
+        "enabled": false
+      },
+      "searxng": {
+        "enabled": true
+      }
+    }
+  }
+}

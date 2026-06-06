@@ -1,0 +1,18 @@
+{
+    "compilerOptions": {
+        "allowUnreachableCode": false,
+        "declaration": true,
+        "module": "ESNext",
+        "moduleResolution": "NodeNext",
+        "noFallthroughCasesInSwitch": true,
+        "noUnusedLocals": true,
+        "noUnusedParameters": true,
+        "outDir": "dist/esm",
+        "pretty": true,
+        "strict": true,
+        "target": "ES2020"
+    },
+    "include": [
+        "src"
+    ]
+}

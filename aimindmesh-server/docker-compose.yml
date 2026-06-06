@@ -1,0 +1,143 @@
+services:
+  aimindmesh-server:
+    build: .
+    container_name: aimindmesh-server
+    restart: always
+    env_file: .env
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "3030:3030"
+    environment:
+      - OPENCLAW_URL=http://openclaw-gateway:18789
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
+      - GITEA_URL=${GITEA_URL:-http://gitea:3000}
+      - GITEA_TOKEN=${GITEA_TOKEN}
+      - LOG_LEVEL=info
+    networks:
+      wirehole_private_network:
+        ipv4_address: 10.2.0.50
+    volumes:
+      - ./config.json:/app/config.json
+      - ./data:/app/data
+      - ./backups:/app/backups
+      - ./openclaw-config:/app/openclaw-config
+      - ./openclaw-workspace:/app/openclaw-workspace
+      - ./hermes-data:/app/hermes-data
+    depends_on:
+      - openclaw-gateway
+      - neo4j
+
+  neo4j:
+    image: neo4j:5.20-community
+    container_name: aimindmesh-neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/aimindmesh
+      - TZ=Europe/Rome
+    networks:
+      wirehole_private_network:
+        ipv4_address: 10.2.0.53
+    volumes:
+      - ./data/neo4j:/data
+      - ./backups/neo4j:/backups
+
+  openclaw-gateway:
+    build:
+      context: .
+      dockerfile: openclaw.Dockerfile
+    image: aimindmesh-openclaw-gateway:latest
+    container_name: aimindmesh-openclaw-gateway
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:18789:18789"
+      - "10.2.0.1:18789:18789"
+    networks:
+      wirehole_private_network:
+        ipv4_address: 10.2.0.51
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - TZ=Europe/Rome
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - OPENAI_API_KEY=${FREELLMAPI_API_KEY}
+      - OPENAI_BASE_URL=http://aimindmesh-server:3030/api/freellmapi-proxy/v1
+      - GITEA_URL=${GITEA_URL:-http://gitea:3000}
+      - GITEA_TOKEN=${GITEA_TOKEN}
+      - SEARXNG_BASE_URL=http://10.2.0.52:8080
+      - LOG_LEVEL=info
+      - PATH=/home/node/.openclaw/tools/sherpa-onnx-tts/runtime/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    volumes:
+      - ./openclaw-config:/home/node/.openclaw
+      - ./openclaw-workspace:/home/node/.openclaw/workspace
+
+  openclaw-cli:
+    image: aimindmesh-openclaw-gateway:latest
+    container_name: aimindmesh-openclaw-cli
+    network_mode: "service:openclaw-gateway"
+    profiles: [ "cli" ]
+    entrypoint: [ "node", "dist/index.js" ]
+    volumes:
+      - ./openclaw-config:/home/node/.openclaw
+
+  freellmapi:
+    build:
+      context: .
+      dockerfile: freellmapi.Dockerfile
+    container_name: aimindmesh-freellmapi
+    restart: unless-stopped
+    environment:
+      - PORT=3001
+      - NODE_ENV=production
+      - SESSION_SECRET=${FREELLMAPI_SECRET:-aimindmesh-secret-key}
+      - DATABASE_PATH=/app/data/freellmapi.db
+    networks:
+      wirehole_private_network:
+        ipv4_address: 10.2.0.54
+    volumes:
+      - ./data/freellmapi:/app/server/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  hermes:
+    image: nousresearch/hermes-agent:latest
+    container_name: hermes-agent
+    restart: unless-stopped
+    networks:
+      wirehole_private_network:
+        ipv4_address: "${HERMES_STATIC_IP:-}"
+    ports:
+      - "127.0.0.1:9119:9119"
+      - "10.2.0.1:9119:9119"
+      - "127.0.0.1:8642:8642"
+      - "10.2.0.1:8642:8642"
+    volumes:
+      - ./hermes-data:/opt/data
+    environment:
+      - TZ=Europe/Rome
+      - HERMES_UID=${HERMES_UID:-1000}
+      - HERMES_GID=${HERMES_GID:-1000}
+      - HERMES_DASHBOARD=1
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      - API_SERVER_KEY=${HERMES_API_KEY}
+      - API_SERVER_CORS_ORIGINS=*
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - OPENAI_API_KEY=${FREELLMAPI_API_KEY}
+      - OPENAI_BASE_URL=http://aimindmesh-server:3030/api/freellmapi-proxy/v1
+      - GITEA_URL=${GITEA_URL:-http://gitea:3000}
+      - GITEA_TOKEN=${GITEA_TOKEN}
+      - SEARXNG_URL=http://10.2.0.52:8080
+      - OLLAMA_URL=http://host.docker.internal:11434
+      - NEO4J_URI=bolt://neo4j:7687
+    command: ["gateway", "run"]
+
+networks:
+  wirehole_private_network:
+    external: true

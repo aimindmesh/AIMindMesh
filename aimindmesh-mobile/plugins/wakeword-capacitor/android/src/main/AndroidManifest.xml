@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    
+    <!-- Required for audio recording -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    
+    <!-- For foreground service (background wake word detection) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    
+    <!-- Wake lock for keeping CPU active during detection -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    
+</manifest>

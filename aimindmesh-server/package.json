@@ -1,0 +1,50 @@
+{
+  "name": "aimindmesh-server",
+  "version": "0.1.0",
+  "description": "AIMindMesh Server",
+  "author": "Andre <aimindmesh@proton.me>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aimindmesh/AIMindMesh.git"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "npx tsx src/index.ts",
+    "recover": "node dist/scripts/recover_enrichment.js",
+    "deploy:arm64": "npm install && npm rebuild --target_arch=arm64 better-sqlite3 && npm run build"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.2.0",
+    "@fastify/multipart": "^9.4.0",
+    "@fastify/static": "^9.1.3",
+    "@fastify/websocket": "^11.0.1",
+    "@types/minimatch": "^5.1.2",
+    "better-sqlite3": "^12.9.0",
+    "busboy": "^1.6.0",
+    "cheerio": "^1.0.0",
+    "fastify": "^5.8.5",
+    "google-auth-library": "^10.6.2",
+    "mammoth": "^1.8.0",
+    "minimatch": "^10.2.5",
+    "neo4j-driver": "^5.28.3",
+    "node-cron": "^4.2.1",
+    "p-limit": "^7.3.0",
+    "pdf-parse-fork": "^1.1.1",
+    "uuid": "^14.0.0",
+    "axios": "^1.16.0"
+  },
+  "devDependencies": {
+    "@types/axios": "^0.9.36",
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/busboy": "^1.5.4",
+    "@types/node": "^22.19.18",
+    "@types/node-cron": "^3.0.11",
+    "@types/pdf-parse": "^1.1.4",
+    "@types/uuid": "^10.0.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.3"
+  }
+}

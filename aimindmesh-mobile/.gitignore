@@ -1,0 +1,96 @@
+
+# Android
+android/app/build/
+android/.gradle/
+android/local.properties
+android/captures/
+android/.idea/
+android/app/src/main/assets/public/
+android/build_log.txt
+
+# Plugin Artifacts (Recursive)
+**/build/
+**/.gradle/
+**/.cxx/
+**/captures/
+**/.kotlin/
+
+# Tauri / Rust
+src-tauri/target/
+**/target/
+src-tauri/gen/
+**/gen/
+
+# Build and Dist
+dist/
+dist-ssr/
+**/dist/
+**/out/
+build.sh
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Logs
+logs
+*.log
+**/npm-debug.log*
+**/yarn-debug.log*
+**/yarn-error.log*
+**/pnpm-debug.log*
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+**/.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# AI Session and Temporary data
+.gemini/
+**/*.bak
+**/*.tmp
+**/*.temp
+**/*.swp
+**/*.swo
+
+# OS specific files
+.DS_Store
+**/Thumbs.db
+
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+
+# Binary artifacts (excluding tracked ones in lib/)
+**/bin/
+**/obj/
+**/.externalNativeBuild/
+**/*.o
+**/*.a
+# Note: .so files are handled carefully as some are tracked in lib/ and jniLibs/
+# If you want to ignore all untracked .so files:
+# **/*.so
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Large files and archives
+*.zip
+*.tar.gz
+*.aar
+*.apk
+*.aab
+temp_vosk/
+SmolChat-Android-main/
+gallery-main/
+Models/
+vendor/llama-cpp-rs

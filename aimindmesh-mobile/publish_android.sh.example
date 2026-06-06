@@ -1,0 +1,84 @@
+#!/bin/bash
+set -e
+
+# Configuration
+SERVER="your-vps-ip-or-ddns" 
+REMOTE_DIR="/home/your-user/aimindmesh-server/data/downloads"
+LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Colors for output
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# 1. Extract Version
+VERSION=$(node -p "require('./package.json').version")
+echo -e "${BLUE}🏗️  Starting Android Distribution process (v$VERSION)...${NC}"
+
+# 2. Build Frontend
+echo -e "${BLUE}📦 Building React frontend...${NC}"
+npm run build
+
+# 3. Capacitor Sync
+echo -e "${BLUE}🔄 Syncing Capacitor with Android platform...${NC}"
+npx cap sync android
+
+# 4. Android Build
+echo -e "${BLUE}🤖 Compiling Release APK...${NC}"
+cd android
+./gradlew assembleRelease
+cd ..
+
+# 5. Artifact Collection
+echo -e "${BLUE}📂 Organizing installer...${NC}"
+APK_SOURCE="android/app/build/outputs/apk/release/app-release.apk"
+APK_FILENAME="aimindmesh-v$VERSION.apk"
+APK_TARGET="dist/$APK_FILENAME"
+
+if [ ! -f "$APK_SOURCE" ]; then
+    echo -e "❌ CRITICAL: Build failed, APK not found at $APK_SOURCE"
+    exit 1
+fi
+
+mkdir -p dist
+cp "$APK_SOURCE" "$APK_TARGET"
+echo -e "${GREEN}✅ Local build complete: $APK_TARGET${NC}"
+
+# 6. Private Cloud Upload
+echo -e "${BLUE}🚀 Syncing APK to VPN-only download zone ($SERVER)...${NC}"
+ssh "$SERVER" "mkdir -p $REMOTE_DIR"
+rsync -avz --progress "$APK_TARGET" "$SERVER:$REMOTE_DIR/"
+
+# 7. Update versions.json
+echo -e "${BLUE}📝 Updating versions.json on remote server...${NC}"
+ssh "$SERVER" "python3 -c \"
+import json, os, datetime
+path = os.path.expanduser('$REMOTE_DIR/versions.json')
+try:
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        with open(path, 'r') as f:
+            data = json.load(f)
+    else:
+        data = {'pc': {}, 'android': {}}
+except Exception as e:
+    print(f'Warning: Versions file was corrupted, resetting. Error: {e}')
+    data = {'pc': {}, 'android': {}}
+
+data['android'] = {
+    'version': '$VERSION',
+    'apk': '$APK_FILENAME',
+    'timestamp': datetime.datetime.now().isoformat()
+}
+
+with open(path, 'w') as f:
+    json.dump(data, f, indent=2)
+\""
+
+echo -e "\n${GREEN}🎉 Distribution Complete!${NC}"
+echo "--------------------------------------------------"
+echo "Android installer is now hosted SECURELY on the VPN."
+echo "Version: $VERSION"
+echo "Filename: $APK_FILENAME"
+echo "URL: http://$SERVER:3030/dl/$APK_FILENAME"
+echo "--------------------------------------------------"

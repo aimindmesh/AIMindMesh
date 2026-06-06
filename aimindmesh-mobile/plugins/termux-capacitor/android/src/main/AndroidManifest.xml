@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Permission to query and interact with Termux -->
+    <queries>
+        <package android:name="com.termux" />
+        <package android:name="com.termux.api" />
+    </queries>
+</manifest>

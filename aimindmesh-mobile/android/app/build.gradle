@@ -1,0 +1,142 @@
+apply plugin: 'com.android.application'
+apply plugin: 'kotlin-android'
+
+android {
+    namespace "com.aimindmesh.mobile"
+    compileSdk rootProject.ext.compileSdkVersion
+    defaultConfig {
+        applicationId "com.aimindmesh.mobile"
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        versionCode 1
+        versionName "0.1.0"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        aaptOptions {
+             // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
+             // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
+            ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+        }
+        
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+    
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+    
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+    signingConfigs {
+        release {
+            storeFile file(MYAPP_RELEASE_STORE_FILE)
+            storePassword MYAPP_RELEASE_STORE_PASSWORD
+            keyAlias MYAPP_RELEASE_KEY_ALIAS
+            keyPassword MYAPP_RELEASE_KEY_PASSWORD
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.release
+        }
+    }
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+        pickFirst 'lib/x86/libjnidispatch.so'
+        pickFirst 'lib/x86_64/libjnidispatch.so'
+        pickFirst 'lib/armeabi-v7a/libjnidispatch.so'
+        pickFirst 'lib/arm64-v8a/libjnidispatch.so'
+        // ONNX Runtime native libs - pick first to avoid duplicate between piper and speaker-embedding
+        pickFirst 'lib/arm64-v8a/libonnxruntime.so'
+        pickFirst 'lib/x86_64/libonnxruntime.so'
+        pickFirst 'lib/armeabi-v7a/libonnxruntime.so'
+        pickFirst 'lib/x86/libonnxruntime.so'
+        pickFirst '**/libLiteRt*.so'
+        pickFirst '**/libLiteRtTopKOpenClSampler.so'
+        pickFirst '**/libtensorflowlite_gpu_delegate.so'
+        pickFirst '**/libtensorflowlite_gpu_jni.so'
+    }
+}
+
+repositories {
+    mavenCentral()
+    flatDir {
+        dirs 'libs'
+    }
+}
+
+// Resolution strategy removed to allow TFLite Play Services
+
+configurations.all {
+    exclude group: 'org.tensorflow', module: 'tensorflow-lite-support-api'
+    exclude group: 'org.tensorflow', module: 'tensorflow-lite-api'
+    exclude group: 'org.tensorflow', module: 'tensorflow-lite'
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar', '*.aar'], dir: 'libs')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    // Encrypted SharedPreferences for secure API key storage (Android Keystore)
+    implementation "androidx.security:security-crypto:1.1.0-alpha06"
+    implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
+    implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
+    implementation project(':capacitor-android')
+
+    testImplementation "junit:junit:$junitVersion"
+    androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
+    androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
+    implementation project(':capacitor-cordova-android-plugins')
+    
+    // LiteRT-LM for Gemma 4 models
+    implementation('com.google.ai.edge.litertlm:litertlm-android:0.11.0')
+    
+    // Core TFLite GPU Support
+    implementation 'com.google.android.gms:play-services-tflite-java:16.5.0'
+    implementation 'com.google.android.gms:play-services-tflite-gpu:16.5.0'
+    implementation('com.google.android.gms:play-services-tflite-support:16.5.0') {
+        exclude group: 'org.tensorflow', module: 'tensorflow-lite-support-api'
+    }
+    
+    // LiteRT Capacitor Plugin
+    implementation project(':litert-capacitor')
+    
+    // ExoPlayer for robust audio segment playback
+    implementation "androidx.media3:media3-exoplayer:1.2.0"
+    implementation "androidx.media3:media3-session:1.2.0"
+
+    // ONNX Runtime for TextEmbedding
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.26.0'
+
+    // Sherpa-ONNX per Kokoro TTS v2 (local aar, statically linked to avoid ONNX conflicts)
+    implementation files('libs/sherpa-onnx-static-link-onnxruntime-1.13.2.aar')
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+    implementation 'org.apache.commons:commons-compress:1.26.1'
+
+    // Firebase Cloud Messaging (v4.0.0 — push notifications for Feed/insights)
+    implementation 'com.google.firebase:firebase-messaging:24.0.0'
+
+    // FCM Capacitor Plugin (v4.0.0)
+    implementation project(':fcm-capacitor')
+}
+
+apply from: 'capacitor.build.gradle'
+
+try {
+    def servicesJSON = file('google-services.json')
+    if (servicesJSON.text) {
+        apply plugin: 'com.google.gms.google-services'
+    }
+} catch(Exception e) {
+    logger.info("google-services.json not found, google-services plugin not applied. Push Notifications won't work")
+}

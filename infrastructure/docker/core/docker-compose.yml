@@ -1,0 +1,61 @@
+services:
+  aimindmesh-server:
+    build: .
+    container_name: aimindmesh-server
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "3030:3030"
+    environment:
+      - OPENCLAW_URL=http://openclaw-gateway:18789
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
+      - GITEA_URL=${GITEA_URL:-http://gitea:3000}
+      - GITEA_TOKEN=${GITEA_TOKEN}
+      - LOG_LEVEL=info
+    networks:
+      wirehole_private_network:
+        ipv4_address: 10.2.0.50
+    volumes:
+      - ./config.json:/app/config.json
+      - ./data:/app/data
+      - ./openclaw-config:/app/openclaw-config
+    depends_on:
+      - openclaw-gateway
+
+  openclaw-gateway:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: aimindmesh-openclaw-gateway
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18789:18789"
+      - "10.2.0.1:18789:18789"
+    networks:
+      wirehole_private_network:
+        ipv4_address: 10.2.0.51
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - TZ=Europe/Rome
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GITEA_URL=${GITEA_URL:-http://gitea:3000}
+      - GITEA_TOKEN=${GITEA_TOKEN}
+      - SEARXNG_BASE_URL=http://10.2.0.52:8080
+      - LOG_LEVEL=info
+    volumes:
+      - ./openclaw-config:/home/node/.openclaw
+      - ./openclaw-workspace:/home/node/.openclaw/workspace
+
+  openclaw-cli:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: aimindmesh-openclaw-cli
+    network_mode: "service:openclaw-gateway"
+    profiles: [ "cli" ]
+    entrypoint: [ "node", "dist/index.js" ]
+    volumes:
+      - ./openclaw-config:/home/node/.openclaw
+
+networks:
+  wirehole_private_network:
+    external: true

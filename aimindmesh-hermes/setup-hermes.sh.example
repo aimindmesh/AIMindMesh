@@ -1,0 +1,166 @@
+#!/bin/bash
+
+# Setup script for Hermes Agent on Docker Compose
+# This script helps initialize the Hermes Agent container and configure it
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+echo -e "${GREEN}Hermes Agent Setup Script${NC}"
+echo "=================================="
+echo "" 
+echo -e "${YELLOW}Network Configuration:${NC}"
+echo "- Hermes Agent will connect to wirehole_private_network network"
+echo "- Static IP address: HERMES_HOST_PLACEHOLDER (as specified for your 10.2.0.0/24 network)"
+echo "- Accessible only within your private network"
+echo ""
+
+# Check if Docker is installed
+if ! command -v docker &> /dev/null; then
+    echo -e "${RED}Error: Docker is not installed. Please install Docker first.${NC}"
+    exit 1
+fi
+
+# Check if Docker Compose is installed
+if ! command -v docker-compose &> /dev/null; then
+    echo -e "${RED}Error: Docker Compose is not installed. Please install Docker Compose first.${NC}"
+    exit 1
+fi
+
+# Create data directory
+echo -e "${YELLOW}Creating Hermes data directory...${NC}"
+mkdir -p ./data
+
+# Set default UID/GID if not already set
+if [ -z "$HERMES_UID" ]; then
+    HERMES_UID=$(id -u)
+    export HERMES_UID
+fi
+
+if [ -z "$HERMES_GID" ]; then
+    HERMES_GID=$(id -g)
+    export HERMES_GID
+fi
+
+echo "Using UID: $HERMES_UID, GID: $HERMES_GID"
+
+# Check if environment file exists
+if [ ! -f ./data/.env ]; then
+    echo -e "${YELLOW}No environment file found. Running setup wizard...${NC}"
+    
+    # Run the setup wizard with local volume
+    docker run -it --rm \
+        -v "$(pwd)/data":/opt/data \
+        nousresearch/hermes-agent setup
+    
+    echo -e "${GREEN}Setup wizard completed.${NC}"
+else
+    echo -e "${GREEN}Environment file already exists at ./data/.env${NC}"
+fi
+
+# Check if Telegram bot token is set
+if ! grep -q "TELEGRAM_BOT_TOKEN" ./data/.env 2>/dev/null; then
+    echo -e "${YELLOW}Telegram bot token not set in ./data/.env${NC}"
+    echo -e "${YELLOW}To enable Telegram messaging, add your bot token:${NC}"
+    echo -e "${YELLOW}TELEGRAM_BOT_TOKEN=your_bot_token_here${NC}"
+    echo -e "${YELLOW}You can get this from @BotFather on Telegram${NC}"
+fi
+
+# Check if LLM API keys are set
+echo -e "${YELLOW}Checking for LLM API keys...${NC}"
+LLM_KEYS_FOUND=0
+
+if grep -q "OPENAI_API_KEY" ./data/.env 2>/dev/null; then
+    echo -e "${GREEN}OpenAI API key found${NC}"
+    LLM_KEYS_FOUND=$((LLM_KEYS_FOUND + 1))
+fi
+
+if grep -q "ANTHROPIC_API_KEY" ./data/.env 2>/dev/null; then
+    echo -e "${GREEN}Anthropic API key found${NC}"
+    LLM_KEYS_FOUND=$((LLM_KEYS_FOUND + 1))
+fi
+
+if grep -q "OPENROUTER_API_KEY" ./data/.env 2>/dev/null; then
+    echo -e "${GREEN}OpenRouter API key found${NC}"
+    LLM_KEYS_FOUND=$((LLM_KEYS_FOUND + 1))
+fi
+
+if grep -q "GEMINI_API_KEY" ./data/.env 2>/dev/null; then
+    echo -e "${GREEN}Gemini API key found${NC}"
+    LLM_KEYS_FOUND=$((LLM_KEYS_FOUND + 1))
+fi
+
+if [ $LLM_KEYS_FOUND -eq 0 ]; then
+    echo -e "${YELLOW}No LLM API keys found in ./data/.env${NC}"
+    echo -e "${YELLOW}Add at least one LLM provider API key to enable chat functionality:${NC}"
+    echo -e "${YELLOW}OPENAI_API_KEY=your_openai_key${NC}"
+    echo -e "${YELLOW}ANTHROPIC_API_KEY=your_anthropic_key${NC}"
+    echo -e "${YELLOW}OPENROUTER_API_KEY=your_openrouter_key${NC}"
+    echo -e "${YELLOW}GEMINI_API_KEY=your_gemini_key${NC}"
+fi
+
+# Optional: Set up local integrations if services exist
+echo -e "${YELLOW}Checking for local integrations...${NC}"
+
+if command -v hermes &> /dev/null; then
+    echo -e "${GREEN}Hermes CLI is installed locally. Skipping local service setup.${NC}"
+else
+    # Check for SearXNG
+    if curl -s http://localhost:8080/health > /dev/null 2>&1; then
+        echo -e "${GREEN}SearXNG is running on localhost:8080${NC}"
+        echo -e "${YELLOW}Add to your ./data/.env:${NC}"
+        echo -e "${YELLOW}SEARXNG_URL=http://localhost:8080${NC}"
+    fi
+
+    # Check for Ollama
+    if curl -s http://localhost:11434/api/version > /dev/null 2>&1; then
+        echo -e "${GREEN}Ollama is running on localhost:11434${NC}"
+        echo -e "${YELLOW}Add to your ./data/.env:${NC}"
+        echo -e "${YELLOW}OLLAMA_URL=http://localhost:11434${NC}"
+    fi
+
+    # Check for Neo4j
+    if curl -s http://localhost:7474 > /dev/null 2>&1; then
+        echo -e "${GREEN}Neo4j is running on localhost:7474${NC}"
+        echo -e "${YELLOW}Add to your ./data/.env:${NC}"
+        echo -e "${YELLOW}NEO4J_URI=bolt://localhost:7687${NC}"
+    fi
+fi
+
+# Ask if user wants to start the service
+echo -e "\n${GREEN}Setup complete!${NC}"
+read -p "Do you want to start the Hermes Agent service now? (y/n) " -n 1 -r
+echo
+
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo -e "${YELLOW}Starting Hermes Agent...${NC}"
+    
+    # Check if API server key is needed (for external access)
+    if ! grep -q "API_SERVER_KEY" ./data/.env 2>/dev/null; then
+        echo -e "${YELLOW}Generating API server key...${NC}"
+        API_SERVER_KEY=$(openssl rand -hex 32)
+        echo "API_SERVER_ENABLED=true" >> ./data/.env
+        echo "API_SERVER_HOST=0.0.0.0" >> ./data/.env
+        echo "API_SERVER_KEY=$API_SERVER_KEY" >> ./data/.env
+        echo "API_SERVER_CORS_ORIGINS='*'" >> ./data/.env
+        echo -e "${GREEN}API server key generated and added to ./data/.env${NC}"
+        echo -e "${YELLOW}API server will be available on port 8642${NC}"
+        echo -e "${YELLOW}Dashboard will be available on port 9119${NC}"
+    fi
+    
+    # Start the service
+    docker compose up -d
+    
+    echo -e "${GREEN}Hermes Agent is now running!${NC}"
+    echo -e "${YELLOW}View logs: docker compose logs -f${NC}"
+    echo -e "${YELLOW}Dashboard: http://HERMES_HOST_PLACEHOLDER:9119 (accessible within wirehole_private_network network)${NC}"
+    echo -e "${YELLOW}API server: http://HERMES_HOST_PLACEHOLDER:8642 (accessible within wirehole_private_network network)${NC}"
+else
+    echo -e "${GREEN}You can start the service later with:${NC}"
+    echo -e "${YELLOW}docker compose up -d${NC}"
+fi
+
+echo -e "\n${GREEN}Setup complete!${NC}"

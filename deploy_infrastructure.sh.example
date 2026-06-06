@@ -1,0 +1,63 @@
+#!/bin/bash
+# AIMindMesh Infrastructure Deployment Orchestrator (EXAMPLE)
+# This script consolidates the entire AIMindMesh ecosystem setup.
+
+set -e
+
+# --- CONFIGURATION (EDIT THESE) ---
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INFRA_DIR="$BASE_DIR/infrastructure"
+GITEA_TOKEN=${GITEA_TOKEN:-"your-gitea-token"} 
+GOOGLE_API_KEY=${GOOGLE_API_KEY:-"your-google-api-key"}
+PIHOLE_PASSWORD=${PIHOLE_PASSWORD:-"your-pihole-password"}
+
+echo "🚀 Starting AIMindMesh Infrastructure Deployment..."
+
+# 1. Prerequisite Check
+echo "🔍 Checking prerequisites..."
+command -v docker >/dev/null 2>&1 || { echo "❌ Docker is required. Aborting." >&2; exit 1; }
+command -v docker-compose >/dev/null 2>&1 || { echo "❌ docker-compose is required. Aborting." >&2; exit 1; }
+
+# 1.1 Stop native Neo4j to prevent port conflicts with the container version
+echo "🛑 Ensuring native Neo4j is disabled..."
+sudo systemctl stop neo4j 2>/dev/null || true
+sudo systemctl disable neo4j 2>/dev/null || true
+
+# 2. Ollama Setup
+echo "🦙 Setting up Ollama..."
+bash "$INFRA_DIR/scripts/install_ollama.sh"
+
+# 3. Networking Setup (WireGuard / Bridge)
+echo "🌐 Setting up Networking..."
+bash "$INFRA_DIR/scripts/setup_networking.sh"
+
+# 4. Launch Supporting Services (WireHole, Gitea, SearXNG)
+echo "🛠️  Launching Supporting Services..."
+cd "$INFRA_DIR/docker/services/wirehole" && PIHOLE_PASSWORD="$PIHOLE_PASSWORD" docker-compose up -d
+cd "$INFRA_DIR/docker/services/gitea" && docker-compose up -d
+cd "$INFRA_DIR/docker/services/searxng" && docker-compose up -d
+
+# 5. Launch Utilities (Portainer, Watchtower, etc.)
+echo "🔧 Launching Management Utilities..."
+cd "$INFRA_DIR/docker/utils" && docker-compose up -d
+
+# 6. Launch Kasm Workspaces (if available)
+echo "🖼️  Setting up Kasm Workspaces..."
+if [ -d "/opt/kasm" ]; then
+    echo "✅ Kasm installation found at /opt/kasm. Starting services..."
+    sudo /opt/kasm/bin/start || echo "⚠️  Failed to start Kasm. Please check /opt/kasm manually."
+else
+    echo "ℹ️  Kasm not found in /opt/kasm. Skipping Kasm startup."
+fi
+
+# 7. Launch Core AIMindMesh Stack (Server + OpenClaw + Neo4j)
+echo "🧠 Launching Core AIMindMesh Stack..."
+# Note: The core stack is usually deployed via aimindmesh-server/deploy_to_cloud.sh
+# but this section ensures the docker-compose in infrastructure/docker/core is up.
+CORE_DIR="$INFRA_DIR/docker/core"
+
+if [ -f "$CORE_DIR/docker-compose.yml" ]; then
+    cd "$CORE_DIR" && GITEA_TOKEN="$GITEA_TOKEN" GOOGLE_API_KEY="$GOOGLE_API_KEY" docker-compose up -d --build
+fi
+
+echo "✅ Infrastructure Deployment Complete!"

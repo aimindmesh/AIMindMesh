@@ -1,0 +1,58 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": [
+      "ES2020",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "baseUrl": ".",
+    "paths": {
+      "android-auto-capacitor": ["plugins/android-auto-capacitor/src/index.ts"],
+      "audio-output-capacitor": ["plugins/audio-output-capacitor/src/index.ts"],
+      "background-service-capacitor": ["plugins/background-service-capacitor/src/index.ts"],
+      "litert-capacitor": ["plugins/litert-capacitor/src/index.ts"],
+      "llama-cpp-capacitor": ["plugins/llama-cpp-capacitor/types/llama-cpp-capacitor.d.ts"],
+      "mnn-capacitor": ["plugins/mnn-capacitor/src/index.ts"],
+      "piper-capacitor": ["plugins/piper-capacitor/src/index.ts"],
+      "speaker-embedding-capacitor": ["plugins/speaker-embedding-capacitor/src/index.ts"],
+      "termux-capacitor": ["plugins/termux-capacitor/src/index.ts"],
+      "text-embedding-capacitor": ["plugins/text-embedding-capacitor/src/index.ts"],
+      "vad-capacitor": ["plugins/vad-capacitor/src/index.ts"],
+      "vosk-capacitor": ["plugins/vosk-capacitor/src/index.ts"],
+      "wakeword-capacitor": ["plugins/wakeword-capacitor/src/index.ts"],
+      "whisper-capacitor": ["plugins/whisper-capacitor/src/index.ts"]
+    }
+  },
+  "include": [
+    "**/*.ts",
+    "**/*.tsx",
+    "**/*.d.ts"
+  ],
+  "exclude": [
+    "vite.config.ts",
+    "capacitor.config.ts",
+    "node_modules",
+    "dist",
+    "src-tauri",
+    "vendor"
+  ],
+  "references": [
+    {
+      "path": "./tsconfig.node.json"
+    }
+  ]
+}
