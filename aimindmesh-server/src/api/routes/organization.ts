@@ -396,8 +396,8 @@ export async function organizationRoutes(app: FastifyInstance) {
 
       if (debateResult.consensus) {
         try {
-          const { VentureOrchestrator } = await import('../../services/organization/VentureOrchestrator');
-          await VentureOrchestrator.onIdeaApproved(ideaId);
+          const { DesignOrchestrator } = await import('../../services/organization/DesignOrchestrator');
+          await DesignOrchestrator.characterizeIdea(ideaId);
         } catch (orr: any) {
           console.error(`Auto-orchestration failed on review approval: ${orr.message}`);
         }
@@ -446,8 +446,8 @@ export async function organizationRoutes(app: FastifyInstance) {
       });
 
       try {
-        const { VentureOrchestrator } = await import('../../services/organization/VentureOrchestrator');
-        await VentureOrchestrator.onIdeaApproved(ideaId);
+        const { DesignOrchestrator } = await import('../../services/organization/DesignOrchestrator');
+        await DesignOrchestrator.characterizeIdea(ideaId);
       } catch (orr: any) {
         console.error(`Auto-orchestration failed on manual approval: ${orr.message}`);
       }
@@ -587,8 +587,8 @@ Format:
   app.post('/ideas/:ideaId/transition', async (request: FastifyRequest, reply: FastifyReply) => {
     try {
       const { ideaId } = request.params as { ideaId: string };
-      const { VentureOrchestrator } = await import('../../services/organization/VentureOrchestrator');
-      await VentureOrchestrator.onIdeaApproved(ideaId);
+      const { DesignOrchestrator } = await import('../../services/organization/DesignOrchestrator');
+      await DesignOrchestrator.characterizeIdea(ideaId);
       return { success: true };
     } catch (e: any) {
       reply.status(500).send({ error: e.message });
