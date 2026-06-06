@@ -1,0 +1,53 @@
+{
+    "name": "litert-capacitor",
+    "version": "0.0.1",
+    "description": "Capacitor plugin for LiteRT LLM Inference API with Gemma models support",
+    "main": "dist/plugin.cjs.js",
+    "module": "dist/esm/index.js",
+    "types": "dist/esm/index.d.ts",
+    "unpkg": "dist/plugin.js",
+    "files": [
+        "android/src/main/",
+        "android/build.gradle",
+        "dist/"
+    ],
+    "author": "",
+    "license": "MIT",
+    "keywords": [
+        "capacitor",
+        "plugin",
+        "litert",
+        "gemma",
+        "llm",
+        "multimodal",
+        "on-device-ai"
+    ],
+    "scripts": {
+        "build": "tsc && rollup -c rollup.config.mjs",
+        "clean": "rimraf ./dist"
+    },
+    "devDependencies": {
+        "@capacitor/android": "^7.0.0",
+        "@capacitor/core": "^7.4.3",
+        "rimraf": "^6.0.1",
+        "rollup": "^4.30.1",
+        "typescript": "~4.1.5"
+    },
+    "peerDependencies": {
+        "@capacitor/core": ">=7.0.0"
+    },
+    "capacitor": {
+        "ios": {
+            "src": "ios"
+        },
+        "android": {
+            "src": "android"
+        }
+    },
+    "overrides": {
+        "eslint": "^9.26.0",
+        "lodash": "4.17.23",
+        "lodash-es": "4.17.23",
+        "tar": "^7.5.7"
+    }
+}

@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  freellmapi:
+    build: .
+    container_name: aimindmesh-freellmapi
+    restart: unless-stopped
+    environment:
+      - PORT=3001
+      - NODE_ENV=production
+      - SESSION_SECRET=${FREELLMAPI_SECRET:-aimindmesh-secret-key}
+      - DATABASE_PATH=/app/data/freellmapi.db
+    networks:
+      wirehole_private_network:
+        ipv4_address: 10.2.0.54
+    volumes:
+      - ./data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+networks:
+  wirehole_private_network:
+    external: true

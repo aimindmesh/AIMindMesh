@@ -1,0 +1,70 @@
+#!/bin/bash
+set -e
+
+# Configuration
+SERVER="your-vps-ip-or-ddns" 
+REMOTE_DIR="~/aimindmesh-server/data/downloads"
+LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# 1. Extract Version
+VERSION=$(node -p "require('./package.json').version")
+echo "🏗️  Starting Desktop Distribution process (v$VERSION)..."
+
+# 2. Frontend Build
+echo "📦 Building React frontend..."
+npm run build
+
+# 3. Tauri Build
+echo "🦀 Compiling Tauri Native Application (Linux)..."
+npm run tauri build
+
+# 4. Artifact Collection
+echo "📂 Organizing installers..."
+INSTALLER_DIR="$LOCAL_DIR/dist/installers"
+mkdir -p "$INSTALLER_DIR"
+
+# Find artifacts (naming depends on tauri config, usually includes version)
+DEB_FILE=$(find src-tauri/target/release/bundle/deb/ -name "*.deb" -print -quit)
+APPIMAGE_FILE=$(find src-tauri/target/release/bundle/appimage/ -name "*.AppImage" -print -quit)
+
+if [ -f "$DEB_FILE" ]; then 
+    DEB_NAME=$(basename "$DEB_FILE")
+    cp "$DEB_FILE" "$INSTALLER_DIR/"
+fi
+if [ -f "$APPIMAGE_FILE" ]; then 
+    APPIMAGE_NAME=$(basename "$APPIMAGE_FILE")
+    cp "$APPIMAGE_FILE" "$INSTALLER_DIR/"
+    # Cleanup previous versions from Scrivania before copy
+    rm -f ~/Scrivania/aimindmesh-client_*.AppImage
+    cp "$APPIMAGE_FILE" ~/Scrivania/
+fi
+
+echo "✅ Local build complete. Artifacts tracked: $DEB_NAME, $APPIMAGE_NAME"
+
+# 5. Private Cloud Upload
+echo "🚀 Syncing installers to VPN download zone ($SERVER)..."
+ssh "$SERVER" "mkdir -p $REMOTE_DIR"
+rsync -avz "$INSTALLER_DIR/" "$SERVER:$REMOTE_DIR/"
+
+# 6. Update versions.json
+echo "📝 Updating versions.json on server..."
+ssh "$SERVER" "python3 -c \"
+import json, os
+path = os.path.expanduser('$REMOTE_DIR/versions.json')
+data = json.load(open(path)) if os.path.exists(path) else {'pc': {}, 'android': {}}
+data['pc'] = {
+    'version': '$VERSION',
+    'deb': '$DEB_NAME',
+    'appimage': '$APPIMAGE_NAME',
+    'timestamp': '$(date +%Y-%m-%dT%H:%M:%S%z)'
+}
+with open(path, 'w') as f:
+    json.dump(data, f, indent=2)
+\""
+
+echo ""
+echo "🎉 Distribution Complete!"
+echo "--------------------------------------------------"
+echo "Installers are now hosted SECURELY on the VPN."
+echo "Version: $VERSION"
+echo "--------------------------------------------------"

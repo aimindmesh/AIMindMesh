@@ -1,0 +1,46 @@
+# SearXNG settings for AIMindMesh Ecosystem
+use_default_settings: true
+
+server:
+  secret_key: "${SEARXNG_SECRET:-searxng_9be0e66bb887b3dba66260721eb3645f}"
+  limiter: false
+  image_proxy: true
+  method: "GET"
+
+ui:
+  static_use_hash: true
+
+redis:
+  url: redis://redis:6379/0
+
+general:
+  instance_name: "AIMindMesh Search Gateway"
+
+search:
+  autocomplete: "duckduckgo"
+  formats:
+    - html
+    - json
+
+engines:
+  - name: google
+    engine: google
+    disabled: false
+  - name: bing
+    engine: bing
+    disabled: false
+  - name: yahoo
+    engine: yahoo
+    disabled: true
+  - name: brave
+    engine: brave
+    weight: 2
+  - name: duckduckgo
+    engine: duckduckgo
+    weight: 2
+  - name: qwant
+    engine: qwant
+    weight: 1
+  - name: wikipedia
+    engine: wikipedia
+    weight: 1

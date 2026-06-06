@@ -1,0 +1,135 @@
+# Docker Compose file for Hermes Agent
+# 
+# This configuration sets up Hermes Agent with both gateway and dashboard
+# for deployment on a VPS with other services.
+#
+# Usage:
+#   HERMES_UID=$(id -u) HERMES_GID=$(id -g) docker compose up -d
+#
+# Set HERMES_UID / HERMES_GID to the host user that owns ~/.hermes so
+# files created inside the container stay readable/writable on the host.
+# The s6-overlay stage2 hook remaps the internal `hermes` user to these
+# values via usermod/groupmod; each supervised service then drops to that
+# user via `s6-setuidgid`.
+
+# Security notes:
+#   - The dashboard service binds to 127.0.0.1 by default. It stores API
+#     keys; exposing it on LAN without auth is unsafe. If you want remote
+#     access, use an SSH tunnel or put it behind a reverse proxy that
+#     adds authentication — do NOT pass --insecure --host 0.0.0.0.
+#   - If you override entrypoint, keep `/init` as the first command in
+#     the chain (or let docker use the image's default ENTRYPOINT,
+#     which is `["/init", "/opt/hermes/docker/main-wrapper.sh"]`).
+#     `/init` is s6-overlay's PID 1 — it runs the cont-init.d scripts
+#     (chown, profile reconcile, dashboard toggle) and sets up the
+#     supervision tree before any service starts. Bypassing it skips
+#     all of that setup and the gateway will not work correctly.
+#   - The gateway's API server is off by default. To expose it beyond
+#     localhost, uncomment API_SERVER_KEY and API_SERVER_HOST below.
+#     See the documentation before doing this on an internet-facing host.
+
+services:
+  hermes:
+    image: nousresearch/hermes-agent:latest
+    container_name: hermes-agent
+    restart: unless-stopped
+    networks:
+      wirehole_private_network:
+        ipv4_address: HERMES_HOST_PLACEHOLDER
+    ports:
+      - "127.0.0.1:9119:9119"
+      - "10.2.0.1:9119:9119"
+      - "127.0.0.1:8642:8642"
+      - "10.2.0.1:8642:8642"
+    volumes:
+      - ./data:/opt/data
+    environment:
+      # Set user ownership of files in the container to match the host
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      
+      # Enable dashboard (runs as a supervised service in the same container)
+      - HERMES_DASHBOARD=1
+      
+      # Gateway API server settings (optional - for external access)
+      # Uncomment and set these if you need to expose the API server beyond localhost
+      # - API_SERVER_ENABLED=true
+      # - API_SERVER_HOST=0.0.0.0
+      # - API_SERVER_KEY=${API_SERVER_KEY}  # Generate with: openssl rand -hex 32
+      # - API_SERVER_CORS_ORIGINS='*'  # Use with caution
+      
+      # Telegram integration (required for Telegram messaging)
+      # Get your bot token from @BotFather on Telegram
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      
+      # Optional: Other messaging platforms
+      # Microsoft Teams — uncomment and fill in to enable
+      # - TEAMS_CLIENT_ID=${TEAMS_CLIENT_ID}
+      # - TEAMS_CLIENT_SECRET=${TEAMS_CLIENT_SECRET}
+      # - TEAMS_TENANT_ID=${TEAMS_TENANT_ID}
+      # - TEAMS_ALLOWED_USERS=${TEAMS_ALLOWED_USERS}
+      # - TEAMS_PORT=${TEAMS_PORT:-3978}
+      
+      # Google Chat — uncomment and fill in to enable
+      # - GOOGLE_CHAT_PROJECT_ID=${GOOGLE_CHAT_PROJECT_ID}
+      # - GOOGLE_CHAT_SUBSCRIPTION_NAME=${GOOGLE_CHAT_SUBSCRIPTION_NAME}
+      # - GOOGLE_CHAT_SERVICE_ACCOUNT_JSON=${GOOGLE_CHAT_SERVICE_ACCOUNT_JSON}
+      # - GOOGLE_CHAT_ALLOWED_USERS=${GOOGLE_CHAT_ALLOWED_USERS}
+      
+      # LLM provider API keys
+      # Uncomment and set your API keys:
+      # - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      # - GEMINI_API_KEY=${GEMINI_API_KEY}
+      
+      # Optional: Integration with local services on your VPS
+      # - SEARXNG_URL=http://localhost:8080  # If you have SearXNG running
+      # - OLLAMA_URL=http://localhost:11434  # If you have Ollama running
+      # - NEO4J_URI=bolt://localhost:7687  # If you have Neo4j running
+      
+    command: ["gateway", "run"]
+
+  # Optional: Database service for Hermes if you need persistent storage
+  # This is only necessary if you want a separate database for Hermes
+  # Otherwise, Hermes uses its internal file-based storage
+  # hermes-db:
+  #   image: postgres:15
+  #   container_name: hermes-postgres
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_DB: hermes
+  #     POSTGRES_USER: hermes
+  #     POSTGRES_PASSWORD: ${HERMES_DB_PASSWORD}
+  #   volumes:
+  #     - hermes-db-data:/var/lib/postgresql/data
+  #   networks:
+  #     - hermes-network
+
+# Optional: Volume for database if you enable the database service
+# volumes:
+#   hermes-db-data:
+#     driver: local
+
+# Optional: Network if you enable the database service
+# networks:
+#   hermes-network:
+#     driver: bridge
+
+# Network configuration
+# Connects to the existing wirehole_private_network network
+networks:
+  wirehole_private_network:
+    external: true
+    name: wirehole_private_network
+
+# Resource limits
+# Uncomment to set resource limits
+# deploy:
+#   resources:
+#     limits:
+#       memory: 4G
+#       cpus: "2.0"
+#     reservations:
+#       memory: 2G
+#       cpus: "1.0"

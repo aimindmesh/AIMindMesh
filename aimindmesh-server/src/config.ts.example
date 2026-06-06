@@ -1,0 +1,211 @@
+import fs from 'fs';
+import path from 'path';
+
+export interface ServerConfig {
+  infrastructureBrake?: boolean;
+  server: { port: number; apiKey: string };
+  ollama: { 
+    baseUrl: string; 
+    defaultModel: string; 
+    embeddingModel: string; 
+    timeoutMs: number;
+    numThread: number;
+    numCtx: number;
+    keepAlive: string; 
+  };
+  neo4j: { uri: string; user: string; password: string };
+  fcm: { serviceAccountPath: string; testToken?: string };
+  gemini: { apiKey: string; model: string; dailyQuotaCap: number; rpmLimit?: number; timeoutMs?: number; maxRetries?: number };
+  openrouter: { 
+    apiKey: string; 
+    model: string; 
+    dailyQuotaCap: number; 
+    timeoutMs?: number;
+    creditCheckIntervalHours?: number;
+    lowCreditThreshold?: number;
+  };
+  proactive: {
+    enabled: boolean;
+    intervalHours: number;
+    timezone: string;
+    relevanceThreshold: number;
+    samplingLimit: number;
+    enrichWithWeb?: boolean;
+  };
+  openclaw?: {
+    enabled: boolean;
+    gatewayUrl: string;
+    defaultSessionKey: string;
+    taskTimeoutMs: number;
+  };
+  ingestion: { chunkSize: number; chunkOverlap: number };
+  routing: { 
+    preferredNode: 'AUTO' | 'LAPTOP' | 'SERVER_LOCAL' | 'GEMINI' | 'OPENROUTER';
+    taskPriorities?: Record<string, string[]>;
+  };
+  logging: { level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR' };
+  auth?: { keys: Record<string, string> };
+  debate?: {
+    enabled?: boolean;
+    mergeEnabled?: boolean;
+    mergeIntervalHours?: number;
+    participants?: { name: string; persona: string }[];
+  };
+  delivery: {
+    fallbackAfterHours?: number;
+    quietHours: boolean;
+    quietStart: string;
+    quietEnd: string;
+  };
+  search?: {
+    enabled: boolean;
+    searxngUrl: string;
+    maxResults: number;
+  };
+  tasks?: {
+    retentionLimit?: number;
+  };
+  wiki?: {
+    enabled: boolean;
+    storagePath: string;
+    syncIntervalHours: number;
+    gitEnabled: boolean;
+    maxConceptsPerCycle: number;
+  };
+  autoEvolution?: {
+    enabled: boolean;
+    cronExpression: string;
+    maxProposalsPerDay: number;
+    minSeverityThreshold: number;
+    minConfidenceThreshold: number;
+    requireComplexTier: boolean;
+    validationTimeoutMs: number;
+    giteaRepoOwner: string;
+    giteaRepoName: string;
+    giteaDeveloperUsername: string;
+    repoLocalPath: string;
+    autoMerge: boolean;
+    shadowMode?: boolean;
+    preferredNode?: string;
+    maxFeedbackIterations?: number;
+    feedbackAutoTrigger?: boolean;
+    giteaWebhookSecret?: string;
+  };
+  kasm?: {
+    enabled: boolean;
+    baseUrl: string;
+    apiKey: string;
+    apiKeySecret: string;
+    defaultImage: string;
+    userId: string;
+  };
+  freellmapi?: {
+    enabled: boolean;
+    baseUrl: string;
+    apiKey: string;
+    timeoutMs: number;
+    model: string;
+  };
+}
+
+
+const configPath = path.join(__dirname, '../config.json');
+
+export function loadConfig(): ServerConfig {
+  if (!fs.existsSync(configPath)) {
+    throw new Error(`Configuration file not found at ${configPath}. Please copy config.json.example to config.json and fill in your details.`);
+  }
+
+  const content = fs.readFileSync(configPath, 'utf-8');
+  const parsed = JSON.parse(content) as ServerConfig;
+  
+  // Set defaults for missing values
+  if (parsed.infrastructureBrake === undefined) parsed.infrastructureBrake = false;
+  if (!parsed.logging) parsed.logging = { level: 'INFO' };
+  
+  if (!parsed.delivery) {
+    parsed.delivery = { 
+      quietHours: false, 
+      quietStart: "23:00", 
+      quietEnd: "07:00",
+      fallbackAfterHours: 6 
+    };
+  }
+  
+  if (!parsed.search) {
+    parsed.search = {
+      enabled: false,
+      searxngUrl: 'http://your-searxng-ip:8080',
+      maxResults: 5
+    };
+  }
+
+  if (parsed.ollama) {
+    if (parsed.ollama.timeoutMs === undefined) parsed.ollama.timeoutMs = 86400000;
+    if (parsed.ollama.numThread === undefined) parsed.ollama.numThread = 6;
+    if (parsed.ollama.numCtx === undefined) parsed.ollama.numCtx = 8192;
+    if (parsed.ollama.keepAlive === undefined) parsed.ollama.keepAlive = "5m";
+  }
+
+  if (!parsed.wiki) {
+    parsed.wiki = {
+      enabled: true,
+      storagePath: './data/wiki',
+      syncIntervalHours: 24,
+      gitEnabled: false,
+      maxConceptsPerCycle: 20
+    };
+  }
+
+  if (!parsed.openrouter) {
+    parsed.openrouter = {
+      apiKey: '',
+      model: 'anthropic/claude-3.5-sonnet',
+      dailyQuotaCap: 100
+    };
+  }
+
+  if (!parsed.autoEvolution) {
+    parsed.autoEvolution = {
+      enabled: false,
+      cronExpression: "0 3 * * *",
+      maxProposalsPerDay: 3,
+      minSeverityThreshold: 6,
+      minConfidenceThreshold: 0.65,
+      requireComplexTier: true,
+      validationTimeoutMs: 60000,
+      giteaRepoOwner: "your-username",
+      giteaRepoName: "aimindmesh",
+      giteaDeveloperUsername: "your-username",
+      repoLocalPath: path.join(__dirname, '../../'),
+      autoMerge: false,
+      shadowMode: false,
+      preferredNode: 'AUTO'
+    };
+  }
+
+  if (!parsed.kasm) {
+    parsed.kasm = {
+      enabled: false,
+      baseUrl: 'https://your-vps-ip',
+      apiKey: '',
+      apiKeySecret: '',
+      defaultImage: 'kasmweb/ubuntu-focal-desktop:1.15.0',
+      userId: ''
+    };
+  }
+
+  if (!parsed.freellmapi) {
+    parsed.freellmapi = {
+      enabled: false,
+      baseUrl: 'http://10.2.0.54:3001',
+      apiKey: '',
+      timeoutMs: 120000,
+      model: 'auto'
+    };
+  }
+  
+  return parsed;
+}
+
+export const config = loadConfig();

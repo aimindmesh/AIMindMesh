@@ -1,0 +1,23 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">AMM Mobile</string>
+    <string name="title_activity_main">AMM Mobile</string>
+    <string name="package_name">com.aimindmesh.mobile</string>
+    <string name="custom_url_scheme">com.aimindmesh.mobile</string>
+    
+    <!-- Widget strings -->
+    <string name="widget_call_mode_label">Call Mode</string>
+    <string name="widget_call_mode_description">Start voice call with AI Assistant</string>
+    <string name="widget_message_label">Send Message</string>
+    <string name="widget_message_description">Send a message to AI Assistant</string>
+    <string name="widget_message_hint">Ask AMM Mobile...</string>
+    <string name="widget_send_description">Send message</string>
+
+    <!-- Shortcut strings -->
+    <string name="shortcut_kanban_short">Kanban Board</string>
+    <string name="shortcut_kanban_long">Open Kanban Board</string>
+    <string name="shortcut_assistant_short">Assistant Call</string>
+    <string name="shortcut_assistant_long">Start Assistant Call</string>
+    <string name="shortcut_agenda_short">Agenda</string>
+    <string name="shortcut_agenda_long">Open Agenda</string>
+</resources>

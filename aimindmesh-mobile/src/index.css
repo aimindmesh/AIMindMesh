@@ -1,0 +1,81 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ========================================
+   Theme CSS Variables
+   ======================================== */
+:root {
+  /* Core Colors (Fuchsia Night default — overridden by JS for named themes) */
+  --color-background: #0d0d12;
+  --color-surface: #1c1c24;
+  --color-primary: #c026d3;
+  --color-secondary: #7c3aed;
+  
+  /* UI Elements */
+  --color-bubble-user: #c026d3;
+  --color-bubble-model: #1c1c24;
+  --color-input: #272730;
+  
+  /* Text Colors */
+  --color-text-primary: #f3f4f6;
+  --color-text-secondary: #9ca3af;
+  
+  /* Status Colors */
+  --color-online: #4ade80;
+  
+  /* Gradients */
+  --gradient-glow-color: #2e1065;
+}
+
+/* ========================================
+   System-Aware Theme (follows device dark/light mode)
+   ======================================== */
+[data-theme="system"] {
+  --color-background: #ffffff;
+  --color-surface: #f5f5f5;
+  --color-primary: #7c3aed;
+  --color-secondary: #6d28d9;
+  --color-bubble-user: #7c3aed;
+  --color-bubble-model: #f0f0f5;
+  --color-input: #eeeeee;
+  --color-text-primary: #111111;
+  --color-text-secondary: #555555;
+  --color-online: #22c55e;
+  --gradient-glow-color: #ede9fe;
+}
+
+@media (prefers-color-scheme: dark) {
+  [data-theme="system"] {
+    --color-background: #0f0f10;
+    --color-surface: #1a1a1e;
+    --color-primary: #a855f7;
+    --color-secondary: #7c3aed;
+    --color-bubble-user: #a855f7;
+    --color-bubble-model: #1a1a1e;
+    --color-input: #252529;
+    --color-text-primary: #f0f0f5;
+    --color-text-secondary: #9090a0;
+    --color-online: #4ade80;
+    --gradient-glow-color: #2e1065;
+  }
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  background-color: var(--color-background);
+}
+
+/* Add safe-area padding for mobile devices with notches */
+.pt-safe {
+  padding-top: env(safe-area-inset-top);
+}
+.pb-safe {
+  padding-bottom: calc(env(safe-area-inset-bottom) + 12px);
+}
+

@@ -1,0 +1,1627 @@
+#include "jni-utils.h"
+#include "cap-llama.h"
+#include "cap-completion.h"
+#include <android/log.h>
+#include <cstring>
+#include <memory>
+#include <fstream> // Added for file existence and size checks
+#include <signal.h> // Added for signal handling
+#include <sys/signal.h> // Added for sigaction
+#include <thread> // For background downloads
+#include <atomic> // For thread-safe progress tracking
+#include <filesystem> // For file operations
+#include <mutex> // For thread synchronization
+
+// Add missing symbol
+// namespace rnllama {
+//     bool rnllama_verbose = false;
+// }
+
+#define LOG_TAG "LlamaCpp"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+namespace jni_utils {
+
+std::string jstring_to_string(JNIEnv* env, jstring jstr) {
+    if (jstr == nullptr) return "";
+    const char* chars = env->GetStringUTFChars(jstr, nullptr);
+    std::string str(chars);
+    env->ReleaseStringUTFChars(jstr, chars);
+    return str;
+}
+
+jstring string_to_jstring(JNIEnv* env, const std::string& str) {
+    // Sanitize UTF-8 to prevent JNI crashes from invalid byte sequences
+    // JNI's NewStringUTF expects valid Modified UTF-8
+    std::string sanitized;
+    sanitized.reserve(str.size());
+    
+    size_t i = 0;
+    while (i < str.size()) {
+        unsigned char c = static_cast<unsigned char>(str[i]);
+        
+        if (c < 0x80) {
+            // ASCII character (0x00-0x7F), but JNI doesn't allow embedded nulls
+            if (c == 0x00) {
+                // Skip null bytes
+                i++;
+                continue;
+            }
+            sanitized += static_cast<char>(c);
+            i++;
+        } else if ((c & 0xE0) == 0xC0) {
+            // 2-byte sequence (110xxxxx 10xxxxxx)
+            if (i + 1 < str.size() && (static_cast<unsigned char>(str[i + 1]) & 0xC0) == 0x80) {
+                sanitized += str[i];
+                sanitized += str[i + 1];
+                i += 2;
+            } else {
+                // Invalid sequence, skip this byte
+                i++;
+            }
+        } else if ((c & 0xF0) == 0xE0) {
+            // 3-byte sequence (1110xxxx 10xxxxxx 10xxxxxx)
+            if (i + 2 < str.size() && 
+                (static_cast<unsigned char>(str[i + 1]) & 0xC0) == 0x80 &&
+                (static_cast<unsigned char>(str[i + 2]) & 0xC0) == 0x80) {
+                sanitized += str[i];
+                sanitized += str[i + 1];
+                sanitized += str[i + 2];
+                i += 3;
+            } else {
+                // Invalid sequence, skip this byte
+                i++;
+            }
+        } else if ((c & 0xF8) == 0xF0) {
+            // 4-byte sequence (11110xxx 10xxxxxx 10xxxxxx 10xxxxxx)
+            if (i + 3 < str.size() && 
+                (static_cast<unsigned char>(str[i + 1]) & 0xC0) == 0x80 &&
+                (static_cast<unsigned char>(str[i + 2]) & 0xC0) == 0x80 &&
+                (static_cast<unsigned char>(str[i + 3]) & 0xC0) == 0x80) {
+                sanitized += str[i];
+                sanitized += str[i + 1];
+                sanitized += str[i + 2];
+                sanitized += str[i + 3];
+                i += 4;
+            } else {
+                // Invalid sequence, skip this byte
+                i++;
+            }
+        } else {
+            // Invalid leading byte (10xxxxxx or 11111xxx), skip
+            i++;
+        }
+    }
+    
+    return env->NewStringUTF(sanitized.c_str());
+}
+
+std::vector<std::string> jstring_array_to_string_vector(JNIEnv* env, jobjectArray jarray) {
+    std::vector<std::string> result;
+    if (jarray == nullptr) return result;
+    
+    jsize length = env->GetArrayLength(jarray);
+    for (jsize i = 0; i < length; i++) {
+        jstring jstr = (jstring)env->GetObjectArrayElement(jarray, i);
+        result.push_back(jstring_to_string(env, jstr));
+        env->DeleteLocalRef(jstr);
+    }
+    return result;
+}
+
+jobjectArray string_vector_to_jstring_array(JNIEnv* env, const std::vector<std::string>& vec) {
+    jclass stringClass = env->FindClass("java/lang/String");
+    jobjectArray result = env->NewObjectArray(vec.size(), stringClass, nullptr);
+    
+    for (size_t i = 0; i < vec.size(); i++) {
+        jstring jstr = string_to_jstring(env, vec[i]);
+        env->SetObjectArrayElement(result, i, jstr);
+        env->DeleteLocalRef(jstr);
+    }
+    return result;
+}
+
+bool jboolean_to_bool(jboolean jbool) {
+    return jbool == JNI_TRUE;
+}
+
+jboolean bool_to_jboolean(bool b) {
+    return b ? JNI_TRUE : JNI_FALSE;
+}
+
+int jint_to_int(jint jint_val) {
+    return static_cast<int>(jint_val);
+}
+
+jint int_to_jint(int val) {
+    return static_cast<jint>(val);
+}
+
+float jfloat_to_float(jfloat jfloat_val) {
+    return static_cast<float>(jfloat_val);
+}
+
+jfloat float_to_jfloat(float val) {
+    return static_cast<jfloat>(val);
+}
+
+long jlong_to_long(jlong jlong_val) {
+    return static_cast<long>(jlong_val);
+}
+
+jlong long_to_jlong(long val) {
+    return static_cast<jlong>(val);
+}
+
+double jdouble_to_double(jdouble jdouble_val) {
+    return static_cast<double>(jdouble_val);
+}
+
+jdouble double_to_jdouble(double val) {
+    return static_cast<jdouble>(val);
+}
+
+void throw_java_exception(JNIEnv* env, const char* class_name, const char* message) {
+    jclass exceptionClass = env->FindClass(class_name);
+    if (exceptionClass != nullptr) {
+        env->ThrowNew(exceptionClass, message);
+    }
+}
+
+bool check_exception(JNIEnv* env) {
+    return env->ExceptionCheck() == JNI_TRUE;
+}
+
+jfieldID get_field_id(JNIEnv* env, jclass clazz, const char* name, const char* sig) {
+    jfieldID fieldID = env->GetFieldID(clazz, name, sig);
+    if (check_exception(env)) {
+        return nullptr;
+    }
+    return fieldID;
+}
+
+jmethodID get_method_id(JNIEnv* env, jclass clazz, const char* name, const char* sig) {
+    jmethodID methodID = env->GetMethodID(clazz, name, sig);
+    if (check_exception(env)) {
+        return nullptr;
+    }
+    return methodID;
+}
+
+jclass find_class(JNIEnv* env, const char* name) {
+    jclass clazz = env->FindClass(name);
+    if (check_exception(env)) {
+        return nullptr;
+    }
+    return clazz;
+}
+
+// Convert llama_cap_context to jobject
+jobject llama_context_to_jobject(JNIEnv* env, const capllama::llama_cap_context* context);
+
+// Convert jobject to llama_cap_context
+capllama::llama_cap_context* jobject_to_llama_context(JNIEnv* env, jobject obj);
+
+// Convert completion result to jobject
+jobject completion_result_to_jobject(JNIEnv* env, const capllama::completion_token_output& result);
+
+// Convert tokenize result to jobject
+jobject tokenize_result_to_jobject(JNIEnv* env, const capllama::llama_cap_tokenize_result& result);
+
+
+
+// Llama log callback to redirect native logs to Android Logcat
+static void llama_log_callback(lm_ggml_log_level level, const char * text, void * user_data) {
+    if (level == LM_GGML_LOG_LEVEL_ERROR) {
+        LOGE("%s", text);
+    } else if (level == LM_GGML_LOG_LEVEL_WARN) {
+        LOGI("[WARN] %s", text); 
+    } else {
+        // Drop INFO and DEBUG logs from the native library to prevent logcat spam
+        // LOGI("%s", text);
+    }
+}
+
+// Flag to track if log callback has been registered
+static bool log_callback_registered = false;
+
+// Helper to ensure log callback is registered (can be called multiple times safely)
+static void ensure_log_callback_registered() {
+    if (!log_callback_registered) {
+        llama_log_set(llama_log_callback, nullptr);
+        log_callback_registered = true;
+        LOGI("Llama log callback registered");
+    }
+}
+
+// Global context storage - fix namespace
+static std::map<jlong, std::unique_ptr<capllama::llama_cap_context>> contexts;
+static jlong next_context_id = 1;
+
+// Global mutex for thread safety
+static std::recursive_mutex global_mutex;
+
+// Download progress tracking (simplified for now)
+// This can be enhanced later to track actual download progress
+
+extern "C" {
+
+// Register native methods and log callback on load
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+    ensure_log_callback_registered();
+    LOGI("JNI_OnLoad completed");
+    return JNI_VERSION_1_6;
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_aimindmesh_llama_LlamaCpp_initContextNative(
+    JNIEnv *env, jobject thiz, jstring modelPath, jobjectArray searchPaths, jobject params) {
+    
+    // Lock global mutex to prevent race conditions during initialization
+    std::lock_guard<std::recursive_mutex> lock(global_mutex);
+    
+    // Ensure log callback is registered (fallback if JNI_OnLoad wasn't called)
+    ensure_log_callback_registered();
+
+    try {
+        std::string model_path_str = jstring_to_string(env, modelPath);
+        
+        // Get search paths from Java
+        jsize pathCount = env->GetArrayLength(searchPaths);
+        std::vector<std::string> paths_to_check;
+        
+        // Add the original path first
+        paths_to_check.push_back(model_path_str);
+        
+        // Add all search paths from Java
+        for (jsize i = 0; i < pathCount; i++) {
+            jstring pathJString = (jstring)env->GetObjectArrayElement(searchPaths, i);
+            std::string path = jstring_to_string(env, pathJString);
+            paths_to_check.push_back(path);
+            env->DeleteLocalRef(pathJString);
+        }
+        
+        // Rest of the existing logic remains the same...
+        std::string full_model_path;
+        bool file_found = false;
+        
+        for (const auto& path : paths_to_check) {
+            LOGI("Checking path: %s", path.c_str());
+            if (std::filesystem::exists(path)) {
+                full_model_path = path;
+                file_found = true;
+                LOGI("Found model file at: %s", path.c_str());
+                break;
+            } else {
+                LOGE("Path not found: %s", path.c_str());
+            }
+        }
+        
+        if (!file_found) {
+            LOGE("Model file not found in any of the search paths");
+            return -1;
+        }
+        
+        // Additional model validation
+        LOGI("Performing additional model validation...");
+        std::ifstream validation_file(full_model_path, std::ios::binary);
+        if (validation_file.good()) {
+            // Read first 8 bytes to check GGUF version
+            char header[8];
+            if (validation_file.read(header, 8)) {
+                uint32_t version = *reinterpret_cast<uint32_t*>(header + 4);
+                LOGI("GGUF version: %u", version);
+                
+                // Check if version is reasonable (should be > 0 and < 1000)
+                if (version == 0 || version > 1000) {
+                    LOGE("Suspicious GGUF version: %u", version);
+                    LOGI("This might indicate a corrupted or incompatible model file");
+                }
+            }
+            validation_file.close();
+        }
+
+        // Create new context - fix namespace
+        auto context = std::make_unique<capllama::llama_cap_context>();
+        LOGI("Created llama_cap_context");
+        
+        // Parse optimization parameters from JSObject
+        // Get JSObject class and methods for parameter extraction
+        jclass jsObjectClass = env->GetObjectClass(params);
+        jmethodID getIntMethod = nullptr;
+        jmethodID getBoolMethod = nullptr;
+        
+        // Try to get JSObject methods
+        if (env->ExceptionCheck()) { env->ExceptionClear(); }
+        getIntMethod = env->GetMethodID(jsObjectClass, "getInteger", "(Ljava/lang/String;)Ljava/lang/Integer;");
+        if (env->ExceptionCheck()) { 
+            env->ExceptionClear(); 
+            getIntMethod = nullptr;
+        }
+        getBoolMethod = env->GetMethodID(jsObjectClass, "optBoolean", "(Ljava/lang/String;Z)Z");
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            getBoolMethod = nullptr;
+        }
+        
+        // Extract parameters with defaults optimized for Snapdragon 8 Gen 2/4 (Z Fold 5/7)
+        int n_ctx = 2048;
+        int n_batch = 512;
+        int n_ubatch = 256;
+        int n_gpu_layers = 99;      // 99 = offload tutto
+        int n_threads = 6;          // 4 big + 2 little cores for Z Fold
+        int n_threads_batch = 4;    // Batch eval on big cores only
+        bool flash_attn = true;     // Enable flash attention by default
+        bool use_mmap = true;       // Enable mmap for fast loading
+        
+        // Parse integer parameters
+        if (getIntMethod) {
+            auto getIntParam = [&](const char* key, int defaultVal) -> int {
+                jstring keyStr = jni_utils::string_to_jstring(env, key);
+                jobject valObj = env->CallObjectMethod(params, getIntMethod, keyStr);
+                env->DeleteLocalRef(keyStr);
+                if (valObj && !env->ExceptionCheck()) {
+                    jclass intClass = env->FindClass("java/lang/Integer");
+                    jmethodID intValueMethod = env->GetMethodID(intClass, "intValue", "()I");
+                    int result = env->CallIntMethod(valObj, intValueMethod);
+                    env->DeleteLocalRef(valObj);
+                    return result;
+                }
+                if (env->ExceptionCheck()) { env->ExceptionClear(); }
+                return defaultVal;
+            };
+            
+            n_ctx = getIntParam("n_ctx", n_ctx);
+            n_batch = getIntParam("n_batch", n_batch);
+            n_ubatch = getIntParam("n_ubatch", n_ubatch);
+            n_gpu_layers = getIntParam("n_gpu_layers", n_gpu_layers);
+            n_threads = getIntParam("n_threads", n_threads);
+            n_threads_batch = getIntParam("n_threads_batch", n_threads_batch);
+        }
+        
+        // Parse boolean parameters
+        if (getBoolMethod) {
+            jstring flashKey = jni_utils::string_to_jstring(env, "flash_attn");
+            flash_attn = env->CallBooleanMethod(params, getBoolMethod, flashKey, (jboolean)flash_attn);
+            env->DeleteLocalRef(flashKey);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); flash_attn = true; }
+            
+            jstring mmapKey = jni_utils::string_to_jstring(env, "use_mmap");
+            use_mmap = env->CallBooleanMethod(params, getBoolMethod, mmapKey, (jboolean)use_mmap);
+            env->DeleteLocalRef(mmapKey);
+            if (env->ExceptionCheck()) { env->ExceptionClear(); use_mmap = false; }
+        }
+        
+        LOGI("Parsed optimization params: n_threads=%d, n_threads_batch=%d, flash_attn=%d, use_mmap=%d",
+             n_threads, n_threads_batch, flash_attn, use_mmap);
+        
+        // Initialize common parameters with parsed values
+        common_params cparams;
+        cparams.model.path = full_model_path;
+        cparams.n_ctx = n_ctx;
+        cparams.n_batch = n_batch;
+        cparams.n_ubatch = n_ubatch;
+        cparams.n_gpu_layers = n_gpu_layers;
+        cparams.rope_freq_base = 10000.0f;
+        cparams.rope_freq_scale = 1.0f;
+        cparams.use_mmap = use_mmap;
+        cparams.use_mlock = false;
+        cparams.numa = LM_GGML_NUMA_STRATEGY_DISABLED;
+        cparams.ctx_shift = false;
+        cparams.chat_template = "";
+        cparams.embedding = false;
+        cparams.cont_batching = false;
+        cparams.n_parallel = 1;
+        cparams.antiprompt.clear();
+        cparams.vocab_only = false;
+        cparams.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
+        cparams.yarn_ext_factor = -1.0f;
+        cparams.yarn_attn_factor = 1.0f;
+        cparams.yarn_beta_fast = 32.0f;
+        cparams.yarn_beta_slow = 1.0f;
+        cparams.yarn_orig_ctx = 0;
+        cparams.flash_attn_type = flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        cparams.n_keep = 0;
+        cparams.n_chunks = -1;
+        cparams.n_sequences = 1;
+        cparams.model_alias = { "unknown" };
+        
+        // Set CPU threading parameters for optimal Snapdragon performance
+        cparams.cpuparams.n_threads = n_threads;
+        cparams.cpuparams_batch.n_threads = n_threads_batch;
+
+        LOGI("Initialized common parameters, attempting to load model from: %s", full_model_path.c_str());
+        LOGI("Model parameters: n_ctx=%d, n_batch=%d, n_ubatch=%d, n_gpu_layers=%d, n_threads=%d, n_threads_batch=%d, flash_attn=%d", 
+             cparams.n_ctx, cparams.n_batch, cparams.n_ubatch, cparams.n_gpu_layers, n_threads, n_threads_batch, cparams.flash_attn_type);
+
+        
+        // Try to load the model with error handling and signal protection
+        bool load_success = false;
+        
+        // Set up signal handler to catch segmentation faults
+        struct sigaction old_action;
+        struct sigaction new_action;
+        new_action.sa_handler = [](int sig) {
+            LOGE("Segmentation fault caught during model loading");
+            // Restore default handler and re-raise signal
+            signal(sig, SIG_DFL);
+            raise(sig);
+        };
+        new_action.sa_flags = SA_RESETHAND;
+        sigemptyset(&new_action.sa_mask);
+        
+        if (sigaction(SIGSEGV, &new_action, &old_action) == 0) {
+            LOGI("Signal handler installed for segmentation fault protection");
+        }
+        
+        try {
+            LOGI("Attempting to load model with standard parameters...");
+            load_success = context->loadModel(cparams);
+            if (load_success) {
+                LOGI("Model loaded successfully. GPU Offload requested: %d layers", cparams.n_gpu_layers);
+                // Note: Actual offloading details are printed by llama.cpp to stderr/stdout
+            }
+        } catch (const std::exception& e) {
+            LOGE("Exception during model loading: %s", e.what());
+            load_success = false;
+        } catch (...) {
+            LOGE("Unknown exception during model loading");
+            load_success = false;
+        }
+        
+        // Restore original signal handler
+        sigaction(SIGSEGV, &old_action, nullptr);
+        
+        if (!load_success) {
+            LOGE("context->loadModel() returned false - model loading failed");
+            
+            // Try with ultra-minimal parameters as fallback
+            LOGI("Trying with ultra-minimal parameters...");
+            common_params ultra_minimal_params;
+            ultra_minimal_params.model.path = full_model_path;
+            ultra_minimal_params.n_ctx = 256;  // Very small context
+            ultra_minimal_params.n_batch = 128; // Very small batch
+            ultra_minimal_params.n_gpu_layers = 0;
+            ultra_minimal_params.use_mmap = false; // Disable mmap to avoid memory issues
+            ultra_minimal_params.use_mlock = false;
+            ultra_minimal_params.numa = LM_GGML_NUMA_STRATEGY_DISABLED;
+            ultra_minimal_params.ctx_shift = false;
+            ultra_minimal_params.chat_template = "";
+            ultra_minimal_params.embedding = false;
+            ultra_minimal_params.cont_batching = false;
+            ultra_minimal_params.n_parallel = 1;
+            ultra_minimal_params.antiprompt.clear();
+            ultra_minimal_params.vocab_only = false;
+            ultra_minimal_params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
+            ultra_minimal_params.yarn_ext_factor = -1.0f;
+            ultra_minimal_params.yarn_attn_factor = 1.0f;
+            ultra_minimal_params.yarn_beta_fast = 32.0f;
+            ultra_minimal_params.yarn_beta_slow = 1.0f;
+            ultra_minimal_params.yarn_orig_ctx = 0;
+            ultra_minimal_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            ultra_minimal_params.n_keep = 0;
+            ultra_minimal_params.n_chunks = -1;
+            ultra_minimal_params.n_sequences = 1;
+            ultra_minimal_params.model_alias = { "unknown" };
+
+            // Set up signal handler again for ultra-minimal attempt
+            if (sigaction(SIGSEGV, &new_action, &old_action) == 0) {
+                LOGI("Signal handler reinstalled for ultra-minimal attempt");
+            }
+            
+            try {
+                load_success = context->loadModel(ultra_minimal_params);
+            } catch (const std::exception& e) {
+                LOGE("Exception during ultra-minimal model loading: %s", e.what());
+                load_success = false;
+            } catch (...) {
+                LOGE("Unknown exception during ultra-minimal model loading");
+                load_success = false;
+            }
+            
+            // Restore original signal handler
+            sigaction(SIGSEGV, &old_action, nullptr);
+            
+            if (!load_success) {
+                LOGE("Model loading failed even with ultra-minimal parameters");
+                throw_java_exception(env, "java/lang/RuntimeException", 
+                    "Failed to load model - model appears to be corrupted or incompatible with this llama.cpp version. "
+                    "Try downloading a fresh copy of the model file.");
+                return -1;
+            }
+        }
+        
+        LOGI("Model loaded successfully!");
+        
+        // Store context
+        jlong context_id = next_context_id++;
+        contexts[context_id] = std::move(context);
+        
+        LOGI("Initialized context %ld with model: %s", context_id, full_model_path.c_str());
+        return context_id;
+        
+    } catch (const std::exception& e) {
+        LOGE("Exception in initContext: %s", e.what());
+        throw_java_exception(env, "java/lang/RuntimeException", e.what());
+        return -1;
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_aimindmesh_llama_LlamaCpp_releaseContextNative(
+    JNIEnv* env, jobject thiz, jlong context_id) {
+    
+    try {
+        auto it = contexts.find(context_id);
+        if (it != contexts.end()) {
+            contexts.erase(it);
+            LOGI("Released context %ld", context_id);
+        }
+    } catch (const std::exception& e) {
+        LOGE("Exception in releaseContext: %s", e.what());
+        throw_java_exception(env, "java/lang/RuntimeException", e.what());
+    }
+}
+
+JNIEXPORT jobject JNICALL
+Java_com_aimindmesh_llama_LlamaCpp_completionNative(
+    JNIEnv* env, jobject thiz, jlong context_id, jobject params) {
+    
+    try {
+        LOGI("Starting completion for context: %ld", context_id);
+        
+        auto it = contexts.find(context_id);
+        if (it == contexts.end()) {
+            LOGE("Context not found: %ld", context_id);
+            throw_java_exception(env, "java/lang/IllegalArgumentException", "Invalid context ID");
+            return nullptr;
+        }
+        
+        auto& ctx = it->second;
+        if (!ctx || !ctx->ctx) {
+            LOGE("Invalid context or llama context is null");
+            throw_java_exception(env, "java/lang/RuntimeException", "Invalid context");
+            return nullptr;
+        }
+        
+        // Extract parameters from JSObject using compatible API
+        jclass jsObjectClass = env->GetObjectClass(params);
+        
+        // Try to get method IDs and handle exceptions
+        jmethodID getStringMethod = nullptr;
+        jmethodID getIntegerMethod = nullptr; 
+        jmethodID getDoubleMethod = nullptr;
+        
+        // Clear any pending exceptions first
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+        
+        try {
+            getStringMethod = env->GetMethodID(jsObjectClass, "getString", "(Ljava/lang/String;)Ljava/lang/String;");
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                getStringMethod = nullptr;
+            }
+            
+            getIntegerMethod = env->GetMethodID(jsObjectClass, "getInteger", "(Ljava/lang/String;)Ljava/lang/Integer;");
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                getIntegerMethod = nullptr;
+            }
+            
+            getDoubleMethod = env->GetMethodID(jsObjectClass, "getDouble", "(Ljava/lang/String;)Ljava/lang/Double;");
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                getDoubleMethod = nullptr;
+            }
+        } catch (...) {
+            LOGE("Exception getting JSObject method IDs");
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            }
+        }
+        
+        // Get prompt with safe method calls
+        std::string prompt_str = "Once upon a time";
+        jint n_predict = 50;
+        jdouble temperature = 0.7;
+        jdouble top_p = 0.9;  // Default top_p
+        
+        if (getStringMethod) {
+            jstring promptKey = jni_utils::string_to_jstring(env, "prompt");
+            jstring promptObj = (jstring)env->CallObjectMethod(params, getStringMethod, promptKey);
+            if (promptObj && !env->ExceptionCheck()) {
+                prompt_str = jni_utils::jstring_to_string(env, promptObj);
+            } else if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            }
+        }
+        
+        // Get n_predict with safe method calls
+        if (getIntegerMethod) {
+            jstring nPredictKey = jni_utils::string_to_jstring(env, "n_predict");
+            jobject nPredictObj = env->CallObjectMethod(params, getIntegerMethod, nPredictKey);
+            if (nPredictObj && !env->ExceptionCheck()) {
+                n_predict = env->CallIntMethod(nPredictObj, env->GetMethodID(env->FindClass("java/lang/Integer"), "intValue", "()I"));
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    n_predict = 50; // fallback
+                }
+            } else if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            }
+        }
+        // Get temperature with safe method calls - try getDouble first, then fallback to get()
+        bool tempExtracted = false;
+        if (getDoubleMethod) {
+            jstring temperatureKey = jni_utils::string_to_jstring(env, "temperature");
+            jobject tempObj = env->CallObjectMethod(params, getDoubleMethod, temperatureKey);
+            if (tempObj && !env->ExceptionCheck()) {
+                temperature = env->CallDoubleMethod(tempObj, env->GetMethodID(env->FindClass("java/lang/Double"), "doubleValue", "()D"));
+                if (!env->ExceptionCheck()) {
+                    tempExtracted = true;
+                    LOGI("Temperature extracted via getDouble: %.2f", temperature);
+                } else {
+                    env->ExceptionClear();
+                }
+            } else if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            }
+            env->DeleteLocalRef(temperatureKey);
+        }
+        
+        // Fallback: try using get() and casting to Number
+        if (!tempExtracted) {
+            jmethodID getMethod = env->GetMethodID(jsObjectClass, "get", "(Ljava/lang/String;)Ljava/lang/Object;");
+            if (getMethod && !env->ExceptionCheck()) {
+                jstring temperatureKey = jni_utils::string_to_jstring(env, "temperature");
+                jobject tempObj = env->CallObjectMethod(params, getMethod, temperatureKey);
+                if (tempObj && !env->ExceptionCheck()) {
+                    jclass numberClass = env->FindClass("java/lang/Number");
+                    if (numberClass && env->IsInstanceOf(tempObj, numberClass)) {
+                        jmethodID doubleValueMethod = env->GetMethodID(numberClass, "doubleValue", "()D");
+                        temperature = env->CallDoubleMethod(tempObj, doubleValueMethod);
+                        if (!env->ExceptionCheck()) {
+                            LOGI("Temperature extracted via get(): %.2f", temperature);
+                        } else {
+                            env->ExceptionClear();
+                            temperature = 0.7;
+                        }
+                    }
+                }
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                env->DeleteLocalRef(temperatureKey);
+            }
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+        
+        // Get top_p with safe method calls - try getDouble first, then fallback to get()
+        bool topPExtracted = false;
+        if (getDoubleMethod) {
+            jstring topPKey = jni_utils::string_to_jstring(env, "top_p");
+            jobject topPObj = env->CallObjectMethod(params, getDoubleMethod, topPKey);
+            if (topPObj && !env->ExceptionCheck()) {
+                top_p = env->CallDoubleMethod(topPObj, env->GetMethodID(env->FindClass("java/lang/Double"), "doubleValue", "()D"));
+                if (!env->ExceptionCheck()) {
+                    topPExtracted = true;
+                    LOGI("top_p extracted via getDouble: %.2f", top_p);
+                } else {
+                    env->ExceptionClear();
+                }
+            } else if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            }
+            env->DeleteLocalRef(topPKey);
+        }
+        
+        // Fallback: try using get() and casting to Number
+        if (!topPExtracted) {
+            jmethodID getMethod = env->GetMethodID(jsObjectClass, "get", "(Ljava/lang/String;)Ljava/lang/Object;");
+            if (getMethod && !env->ExceptionCheck()) {
+                jstring topPKey = jni_utils::string_to_jstring(env, "top_p");
+                jobject topPObj = env->CallObjectMethod(params, getMethod, topPKey);
+                if (topPObj && !env->ExceptionCheck()) {
+                    jclass numberClass = env->FindClass("java/lang/Number");
+                    if (numberClass && env->IsInstanceOf(topPObj, numberClass)) {
+                        jmethodID doubleValueMethod = env->GetMethodID(numberClass, "doubleValue", "()D");
+                        top_p = env->CallDoubleMethod(topPObj, doubleValueMethod);
+                        if (!env->ExceptionCheck()) {
+                            LOGI("top_p extracted via get(): %.2f", top_p);
+                        } else {
+                            env->ExceptionClear();
+                            top_p = 0.9;
+                        }
+                    }
+                }
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                env->DeleteLocalRef(topPKey);
+            }
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
+        
+        LOGI("Completion params - prompt length: %zu, n_predict: %d, temperature: %.2f, top_p: %.2f", 
+             prompt_str.length(), n_predict, temperature, top_p);
+        
+        // Extract stop tokens from JSObject params
+        ctx->params.antiprompt.clear(); // Clear any previous stop tokens
+        try {
+            jmethodID getMethod = env->GetMethodID(jsObjectClass, "get", "(Ljava/lang/String;)Ljava/lang/Object;");
+            if (getMethod && !env->ExceptionCheck()) {
+                jstring stopKey = jni_utils::string_to_jstring(env, "stop");
+                jobject stopObj = env->CallObjectMethod(params, getMethod, stopKey);
+                
+                if (stopObj && !env->ExceptionCheck()) {
+                    // Check if it's an array (JSArray in Capacitor is backed by org.json.JSONArray)
+                    jclass jsonArrayClass = env->FindClass("org/json/JSONArray");
+                    if (jsonArrayClass && env->IsInstanceOf(stopObj, jsonArrayClass)) {
+                        jmethodID lengthMethod = env->GetMethodID(jsonArrayClass, "length", "()I");
+                        jmethodID getStringMethod = env->GetMethodID(jsonArrayClass, "getString", "(I)Ljava/lang/String;");
+                        
+                        if (lengthMethod && getStringMethod) {
+                            jint arrayLength = env->CallIntMethod(stopObj, lengthMethod);
+                            LOGI("Found stop array with %d elements", arrayLength);
+                            
+                            for (jint i = 0; i < arrayLength; i++) {
+                                jstring stopTokenJStr = (jstring)env->CallObjectMethod(stopObj, getStringMethod, i);
+                                if (stopTokenJStr && !env->ExceptionCheck()) {
+                                    std::string stopToken = jni_utils::jstring_to_string(env, stopTokenJStr);
+                                    ctx->params.antiprompt.push_back(stopToken);
+                                    LOGI("Added stop token: '%s'", stopToken.c_str());
+                                    env->DeleteLocalRef(stopTokenJStr);
+                                } else if (env->ExceptionCheck()) {
+                                    env->ExceptionClear();
+                                }
+                            }
+                        }
+                    }
+                } else if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                }
+            }
+        } catch (...) {
+            LOGE("Exception while extracting stop tokens");
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            }
+        }
+        
+        LOGI("Stop tokens configured: %zu tokens", ctx->params.antiprompt.size());
+        for (size_t i = 0; i < ctx->params.antiprompt.size(); i++) {
+            LOGI("  Stop token %zu: '%s'", i, ctx->params.antiprompt[i].c_str());
+        }
+        
+        // Set sampling parameters based on extracted values
+        ctx->params.sampling.temp = static_cast<float>(temperature);
+        ctx->params.sampling.top_k = 40;  // Default value - could be made configurable
+        ctx->params.sampling.top_p = static_cast<float>(top_p);
+        ctx->params.sampling.penalty_repeat = 1.1f; // Default value (correct field name)
+        ctx->params.n_predict = n_predict;
+        ctx->params.prompt = prompt_str;
+        
+        LOGI("Updated context sampling params - temp: %.2f, top_k: %d, top_p: %.2f", 
+             ctx->params.sampling.temp, ctx->params.sampling.top_k, ctx->params.sampling.top_p);
+        
+        // Tokenize the prompt
+        capllama::llama_cap_tokenize_result tokenize_result = ctx->tokenize(prompt_str, {});
+        std::vector<llama_token> prompt_tokens = tokenize_result.tokens;
+        
+        LOGI("Tokenized prompt into %zu tokens", prompt_tokens.size());
+        
+        // Initialize completion context if not already done
+        if (!ctx->completion) {
+            LOGI("Initializing completion context for the first time");
+            
+            // Validate parent context before creating completion
+            if (!ctx->ctx || !ctx->model) {
+                LOGE("Parent context is invalid - missing llama context or model");
+                throw_java_exception(env, "java/lang/RuntimeException", "Parent context is not properly initialized");
+                return nullptr;
+            }
+            
+            try {
+                LOGI("Creating llama_cap_context_completion...");
+                LOGI("Parent context pointer: %p", ctx.get());
+                LOGI("Parent context->ctx: %p", ctx->ctx);
+                LOGI("Parent context->model: %p", ctx->model);
+                
+                // Additional safety checks before constructor
+                if (!ctx.get()) {
+                    LOGE("Parent context pointer is null");
+                    throw_java_exception(env, "java/lang/RuntimeException", "Parent context pointer is null");
+                    return nullptr;
+                }
+                
+                ctx->completion = new capllama::llama_cap_context_completion(ctx.get());
+                
+                if (!ctx->completion) {
+                    LOGE("Failed to create completion context - constructor returned null");
+                    throw_java_exception(env, "java/lang/RuntimeException", "Failed to create completion context");
+                    return nullptr;
+                }
+                
+                LOGI("Completion context created successfully at: %p", ctx->completion);
+                
+                LOGI("Initializing sampling for completion context...");
+                LOGI("Parent context params before initSampling - model: %p, params: %p", ctx->model, &(ctx->params));
+                LOGI("Parent context sampling params - temperature: %.2f, top_k: %d, top_p: %.2f", 
+                     ctx->params.sampling.temp, ctx->params.sampling.top_k, ctx->params.sampling.top_p);
+                
+                bool sampling_result = false;
+                try {
+                    sampling_result = ctx->completion->initSampling();
+                    LOGI("initSampling completed, result: %s", sampling_result ? "true" : "false");
+                    LOGI("Sampler pointer after init: %p", ctx->completion->ctx_sampling);
+                } catch (const std::exception& e) {
+                    LOGE("Exception in initSampling: %s", e.what());
+                    delete ctx->completion;
+                    ctx->completion = nullptr;
+                    throw_java_exception(env, "java/lang/RuntimeException", 
+                        ("Failed to initialize sampling: " + std::string(e.what())).c_str());
+                    return nullptr;
+                } catch (...) {
+                    LOGE("Unknown exception in initSampling");
+                    delete ctx->completion;
+                    ctx->completion = nullptr;
+                    throw_java_exception(env, "java/lang/RuntimeException", "Unknown error in sampling initialization");
+                    return nullptr;
+                }
+                
+                if (!sampling_result || !ctx->completion->ctx_sampling) {
+                    LOGE("Failed to initialize sampling - result: %s, sampler: %p", 
+                         sampling_result ? "true" : "false", ctx->completion->ctx_sampling);
+                    delete ctx->completion;
+                    ctx->completion = nullptr;
+                    throw_java_exception(env, "java/lang/RuntimeException", "Failed to initialize sampling context");
+                    return nullptr;
+                }
+                
+                LOGI("Completion context initialized successfully");
+            } catch (const std::exception& e) {
+                LOGE("Exception during completion context creation: %s", e.what());
+                if (ctx->completion) {
+                    delete ctx->completion;
+                    ctx->completion = nullptr;
+                }
+                throw_java_exception(env, "java/lang/RuntimeException", 
+                    ("Failed to create completion context: " + std::string(e.what())).c_str());
+                return nullptr;
+            } catch (...) {
+                LOGE("Unknown exception during completion context creation");
+                if (ctx->completion) {
+                    delete ctx->completion;
+                    ctx->completion = nullptr;
+                }
+                throw_java_exception(env, "java/lang/RuntimeException", "Unknown error during completion context creation");
+                return nullptr;
+            }
+        }
+        
+        // Set up sampling parameters
+        // Note: For now, we'll use the completion context's default parameters
+        // TODO: Update sampling parameters with user values
+        
+        // Pre-calculate stop token IDs from antiprompts
+        // This is crucial for special tokens like <end_of_turn> which might decode to empty strings
+        std::vector<llama_token> explicit_stop_token_ids;
+        for (const auto& stop_str : ctx->params.antiprompt) {
+            // Tokenize call matching signature: tokenize(text, media_paths)
+            // We pass empty media paths. The internal implementation should handle special tokens if configured.
+            // If the stop string maps to exactly one token, we assume it's a special control token or simple word.
+            auto result = ctx->tokenize(stop_str, {}); // Use empty vector for media_paths
+            
+            if (result.tokens.size() == 1) {
+                explicit_stop_token_ids.push_back(result.tokens[0]);
+                LOGI("Converted stop string '%s' to token ID: %d", stop_str.c_str(), result.tokens[0]);
+            }
+        }
+        
+        // 
+            // Declare variables outside try block so they're accessible later
+        std::string generated_text;
+        int tokens_generated = 0;
+        
+        try {
+            LOGI("Rewinding completion context...");
+            try {
+                ctx->completion->rewind();
+                LOGI("Rewind completed successfully");
+            } catch (const std::exception& e) {
+                LOGE("Exception in rewind: %s", e.what());
+                throw;
+            }
+            
+            LOGI("Loading prompt into completion context...");
+            try {
+                // ALWAYS reinitialize sampler to pick up new sampling parameters
+                // The sampling params (temp, top_p, etc.) were just set, so we need
+                // a fresh sampler instance to use them
+                LOGI("Reinitializing sampler with current params (temp: %.2f, top_p: %.2f)",
+                     ctx->params.sampling.temp, ctx->params.sampling.top_p);
+                if (!ctx->completion->initSampling()) {
+                    LOGE("Failed to reinitialize sampling");
+                    throw std::runtime_error("Sampler initialization failed");
+                }
+                LOGI("Sampler reinitialized successfully");
+                
+                ctx->completion->loadPrompt({});
+                LOGI("loadPrompt completed successfully");
+            } catch (const std::exception& e) {
+                LOGE("Exception in loadPrompt: %s", e.what());
+                throw;
+            }
+            
+            LOGI("Beginning completion generation...");
+            try {
+                ctx->completion->beginCompletion();
+                LOGI("beginCompletion completed successfully");
+            } catch (const std::exception& e) {
+                LOGE("Exception in beginCompletion: %s", e.what());
+                throw;
+            }
+            
+            LOGI("Starting token generation loop (max tokens: %d)...", n_predict);
+            
+            while (tokens_generated < n_predict && !ctx->completion->is_interrupted) {
+                try {
+                    LOGI("Generating token %d...", tokens_generated + 1);
+                    auto token_output = ctx->completion->nextToken();
+                    
+                    // Check for end-of-sequence
+                    // Use the model's specific EOS token
+                    const llama_vocab* vocab = llama_model_get_vocab(ctx->model);
+                    if (token_output.tok == llama_vocab_eos(vocab)) {
+                        LOGI("Reached EOS token, stopping generation");
+                        break;
+                    }
+                    
+                    // Convert token to text
+                    std::string token_text = capllama::tokens_to_output_formatted_string(ctx->ctx, token_output.tok);
+                    generated_text += token_text;
+                    tokens_generated++;
+                    
+                    LOGI("Generated token %d (ID: %d): %s", tokens_generated, token_output.tok, token_text.c_str());
+                    
+                    // Check if we should stop due to stop tokens or other conditions
+                    if (ctx->completion->stopped_word) {
+                        LOGI("Stop token detected! Stopping word: '%s'", ctx->completion->stopping_word.c_str());
+                        break;
+                    }
+
+                    // Check explicit stop token IDs (handles special tokens like <end_of_turn> that might decode to empty strings)
+                    bool is_stop_token = false;
+                    for (llama_token stop_id : explicit_stop_token_ids) {
+                        if (token_output.tok == stop_id) {
+                            LOGI("Explicit stop token ID detected: %d, stopping generation", stop_id);
+                            is_stop_token = true;
+                            break;
+                        }
+                    }
+                    if (is_stop_token) break;
+
+                    if (ctx->completion->stopped_eos) {
+                        LOGI("EOS detected, stopping generation");
+                        break;
+                    }
+                    if (ctx->completion->stopped_limit) {
+                        LOGI("Token limit reached, stopping generation");
+                        break;
+                    }
+                    if (!ctx->completion->has_next_token) {
+                        LOGI("No more tokens to generate (has_next_token=false)");
+                        break;
+                    }
+                    
+                } catch (const std::exception& e) {
+                    LOGE("Exception during token generation %d: %s", tokens_generated + 1, e.what());
+                    break;
+                } catch (...) {
+                    LOGE("Unknown exception during token generation %d", tokens_generated + 1);
+                    break;
+                }
+            }
+            
+            LOGI("Token generation completed. Generated %d tokens.", tokens_generated);
+            
+            // End completion
+            LOGI("Ending completion...");
+            ctx->completion->endCompletion();
+            
+        } catch (const std::exception& e) {
+            LOGE("Exception during completion process: %s", e.what());
+            try {
+                ctx->completion->endCompletion();
+            } catch (...) {
+                LOGE("Failed to properly end completion after exception");
+            }
+            throw_java_exception(env, "java/lang/RuntimeException", 
+                ("Completion process failed: " + std::string(e.what())).c_str());
+            return nullptr;
+        } catch (...) {
+            LOGE("Unknown exception during completion process");
+            try {
+                ctx->completion->endCompletion();
+            } catch (...) {
+                LOGE("Failed to properly end completion after unknown exception");
+            }
+            throw_java_exception(env, "java/lang/RuntimeException", "Unknown error during completion process");
+            return nullptr;
+        }
+        
+        LOGI("Completion finished. Generated %d tokens: %s", tokens_generated, generated_text.c_str());
+        
+        // Create result HashMap
+        jclass hashMapClass = env->FindClass("java/util/HashMap");
+        jmethodID hashMapConstructor = env->GetMethodID(hashMapClass, "<init>", "()V");
+        jmethodID putMethod = env->GetMethodID(hashMapClass, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+        
+        jobject resultMap = env->NewObject(hashMapClass, hashMapConstructor);
+        
+        // Add completion results
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "text"), jni_utils::string_to_jstring(env, generated_text));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "content"), jni_utils::string_to_jstring(env, generated_text));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "reasoning_content"), jni_utils::string_to_jstring(env, ""));
+        
+        // Create empty tool_calls array
+        jclass arrayListClass = env->FindClass("java/util/ArrayList");
+        jmethodID arrayListConstructor = env->GetMethodID(arrayListClass, "<init>", "()V");
+        jobject emptyToolCalls = env->NewObject(arrayListClass, arrayListConstructor);
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "tool_calls"), emptyToolCalls);
+        
+        // Add token counts and status
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "tokens_predicted"), 
+            env->NewObject(env->FindClass("java/lang/Integer"), 
+                env->GetMethodID(env->FindClass("java/lang/Integer"), "<init>", "(I)V"), tokens_generated));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "tokens_evaluated"), 
+            env->NewObject(env->FindClass("java/lang/Integer"), 
+                env->GetMethodID(env->FindClass("java/lang/Integer"), "<init>", "(I)V"), (jint)prompt_tokens.size()));
+        
+        // Add completion status flags
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "truncated"), 
+            env->NewObject(env->FindClass("java/lang/Boolean"), 
+                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), JNI_FALSE));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "stopped_eos"), 
+            env->NewObject(env->FindClass("java/lang/Boolean"), 
+                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), 
+                tokens_generated < n_predict ? JNI_TRUE : JNI_FALSE));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "stopped_limit"), 
+            env->NewObject(env->FindClass("java/lang/Boolean"), 
+                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), 
+                tokens_generated >= n_predict ? JNI_TRUE : JNI_FALSE));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "context_full"), 
+            env->NewObject(env->FindClass("java/lang/Boolean"), 
+                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), JNI_FALSE));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "interrupted"), 
+            env->NewObject(env->FindClass("java/lang/Boolean"), 
+                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), JNI_FALSE));
+        
+        // Add empty strings for stop reasons
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "stopped_word"), jni_utils::string_to_jstring(env, ""));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "stopping_word"), jni_utils::string_to_jstring(env, ""));
+        
+        // Add timing information (basic)
+        jobject timingsMap = env->NewObject(hashMapClass, hashMapConstructor);
+        env->CallObjectMethod(timingsMap, putMethod,
+            jni_utils::string_to_jstring(env, "prompt_n"), 
+            env->NewObject(env->FindClass("java/lang/Integer"), 
+                env->GetMethodID(env->FindClass("java/lang/Integer"), "<init>", "(I)V"), (jint)prompt_tokens.size()));
+        env->CallObjectMethod(timingsMap, putMethod,
+            jni_utils::string_to_jstring(env, "predicted_n"), 
+            env->NewObject(env->FindClass("java/lang/Integer"), 
+                env->GetMethodID(env->FindClass("java/lang/Integer"), "<init>", "(I)V"), tokens_generated));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "timings"), timingsMap);
+        
+        LOGI("Completion result created successfully");
+        return resultMap;
+        
+    } catch (const std::exception& e) {
+        LOGE("Exception in completion: %s", e.what());
+        throw_java_exception(env, "java/lang/RuntimeException", e.what());
+        return nullptr;
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_aimindmesh_llama_LlamaCpp_stopCompletionNative(
+    JNIEnv* env, jobject thiz, jlong context_id) {
+    
+    try {
+        auto it = contexts.find(context_id);
+        if (it != contexts.end()) {
+            // Stop completion logic would go here
+            LOGI("Stopped completion for context %ld", context_id);
+        }
+    } catch (const std::exception& e) {
+        LOGE("Exception in stopCompletion: %s", e.what());
+        throw_java_exception(env, "java/lang/RuntimeException", e.what());
+    }
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_aimindmesh_llama_LlamaCpp_getFormattedChatNative(
+    JNIEnv* env, jobject thiz, jlong context_id, jstring messages, jstring chat_template) {
+    
+    try {
+        auto it = contexts.find(context_id);
+        if (it == contexts.end()) {
+            throw_java_exception(env, "java/lang/IllegalArgumentException", "Invalid context ID");
+            return nullptr;
+        }
+        
+        std::string messages_str = jstring_to_string(env, messages);
+        std::string template_str = jstring_to_string(env, chat_template);
+        
+        capllama::llama_cap_context* context = it->second.get();
+        
+        // Format chat using the context's method
+        std::string result = context->getFormattedChat(messages_str, template_str);
+        
+        LOGI("Formatted chat for context %ld", context_id);
+        return string_to_jstring(env, result);
+        
+    } catch (const std::exception& e) {
+        LOGE("Exception in getFormattedChat: %s", e.what());
+        throw_java_exception(env, "java/lang/RuntimeException", e.what());
+        return nullptr;
+    }
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_aimindmesh_llama_LlamaCpp_toggleNativeLogNative(
+    JNIEnv* env, jobject thiz, jboolean enabled) {
+    
+    try {
+        // rnllama::rnllama_verbose = jboolean_to_bool(enabled); // This line is removed as per the edit hint
+        LOGI("Native logging %s", enabled ? "enabled" : "disabled");
+        return bool_to_jboolean(true);
+    } catch (const std::exception& e) {
+        LOGE("Exception in toggleNativeLog: %s", e.what());
+        throw_java_exception(env, "java/lang/RuntimeException", e.what());
+        return bool_to_jboolean(false);
+    }
+}
+
+JNIEXPORT jobject JNICALL
+Java_com_aimindmesh_llama_LlamaCpp_modelInfoNative(
+    JNIEnv* env, jobject thiz, jstring model_path) {
+    
+    try {
+        std::string model_path_str = jstring_to_string(env, model_path);
+        LOGI("Getting model info for: %s", model_path_str.c_str());
+
+        // Extract filename from path
+        std::string filename = model_path_str;
+        size_t last_slash = model_path_str.find_last_of('/');
+        if (last_slash != std::string::npos) {
+            filename = model_path_str.substr(last_slash + 1);
+        }
+        LOGI("Extracted filename for model info: %s", filename.c_str());
+
+        // List all possible paths we should check (same as initContextNative)
+        std::vector<std::string> paths_to_check = {
+            model_path_str, // Try the original path first
+            "/data/data/com.aimindmesh.mobile/files/" + filename,
+            "/data/data/com.aimindmesh.mobile/files/Documents/" + filename,
+            "/storage/emulated/0/Android/data/com.aimindmesh.mobile/files/" + filename,
+            "/storage/emulated/0/Android/data/com.aimindmesh.mobile/files/Documents/" + filename,
+            "/storage/emulated/0/Documents/" + filename,
+            "/storage/emulated/0/Download/" + filename
+        };
+
+        // Check each path and find the actual file
+        std::string full_model_path;
+        bool file_found = false;
+        
+        for (const auto& path : paths_to_check) {
+            LOGI("Checking path for model info: %s", path.c_str());
+            std::ifstream file_check(path, std::ios::binary);
+            if (file_check.good()) {
+                file_check.seekg(0, std::ios::end);
+                std::streamsize file_size = file_check.tellg();
+                file_check.seekg(0, std::ios::beg);
+                
+                // Validate file size
+                if (file_size < 1024 * 1024) { // Less than 1MB
+                    LOGE("Model file is too small, likely corrupted: %s", path.c_str());
+                    file_check.close();
+                    continue; // Try next path
+                }
+                
+                // Check if it's a valid GGUF file by reading the magic number
+                char magic[4];
+                if (file_check.read(magic, 4)) {
+                    if (magic[0] == 'G' && magic[1] == 'G' && magic[2] == 'U' && magic[3] == 'F') {
+                        LOGI("Valid GGUF file detected for model info at: %s", path.c_str());
+                        full_model_path = path;
+                        file_found = true;
+                        file_check.close();
+                        break;
+                    } else {
+                        LOGI("File does not appear to be a GGUF file (magic: %c%c%c%c) at: %s", 
+                             magic[0], magic[1], magic[2], magic[3], path.c_str());
+                    }
+                }
+                file_check.close();
+            } else {
+                LOGI("File not found at: %s", path.c_str());
+            }
+        }
+
+        if (!file_found) {
+            LOGE("Model file not found in any of the checked paths");
+            throw_java_exception(env, "java/lang/RuntimeException", "Model file not found");
+            return nullptr;
+        }
+
+        // Now use the found path for getting model info
+        std::ifstream file_check(full_model_path, std::ios::binary);
+
+        // Get file size
+        file_check.seekg(0, std::ios::end);
+        std::streamsize file_size = file_check.tellg();
+        file_check.seekg(0, std::ios::beg);
+
+        // Check GGUF magic number
+        char magic[4];
+        if (!file_check.read(magic, 4)) {
+            LOGE("Failed to read magic number from: %s", full_model_path.c_str());
+            throw_java_exception(env, "java/lang/RuntimeException", "Failed to read model file header");
+            return nullptr;
+        }
+
+        if (magic[0] != 'G' || magic[1] != 'G' || magic[2] != 'U' || magic[3] != 'F') {
+            LOGE("Invalid GGUF file (magic: %c%c%c%c): %s", magic[0], magic[1], magic[2], magic[3], full_model_path.c_str());
+            throw_java_exception(env, "java/lang/RuntimeException", "Invalid GGUF file format");
+            return nullptr;
+        }
+
+        // Read GGUF version
+        uint32_t version;
+        if (!file_check.read(reinterpret_cast<char*>(&version), sizeof(version))) {
+            LOGE("Failed to read GGUF version from: %s", full_model_path.c_str());
+            throw_java_exception(env, "java/lang/RuntimeException", "Failed to read GGUF version");
+            return nullptr;
+        }
+
+        file_check.close();
+
+        // Create Java HashMap
+        jclass hashMapClass = env->FindClass("java/util/HashMap");
+        jmethodID hashMapConstructor = env->GetMethodID(hashMapClass, "<init>", "()V");
+        jmethodID putMethod = env->GetMethodID(hashMapClass, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+
+        jobject hashMap = env->NewObject(hashMapClass, hashMapConstructor);
+
+        // Add model info to HashMap
+        env->CallObjectMethod(hashMap, putMethod, 
+            string_to_jstring(env, "path"), 
+            string_to_jstring(env, full_model_path));
+        
+        env->CallObjectMethod(hashMap, putMethod, 
+            string_to_jstring(env, "size"), 
+            env->NewObject(env->FindClass("java/lang/Long"), 
+                env->GetMethodID(env->FindClass("java/lang/Long"), "<init>", "(J)V"), 
+                static_cast<jlong>(file_size)));
+        
+        env->CallObjectMethod(hashMap, putMethod, 
+            string_to_jstring(env, "desc"), 
+            string_to_jstring(env, "GGUF Model (v" + std::to_string(version) + ")"));
+        
+        env->CallObjectMethod(hashMap, putMethod, 
+            string_to_jstring(env, "nEmbd"), 
+            env->NewObject(env->FindClass("java/lang/Integer"), 
+                env->GetMethodID(env->FindClass("java/lang/Integer"), "<init>", "(I)V"), 
+                0)); // Will be filled by actual model loading
+        
+        env->CallObjectMethod(hashMap, putMethod, 
+            string_to_jstring(env, "nParams"), 
+            env->NewObject(env->FindClass("java/lang/Integer"), 
+                env->GetMethodID(env->FindClass("java/lang/Integer"), "<init>", "(I)V"), 
+                0)); // Will be filled by actual model loading
+
+        LOGI("Model info retrieved successfully from %s: size=%ld, version=%u", full_model_path.c_str(), file_size, version);
+        return hashMap;
+
+    } catch (const std::exception& e) {
+        LOGE("Exception in modelInfo: %s", e.what());
+        throw_java_exception(env, "java/lang/RuntimeException", e.what());
+        return nullptr;
+    }
+}
+
+
+
+JNIEXPORT jstring JNICALL
+Java_com_aimindmesh_llama_LlamaCpp_downloadModelNative(
+    JNIEnv* env, jobject thiz, jstring url, jstring filename) {
+    
+    try {
+        std::string url_str = jstring_to_string(env, url);
+        std::string filename_str = jstring_to_string(env, filename);
+        
+        LOGI("Preparing download path for model: %s", filename_str.c_str());
+        
+        // Determine local storage path (use external storage for large files)
+        std::string local_path = "/storage/emulated/0/Android/data/com.aimindmesh.mobile/files/Models/" + filename_str;
+        
+        // Create directory if it doesn't exist
+        std::string dir_path = "/storage/emulated/0/Android/data/com.aimindmesh.mobile/files/Models/";
+        std::filesystem::create_directories(dir_path);
+        
+        LOGI("Download path prepared: %s", local_path.c_str());
+        
+        return string_to_jstring(env, local_path);
+        
+    } catch (const std::exception& e) {
+        LOGE("Exception in downloadModel: %s", e.what());
+        throw_java_exception(env, "java/lang/RuntimeException", e.what());
+        return nullptr;
+    }
+}
+
+JNIEXPORT jobject JNICALL
+Java_com_aimindmesh_llama_LlamaCpp_getDownloadProgressNative(
+    JNIEnv* env, jobject thiz, jstring url) {
+    
+    try {
+        // For now, return a placeholder since we'll handle download in Java
+        // This can be enhanced later to track actual download progress
+        
+        jclass hashMapClass = env->FindClass("java/util/HashMap");
+        jmethodID hashMapConstructor = env->GetMethodID(hashMapClass, "<init>", "()V");
+        jmethodID putMethod = env->GetMethodID(hashMapClass, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+        
+        jobject hashMap = env->NewObject(hashMapClass, hashMapConstructor);
+        
+        // Return placeholder progress info
+        env->CallObjectMethod(hashMap, putMethod, 
+            string_to_jstring(env, "progress"), 
+            env->NewObject(env->FindClass("java/lang/Double"), 
+                env->GetMethodID(env->FindClass("java/lang/Double"), "<init>", "(D)V"), 
+                0.0));
+        
+        env->CallObjectMethod(hashMap, putMethod, 
+            string_to_jstring(env, "completed"), 
+            env->NewObject(env->FindClass("java/lang/Boolean"), 
+                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), 
+                false));
+        
+        env->CallObjectMethod(hashMap, putMethod, 
+            string_to_jstring(env, "failed"), 
+            env->NewObject(env->FindClass("java/lang/Boolean"), 
+                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), 
+                false));
+        
+        return hashMap;
+        
+    } catch (const std::exception& e) {
+        LOGE("Exception in getDownloadProgress: %s", e.what());
+        throw_java_exception(env, "java/lang/RuntimeException", e.what());
+        return nullptr;
+    }
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_aimindmesh_llama_LlamaCpp_cancelDownloadNative(
+    JNIEnv* env, jobject thiz, jstring url) {
+    
+    try {
+        // For now, return false since we'll handle download cancellation in Java
+        // This can be enhanced later to actually cancel downloads
+        return JNI_FALSE;
+        
+    } catch (const std::exception& e) {
+        LOGE("Exception in cancelDownload: %s", e.what());
+        throw_java_exception(env, "java/lang/RuntimeException", e.what());
+        return JNI_FALSE;
+    }
+}
+
+JNIEXPORT jobject JNICALL
+Java_com_aimindmesh_llama_LlamaCpp_getAvailableModelsNative(
+    JNIEnv* env, jobject thiz) {
+    
+    try {
+        std::string models_dir = "/storage/emulated/0/Android/data/com.aimindmesh.mobile/files/Models/";
+        
+        // Create Java ArrayList
+        jclass arrayListClass = env->FindClass("java/util/ArrayList");
+        jmethodID arrayListConstructor = env->GetMethodID(arrayListClass, "<init>", "()V");
+        jmethodID addMethod = env->GetMethodID(arrayListClass, "add", "(Ljava/lang/Object;)Z");
+        
+        jobject arrayList = env->NewObject(arrayListClass, arrayListConstructor);
+        
+        if (std::filesystem::exists(models_dir)) {
+            for (const auto& entry : std::filesystem::directory_iterator(models_dir)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".gguf") {
+                    std::string filename = entry.path().filename().string();
+                    std::string full_path = entry.path().string();
+                    size_t file_size = entry.file_size();
+                    
+                    // Create model info HashMap
+                    jclass hashMapClass = env->FindClass("java/util/HashMap");
+                    jmethodID hashMapConstructor = env->GetMethodID(hashMapClass, "<init>", "()V");
+                    jmethodID putMethod = env->GetMethodID(hashMapClass, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+                    
+                    jobject modelInfo = env->NewObject(hashMapClass, hashMapConstructor);
+                    
+                    env->CallObjectMethod(modelInfo, putMethod, 
+                        string_to_jstring(env, "name"), 
+                        string_to_jstring(env, filename));
+                    
+                    env->CallObjectMethod(modelInfo, putMethod, 
+                        string_to_jstring(env, "path"), 
+                        string_to_jstring(env, full_path));
+                    
+                    env->CallObjectMethod(modelInfo, putMethod, 
+                        string_to_jstring(env, "size"), 
+                        env->NewObject(env->FindClass("java/lang/Long"), 
+                            env->GetMethodID(env->FindClass("java/lang/Long"), "<init>", "(J)V"), 
+                            static_cast<jlong>(file_size)));
+                    
+                    // Add to ArrayList
+                    env->CallBooleanMethod(arrayList, addMethod, modelInfo);
+                }
+            }
+        }
+        
+        return arrayList;
+        
+    } catch (const std::exception& e) {
+        LOGE("Exception in getAvailableModels: %s", e.what());
+        throw_java_exception(env, "java/lang/RuntimeException", e.what());
+        return nullptr;
+    }
+}
+
+// MARK: - Tokenization methods
+
+JNIEXPORT jobject JNICALL
+Java_com_aimindmesh_llama_LlamaCpp_tokenizeNative(
+    JNIEnv* env, jobject thiz, jlong contextId, jstring text, jobjectArray imagePaths) {
+    
+    try {
+        LOGI("Tokenizing with context ID: %ld", contextId);
+        
+        std::string text_str = jni_utils::jstring_to_string(env, text);
+        LOGI("Text to tokenize: %s", text_str.c_str());
+        
+        // Find the context
+        auto it = contexts.find(contextId);
+        if (it == contexts.end()) {
+            LOGE("Context not found: %ld", contextId);
+            throw_java_exception(env, "java/lang/RuntimeException", "Context not found");
+            return nullptr;
+        }
+        
+        auto& ctx = it->second;
+        if (!ctx || !ctx->ctx) {
+            LOGE("Invalid context or llama context is null");
+            throw_java_exception(env, "java/lang/RuntimeException", "Invalid context");
+            return nullptr;
+        }
+        
+        // Tokenize the text using the context's tokenize method
+        capllama::llama_cap_tokenize_result tokenize_result = ctx->tokenize(text_str, {});
+        std::vector<llama_token> tokens = tokenize_result.tokens;
+        
+        LOGI("Tokenized %zu tokens", tokens.size());
+        
+        // Create Java HashMap for result
+        jclass hashMapClass = env->FindClass("java/util/HashMap");
+        jmethodID hashMapConstructor = env->GetMethodID(hashMapClass, "<init>", "()V");
+        jmethodID putMethod = env->GetMethodID(hashMapClass, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+        
+        jobject resultMap = env->NewObject(hashMapClass, hashMapConstructor);
+        
+        // Create Java ArrayList for tokens
+        jclass arrayListClass = env->FindClass("java/util/ArrayList");
+        jmethodID arrayListConstructor = env->GetMethodID(arrayListClass, "<init>", "()V");
+        jmethodID addMethod = env->GetMethodID(arrayListClass, "add", "(Ljava/lang/Object;)Z");
+        
+        jobject tokensArray = env->NewObject(arrayListClass, arrayListConstructor);
+        
+        // Add tokens to ArrayList
+        jclass integerClass = env->FindClass("java/lang/Integer");
+        jmethodID integerConstructor = env->GetMethodID(integerClass, "<init>", "(I)V");
+        
+        for (llama_token token : tokens) {
+            jobject jToken = env->NewObject(integerClass, integerConstructor, static_cast<jint>(token));
+            env->CallBooleanMethod(tokensArray, addMethod, jToken);
+            env->DeleteLocalRef(jToken);
+        }
+        
+        // Create empty arrays for other fields
+        jobject emptyBitmapHashes = env->NewObject(arrayListClass, arrayListConstructor);
+        jobject emptyChunkPos = env->NewObject(arrayListClass, arrayListConstructor);
+        jobject emptyChunkPosImages = env->NewObject(arrayListClass, arrayListConstructor);
+        
+        // Put all data into result map
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "tokens"), tokensArray);
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "has_images"), 
+            env->NewObject(env->FindClass("java/lang/Boolean"), 
+                env->GetMethodID(env->FindClass("java/lang/Boolean"), "<init>", "(Z)V"), JNI_FALSE));
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "bitmap_hashes"), emptyBitmapHashes);
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "chunk_pos"), emptyChunkPos);
+        env->CallObjectMethod(resultMap, putMethod,
+            jni_utils::string_to_jstring(env, "chunk_pos_images"), emptyChunkPosImages);
+        
+        LOGI("Tokenization completed successfully");
+        return resultMap;
+        
+    } catch (const std::exception& e) {
+        LOGE("Exception in tokenize: %s", e.what());
+        throw_java_exception(env, "java/lang/RuntimeException", e.what());
+        return nullptr;
+    }
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_aimindmesh_llama_LlamaCpp_detokenizeNative(
+    JNIEnv* env, jobject thiz, jlong contextId, jintArray tokens) {
+    
+    try {
+        LOGI("Detokenizing with context ID: %ld", contextId);
+        
+        // Find the context
+        auto it = contexts.find(contextId);
+        if (it == contexts.end()) {
+            LOGE("Context not found: %ld", contextId);
+            throw_java_exception(env, "java/lang/RuntimeException", "Context not found");
+            return nullptr;
+        }
+        
+        auto& ctx = it->second;
+        if (!ctx || !ctx->ctx) {
+            LOGE("Invalid context or llama context is null");
+            throw_java_exception(env, "java/lang/RuntimeException", "Invalid context");
+            return nullptr;
+        }
+        
+        // Convert Java int array to C++ vector
+        jsize length = env->GetArrayLength(tokens);
+        jint* tokenArray = env->GetIntArrayElements(tokens, nullptr);
+        
+        std::vector<llama_token> llamaTokens;
+        for (jsize i = 0; i < length; i++) {
+            llamaTokens.push_back(static_cast<llama_token>(tokenArray[i]));
+        }
+        
+        env->ReleaseIntArrayElements(tokens, tokenArray, JNI_ABORT);
+        
+        // Detokenize using llama.cpp
+        std::string result = capllama::tokens_to_str(ctx->ctx, llamaTokens.begin(), llamaTokens.end());
+        
+        LOGI("Detokenized to: %s", result.c_str());
+        
+        return jni_utils::string_to_jstring(env, result);
+        
+    } catch (const std::exception& e) {
+        LOGE("Exception in detokenize: %s", e.what());
+        throw_java_exception(env, "java/lang/RuntimeException", e.what());
+        return nullptr;
+    }
+}
+
+} // extern "C"
+
+} // namespace jni_utils

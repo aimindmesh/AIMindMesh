@@ -1,0 +1,67 @@
+services:
+  unbound:
+    image: mvance/unbound:latest
+    container_name: unbound
+    restart: unless-stopped
+    hostname: unbound
+    volumes:
+      - "./unbound:/opt/unbound/etc/unbound"
+    networks:
+      wirehole_private_network:
+        ipv4_address: 10.2.0.200
+
+  pihole:
+    depends_on: [unbound]
+    container_name: pihole
+    image: pihole/pihole:latest
+    restart: unless-stopped
+    hostname: pihole
+    dns:
+      - 127.0.0.1
+      - 10.2.0.200
+    environment:
+      TZ: "Europe/Rome"
+      WEBPASSWORD: "${PIHOLE_PASSWORD}"
+      ServerIP: 10.2.0.100
+      DNS1: 10.2.0.200
+      DNS2: 10.2.0.200
+    volumes:
+      - "./etc-pihole:/etc/pihole"
+      - "./etc-dnsmasq.d:/etc/dnsmasq.d"
+    cap_add:
+      - NET_ADMIN
+    networks:
+      wirehole_private_network:
+        ipv4_address: 10.2.0.100
+
+  wireguard:
+    depends_on: [pihole]
+    image: linuxserver/wireguard:latest
+    container_name: wireguard
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Rome
+      - SERVERURL=auto
+      - SERVERPORT=51820
+      - PEERS=10
+      - PEERDNS=10.2.0.100
+      - INTERNAL_CONTROL_PORT=51821
+    volumes:
+      - "./wireguard:/config"
+      - "/lib/modules:/lib/modules"
+    ports:
+      - "51820:51820/udp"
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    restart: unless-stopped
+    networks:
+      wirehole_private_network:
+        ipv4_address: 10.2.0.1
+
+networks:
+  wirehole_private_network:
+    external: true

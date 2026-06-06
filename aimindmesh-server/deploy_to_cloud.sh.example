@@ -1,0 +1,257 @@
+#!/bin/bash
+set -e
+
+SERVER="your-vps-ip-or-domain"
+REMOTE_DIR="~/aimindmesh-server"
+LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load .env if exists to get current tokens locally
+if [ -f "$LOCAL_DIR/.env" ]; then
+  export $(grep -v '^#' "$LOCAL_DIR/.env" | xargs)
+fi
+
+# Fallback defaults if not in .env
+OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-"your-token-here"}
+GITEA_TOKEN=${GITEA_TOKEN:-"your-token-here"}
+GOOGLE_API_KEY=${GOOGLE_API_KEY:-"your-api-key-here"}
+
+FULL_DEPLOY=false
+if [[ "$1" == "--full" ]]; then
+  FULL_DEPLOY=true
+fi
+
+echo "🚀 Starting Deployment from Local PC to Cloud ($SERVER)..."
+if [ "$FULL_DEPLOY" = true ]; then
+  echo "🌟 Mode: FULL DEPLOYMENT (All services: Server + Neo4j + OpenClaw)"
+else
+  echo "⚡ Mode: FAST DEPLOYMENT (aimindmesh-server only)"
+fi
+
+echo "📦 Syncing files with rsync..."
+rsync -avz \
+  --rsync-path="sudo rsync" \
+  --exclude 'node_modules' \
+  --exclude 'dist' \
+  --exclude '.git' \
+  --exclude 'config.json' \
+  --exclude 'data' \
+  --exclude 'backups' \
+  --exclude 'openclaw-config/memory.md' \
+  --exclude 'openclaw-config/config.json' \
+  --exclude 'openclaw-workspace' \
+  "$LOCAL_DIR/" "$SERVER:$REMOTE_DIR/"
+
+ssh "$SERVER" "bash -s -- $FULL_DEPLOY $OPENCLAW_GATEWAY_TOKEN $GITEA_TOKEN $GOOGLE_API_KEY" << 'EOF'
+  set -e
+  FULL_DEPLOY=$1
+  OPENCLAW_GATEWAY_TOKEN=$2
+  GITEA_TOKEN=$3
+  GOOGLE_API_KEY=$4
+  
+  cd ~/aimindmesh-server
+  echo "🐳 Starting Deployment (FULL_DEPLOY=$FULL_DEPLOY) on Remote Host..."
+
+  # 1. Ownership Fix (MANDATORY for Docker UID 1000 and Neo4j UID 7474)
+  sudo mkdir -p ./data ./data/downloads ./data/neo4j ./backups ./backups/neo4j ./openclaw-config ./openclaw-workspace ./openclaw-config/vosk-models
+  sudo chown -R 1000:1000 ./data ./backups ./openclaw-config ./openclaw-workspace
+  sudo chown -R 7474:7474 ./data/neo4j ./backups/neo4j
+  sudo chown -R $USER:$USER ./data/downloads
+  sudo chmod -R 775 ./data ./backups ./openclaw-config ./openclaw-workspace
+
+  if [ "$FULL_DEPLOY" = "true" ]; then
+    echo "🔑 Preparing OpenClaw volumes..."
+  fi
+  
+  # 2. Cleanup legacy containers and unused resources
+  echo "🧹 Cleaning up target containers..."
+  sudo docker stop aimindmesh-server 2>/dev/null || true
+  sudo docker rm aimindmesh-server 2>/dev/null || true
+  sudo fuser -k 3030/tcp 2>/dev/null || true
+
+  if [ "$FULL_DEPLOY" = "true" ]; then
+    echo "🧹 Cleaning up OpenClaw gateway and Neo4j..."
+    sudo docker stop aimindmesh-openclaw-gateway aimindmesh-neo4j 2>/dev/null || true
+    sudo docker rm aimindmesh-openclaw-gateway aimindmesh-neo4j 2>/dev/null || true
+    sudo fuser -k 18789/tcp 7687/tcp 7474/tcp 2>/dev/null || true
+    
+    # Ensure native neo4j is not blocking the ports
+    sudo systemctl stop neo4j 2>/dev/null || true
+    sudo systemctl disable neo4j 2>/dev/null || true
+  fi
+  
+  sudo docker image prune -f
+  sudo docker builder prune -f
+
+  # 3. Remote Config Patch (Ensure port 3030 is set on the VPS)
+  echo "🛠️  Patching remote config.json..."
+  if [ -f "./config.json" ]; then
+    sudo sed -i 's/"port": [0-9]*/"port": 3030/' ./config.json
+    echo "🛠️  Patching Neo4j configuration to container service..."
+    sudo sed -i '/"neo4j": {/,/}/ s/"uri": "bolt:\/\/.*:7687"/"uri": "bolt:\/\/neo4j:7687"/' ./config.json
+    sudo sed -i '/"neo4j": {/,/}/ s/"password": ".*"/"password": "aimindmesh"/' ./config.json
+  fi
+
+  # 4. Build and Launch
+  echo "📦 Building and starting services..."
+  export OPENCLAW_GATEWAY_TOKEN="$OPENCLAW_GATEWAY_TOKEN"
+  export GITEA_TOKEN="$GITEA_TOKEN"
+  export GOOGLE_API_KEY="$GOOGLE_API_KEY"
+
+  if [ "$FULL_DEPLOY" = "true" ]; then
+    echo "🚀 Launching FULL stack..."
+    sudo -E docker compose build aimindmesh-server
+    sudo -E docker compose up -d --force-recreate
+  else
+    echo "🚀 Launching AIMindMesh Server ONLY..."
+    sudo -E docker compose build aimindmesh-server
+    sudo -E docker compose up -d --no-deps aimindmesh-server
+  fi
+
+  if [ "$FULL_DEPLOY" = "true" ]; then
+    # 5. Gateway Configuration
+    echo "🔒 Configuring OpenClaw gateway via CLI exec..."
+    sleep 10
+    
+    echo "📦 Setting up system prerequisites intelligently..."
+    sudo docker compose exec -T -u root openclaw-gateway sh -c '
+      if ! command -v jq >/dev/null || ! command -v rg >/dev/null || ! command -v gh >/dev/null || ! command -v ffmpeg >/dev/null || ! command -v tmux >/dev/null || ! command -v bzip2 >/dev/null || ! command -v wget >/dev/null || ! command -v unzip >/dev/null; then
+        echo "Installing system packages (jq, ripgrep, gh, ffmpeg, tmux, bzip2, wget, unzip)..."
+        apt-get update && apt-get install -y jq ripgrep gh ffmpeg tmux bzip2 wget unzip
+      else
+        echo "✅ System packages already installed."
+      fi
+    ' < /dev/null || true
+    
+    echo "📦 Setting up global npm tools intelligently..."
+    sudo docker compose exec -T -u root openclaw-gateway sh -c '
+      to_install=""
+      for pkg in @google/gemini-cli mcporter @steipete/summarize @xdevplatform/xurl clawhub; do
+        if ! npm list -g "$pkg" --depth=0 >/dev/null 2>&1; then
+          to_install="$to_install $pkg"
+        fi
+      done
+      if [ -n "$to_install" ]; then
+        echo "Installing missing NPM packages:$to_install..."
+        npm install -g $to_install
+      else
+        echo "✅ All global NPM packages already installed."
+      fi
+    ' < /dev/null || true
+    
+    echo "📦 Setting up Python tools intelligently..."
+    sudo docker compose exec -T -u root openclaw-gateway sh -c '
+      if ! command -v uv >/dev/null; then
+        echo "Installing uv..."
+        curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+      fi
+      to_install_py=""
+      for pkg in nano-pdf openai-whisper vosk; do
+        py_pkg="$pkg"
+        if [ "$pkg" = "openai-whisper" ]; then py_pkg="whisper"; fi
+        if [ "$pkg" = "nano-pdf" ]; then py_pkg="nano_pdf"; fi
+        if [ "$pkg" = "vosk" ]; then py_pkg="vosk"; fi
+        if ! python3 -c "import $py_pkg" >/dev/null 2>&1; then
+          to_install_py="$to_install_py $pkg"
+        fi
+      done
+      if [ -n "$to_install_py" ]; then
+        echo "Installing missing Python packages:$to_install_py..."
+        export UV_BREAK_SYSTEM_PACKAGES=1
+        uv pip install --system --extra-index-url https://download.pytorch.org/whl/cpu $to_install_py
+      else
+        echo "✅ All Python packages already installed."
+      fi
+    ' < /dev/null || true
+
+    echo "📦 Setting up sherpa-onnx-tts runtime and models intelligently..."
+    sudo docker compose exec -T -u node openclaw-gateway sh -c '
+      mkdir -p /home/node/.openclaw/tools/sherpa-onnx-tts/runtime /home/node/.openclaw/tools/sherpa-onnx-tts/models
+      
+      if [ ! -f "/home/node/.openclaw/tools/sherpa-onnx-tts/runtime/bin/sherpa-onnx-offline-tts" ]; then
+        echo "Downloading and extracting sherpa-onnx runtime..."
+        curl -LsSf https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.23/sherpa-onnx-v1.12.23-linux-aarch64-static.tar.bz2 | tar -xj -C /home/node/.openclaw/tools/sherpa-onnx-tts/runtime --strip-components=1
+      else
+        echo "✅ sherpa-onnx runtime already installed."
+      fi
+
+      if [ ! -f "/home/node/.openclaw/tools/sherpa-onnx-tts/models/vits-piper-en_US-amy-medium/en_US-amy-medium.onnx" ]; then
+        echo "Downloading amy-medium model..."
+        curl -LsSf https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-amy-medium.tar.bz2 | tar -xj -C /home/node/.openclaw/tools/sherpa-onnx-tts/models
+      else
+        echo "✅ amy-medium model already exists."
+      fi
+
+      if [ ! -f "/home/node/.openclaw/tools/sherpa-onnx-tts/models/vits-piper-en_US-kristin-medium/en_US-kristin-medium.onnx" ]; then
+        echo "Downloading kristin-medium model..."
+        curl -LsSf https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-kristin-medium.tar.bz2 | tar -xj -C /home/node/.openclaw/tools/sherpa-onnx-tts/models
+      else
+        echo "✅ kristin-medium model already exists."
+      fi
+
+      if [ ! -f "/home/node/.openclaw/tools/sherpa-onnx-tts/models/vits-piper-en_US-hfc_female-medium/en_US-hfc_female-medium.onnx" ]; then
+        echo "Downloading hfc_female-medium model..."
+        curl -LsSf https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-hfc_female-medium.tar.bz2 | tar -xj -C /home/node/.openclaw/tools/sherpa-onnx-tts/models
+      else
+        echo "✅ hfc_female-medium model already exists."
+      fi
+
+      if [ ! -f "/home/node/.openclaw/tools/sherpa-onnx-tts/models/vits-piper-it_IT-paola-medium/it_IT-paola-medium.onnx" ]; then
+        echo "Downloading paola-medium model..."
+        curl -LsSf https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-it_IT-paola-medium.tar.bz2 | tar -xj -C /home/node/.openclaw/tools/sherpa-onnx-tts/models
+      else
+        echo "✅ paola-medium model already exists."
+      fi
+    ' < /dev/null || true
+
+    sudo docker compose exec -T -u node openclaw-gateway sh -c '
+      mkdir -p /home/node/.cache
+      ln -sf /home/node/.openclaw/vosk-models /home/node/.cache/vosk
+    ' < /dev/null || true
+
+    sudo docker compose exec -T openclaw-gateway node dist/index.js config set gateway.bind custom < /dev/null || true
+    sudo docker compose exec -T openclaw-gateway node dist/index.js config set gateway.customBindHost 0.0.0.0 < /dev/null || true
+    sudo docker compose exec -T openclaw-gateway node dist/index.js config set gateway.auth.mode token < /dev/null || true
+    sudo docker compose exec -T openclaw-gateway node dist/index.js config set gateway.auth.token "$OPENCLAW_GATEWAY_TOKEN" < /dev/null || true
+    sudo docker compose exec -T openclaw-gateway node dist/index.js config set gateway.controlUi.enabled true < /dev/null || true
+    sudo docker compose exec -T openclaw-gateway node dist/index.js config set gateway.controlUi.allowInsecureAuth false --strict-json < /dev/null || true
+    sudo docker compose exec -T openclaw-gateway node dist/index.js config set gateway.controlUi.allowedOrigins '["*"]' --strict-json < /dev/null || true
+    
+    echo "📡 Configuring SearXNG as native Web Search provider..."
+    sudo docker compose exec -T openclaw-gateway node dist/index.js config set tools.web.search.provider searxng < /dev/null || true
+    
+    echo "🔍 Verifying installed plugins..."
+    sudo docker compose exec -T openclaw-gateway node dist/index.js plugins list < /dev/null || true
+    
+    echo "🔄 Restarting gateway to apply settings..."
+    sudo docker compose restart openclaw-gateway < /dev/null
+
+    echo "🛡️  Checking for and fixing NPM vulnerabilities in aimindmesh-server..."
+    sudo docker compose exec -T aimindmesh-server npm audit fix --force < /dev/null || true
+
+    echo "🛡️  Checking for NPM vulnerabilities in openclaw-gateway..."
+    sudo docker compose exec -T -u root openclaw-gateway sh -c '
+      npm i --package-lock-only --ignore-scripts >/dev/null 2>&1
+      if [ -f "package-lock.json" ]; then
+        npm audit fix --force --package-lock-only >/dev/null 2>&1 || true
+        npm audit || echo "✅ No outstanding high-severity vulnerabilities in OpenClaw!"
+        rm -f package-lock.json
+      fi
+    ' < /dev/null || true
+
+    echo "📊 Initializing Neo4j Schema (First boot)..."
+    # Wait for Neo4j to be ready before initializing
+    sleep 30
+    sudo docker compose exec -T aimindmesh-server node dist/db/neo4j.js < /dev/null || true
+
+    # 6. Final File Transfer (Soul, Identity, etc.)
+    echo "📝 Transferring configuration files to container..."
+    sudo docker compose cp ./openclaw-config/soul.md aimindmesh-openclaw-gateway:/home/node/.openclaw/soul.md 2>/dev/null || true
+    sudo docker compose cp ./openclaw-config/identity.md aimindmesh-openclaw-gateway:/home/node/.openclaw/identity.md 2>/dev/null || true
+    sudo docker compose cp ./openclaw-config/agents.md aimindmesh-openclaw-gateway:/home/node/.openclaw/agents.md 2>/dev/null || true
+    sudo docker compose cp ./openclaw-config/memory.md aimindmesh-openclaw-gateway:/home/node/.openclaw/memory.md 2>/dev/null || true
+    sudo docker compose cp ./openclaw-config/tools.md aimindmesh-openclaw-gateway:/home/node/.openclaw/tools.md 2>/dev/null || true
+  fi
+  
+  echo "✅ Deployment Process Complete!"
+  sudo docker compose ps
+EOF

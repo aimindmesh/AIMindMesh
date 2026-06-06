@@ -1,0 +1,75 @@
+name: Update Vulkan-Headers PR
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # every day at midnight
+
+jobs:
+  update-vulkan-headers:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        build_type: [Debug]
+        cxx_compiler: [g++-9]
+        cxx_standard: [11]
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    
+    - name: Install libraries
+      run: |
+        wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+        sudo echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy main" | sudo tee -a "/etc/apt/sources.list"
+        sudo echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-15 main" | sudo tee -a "/etc/apt/sources.list"
+        sudo apt-get update
+        sudo apt-get install -y clang-format-15
+
+    - name: Update Submodules
+      run: |
+        cd Vulkan-Headers
+        git fetch --all --tags
+        VK_HEADER_GIT_TAG=$(git describe --always --tags $(git rev-list --tags) | grep 'v[0-9]\.' | head -n1)
+        echo "New revision of Vulkan-Headers: $VK_HEADER_GIT_TAG"
+        git checkout $VK_HEADER_GIT_TAG
+        echo "VK_HEADER_GIT_TAG=$VK_HEADER_GIT_TAG" >> $GITHUB_ENV
+
+    - name: Configure CMake
+      run: cmake -B ${{github.workspace}}/build
+            -DVULKAN_HPP_SAMPLES_BUILD=OFF
+            -DVULKAN_HPP_TESTS_BUILD=OFF
+            -DVULKAN_HPP_RUN_GENERATOR=ON
+            -DCMAKE_CXX_COMPILER=${{matrix.cxx_compiler}}
+            -DCMAKE_CXX_STANDARD=${{matrix.cxx_standard}}
+
+    - name: Build
+      run: cmake --build ${{github.workspace}}/build --config ${{matrix.build_type}}
+
+    - name: Commit changes
+      run: |
+        git config user.name "GitHub"
+        git config user.email "noreply@github.com"
+        git add Vulkan-Headers vulkan
+        rm -rf build
+        git fetch --all --tags
+        if [ -z $(git tag | grep $VK_HEADER_GIT_TAG) ]
+        then
+          echo "Creating commit for new tag: $VK_HEADER_GIT_TAG"
+          git commit -m "Update Vulkan-Headers to $VK_HEADER_GIT_TAG" || echo 'No commit necessary!'
+        else
+          echo "Tag already exists: $VK_HEADER_GIT_TAG"
+        fi
+        git stash
+        git clean -xf
+
+    - name: Create Pull Request
+      uses: peter-evans/create-pull-request@v5
+      with:
+        commit-message: Update Vulkan-Headers to ${{ env.VK_HEADER_GIT_TAG }}
+        title: Update Vulkan-Headers to ${{ env.VK_HEADER_GIT_TAG }}
+        branch: update-vulkan-headers-pr
+        base: ${{ github.head_ref }}
+        body: |
+          Please close and reopen this PR to trigger the CI!

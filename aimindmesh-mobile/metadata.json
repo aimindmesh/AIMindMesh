@@ -1,0 +1,7 @@
+{
+  "name": "AI Mind Mesh",
+  "description": "A personal AI companion that simulates natural human interactions through text and real-time voice conversations. All data is stored locally for complete privacy.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}

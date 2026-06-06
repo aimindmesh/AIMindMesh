@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="kanban_board"
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_kanban"
+        android:shortcutShortLabel="@string/shortcut_kanban_short"
+        android:shortcutLongLabel="@string/shortcut_kanban_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.aimindmesh.mobile"
+            android:targetClass="com.aimindmesh.mobile.MainActivity">
+            <extra android:name="route" android:value="kanban" />
+        </intent>
+        <categories android:name="android.shortcut.conversation" />
+    </shortcut>
+    <shortcut
+        android:shortcutId="assistant_call"
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_assistant"
+        android:shortcutShortLabel="@string/shortcut_assistant_short"
+        android:shortcutLongLabel="@string/shortcut_assistant_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.aimindmesh.mobile"
+            android:targetClass="com.aimindmesh.mobile.MainActivity">
+            <extra android:name="route" android:value="call" />
+        </intent>
+        <categories android:name="android.shortcut.conversation" />
+    </shortcut>
+    <shortcut
+        android:shortcutId="agenda"
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_agenda"
+        android:shortcutShortLabel="@string/shortcut_agenda_short"
+        android:shortcutLongLabel="@string/shortcut_agenda_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.aimindmesh.mobile"
+            android:targetClass="com.aimindmesh.mobile.MainActivity">
+            <extra android:name="route" android:value="agenda" />
+        </intent>
+        <categories android:name="android.shortcut.conversation" />
+    </shortcut>
+</shortcuts>

@@ -1,0 +1,23 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Node.js
+node_modules/
+dist/
+.npm/
+
+# Environment variables and secrets
+config.json
+firebase-service-account.json
+src/config.ts
+
+# Local databases
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Build artifacts
+tsconfig.tsbuildinfo

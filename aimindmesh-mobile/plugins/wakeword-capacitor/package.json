@@ -1,0 +1,62 @@
+{
+    "name": "wakeword-capacitor",
+    "version": "1.0.0",
+    "description": "OpenWakeWord plugin for Capacitor - Wake word detection using TensorFlow Lite",
+    "main": "dist/plugin.cjs.js",
+    "module": "dist/esm/index.js",
+    "types": "dist/esm/index.d.ts",
+    "unpkg": "dist/plugin.js",
+    "files": [
+        "android/src/main/",
+        "android/build.gradle",
+        "dist/"
+    ],
+    "author": "AI Mind Mesh",
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/aimindmesh/wakeword-capacitor"
+    },
+    "bugs": {
+        "url": "https://github.com/aimindmesh/wakeword-capacitor/issues"
+    },
+    "keywords": [
+        "capacitor",
+        "plugin",
+        "native",
+        "wake-word",
+        "voice-activation",
+        "openwakeword",
+        "tensorflow-lite"
+    ],
+    "scripts": {
+        "verify": "npm run verify:android",
+        "verify:android": "cd android && ./gradlew clean build --warning-mode all",
+        "build": "npm run clean && tsc && rollup -c rollup.config.mjs",
+        "clean": "rimraf ./dist",
+        "watch": "tsc --watch",
+        "prepublishOnly": "npm run build"
+    },
+    "devDependencies": {
+        "@capacitor/android": "^7.0.0",
+        "@capacitor/core": "^7.0.0",
+        "@rollup/plugin-node-resolve": "^15.2.3",
+        "rimraf": "^5.0.5",
+        "rollup": "^4.9.0",
+        "typescript": "~5.2.2"
+    },
+    "peerDependencies": {
+        "@capacitor/core": "^7.0.0"
+    },
+    "capacitor": {
+        "android": {
+            "src": "android"
+        }
+    },
+    "overrides": {
+        "eslint": "^9.26.0",
+        "lodash": "4.17.23",
+        "lodash-es": "4.17.23",
+        "tar": "^7.5.7"
+    }
+}
