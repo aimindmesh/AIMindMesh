@@ -113,6 +113,9 @@ export const organizationApi = {
   transitionIdeaToDevelopment: (ideaId: string) =>
     serverApi.post<{ success: boolean }>(`/api/organization/ideas/${ideaId}/transition`),
 
+  getIdeaDesign: (ideaId: string) =>
+    serverApi.get<any>(`/api/organization/ideas/${ideaId}/design`),
+
   getRepositories: () =>
     serverApi.get<{ success: boolean; repositories: any[] }>('/api/organization/repositories'),
 

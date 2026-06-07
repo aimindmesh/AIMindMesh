@@ -27,7 +27,7 @@ export interface SemanticMemoryConfig {
 
 const DEFAULT_CONFIG: SemanticMemoryConfig = {
     maxResults: 3,
-    minSimilarity: 0.75,
+    minSimilarity: 0.60, // Lowered from 0.75 to allow cross-language matching (e.g. English model vs Italian query)
     maxTokens: 400,
     maxAgeDays: 30,
     sessionBoost: 1.2, // 20% boost for current session
@@ -259,14 +259,11 @@ class SemanticMemoryRetriever {
             // Filter by minimum similarity
             const filtered = scored.filter(m => m.similarity >= minSimilarity);
 
-            // If no semantic matches, fallback to recent
+            // If no semantic matches, return empty. Do NOT fallback to recency because the LLM already 
+            // has the recent history natively. Returning recent history here pollutes the factual context block.
             if (filtered.length === 0) {
-                logger.log('debug', `[SemanticMemory] No matches above similarity threshold ${minSimilarity}, using recency fallback`);
-                const topRecent = scored
-                    .sort((a, b) => b.timestamp - a.timestamp)
-                    .slice(0, maxResults);
-                logger.log('info', `[SemanticMemory] ✓ Returning ${topRecent.length} recent memories as fallback`);
-                return topRecent;
+                logger.log('debug', `[SemanticMemory] No matches above similarity threshold ${minSimilarity}`);
+                return [];
             }
 
             // Sort by similarity and take top N

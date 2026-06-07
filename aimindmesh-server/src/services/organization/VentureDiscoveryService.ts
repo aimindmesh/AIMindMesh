@@ -38,15 +38,16 @@ export class VentureDiscoveryService {
       ...internalSignals.map(s => `Internal Insight: ${s}`)
     ].join('\n');
 
-    const prompt = `Based on the following signals:
+    const prompt = `Based on the following search results and market signals from SearxNG:
 ${contextText}
 
-Generate 2 unique software idea proposals addressing the topic "${topic}".
+Generate 2 unique, highly concrete software product proposals (e.g., specific mobile apps, games, SaaS tools) addressing the topic "${topic}".
+Focus EXCLUSIVELY on ideas that have clear market viability, a well-defined target audience, and realistic technical implementation paths. Avoid vague or purely philosophical AI experiments.
 Provide the response strictly as a JSON array of objects. Do not include markdown formatting or reasoning.
 Each object must contain the following keys:
-- title: string
-- problemStatement: string
-- summary: string
+- title: string (The name of the app/game/tool)
+- problemStatement: string (What specific market gap or user need it solves)
+- summary: string (How it solves the problem concretely)
 - strategicScore: number (0.0 to 1.0)
 - feasibilityScore: number (0.0 to 1.0)
 - noveltyScore: number (0.0 to 1.0)
@@ -56,9 +57,9 @@ Each object must contain the following keys:
 Example format:
 [
   {
-    "title": "Local LLM Router",
-    "problemStatement": "High cloud costs",
-    "summary": "Router for Gemma and Gemini",
+    "title": "TradeSimX: Real-Time Market Simulator",
+    "problemStatement": "Retail traders lack risk-free environments to test highly realistic algorithmic strategies.",
+    "summary": "A realistic trading game and simulator using live market data and slippage modeling.",
     "strategicScore": 0.9,
     "feasibilityScore": 0.8,
     "noveltyScore": 0.7,

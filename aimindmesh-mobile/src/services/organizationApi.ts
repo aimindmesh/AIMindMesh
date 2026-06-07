@@ -402,6 +402,15 @@ export const organizationApi = {
     return await resp.json();
   },
 
+  async getIdeaDesign(settings: AIMindMeshServerSettings, ideaId: string) {
+    const resp = await fetch(`${base(settings)}/api/organization/ideas/${ideaId}/design`, {
+      headers: headers(settings),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!resp.ok) throw new Error(`Idea design fetch failed: ${resp.status}`);
+    return await resp.json();
+  },
+
   async getSessionHistory(settings: AIMindMeshServerSettings, sessionKey: string) {
     const resp = await fetch(`${base(settings)}/api/agent/sessions/${sessionKey}/history`, {
       headers: headers(settings),

@@ -929,6 +929,29 @@ Format:
     }
   });
 
+  app.get('/ideas/:ideaId/design', async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const { ideaId } = request.params as { ideaId: string };
+      const row = db.prepare('SELECT * FROM organization_product_designs WHERE idea_id = ? ORDER BY created_at DESC LIMIT 1').get(ideaId) as any;
+      if (!row) {
+        return reply.status(404).send({ error: 'Design not found' });
+      }
+      return {
+        id: row.id,
+        ideaId: row.idea_id,
+        scopeAndAudience: row.scope_and_audience,
+        uiUxDesign: row.ui_ux_design,
+        coreLogic: row.core_logic,
+        techStack: row.tech_stack,
+        rawMarkdown: row.raw_markdown,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      };
+    } catch (e: any) {
+      reply.status(500).send({ error: e.message });
+    }
+  });
+
   // ─── STALE SESSION WATCHDOG ───────────────────────────────────────────────
   // Run once at startup (after a short delay to allow WS connection) and
   // then every 30 minutes to auto-heal repos stuck in "evolving" state.

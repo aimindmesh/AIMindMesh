@@ -26,13 +26,22 @@ export async function* generateNativeGGUFStream(
     logger.log('info', '[LLM_CHAIN] Starting generateNativeGGUFStream...');
     // 1. Prepare Context & System Prompt
     logger.log('info', '[LLM_CHAIN] Preparing context and system prompt...');
-    let { systemPrompt } = await prepareContext(history, personality, llmConfig, memories, maxResponseLength);
+    let { systemPrompt, updatedHistory } = await prepareContext(history, personality, llmConfig, memories, maxResponseLength);
+    
+    // Assign back to history locally so the changes propagate
+    history = updatedHistory || history;
 
-    // Inject Workspace Documents Context
+    // Inject Workspace Documents Context into the user message instead of mutating the system prompt (preserves KV cache)
     try {
         const { contextInjector } = await import('../contextInjector');
-        systemPrompt = await contextInjector.buildSystemPromptWithContext(history[history.length - 1].text, systemPrompt);
-        logger.log('info', '[LLM_CHAIN] Workspace context injected successfully.');
+        const workspaceContext = await contextInjector.buildSystemPromptWithContext(history[history.length - 1].text, "");
+        if (workspaceContext && workspaceContext.trim().length > 0) {
+            history[history.length - 1] = {
+                ...history[history.length - 1],
+                text: `${workspaceContext.trim()}\n\n${history[history.length - 1].text}`
+            };
+            logger.log('info', '[LLM_CHAIN] Workspace context injected directly into user message.');
+        }
     } catch (e) {
         logger.log('warn', '[LLM_CHAIN] Failed to inject workspace context', e);
     }

@@ -423,6 +423,19 @@ try {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS organization_product_designs (
+      id TEXT PRIMARY KEY,
+      idea_id TEXT NOT NULL,
+      scope_and_audience TEXT NOT NULL,
+      ui_ux_design TEXT NOT NULL,
+      core_logic TEXT NOT NULL,
+      tech_stack TEXT NOT NULL,
+      raw_markdown TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (idea_id) REFERENCES organization_ideas(id)
+    );
+
     CREATE TABLE IF NOT EXISTS organization_role_proposals (
       id TEXT PRIMARY KEY,
       candidate_role_name TEXT NOT NULL,

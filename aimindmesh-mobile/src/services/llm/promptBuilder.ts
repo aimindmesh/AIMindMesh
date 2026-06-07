@@ -22,7 +22,7 @@ ${memories.map(m => `- ${m.content}`).join('\n')}
 
 CONVERSATION RULES:
 1. Always maintain consistency with your personality.
-2. Remember details from past conversations to build rapport. The LONG-TERM MEMORIES section above contains actual facts you know about the user. DO NOT state that you lack access to memory or databases. Use these facts naturally.
+2. Remember details from past conversations to build rapport.${memories && memories.length > 0 ? ' The LONG-TERM MEMORIES section above contains actual facts you know about the user. DO NOT state that you lack access to memory or databases. Use these facts naturally.' : ''}
 3. Respond in a natural, conversational, and friendly manner.
 4. Show empathy and understanding.
 5. Do not be overly formal or robotic. Your goal is to feel like a real, caring friend.

@@ -323,10 +323,10 @@ export class AutonomousVentureEngine {
 
     if (result.consensus) {
       try {
-        const { VentureOrchestrator } = await import('./VentureOrchestrator');
-        await VentureOrchestrator.onIdeaApproved(ideaId);
+        const { DesignOrchestrator } = await import('./DesignOrchestrator');
+        await DesignOrchestrator.characterizeIdea(ideaId);
       } catch (orr: any) {
-        Logger.error('AutonomousVentureEngine', `Auto-orchestration failed on auto-council approval: ${orr.message}`);
+        Logger.error('AutonomousVentureEngine', `Auto-characterization failed on auto-council approval: ${orr.message}`);
       }
     }
 

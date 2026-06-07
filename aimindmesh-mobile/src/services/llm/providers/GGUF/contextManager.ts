@@ -29,7 +29,7 @@ export async function prepareContext(
     llmConfig: LLMConfig,
     memories?: Memory[],
     maxResponseLength?: number
-): Promise<{ systemPrompt: string; }> {
+): Promise<{ systemPrompt: string; updatedHistory: Message[]; }> {
     const responseHint = getResponseHintFromTokens(maxResponseLength);
 
     // If semantic memory is enabled, we STILL pass the manual memory list to buildSystemPrompt.
@@ -43,12 +43,22 @@ export async function prepareContext(
     );
     logger.log('info', `[LLM_CHAIN] Base system prompt built. Length: ${systemPrompt.length}`);
 
+    let updatedHistory = [...history];
     // Retrieve semantically relevant memories if enabled
-    if (llmConfig.enableSemanticMemory && llmConfig.embeddingModelId && history.length > 0) {
+    if (llmConfig.enableSemanticMemory && llmConfig.embeddingModelId && updatedHistory.length > 0) {
         logger.log('info', '[LLM_CHAIN] Semantic memory enabled. Attempting retrieval...');
         try {
-            const lastUserMessage = [...history].reverse().find(m => m.role === 'user');
-            if (lastUserMessage) {
+            // Find the index of the last user message
+            let lastUserIndex = -1;
+            for (let i = updatedHistory.length - 1; i >= 0; i--) {
+                if (updatedHistory[i].role === 'user') {
+                    lastUserIndex = i;
+                    break;
+                }
+            }
+
+            if (lastUserIndex !== -1) {
+                const lastUserMessage = updatedHistory[lastUserIndex];
                 logger.log('debug', `[LLM_CHAIN] Querying semantic memory for: "${lastUserMessage.text.substring(0, 50)}..."`);
                 const retriever = await getOrInitializeSemanticMemoryRetriever(llmConfig);
                 if (retriever) {
@@ -60,9 +70,14 @@ export async function prepareContext(
                     );
                     if (relevantMemories.length > 0) {
                         const truncated = retriever.truncateToTokenLimit(relevantMemories, 400);
-                        const semanticContext = retriever.formatForContext(truncated);
-                        systemPrompt += '\n\n' + semanticContext;
-                        logger.log('info', `GGUF: Injected ${truncated.length} semantic memories into context`);
+                        const mergedMemory = truncated.map((m: any) => m.content).join('\n');
+                        
+                        // Inject into user message to preserve KV Cache (prevent systemPrompt changes)
+                        updatedHistory[lastUserIndex] = {
+                            ...lastUserMessage,
+                            text: `<context>\nHere is some factual context about the user from past conversations. You MUST use this information to answer the user's query:\n${mergedMemory}\n</context>\n\n${lastUserMessage.text}`
+                        };
+                        logger.log('info', `GGUF: Injected ${truncated.length} semantic memories into user message`);
                     }
                 }
             }
@@ -101,7 +116,7 @@ Let's analyze the problem...
 Your final answer goes AFTER the thinking tags.`;
     }
 
-    return { systemPrompt };
+    return { systemPrompt, updatedHistory };
 }
 
 export function truncateHistory(

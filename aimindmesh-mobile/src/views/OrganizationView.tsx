@@ -27,12 +27,15 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
   const [newDirDesc, setNewDirDesc] = useState('');
   const [newDirGoal, setNewDirGoal] = useState<'explore' | 'build' | 'improve' | 'stop' | 'pivot' | 'research'>('build');
   const [newDirPriority, setNewDirPriority] = useState(50);
+  const [newDirConstraints, setNewDirConstraints] = useState('{"avoidCloudDependencies": true}');
   const [selectedDirective, setSelectedDirective] = useState<any | null>(null);
 
   // Forms — Repos
   const [newRepoName, setNewRepoName] = useState('');
   const [newRepoNamespace, setNewRepoNamespace] = useState('aimindmesh-labs');
   const [newRepoTemplate, setNewRepoTemplate] = useState('node-webapp');
+  const [newRepoVisibility, setNewRepoVisibility] = useState('private');
+  const [newRepoCiCd, setNewRepoCiCd] = useState(true);
 
   // Forms — Ideas
   const [discoveryTopic, setDiscoveryTopic] = useState('');
@@ -40,10 +43,12 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
   // Forms — Roles
   const [selectedRole, setSelectedRole] = useState<any | null>(null);
   const [selectedIdea, setSelectedIdea] = useState<any | null>(null);
+  const [selectedDesign, setSelectedDesign] = useState<any | null>(null);
+  const [loadingDesign, setLoadingDesign] = useState(false);
   const [humanFeedbackText, setHumanFeedbackText] = useState('');
   const [editRoleForm, setEditRoleForm] = useState<any | null>(null);
   const [showCreateRole, setShowCreateRole] = useState(false);
-  const [newRoleForm, setNewRoleForm] = useState({ name: '', description: '', mission: '', systemPrompt: '' });
+  const [newRoleForm, setNewRoleForm] = useState({ name: '', description: '', mission: '', systemPrompt: '', toolPermissions: ['web:search'], canRecruit: false, canProposeRepo: true, canProvisionValidation: true });
 
   const [isEditingIdea, setIsEditingIdea] = useState(false);
   const [editIdeaTitle, setEditIdeaTitle] = useState('');
@@ -211,7 +216,14 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
               <h3 className="font-bold text-text-primary text-sm uppercase tracking-wider">New Directive</h3>
               <form onSubmit={async (e) => {
                 e.preventDefault();
-                await createDirective(serverSettings, { title: newDirTitle, description: newDirDesc, goalType: newDirGoal, priority: Number(newDirPriority), constraints: { avoidCloudDependencies: true } });
+                let parsedConstraints = {};
+                try {
+                  parsedConstraints = JSON.parse(newDirConstraints);
+                } catch (err) {
+                  // Fallback
+                  parsedConstraints = { avoidCloudDependencies: true };
+                }
+                await createDirective(serverSettings, { title: newDirTitle, description: newDirDesc, goalType: newDirGoal, priority: Number(newDirPriority), constraints: parsedConstraints });
                 setNewDirTitle(''); setNewDirDesc('');
               }} className="space-y-3">
                 <input type="text" required value={newDirTitle} onChange={e => setNewDirTitle(e.target.value)} placeholder="Title..." className="w-full bg-input border border-white/10 rounded-2xl px-4 py-2.5 text-xs text-text-primary" />
@@ -222,6 +234,7 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
                   </select>
                   <input type="number" required min={1} max={100} value={newDirPriority} onChange={e => setNewDirPriority(Number(e.target.value))} className="bg-input border border-white/10 rounded-2xl px-4 py-2.5 text-xs text-text-primary" />
                 </div>
+                <textarea rows={2} value={newDirConstraints} onChange={e => setNewDirConstraints(e.target.value)} placeholder="Constraints JSON..." className="w-full bg-input border border-white/10 rounded-2xl px-4 py-2.5 text-xs text-text-primary font-mono" />
                 <button type="submit" className="w-full bg-blue-500 text-white font-bold py-2.5 rounded-2xl text-xs uppercase tracking-wider">Deploy Goal</button>
               </form>
             </div>
@@ -383,6 +396,28 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
                     <button onClick={(e) => { e.stopPropagation(); triggerHaptic('LIGHT'); if (serverSettings) approveIdea(serverSettings, idea.id); }} className="flex-1 bg-surface/50 border border-white/10 text-text-secondary py-2 rounded-2xl text-xs font-bold uppercase">Approve</button>
                     <button onClick={(e) => { e.stopPropagation(); triggerHaptic('LIGHT'); if (serverSettings) deleteIdea(serverSettings, idea.id); }} className="px-3 bg-red-950/40 border border-red-500/30 text-red-400 py-2 rounded-2xl text-xs font-bold uppercase">Delete</button>
                   </div>
+                  {['characterized', 'development'].includes(idea.status) && (
+                    <button
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        if (!serverSettings) return;
+                        setLoadingDesign(true);
+                        try {
+                          triggerHaptic('LIGHT');
+                          const res = await organizationApi.getIdeaDesign(serverSettings, idea.id);
+                          setSelectedDesign(res);
+                        } catch (err) {
+                          console.error("Failed to load design", err);
+                        } finally {
+                          setLoadingDesign(false);
+                        }
+                      }}
+                      disabled={loadingDesign}
+                      className="w-full mt-2 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl text-xs font-bold uppercase tracking-wider transition-all disabled:opacity-50"
+                    >
+                      {loadingDesign ? '📄 Loading...' : '📄 View Product Design'}
+                    </button>
+                  )}
                 </div>
               ))}
             </div>
@@ -396,14 +431,25 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
               <h3 className="font-bold text-text-primary text-sm uppercase tracking-wider">Provision Repo</h3>
               <form onSubmit={async (e) => {
                 e.preventDefault();
-                await createRepository(serverSettings, { repoName: newRepoName, namespace: newRepoNamespace, bootstrapTemplate: newRepoTemplate, enableCiCd: true, visibility: 'private' });
+                await createRepository(serverSettings, { repoName: newRepoName, namespace: newRepoNamespace, bootstrapTemplate: newRepoTemplate, enableCiCd: newRepoCiCd, visibility: newRepoVisibility });
                 setNewRepoName('');
               }} className="space-y-3">
                 <input type="text" required value={newRepoName} onChange={e => setNewRepoName(e.target.value)} placeholder="Repo Name..." className="w-full bg-input border border-white/10 rounded-2xl px-4 py-2.5 text-xs text-text-primary" />
                 <input type="text" required value={newRepoNamespace} onChange={e => setNewRepoNamespace(e.target.value)} placeholder="Namespace..." className="w-full bg-input border border-white/10 rounded-2xl px-4 py-2.5 text-xs text-text-primary" />
-                <select value={newRepoTemplate} onChange={e => setNewRepoTemplate(e.target.value)} className="w-full bg-input border border-white/10 rounded-2xl px-3 py-2.5 text-xs text-text-primary">
-                  {['node-webapp', 'node-library', 'docker-service', 'tauri-desktop-app', 'static-site'].map(t => <option key={t} value={t}>{t}</option>)}
-                </select>
+                <div className="grid grid-cols-2 gap-3">
+                  <select value={newRepoTemplate} onChange={e => setNewRepoTemplate(e.target.value)} className="w-full bg-input border border-white/10 rounded-2xl px-3 py-2.5 text-xs text-text-primary">
+                    {['node-webapp', 'node-library', 'docker-service', 'tauri-desktop-app', 'static-site'].map(t => <option key={t} value={t}>{t}</option>)}
+                  </select>
+                  <select value={newRepoVisibility} onChange={e => setNewRepoVisibility(e.target.value)} className="w-full bg-input border border-white/10 rounded-2xl px-3 py-2.5 text-xs text-text-primary">
+                    <option value="private">Private</option>
+                    <option value="public">Public</option>
+                    <option value="internal">Internal</option>
+                  </select>
+                </div>
+                <div className="flex items-center gap-2 px-1">
+                  <input type="checkbox" checked={newRepoCiCd} onChange={e => setNewRepoCiCd(e.target.checked)} className="rounded bg-black/20 border-white/10" />
+                  <span className="text-[10px] text-text-secondary uppercase font-bold">Enable CI/CD Pipeline</span>
+                </div>
                 <button type="submit" className="w-full bg-blue-500 text-white font-bold py-2.5 rounded-2xl text-xs uppercase tracking-wider">Create Repository</button>
               </form>
             </div>
@@ -449,10 +495,10 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
           <div className="flex flex-col gap-6">
             {/* Roles List */}
             <div className="space-y-4">
-              <div className="flex justify-between items-center">
-                <h3 className="font-bold text-text-primary text-sm uppercase tracking-wider">AI Registry Roles</h3>
+              <div className="flex justify-between items-center px-1 border-b border-white/5 pb-2">
+                <h3 className="font-bold text-text-primary text-sm uppercase tracking-wider">Active Roles</h3>
                 <button
-                  onClick={() => { triggerHaptic('LIGHT'); setShowCreateRole(true); setNewRoleForm({ name: '', description: '', mission: '', systemPrompt: '' }); }}
+                  onClick={() => { triggerHaptic('LIGHT'); setShowCreateRole(true); setNewRoleForm({ name: '', description: '', mission: '', systemPrompt: '', toolPermissions: ['web:search'], canRecruit: false, canProposeRepo: true, canProvisionValidation: true }); }}
                   className="px-3 py-1.5 bg-blue-500/20 border border-blue-500/30 text-blue-400 rounded-xl text-xs font-bold uppercase"
                 >
                   + New
@@ -822,6 +868,24 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
                 <label className="block text-[10px] text-text-secondary uppercase font-bold mb-1">System Prompt</label>
                 <textarea rows={4} value={editRoleForm.systemPrompt} onChange={e => setEditRoleForm({ ...editRoleForm, systemPrompt: e.target.value })} className="w-full bg-input border border-white/10 rounded-2xl px-4 py-2.5 text-xs text-text-primary" />
               </div>
+              <div>
+                <label className="block text-[10px] text-text-secondary uppercase font-bold mb-1">Tool Permissions (comma separated)</label>
+                <input type="text" value={editRoleForm.toolPermissions?.join(', ') || ''} onChange={e => setEditRoleForm({ ...editRoleForm, toolPermissions: e.target.value.split(',').map(s => s.trim()).filter(Boolean) })} className="w-full bg-input border border-white/10 rounded-2xl px-4 py-2.5 text-xs text-text-primary" />
+              </div>
+              <div className="flex flex-col gap-2 px-1">
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={editRoleForm.canRecruit} onChange={e => setEditRoleForm({ ...editRoleForm, canRecruit: e.target.checked })} className="rounded bg-black/20 border-white/10" />
+                  <span className="text-[10px] text-text-secondary uppercase font-bold">Can Recruit (HR)</span>
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={editRoleForm.canProposeRepo} onChange={e => setEditRoleForm({ ...editRoleForm, canProposeRepo: e.target.checked })} className="rounded bg-black/20 border-white/10" />
+                  <span className="text-[10px] text-text-secondary uppercase font-bold">Can Propose Repo</span>
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={editRoleForm.canProvisionValidation} onChange={e => setEditRoleForm({ ...editRoleForm, canProvisionValidation: e.target.checked })} className="rounded bg-black/20 border-white/10" />
+                  <span className="text-[10px] text-text-secondary uppercase font-bold">Can Provision Validation</span>
+                </label>
+              </div>
               <button
                 onClick={async () => {
                   try {
@@ -864,6 +928,24 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
                 <label className="block text-[10px] text-text-secondary uppercase font-bold mb-1">System Prompt</label>
                 <textarea rows={4} value={newRoleForm.systemPrompt} onChange={e => setNewRoleForm({ ...newRoleForm, systemPrompt: e.target.value })} className="w-full bg-input border border-white/10 rounded-2xl px-4 py-2.5 text-xs text-text-primary" />
               </div>
+              <div>
+                <label className="block text-[10px] text-text-secondary uppercase font-bold mb-1">Tool Permissions (comma separated)</label>
+                <input type="text" value={newRoleForm.toolPermissions?.join(', ') || ''} onChange={e => setNewRoleForm({ ...newRoleForm, toolPermissions: e.target.value.split(',').map(s => s.trim()).filter(Boolean) })} className="w-full bg-input border border-white/10 rounded-2xl px-4 py-2.5 text-xs text-text-primary" />
+              </div>
+              <div className="flex flex-col gap-2 px-1">
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={newRoleForm.canRecruit} onChange={e => setNewRoleForm({ ...newRoleForm, canRecruit: e.target.checked })} className="rounded bg-black/20 border-white/10" />
+                  <span className="text-[10px] text-text-secondary uppercase font-bold">Can Recruit (HR)</span>
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={newRoleForm.canProposeRepo} onChange={e => setNewRoleForm({ ...newRoleForm, canProposeRepo: e.target.checked })} className="rounded bg-black/20 border-white/10" />
+                  <span className="text-[10px] text-text-secondary uppercase font-bold">Can Propose Repo</span>
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={newRoleForm.canProvisionValidation} onChange={e => setNewRoleForm({ ...newRoleForm, canProvisionValidation: e.target.checked })} className="rounded bg-black/20 border-white/10" />
+                  <span className="text-[10px] text-text-secondary uppercase font-bold">Can Provision Validation</span>
+                </label>
+              </div>
               <button
                 onClick={async () => {
                   if (!newRoleForm.name) return;
@@ -873,10 +955,10 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
                       description: newRoleForm.description,
                       mission: newRoleForm.mission,
                       systemPrompt: newRoleForm.systemPrompt,
-                      toolPermissions: ['web:search'],
-                      canRecruit: false,
-                      canProposeRepo: true,
-                      canProvisionValidation: true,
+                      toolPermissions: newRoleForm.toolPermissions,
+                      canRecruit: newRoleForm.canRecruit,
+                      canProposeRepo: newRoleForm.canProposeRepo,
+                      canProvisionValidation: newRoleForm.canProvisionValidation,
                     });
                     setShowCreateRole(false);
                   } catch { /* error shown in view */ }
@@ -988,6 +1070,10 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
                 <label className="block text-[10px] text-text-secondary uppercase font-bold mb-1">Suggested Prompt</label>
                 <textarea rows={4} value={editPropPrompt} onChange={e => setEditPropPrompt(e.target.value)} className="w-full bg-input border border-white/10 rounded-2xl px-4 py-2.5 text-xs text-text-primary" />
               </div>
+              <div>
+                <label className="block text-[10px] text-text-secondary uppercase font-bold mb-1">Required Permissions (comma separated)</label>
+                <input type="text" value={editPropPermissions.join(', ')} onChange={e => setEditPropPermissions(e.target.value.split(',').map(s => s.trim()).filter(Boolean))} className="w-full bg-input border border-white/10 rounded-2xl px-4 py-2.5 text-xs text-text-primary" />
+              </div>
               <button
                 onClick={async () => {
                   try {
@@ -1006,6 +1092,39 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
               >
                 Save Changes
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* PRODUCT DESIGN BOTTOM SHEET */}
+      {selectedDesign && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-40 flex items-end" onClick={() => setSelectedDesign(null)}>
+          <div className="w-full bg-surface rounded-t-3xl p-6 space-y-4 border-t border-white/10 max-h-[85vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+            <div className="flex justify-between items-center border-b border-white/5 pb-3">
+              <div>
+                <h3 className="font-bold text-text-primary text-sm uppercase tracking-wider">Product Design</h3>
+                <p className="text-[9px] text-text-secondary">Generated by AI Council</p>
+              </div>
+              <button onClick={() => setSelectedDesign(null)} className="text-text-secondary text-lg">✕</button>
+            </div>
+            <div className="space-y-6">
+              <div>
+                <h4 className="text-[10px] uppercase font-bold text-text-secondary mb-1">Scope & Audience</h4>
+                <p className="text-xs text-text-primary leading-relaxed whitespace-pre-wrap">{selectedDesign.scopeAndAudience}</p>
+              </div>
+              <div>
+                <h4 className="text-[10px] uppercase font-bold text-text-secondary mb-1">UI/UX Design</h4>
+                <p className="text-xs text-text-primary leading-relaxed whitespace-pre-wrap">{selectedDesign.uiUxDesign}</p>
+              </div>
+              <div>
+                <h4 className="text-[10px] uppercase font-bold text-text-secondary mb-1">Core Logic</h4>
+                <p className="text-xs text-text-primary leading-relaxed whitespace-pre-wrap">{selectedDesign.coreLogic}</p>
+              </div>
+              <div>
+                <h4 className="text-[10px] uppercase font-bold text-text-secondary mb-1">Tech Stack</h4>
+                <p className="text-xs text-text-primary leading-relaxed whitespace-pre-wrap">{selectedDesign.techStack}</p>
+              </div>
             </div>
           </div>
         </div>

@@ -97,10 +97,11 @@ async function* innerGenerateStream(
     }
 
     const activeMemories = [...(_memories || [])];
+    let effectiveHistory = [...history];
 
-    if (llmConfig.enableSemanticMemory && llmConfig.embeddingModelId && history.length > 0) {
+    if (llmConfig.enableSemanticMemory && llmConfig.embeddingModelId && effectiveHistory.length > 0) {
         try {
-            const lastMessage = history[history.length - 1];
+            const lastMessage = effectiveHistory[effectiveHistory.length - 1];
             if (lastMessage.role === 'user') {
                 const { getOrInitializeSemanticMemoryRetriever } = await import('../../memory/semanticMemoryRetriever');
                 const retriever = await getOrInitializeSemanticMemoryRetriever(llmConfig);
@@ -108,13 +109,13 @@ async function* innerGenerateStream(
                     const results = await retriever.retrieveRelevantMemories(lastMessage.text);
                     if (results.length > 0) {
                         const mergedMemory = results.map(r => r.content).join('\n');
-                        activeMemories.push({ 
-                            id: 'semantic_' + Date.now(),
-                            content: `Retrieved Semantic Context related to user query:\n${mergedMemory}`, 
-                            category: 'semantic', 
-                            timestamp: new Date() 
-                        });
-                        logger.log('info', `[LiteRT] Injected ${results.length} semantic memories`);
+                        // Inject directly into the user's message using standard XML context tags
+                        // Small models like Gemma 2B respect <context> blocks much better than conversational notes.
+                        effectiveHistory[effectiveHistory.length - 1] = {
+                            ...lastMessage,
+                            text: `<context>\nHere is some factual context about the user from past conversations. You MUST use this information to answer the user's query:\n${mergedMemory}\n</context>\n\n${lastMessage.text}`
+                        };
+                        logger.log('info', `[LiteRT] Injected ${results.length} semantic memories into current user message`);
                     }
                 }
             }
@@ -125,9 +126,19 @@ async function* innerGenerateStream(
 
     // System Prompt Construction
     let systemPrompt = buildSystemPrompt(personality, activeMemories, undefined, true);
+    
+    // Inject Workspace Documents Context directly into user message to avoid system prompt mutation (preserves KV Cache)
     try {
         const { contextInjector } = await import('../contextInjector');
-        systemPrompt = await contextInjector.buildSystemPromptWithContext(history[history.length - 1].text, systemPrompt);
+        // Use history instead of effectiveHistory to avoid embedding the injected semantic facts (causes OOM)
+        const workspaceContext = await contextInjector.buildSystemPromptWithContext(history[history.length - 1].text, "");
+        if (workspaceContext && workspaceContext.trim().length > 0) {
+            effectiveHistory[effectiveHistory.length - 1] = {
+                ...effectiveHistory[effectiveHistory.length - 1],
+                text: `${workspaceContext.trim()}\n\n${effectiveHistory[effectiveHistory.length - 1].text}`
+            };
+            logger.log('info', '[LiteRT] Workspace context injected into user message.');
+        }
     } catch (e) {
         logger.log('warn', 'Failed to inject workspace context', e);
     }
@@ -140,7 +151,7 @@ async function* innerGenerateStream(
     }
 
     // Sync context with native layer
-    const { messagesToFormat, systemPromptToUse, appendMode } = await syncNativeContext(history, llmConfig, absoluteModelPath, systemPrompt);
+    const { messagesToFormat, systemPromptToUse, appendMode } = await syncNativeContext(effectiveHistory, llmConfig, absoluteModelPath, systemPrompt);
 
     // Always call init to ensure the latest backend config is applied (Java layer handles caching)
     const success = await initLiteRTModel({
@@ -176,7 +187,7 @@ async function* innerGenerateStream(
     // Collect multi-modal content
     const allImages: string[] = [];
     const allAudio: string[] = [];
-    history.forEach(m => {
+    effectiveHistory.forEach(m => {
         if (m.role === 'user') {
             if (m.images) allImages.push(...m.images.map(img => img.base64 || img.path).filter((img): img is string => !!img));
             if (m.audio) allAudio.push(...m.audio.map(aud => aud.path).filter((aud): aud is string => !!aud));
@@ -204,7 +215,9 @@ async function* innerGenerateStream(
                 const role = m.role === 'user' ? 'User' : personality.name;
                 transcript += `${role}: ${buildMessageTextForGGUF(m, allImages.length > 0, 'other')}\n\n`;
             }
-            transcript += `--- CURRENT MESSAGE ---\nUser: ${buildMessageTextForGGUF(messagesToFormat[messagesToFormat.length - 1], allImages.length > 0, 'other')}\n${personality.name}:`;
+            // Do NOT append \n${personality.name}: at the end, because LiteRT automatically adds <end_of_turn>\n<start_of_turn>model
+            // and Gemma gets confused if it sees an empty AI prefix inside the user turn!
+            transcript += `--- CURRENT MESSAGE ---\nUser: ${buildMessageTextForGGUF(messagesToFormat[messagesToFormat.length - 1], allImages.length > 0, 'other')}`;
         } else if (messagesToFormat.length === 1) {
             transcript += `${buildMessageTextForGGUF(messagesToFormat[0], allImages.length > 0, 'other')}`;
         }

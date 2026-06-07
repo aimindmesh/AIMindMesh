@@ -7,6 +7,7 @@ import { InferenceRouter } from '../InferenceRouter';
 // ─────────────────────────────────────────────────────────────────────────────
 // Healing Prompt — injected at the top of EVERY agent task for a venture repo
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 const HEALING_PREAMBLE = `
 ## ⚠️ MANDATORY PRE-FLIGHT INTEGRITY CHECK (execute FIRST, before ANY coding)
 
@@ -15,34 +16,30 @@ partial or empty files. Before writing a single line of code you MUST:
 
 1. Run: git status
 2. Detect empty source files:
-   find . \\( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \\) -not -path "*/node_modules/*" | xargs -I{} sh -c \'test -s "{}" || echo "EMPTY: {}"\'
+   find . \\( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \\) -not -path "*/node_modules/*" | xargs -I{} sh -c 'test -s "{}" || echo "EMPTY: {}"'
 3. If ANY empty/partial files are found:
    a. Run: git log --oneline -5   (inspect last commits)
    b. If the repo has at least one commit: git reset --hard HEAD
    c. If the repo has NO commits yet (empty): rm -rf src && rm -f package.json tsconfig.json (start fresh)
 4. Verify the workspace is clean and coherent before proceeding.
 
-## ⚠️ SPEC-FIRST DEVELOPMENT PARADIGM
+## ⚠️ STRICT CONCRETE DEVELOPMENT PARADIGM
 
 Your development workflow must strictly follow a specs-first approach:
-1. **Understand Requisites**: Analyze the debate synthesis and directives.
-2. **Draft Technical Specification**: Before writing ANY business logic, write a comprehensive \`TECHNICAL_SPECIFICATION.md\` in the root directory. It must specify details on system architecture, endpoints, database schema, and test strategies.
-3. **Phased Implementation**: Implement modular files sequentially following the spec.
+1. **Understand Requisites**: Analyze the TECHNICAL_SPECIFICATION.md already present in the repository.
+2. **NO PLACEHOLDERS OR STUBS**: Writing stub code, half-implemented functions, mock data arrays, or comments like \`// TODO: implement later\` or \`// logic goes here\` is STRICTLY PROHIBITED. All functions, classes, and handlers must be fully written and operational.
+3. **WRITE TESTS**: Create comprehensive unit/integration test files to validate logic correctness.
 
-## ⚠️ STABILITY & STUB LAWS (STRICT LAWS)
-- **NO PLACEHOLDERS OR STUBS**: Writing stub code, half-implemented functions, mock data arrays, or comments like \`// TODO: implement later\` or \`// logic goes here\` is STRICTLY PROHIBITED. All functions, classes, and handlers must be fully written and operational.
-- **WRITE TESTS**: Create comprehensive unit/integration test files to validate logic correctness.
-
-## ⚠️ SANDBOX KASM RUNTIME VALIDATION (execute after a successful build)
+## ⚠️ SANDBOX KASM RUNTIME VALIDATION (MANDATORY BEFORE COMPLETION)
 
 You have access to a full sandbox container (Kasm workspace) inside the VPN. You MUST run and test your software inside the sandbox.
-After completing all code:
+Before you declare your work finished, you MUST independently verify that the software is "concrete and usable".
 1. Run: npm install
 2. Run: npm run build (or equivalent compile commands for the project template)
 3. Start the application: npm start & (or npm run dev &)
-4. Wait 5 seconds, then check the process is still running: pgrep -f node
-5. Validate code behavior manually or with scripts. Fix any crashes, lint errors, or typescript warnings before staging.
-6. Once stable, commit and push to Gitea.
+4. Validate code behavior. Ensure there are no crashes and the UI matches specifications.
+5. If it fails or is incomplete, YOU MUST NOT STOP. Fix the errors and re-test.
+6. Once stable and usable, commit and push to Gitea.
 
 ---
 `;
@@ -52,14 +49,20 @@ After completing all code:
 const STALE_THRESHOLD_MS = 90 * 60 * 1000;
 
 export class VentureOrchestrator {
-  public static async onIdeaApproved(ideaId: string): Promise<void> {
+  public static async onIdeaCharacterized(ideaId: string): Promise<void> {
     try {
-      Logger.info('VentureOrchestrator', `Processing approved idea: ${ideaId}`);
+      Logger.info('VentureOrchestrator', `Processing characterized idea: ${ideaId}`);
 
       // 1. Retrieve the idea details
       const ideaRow = db.prepare('SELECT * FROM organization_ideas WHERE id = ?').get(ideaId) as any;
       if (!ideaRow) {
         Logger.warn('VentureOrchestrator', `Idea ${ideaId} not found in database.`);
+        return;
+      }
+      
+      const designRow = db.prepare('SELECT * FROM organization_product_designs WHERE idea_id = ?').get(ideaId) as any;
+      if (!designRow) {
+        Logger.warn('VentureOrchestrator', `Design for Idea ${ideaId} not found in database.`);
         return;
       }
 
@@ -185,6 +188,15 @@ Format:
           });
 
           Logger.info('VentureOrchestrator', `Automatically created repository ${namespace}/${repoName} for: ${ideaRow.title}`);
+
+          // 3.5 Inject Technical Specification
+          try {
+            const { GiteaService } = await import('../GiteaService');
+            await GiteaService.commitFile(`${namespace}/${repoName}`, 'TECHNICAL_SPECIFICATION.md', designRow.raw_markdown, 'Add initial technical specification from Characterization phase');
+            Logger.info('VentureOrchestrator', `Injected TECHNICAL_SPECIFICATION.md into ${namespace}/${repoName}`);
+          } catch (tsErr: any) {
+            Logger.warn('VentureOrchestrator', `Failed to inject technical spec: ${tsErr.message}`);
+          }
 
           // 4. Bootstrap CI/CD workflow
           try {
