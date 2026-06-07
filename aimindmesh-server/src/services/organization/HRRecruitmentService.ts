@@ -49,8 +49,8 @@ Ensure the suggested role is highly detailed, professional, and has a very rich 
 
     let data: any;
     try {
-      const match = responseText.match(/\{[\s\S]*\}/);
-      data = JSON.parse(match ? match[0] : responseText);
+      const { Parser } = await import('../../utils/Parser');
+      data = Parser.parseLLMJson(responseText);
     } catch (e) {
       data = {
         candidateRoleName: 'Developer Relations Specialist',

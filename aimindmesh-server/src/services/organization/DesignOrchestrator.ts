@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import db from '../../db/sqlite';
 import { Logger } from '../../utils/Logger';
+import { Parser } from '../../utils/Parser';
 import { InferenceRouter } from '../InferenceRouter';
 import { SQLiteOrganizationRoleRepository } from './OrganizationRegistry';
 import { OrgRole } from './types';
@@ -43,13 +44,7 @@ Respond with ONLY a JSON object. If yes, provide the details. If no, set "needsR
           taskName: `HR Assessment for ${ideaRow.title}`
         });
         
-        let cleanJson = hrResponse.trim();
-        if (cleanJson.startsWith('```json')) cleanJson = cleanJson.slice(7);
-        if (cleanJson.startsWith('```')) cleanJson = cleanJson.slice(3);
-        if (cleanJson.endsWith('```')) cleanJson = cleanJson.slice(0, -3);
-        cleanJson = cleanJson.trim();
-
-        const hrData = JSON.parse(cleanJson);
+        const hrData = Parser.parseLLMJson(hrResponse);
         if (hrData.needsRole && hrData.candidateRoleName) {
           Logger.info('DesignOrchestrator', `Recruiting new specialized role: ${hrData.candidateRoleName}`);
           const newRole: OrgRole = {
@@ -99,13 +94,7 @@ Generate a strictly structured JSON response containing the product design detai
         taskName: `Product Design for ${ideaRow.title}`
       });
 
-      let cleanDesignJson = designResponse.trim();
-      if (cleanDesignJson.startsWith('```json')) cleanDesignJson = cleanDesignJson.slice(7);
-      if (cleanDesignJson.startsWith('```')) cleanDesignJson = cleanDesignJson.slice(3);
-      if (cleanDesignJson.endsWith('```')) cleanDesignJson = cleanDesignJson.slice(0, -3);
-      cleanDesignJson = cleanDesignJson.trim();
-
-      const designData = JSON.parse(cleanDesignJson);
+      const designData = Parser.parseLLMJson(designResponse);
 
       // 3. Save to Database
       const designId = randomUUID();
@@ -137,6 +126,7 @@ Generate a strictly structured JSON response containing the product design detai
 
     } catch (err: any) {
       Logger.error('DesignOrchestrator', `Characterization failed for idea ${ideaId}: ${err.message}`);
+      throw err;
     }
   }
 }

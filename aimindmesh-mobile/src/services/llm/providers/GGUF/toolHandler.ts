@@ -116,7 +116,13 @@ export async function extractToolCallsWithDedicatedModel(
 
         // --- Prompt Construction ---
         // Detect model type from path for prompt formatting
-        const isGemma = llmConfig.toolUseModelPath?.toLowerCase().includes('gemma');
+        const modelPath = llmConfig.toolUseModelPath?.toLowerCase() || '';
+        const isGemma = modelPath.includes('gemma');
+        const isQAT = modelPath.includes('qat');
+
+        if (isQAT) {
+            logger.log('info', '[ToolHandler] 🧠 Quantization-Aware Training (QAT) model detected. Using optimized extraction prompt.');
+        }
 
         let toolExtractionPrompt = '';
         let stopTokens = ['<|im_end|>', '<|im_start|>'];
@@ -151,13 +157,8 @@ Output: NO_TOOLS`;
 Output Tool Call:`;
 
         if (isGemma) {
-            // Gemma format
-            toolExtractionPrompt = `<start_of_turn>user
-${systemInst}
-
-${userContent}<end_of_turn>
-<start_of_turn>model
-`;
+            // Gemma format (optimized for QAT models - no trailing spaces before end_of_turn)
+            toolExtractionPrompt = `<start_of_turn>user\n${systemInst}\n\n${userContent}<end_of_turn>\n<start_of_turn>model\n`;
             stopTokens = ['<end_of_turn>', '<start_function_call>'];
         } else {
             // ChatML format (default)

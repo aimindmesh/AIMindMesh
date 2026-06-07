@@ -484,6 +484,28 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
                     <button onClick={() => runValidation(serverSettings, repo.id)} className="flex-1 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 py-2 rounded-2xl text-xs font-bold uppercase">Validate Kasm</button>
                     <button onClick={() => { triggerHaptic('LIGHT'); setSelectedRepoForLogs(repo); }} className="flex-1 bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 py-2 rounded-2xl text-xs font-bold uppercase">Evolution Stream</button>
                   </div>
+                  {repo.created_from_idea_id && (
+                    <button
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        if (!serverSettings) return;
+                        setLoadingDesign(true);
+                        try {
+                          triggerHaptic('LIGHT');
+                          const res = await organizationApi.getIdeaDesign(serverSettings, repo.created_from_idea_id);
+                          setSelectedDesign(res);
+                        } catch (err) {
+                          console.error("Failed to load design", err);
+                        } finally {
+                          setLoadingDesign(false);
+                        }
+                      }}
+                      disabled={loadingDesign}
+                      className="w-full mt-2 py-2 bg-emerald-600/20 border border-emerald-500/30 text-emerald-400 rounded-2xl text-xs font-bold uppercase tracking-wider transition-all disabled:opacity-50"
+                    >
+                      {loadingDesign ? '📄 Loading...' : '📄 View Technical Specification'}
+                    </button>
+                  )}
                 </div>
               ))}
             </div>
@@ -1109,21 +1131,21 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
               <button onClick={() => setSelectedDesign(null)} className="text-text-secondary text-lg">✕</button>
             </div>
             <div className="space-y-6">
-              <div>
-                <h4 className="text-[10px] uppercase font-bold text-text-secondary mb-1">Scope & Audience</h4>
-                <p className="text-xs text-text-primary leading-relaxed whitespace-pre-wrap">{selectedDesign.scopeAndAudience}</p>
+              <div className="bg-white/5 p-4 rounded-2xl border border-white/10">
+                <h4 className="text-[10px] uppercase font-bold text-emerald-400 mb-2 tracking-widest">1. Scope & Audience</h4>
+                <pre className="text-xs text-text-primary leading-relaxed whitespace-pre-wrap font-sans">{selectedDesign.scopeAndAudience}</pre>
               </div>
-              <div>
-                <h4 className="text-[10px] uppercase font-bold text-text-secondary mb-1">UI/UX Design</h4>
-                <p className="text-xs text-text-primary leading-relaxed whitespace-pre-wrap">{selectedDesign.uiUxDesign}</p>
+              <div className="bg-white/5 p-4 rounded-2xl border border-white/10">
+                <h4 className="text-[10px] uppercase font-bold text-blue-400 mb-2 tracking-widest">2. UI/UX Design</h4>
+                <pre className="text-xs text-text-primary leading-relaxed whitespace-pre-wrap font-sans">{selectedDesign.uiUxDesign}</pre>
               </div>
-              <div>
-                <h4 className="text-[10px] uppercase font-bold text-text-secondary mb-1">Core Logic</h4>
-                <p className="text-xs text-text-primary leading-relaxed whitespace-pre-wrap">{selectedDesign.coreLogic}</p>
+              <div className="bg-white/5 p-4 rounded-2xl border border-white/10">
+                <h4 className="text-[10px] uppercase font-bold text-purple-400 mb-2 tracking-widest">3. Core Logic & Features</h4>
+                <pre className="text-xs text-text-primary leading-relaxed whitespace-pre-wrap font-sans">{selectedDesign.coreLogic}</pre>
               </div>
-              <div>
-                <h4 className="text-[10px] uppercase font-bold text-text-secondary mb-1">Tech Stack</h4>
-                <p className="text-xs text-text-primary leading-relaxed whitespace-pre-wrap">{selectedDesign.techStack}</p>
+              <div className="bg-white/5 p-4 rounded-2xl border border-white/10">
+                <h4 className="text-[10px] uppercase font-bold text-amber-400 mb-2 tracking-widest">4. Tech Stack & Architecture</h4>
+                <pre className="text-xs text-text-primary leading-relaxed whitespace-pre-wrap font-sans">{selectedDesign.techStack}</pre>
               </div>
             </div>
           </div>

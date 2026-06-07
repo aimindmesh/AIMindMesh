@@ -97,13 +97,8 @@ Format:
               taskName: `Extracting directives for: ${ideaRow.title}`
             });
 
-            let cleanJson = responseText.trim();
-            if (cleanJson.startsWith('```json')) cleanJson = cleanJson.slice(7);
-            if (cleanJson.startsWith('```')) cleanJson = cleanJson.slice(3);
-            if (cleanJson.endsWith('```')) cleanJson = cleanJson.slice(0, -3);
-            cleanJson = cleanJson.trim();
-
-            const items = JSON.parse(cleanJson);
+            const { Parser } = await import('../../utils/Parser');
+            const items = Parser.parseLLMJson(responseText);
             const { SQLiteDirectiveRepository, DirectiveService } = await import('./DirectiveService');
             const repo = new SQLiteDirectiveRepository();
             const directiveService = new DirectiveService(repo);

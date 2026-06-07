@@ -153,6 +153,13 @@ async function* innerGenerateStream(
     // Sync context with native layer
     const { messagesToFormat, systemPromptToUse, appendMode } = await syncNativeContext(effectiveHistory, llmConfig, absoluteModelPath, systemPrompt);
 
+    const isQAT = modelFilename?.toLowerCase().includes('qat');
+    if (isQAT && llmConfig.liteRTUseNPU) {
+        logger.log('info', '[LiteRT] ⚡ QAT Model detected with NPU enabled. Hardware acceleration will be highly optimized.');
+    } else if (isQAT) {
+        logger.log('info', '[LiteRT] 🧠 QAT Model detected. Consider enabling NPU for maximum performance.');
+    }
+
     // Always call init to ensure the latest backend config is applied (Java layer handles caching)
     const success = await initLiteRTModel({
         modelPath: absoluteModelPath,

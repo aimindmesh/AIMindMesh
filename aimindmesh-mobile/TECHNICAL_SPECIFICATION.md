@@ -70,9 +70,9 @@ The unique power of AI Mind Mesh comes from its extensive suite of custom native
 | Plugin Name | ID | Description & Key Capabilities |
 | :--- | :--- | :--- |
 | **FCM** | `fcm-capacitor` | **Firebase Cloud Messaging**. Native Kotlin plugin for receiving push notifications from AIMindMesh Server. Manages token lifecycle (register, refresh), dispatches foreground messages as typed events to the TypeScript event bus (`onFCMFeedEvent`), and handles inline `MARK_READ_ACTION` from notification tray. Google Services JSON required. |
-| **LlamaCpp** | `llama-cpp-capacitor` | **Core LLM Engine**. Upgraded to `llama.rn@0.11.3` (PocketPal). Native support for Qwen 3.5 (Hybrid Mamba), Gemma 3n, and modern GGUF architectures. Supports CPU, Vulkan, and OpenCL. |
+| **LlamaCpp** | `llama-cpp-capacitor` | **Core LLM Engine**. Upgraded to `llama.rn@0.11.3` (PocketPal). Native support for Qwen 3.5 (Hybrid Mamba), Gemma 4 QAT, and modern GGUF architectures. Supports CPU, Vulkan, and OpenCL. |
 | **MeetingExport** | `meeting-export-capacitor` | **Export & Share**. Renders HTML to PDF and handles Android Share Intents. |
-| **LiteRT** | `litert-capacitor` | **Google Edge AI Engine**. Runs `.litertlm` models (Gemma 3, Gemma 4 E2B/E4B) via LiteRT 0.11.0 runtime. Optimized for mobile NPU/GPU delegates, Multi-Token Prediction (MTP/Speculative Decoding), and memory-mapped embeddings. |
+| **LiteRT** | `litert-capacitor` | **Google Edge AI Engine**. Runs `.litertlm` models (Gemma 4 QAT, Gemma 4 E2B/E4B) via LiteRT 0.11.0 runtime. Optimized per hardware (NPU/GPU), Multi-Token Prediction (MTP), and memory-mapped embeddings. |
 | **Vosk** | `vosk-capacitor` | **Offline Speech-to-Text**. Continuous large-vocabulary speech recognition. Fast, lightweight. Used for Meeting Mode and Voice Mode. |
 | **Voxtral** | `voxtral-capacitor` | **Real-time STT**. Mistral Voxtral Mini 4B Realtime via `mtmd` multimodal API (PCM→mel→CLIP→llama). Greedy token sampling (temperature=0). Auto-unloads main LLM for memory coordination. |
 | **Whisper** | `whisper-capacitor` | **High-Fidelity STT**. Runs OpenAI Whisper models (cpp port). Supports multilingual transcription and diarization preprocessing. |
@@ -459,7 +459,7 @@ The system continuously evaluates **context** to determine when and what actions
     2.  **Split**: When threshold reached, dynamically splits messages:
         *   Older messages (calculated based on threshold) → Summarized.
         *   Recent messages (60-80%) → Kept verbatim for continuity.
-    3.  **Summarize**: Uses active provider (Cloud, GGUF, or LiteRT) to generate concise summary. Supports local models like Gemma-3n for offline summarization.
+    3.  **Summarize**: Uses active provider (Cloud, GGUF, or LiteRT) to generate concise summary. Supports local models like Gemma 4 QAT per estrazione e offline summarization a basso consumo.
     4.  **Replace**: Creates special `[Context Summary]` system message containing summary.
     5.  **Save**: Updates chat history in localStorage: `[Summary Message] + Recent Messages`.
 *   **Context Safety Fallback (Rolling Context)**: If summarization is disabled or reaches its limits, the system employs **Anchor Protection** during history pruning:

@@ -73,16 +73,9 @@ Example format:
         taskName: `Discover ideas: ${topic}`
       });
 
-      let cleanJson = responseText.trim();
-      if (cleanJson.startsWith('```json')) {
-        cleanJson = cleanJson.substring(7);
-      }
-      if (cleanJson.endsWith('```')) {
-        cleanJson = cleanJson.substring(0, cleanJson.length - 3);
-      }
-      cleanJson = cleanJson.trim();
+      const { Parser } = await import('../../utils/Parser');
+      const parsed = Parser.parseLLMJson(responseText);
 
-      const parsed = JSON.parse(cleanJson);
       if (Array.isArray(parsed)) {
         return parsed.map((item: any) => {
           const baseIdea: IdeaProposal = {
