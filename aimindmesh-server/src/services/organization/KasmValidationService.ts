@@ -1,14 +1,18 @@
 import { ValidationResult } from './types';
 import { KasmService } from '../KasmService';
 import { config } from '../../config';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+
+const execAsync = promisify(exec);
 
 // Timeout for individual exec commands (ms)
 const EXEC_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * Runs software validation inside a fresh Kasm Ubuntu workspace.
- * Uses KasmService.executeCommand() (Kasm API) instead of docker exec,
- * which avoids the need for Docker socket access from the server container.
+ * Uses `docker exec kasm docker exec adminkasm.lo_<id>` to execute commands.
+ * Requires Docker socket mounted in the server container.
  */
 export class KasmValidationService {
   async runValidation(repoUrl: string, mode: 'smoke' | 'deploy-preview'): Promise<ValidationResult> {
@@ -35,9 +39,13 @@ export class KasmValidationService {
       throw new Error(`Failed to request Kasm session: ${errMsg}`);
     }
     const kasmId = session.kasm_id;
-    console.log(`[KasmValidationService] Session provisioned: ${kasmId}`);
 
-    // Resolve Gitea hostname to IP and inject authentication token if available
+    // Container name = adminkasm.lo_<first 8 chars of kasm_id> (before first hyphen)
+    const shortId = kasmId.split('-')[0];
+    const containerName = `adminkasm.lo_${shortId}`;
+    console.log(`[KasmValidationService] Session ${kasmId} -> container: ${containerName}`);
+
+    // Resolve Gitea hostname and inject auth token
     let resolvedUrl = repoUrl;
     try {
       const urlObj = new URL(repoUrl);
@@ -57,48 +65,47 @@ export class KasmValidationService {
 
     const logs: string[] = [];
 
-    const execCmd = async (cmd: string, label: string): Promise<string> => {
-      console.log(`[KasmValidationService] Executing [${label}]: ${cmd.substring(0, 80)}...`);
-      const result = await Promise.race([
-        KasmService.executeCommand(kasmId, cmd),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(`Command timed out after ${EXEC_TIMEOUT_MS / 1000}s: ${label}`)), EXEC_TIMEOUT_MS)
-        ),
-      ]);
-      const output = typeof result === 'object' ? JSON.stringify(result) : String(result ?? '');
+    const execInWorkspace = async (shellCmd: string, label: string): Promise<string> => {
+      console.log(`[KasmValidationService] [${label}] Running command...`);
+      // docker exec kasm docker exec -u root <containerName> sh -c '<cmd>'
+      const { stdout, stderr } = await execAsync(
+        `docker exec -u root kasm docker exec -u root ${containerName} sh -c ${JSON.stringify(shellCmd)}`,
+        { timeout: EXEC_TIMEOUT_MS }
+      );
+      const output = [stdout, stderr].filter(Boolean).join('\n');
       logs.push(`[${label}] ${output}`);
       return output;
     };
 
     try {
-      // Wait for container to be fully provisioned (Kasm needs ~20s for Ubuntu workspace)
+      // Wait for workspace container to fully provision inside Kasm DinD
       console.log('[KasmValidationService] Waiting 20s for workspace to provision...');
       await new Promise(resolve => setTimeout(resolve, 20000));
 
       // 1. Install Node.js, npm, and git
-      await execCmd(
-        'apt-get update && apt-get install -y nodejs npm git 2>&1',
+      await execInWorkspace(
+        'apt-get update -qq && apt-get install -y nodejs npm git 2>&1',
         'install-deps'
       );
 
       // 2. Clone the repository
-      await execCmd(
+      await execInWorkspace(
         `rm -rf /tmp/val-repo && git clone ${resolvedUrl} /tmp/val-repo 2>&1`,
         'git-clone'
       );
 
       // 3. Install project dependencies
-      await execCmd(
+      await execInWorkspace(
         'cd /tmp/val-repo && npm install 2>&1',
         'npm-install'
       );
 
-      // 4. Run build or test
+      // 4. Run build or test based on mode
       const testCmd = mode === 'smoke'
         ? 'cd /tmp/val-repo && npm test 2>&1'
         : 'cd /tmp/val-repo && npm run build 2>&1';
 
-      await execCmd(testCmd, mode === 'smoke' ? 'npm-test' : 'npm-build');
+      await execInWorkspace(testCmd, mode === 'smoke' ? 'npm-test' : 'npm-build');
 
       return {
         status: 'passed',
@@ -106,11 +113,11 @@ export class KasmValidationService {
         logs,
       };
     } catch (e: any) {
-      logs.push(`[error] ${e.message}`);
+      const errLogs = [e.message, e.stdout, e.stderr].filter(Boolean);
       return {
         status: 'failed',
         summary: `Validation failed: ${e.message}`,
-        logs,
+        logs: [...logs, ...errLogs],
       };
     } finally {
       try {
