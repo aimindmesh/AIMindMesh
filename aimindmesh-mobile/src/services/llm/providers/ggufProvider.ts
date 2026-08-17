@@ -87,7 +87,12 @@ export async function* generateNativeGGUFStream(
     }));
 
     if (!appendMode && finalSystemPrompt) {
-        messages.unshift({ role: 'system', content: finalSystemPrompt });
+        // Replace existing system message if present, otherwise prepend
+        if (messages.length > 0 && messages[0].role === 'system') {
+            messages[0] = { role: 'system', content: finalSystemPrompt };
+        } else {
+            messages.unshift({ role: 'system', content: finalSystemPrompt });
+        }
     }
 
     let stopTokens: string[] | undefined = undefined;

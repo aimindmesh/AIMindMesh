@@ -14,15 +14,32 @@ export interface TranscriptSegment {
     confidence?: number;
 }
 
+export interface WhisperOptimizationResult {
+    soc: string;
+    availableCores: number;
+    recommendedThreads: number;
+    recommendedModel: string;
+    hasNpu?: boolean;
+    npuArch?: string;
+    recommendedBackend?: 'npu' | 'cpu';
+    deviceInfo: string;
+}
+
 /**
  * Whisper plugin interface for Capacitor
  */
 export interface WhisperPlugin {
     /**
-     * Load a Whisper GGML model from the app's data directory
+     * Load a Whisper GGML / QNN model from the app's data directory
      * @param options.modelPath Relative path to model file (e.g., 'whisper-models/ggml-base.bin')
+     * @param options.useNPU Optional flag to enable Qualcomm Hexagon NPU offload
      */
-    loadModel(options: { modelPath: string }): Promise<void>;
+    loadModel(options: { modelPath: string; useNPU?: boolean; backend?: 'npu' | 'cpu' }): Promise<void>;
+
+    /**
+     * Get device optimization info including NPU capabilities
+     */
+    getDeviceOptimization(): Promise<WhisperOptimizationResult>;
 
     /**
      * Unload the currently loaded model and release resources

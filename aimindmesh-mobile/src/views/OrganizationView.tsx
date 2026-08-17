@@ -14,7 +14,7 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
   const {
     directives, ideas, roles, auditLogs, repositories, hrProposals, discoveryConfig,
     loading, error,
-    createDirective, cancelDirective, discoverIdeas, createRepository, bootstrapCiCd, runValidation,
+    createDirective, cancelDirective, discoverIdeas, createRepository, bootstrapCiCd, runValidation, forceDevelop,
     analyzeRecruitment, materializeProposal, updateProposal, deleteProposal, reviewIdea, approveIdea, deleteIdea, updateIdea, clearSession, generateDirectivesFromIdea, transitionIdeaToDevelopment, refreshAll,
     createRole, archiveRole, updateRole,
     fetchDiscoveryConfig: _fetchDiscovery, updateDiscoveryConfig, triggerDiscovery,
@@ -479,10 +479,13 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
                     </div>
                     <span className="text-[10px] text-text-secondary">{repo.gitea_url}</span>
                   </div>
-                  <div className="flex gap-2 mt-2">
-                    <button onClick={() => bootstrapCiCd(serverSettings, repo.id)} className="flex-1 bg-blue-500/10 border border-blue-500/20 text-blue-400 py-2 rounded-2xl text-xs font-bold uppercase">Bootstrap CI</button>
-                    <button onClick={() => runValidation(serverSettings, repo.id)} className="flex-1 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 py-2 rounded-2xl text-xs font-bold uppercase">Validate Kasm</button>
-                    <button onClick={() => { triggerHaptic('LIGHT'); setSelectedRepoForLogs(repo); }} className="flex-1 bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 py-2 rounded-2xl text-xs font-bold uppercase">Evolution Stream</button>
+                  <div className="flex flex-col gap-2 mt-2">
+                    <button onClick={() => { triggerHaptic('LIGHT'); if (serverSettings) forceDevelop(serverSettings, repo.id); }} className="w-full bg-orange-500/10 border border-orange-500/20 text-orange-400 py-2 rounded-2xl text-xs font-bold uppercase">Force Develop</button>
+                    <div className="flex gap-2">
+                      <button onClick={() => { if (serverSettings) bootstrapCiCd(serverSettings, repo.id); }} className="flex-1 bg-blue-500/10 border border-blue-500/20 text-blue-400 py-2 rounded-2xl text-xs font-bold uppercase">Bootstrap CI</button>
+                      <button onClick={() => { if (serverSettings) runValidation(serverSettings, repo.id); }} className="flex-1 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 py-2 rounded-2xl text-xs font-bold uppercase">Validate Kasm</button>
+                      <button onClick={() => { triggerHaptic('LIGHT'); setSelectedRepoForLogs(repo); }} className="flex-1 bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 py-2 rounded-2xl text-xs font-bold uppercase">Evolution Stream</button>
+                    </div>
                   </div>
                   {repo.created_from_idea_id && (
                     <button

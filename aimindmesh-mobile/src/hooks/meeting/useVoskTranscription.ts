@@ -151,7 +151,9 @@ export function useVoskTranscription({
                                 text: data.text,
                                 timestamp: Date.now(),
                                 start_ms: data.startMs,
-                                end_ms: data.endMs
+                                end_ms: data.endMs,
+                                stt_provider: 'vosk',
+                                confidence: embedding && embedding.length > 0 ? 0.85 : 0.6
                             }];
 
                             // --- Periodic Mini-Clustering ---

@@ -140,6 +140,26 @@ public:
     void resetContext();
 
     /**
+     * Save the KV cache state for a specific sequence to a file.
+     * Uses llama_state_seq_save_file to persist the full inference state.
+     *
+     * @param filepath Path to save the state file
+     * @param seqId Sequence ID to save (0 for main conversation)
+     * @return true on success, false on failure
+     */
+    bool saveState(const char* filepath, int seqId = 0);
+
+    /**
+     * Load the KV cache state for a specific sequence from a file.
+     * Uses llama_state_seq_load_file to restore inference state.
+     *
+     * @param filepath Path to the state file
+     * @param seqId Destination sequence ID (0 for main conversation)
+     * @return true on success, false on failure
+     */
+    bool loadState(const char* filepath, int seqId = 0);
+
+    /**
      * Prepares for completion with the given user query.
      * This tokenizes the query and sets up the batch for decoding.
      * 

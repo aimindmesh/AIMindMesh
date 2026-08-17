@@ -51,7 +51,7 @@ android {
     }
     packagingOptions {
         jniLibs {
-            useLegacyPackaging = false
+            useLegacyPackaging = true
         }
         pickFirst 'lib/x86/libjnidispatch.so'
         pickFirst 'lib/x86_64/libjnidispatch.so'
@@ -66,6 +66,13 @@ android {
         pickFirst '**/libLiteRtTopKOpenClSampler.so'
         pickFirst '**/libtensorflowlite_gpu_delegate.so'
         pickFirst '**/libtensorflowlite_gpu_jni.so'
+        // GGML / Whisper native libs - pick first to avoid duplicate with GenieX SDK
+        pickFirst '**/libggml*.so'
+        pickFirst '**/libggml-base.so'
+        pickFirst '**/libggml-cpu.so'
+        pickFirst '**/libggml-blas.so'
+        pickFirst '**/libwhisper.so'
+        pickFirst '**/libomp.so'
     }
 }
 
@@ -128,6 +135,12 @@ dependencies {
 
     // FCM Capacitor Plugin (v4.0.0)
     implementation project(':fcm-capacitor')
+
+    // Qualcomm Genie NPU Plugin
+    implementation project(':genie-capacitor')
+
+    // Qualcomm Stable Diffusion NPU Plugin
+    implementation project(':sd-capacitor')
 }
 
 apply from: 'capacitor.build.gradle'

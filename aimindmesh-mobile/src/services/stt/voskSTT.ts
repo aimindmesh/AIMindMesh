@@ -10,6 +10,10 @@ export class VoskSpeechToTextService {
     private isRecognizing: boolean = false;
     private listenerHandles: any[] = [];
     private accumulatedTranscript: string = '';
+    private context: string = 'unknown'; // Tracks which feature is using Vosk (meeting|voicechat)
+
+    public isRecognitionActive(): boolean { return this.isRecognizing; }
+    public getContext(): string { return this.context; }
 
     constructor() {
         logger.log('info', 'Vosk STT Service initialized');

@@ -33,7 +33,7 @@ import {
 } from './systemTools';
 import { executeSetVolume, executeSetBrightness, executeToggleWifi, executeGetLocation } from './deviceTools';
 import { executeSendWhatsApp, executeSendTelegram, executeGetContacts } from './communicationTools';
-import { executeRecordAudio, executeTakePhoto } from './mediaTools';
+import { executeRecordAudio, executeTakePhoto, executeGenerateImage } from './mediaTools';
 import { executeLaunchApp, executeCreateKeepNote, executeSetAlarm } from './appTools';
 import {
     executeAddAgendaEvent,
@@ -181,6 +181,9 @@ export async function executeTool(
 
             case 'get_contacts':
                 return await executeGetContacts(call.args as any);
+
+            case 'generate_image':
+                return await executeGenerateImage(call.args as any);
 
             case 'record_audio':
                 return await executeRecordAudio(call.args as any);

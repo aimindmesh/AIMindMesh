@@ -29,11 +29,14 @@ allprojects {
         }
     }
 
-    // Force 16KB page size alignment for all native C/C++ builds (Android 15 compatibility)
+    // Force 16KB page size alignment for all native C/C++ builds (Android 15 compatibility) and align minSdkVersion
     afterEvaluate { project ->
         if (project.hasProperty('android') && project.android.hasProperty('defaultConfig')) {
             project.android {
                 defaultConfig {
+                    if (project.rootProject.ext.has('minSdkVersion')) {
+                        minSdkVersion project.rootProject.ext.minSdkVersion
+                    }
                     externalNativeBuild {
                         cmake {
                             arguments "-DANDROID_LD=lld", "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-z,max-page-size=16384"

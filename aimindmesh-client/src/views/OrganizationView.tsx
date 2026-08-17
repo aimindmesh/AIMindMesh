@@ -9,7 +9,7 @@ export default function OrganizationView() {
     roles, directives, ideas, auditLogs, repositories, hrProposals, loading, error,
     fetchRoles, fetchDirectives, fetchIdeas, fetchAuditLogs, fetchRepositories, fetchHRProposals,
     createRole, updateRole, archiveRole, createDirective, cancelDirective, discoverIdeas, reviewIdea, approveIdea, deleteIdea, generateDirectivesFromIdea, transitionIdeaToDevelopment,
-    createRepository, bootstrapCiCd, runValidation, analyzeRecruitment, materializeProposal, updateProposal, deleteProposal,
+    createRepository, bootstrapCiCd, runValidation, forceDevelop, analyzeRecruitment, materializeProposal, updateProposal, deleteProposal,
     discoveryConfig, fetchDiscoveryConfig, updateDiscoveryConfig, triggerDiscovery,
     updateIdea
   } = useOrganizationStore();
@@ -530,6 +530,7 @@ export default function OrganizationView() {
                       <div>CI/CD: <strong className="text-slate-200">{repo.ci_cd_enabled ? 'Enabled' : 'Disabled'}</strong></div>
                     </div>
                     <div className="flex gap-2 pt-2 border-t border-white/5">
+                      <button onClick={() => forceDevelop(repo.id)} className="flex-1 py-1.5 bg-orange-600/25 border border-orange-500/20 hover:bg-orange-600/45 text-orange-300 rounded-lg text-[10px] font-bold uppercase transition-all" title="Force trigger OpenClaw agent for this repo">Force Develop</button>
                       <button onClick={() => bootstrapCiCd(repo.id)} className="flex-1 py-1.5 bg-blue-600/25 border border-blue-500/20 hover:bg-blue-600/45 text-blue-300 rounded-lg text-[10px] font-bold uppercase transition-all">Bootstrap CI/CD</button>
                       <button onClick={() => runValidation(repo.id)} className="flex-1 py-1.5 bg-emerald-600/25 border border-emerald-500/20 hover:bg-emerald-600/45 text-emerald-300 rounded-lg text-[10px] font-bold uppercase transition-all">Run Kasm Validate</button>
                       <button onClick={() => setSelectedRepoForLogs(repo)} className="flex-1 py-1.5 bg-indigo-600/25 border border-indigo-500/20 hover:bg-indigo-600/45 text-indigo-300 rounded-lg text-[10px] font-bold uppercase transition-all">Evolution Logs</button>

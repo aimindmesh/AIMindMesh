@@ -14,7 +14,7 @@ export class SpeakerDiarization {
     private currentRmsValues: number[] = [];
 
     // Embedding-based identification (PRIMARY method when available)
-    private embeddingService = new SpeakerEmbedding();
+    private embeddingService: SpeakerEmbedding;
 
     // Temporal continuity tracking (for RMS fallback)
     private lastSpeakerId: number = 0;
@@ -22,14 +22,12 @@ export class SpeakerDiarization {
     private readonly MIN_SEGMENTS_BEFORE_SWITCH = 3; // Increased from 2 for better stability
 
     // Threshold for considering two speakers different (higher = more tolerant)
-    // Optimized from 0.45 to 0.55 to reduce spurious speakers
     private _similarityThreshold = 0.55;
 
     // Minimum RMS samples needed before attempting identification
     private readonly minSamplesForIdentification = 20;
 
     constructor(private logCallback: (msg: string) => void = (msg) => logger.log('debug', 'Diarization', msg)) {
-        // Configure embedding service to use same log callback
         this.embeddingService = new SpeakerEmbedding(this.logCallback);
     }
 
@@ -48,11 +46,11 @@ export class SpeakerDiarization {
 
     public setSimilarityThreshold(value: number): void {
         this._similarityThreshold = Math.max(0.3, Math.min(0.8, value));
-        // Convert sensitivity to embedding threshold (tuned for ECAPA-TDNN):
-        // High sensitivity (0.8) → high threshold (0.90) = harder to match = more speakers
-        // Low sensitivity (0.3) → low threshold (0.70) = easier to match = fewer speakers
-        // Range: 0.70 + (value - 0.3) * 0.4 => 0.70 to 0.90
-        const embeddingThreshold = 0.70 + (value - 0.3) * 0.4;
+        // Direct threshold mapping (v2.1): sensitivity slider maps linearly to embedding threshold.
+        // Low sensitivity (0.3) → low threshold (0.60) = easier to match = fewer speakers.
+        // High sensitivity (0.8) → high threshold (0.85) = harder to match = more speakers.
+        // ECAPA-TDNN empirical range: 0.60–0.85 (beyond 0.85 almost nothing matches).
+        const embeddingThreshold = 0.60 + (value - 0.3) * 0.5;
         this.embeddingService.setThreshold(embeddingThreshold);
         this.logCallback(`Sensitivity: ${this._similarityThreshold.toFixed(2)}, embedding threshold: ${embeddingThreshold.toFixed(2)}`);
     }
@@ -82,24 +80,18 @@ export class SpeakerDiarization {
     }
 
     public recordRmsValue(rmsdB: number): void {
-        // RmsdB is typically in range [-2, 10] (normalized 0-1 from plugin)
-        // The plugin sends normalized values (0.0 - 1.0), so we use them directly or adjust if needed.
-        // In Kotlin code: val normalized = ((rmsdB + 2) / 12f).coerceIn(0f, 1f)
-        // But VoskPlugin.java sends: float normalizedLevel = Math.min(rms / 32768.0f, 1.0f);
-        // Wait, VoskPlugin.java sends normalized amplitude (0-1).
-        // The Kotlin SimpleSpeakerDiarization expected dB-like values or normalized values?
-        // Kotlin: recordRmsValue(rmsdB: Float) -> normalized = ((rmsdB + 2) / 12f)
-        // But VoskAudioRecorder.kt sent: normalized = (rms / 10000.0).coerceIn(0.0, 1.0)
-        // It seems the input here should be the normalized amplitude.
-
+        // Input values come from two sources with different scales:
+        // - Vosk Android plugin: rms / 32768.0 (linear PCM amplitude, ~0-1)
+        // - HighQualityAudioRecorder Web Audio API: normalized energy level (~0-1)
+        // Both are normalized to 0-1 range; clamp for safety.
         const normalized = Math.max(0, Math.min(1, rmsdB));
 
-        // Only record values above noise threshold (increased from 0.08 to 0.12)
+        // Only record values above noise floor (0.12 = -18dB approx)
         if (normalized > 0.12) {
             this.currentRmsValues.push(normalized);
         }
 
-        // Keep only recent values (last 2 seconds worth at ~100Hz)
+        // Keep only recent values (last ~2 seconds at ~100Hz sample rate)
         if (this.currentRmsValues.length > 200) {
             this.currentRmsValues.shift();
         }
@@ -122,7 +114,15 @@ export class SpeakerDiarization {
     }
 
     /**
-     * RMS-based speaker identification (fallback when embeddings not available)
+     * RMS-based speaker identification (fallback when embeddings not available).
+     * 
+     * WARNING: RMS-based diarization is fundamentally unreliable for speaker identification.
+     * The same person at different distances produces different RMS, while different people 
+     * at similar distances produce similar RMS. This method is a best-effort heuristic only.
+     * 
+     * Use ONNX embeddings ('precise' recognition mode) for accurate speaker identification,
+     * or post-processing diarization for high-quality results.
+     * 
      * @private
      */
     private identifySpeakerByRms(): number {

@@ -218,7 +218,7 @@ export const useSTTModels = (
         triggerHaptic();
         try {
             const picked = await fileImportService.pickFile({
-                extensions: ['bin'],
+                extensions: ['bin', 'zip'],
                 destinationDirectory: 'whisper-models'
             });
             if (picked && picked.success) {

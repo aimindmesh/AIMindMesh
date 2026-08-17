@@ -57,6 +57,36 @@ export const useModelLoader = (llmConfig: LLMConfig, speechConfig: SpeechConfig)
             }
 
             try {
+                // Load Whisper model if Whisper is selected or configured
+                if (speechConfig.sttProvider === 'whisper') {
+                    logger.log('info', `Whisper STT selected, importing service...`);
+                    const { getWhisperSTTService } = await import('../services/stt/whisperSTT');
+                    const whisperService = getWhisperSTTService();
+
+                    let whisperModel = speechConfig.whisperModelId;
+                    if (!whisperModel) {
+                        try {
+                            const { listLocalWhisperModels } = await import('../services/stt/whisperModelDownloader');
+                            const models = await listLocalWhisperModels();
+                            if (models.length > 0) {
+                                whisperModel = models[0];
+                            }
+                        } catch (e) {
+                            logger.log('warn', 'Failed to list Whisper models for auto-selection', e);
+                        }
+                    }
+
+                    if (whisperModel && (!whisperService.isModelLoaded() || whisperService.getCurrentModelId() !== whisperModel)) {
+                        logger.log('info', `Auto-loading Whisper model: ${whisperModel}`);
+                        await whisperService.loadModel(whisperModel);
+                        logger.log('info', `Whisper model loaded successfully: ${whisperModel}`);
+                    }
+                }
+            } catch (error) {
+                logger.log('error', 'Failed to auto-load Whisper model', error);
+            }
+
+            try {
                 // Load Voxtral model if Voxtral is selected and a model is configured
                 if (speechConfig.sttProvider === 'voxtral') {
                     logger.log('info', `Voxtral STT selected, importing service...`);
@@ -243,7 +273,7 @@ export const useModelLoader = (llmConfig: LLMConfig, speechConfig: SpeechConfig)
 
         loadModels();
     }, [
-        speechConfig.sttProvider, speechConfig.voskModelId,
+        speechConfig.sttProvider, speechConfig.voskModelId, speechConfig.whisperModelId,
         speechConfig.ttsProvider, speechConfig.piperVoiceId, speechConfig.kokoroVoiceId,
         llmConfig.provider, llmConfig.nativeModelPath, llmConfig.engine,
         llmConfig.nThreads, llmConfig.nCtx, llmConfig.flashAttn,

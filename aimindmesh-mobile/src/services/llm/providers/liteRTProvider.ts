@@ -14,7 +14,7 @@ import { parseReActToolCalls } from '../../tools';
 import { buildSystemPrompt } from '../promptBuilder';
 
 // Modular imports
-import { LiteRT, initLiteRTModel, stopLiteRTGeneration, releaseLiteRTSession, restoreLiteRTKvCache, getLiteRTMessageCount } from './liteRT/plugin';
+import { LiteRT, initLiteRTModel, stopLiteRTGeneration, releaseLiteRTSession, restoreLiteRTKvCache, getLiteRTMessageCount, registerLiteRTTools } from './liteRT/plugin';
 import { syncNativeContext } from './liteRT/context';
 
 // Re-export core functions for external use
@@ -173,6 +173,11 @@ async function* innerGenerateStream(
         enableMtp: llmConfig.liteRTEnableMtp ?? true
     });
     if (!success) throw new Error('Failed to initialize LiteRT model');
+
+    // Register tools for native function calling (LiteRT v0.14+)
+    if (llmConfig.enableToolCalling) {
+        await registerLiteRTTools(llmConfig.toolRules as Record<string, string> | undefined);
+    }
 
     // [KV CACHE] Restore session if current native context is empty and setting is enabled
     const currentCount = await getLiteRTMessageCount();
@@ -346,9 +351,10 @@ async function* innerGenerateStream(
                     resolveQueue = resolve;
                     if (_signal) _signal.onabort = () => resolve();
 
-                    // Failsafe: if we wait more than 60 seconds for a chunk, abort to release lock
-                    setTimeout(() => {
+                    // Failsafe: if we wait more than 60 seconds for a chunk, stop generation and release lock
+                    setTimeout(async () => {
                         if (resolveQueue === resolve) {
+                            try { await stopLiteRTGeneration(); } catch (e) {}
                             reject(new Error('LiteRT streaming timeout'));
                         }
                     }, 60000);

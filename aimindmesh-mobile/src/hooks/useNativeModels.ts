@@ -3,6 +3,7 @@ import { RECOMMENDED_MODELS, downloadModel, deleteLocalModel, cancelDownload, Mo
 import { fileImportService } from '../services/file/fileImportService';
 import { logger } from '../services/logger';
 import { LLMConfig } from '../types';
+import type { GenieModelInfo } from 'genie-capacitor';
 
 export const useNativeModels = (
     llmConfig: LLMConfig,
@@ -13,6 +14,7 @@ export const useNativeModels = (
     const [downloadProgress, setDownloadProgress] = useState<Record<string, ModelDownloadProgress>>({});
     const [downloadedModels, setDownloadedModels] = useState<string[]>([]);
     const [importedModels, setImportedModels] = useState<string[]>([]);
+    const [downloadedGenieModels, setDownloadedGenieModels] = useState<GenieModelInfo[]>([]);
     const [externalModels, setExternalModels] = useState<string[]>(() => {
         try {
             const saved = localStorage.getItem('external_gguf_models');
@@ -58,6 +60,15 @@ export const useNativeModels = (
             // Check LiteRT models
             const litertFiles = await getLocalLiteRTModels();
             setDownloadedLiteRTModels([...litertFiles, ...externalLiteRTModels]);
+
+            // Check Qualcomm Genie NPU models
+            try {
+                const { Genie } = await import('genie-capacitor');
+                const { models } = await Genie.listLocalModels();
+                setDownloadedGenieModels(models || []);
+            } catch (e) {
+                // Ignore if not supported
+            }
 
             const allGgufFiles = await getLocalGgufModels();
             const recommendedFilenames = RECOMMENDED_MODELS.map(m => m.id + '.gguf');
@@ -225,14 +236,37 @@ export const useNativeModels = (
         triggerHaptic();
         try {
             const picked = await fileImportService.pickFile({
-                types: ['application/octet-stream'],
-                extensions: ['litertlm', 'task'],
+                types: ['application/octet-stream', 'application/zip', 'application/x-zip-compressed', '*/*'],
+                extensions: ['litertlm', 'task', 'zip'],
                 destinationDirectory: 'models'
             });
 
             if (picked && picked.success) {
                 setIsImporting(true);
                 try {
+                    // Check if user selected a Qualcomm AI Hub .zip bundle
+                    if (picked.cleanName.toLowerCase().endsWith('.zip') || picked.path.toLowerCase().endsWith('.zip')) {
+                        const { Genie } = await import('genie-capacitor');
+                        const loadResult = await Genie.loadModel({
+                            modelPath: picked.path,
+                            runtime: 'npu'
+                        });
+
+                        if (loadResult.success) {
+                            const { models } = await Genie.listLocalModels();
+                            setDownloadedGenieModels(models || []);
+                            onLlmConfigSave({
+                                ...llmConfig,
+                                provider: 'genie-npu',
+                                engine: 'genie',
+                                nativeModelPath: picked.path,
+                                enableVision: loadResult.isVision || llmConfig.enableVision
+                            });
+                            alert(`Qualcomm AI Hub package detected! Automatically switched to Genie NPU engine and loaded: ${loadResult.modelName || picked.cleanName}`);
+                            return;
+                        }
+                    }
+
                     const { importLiteRTFile, getLocalLiteRTModels } = await import('../services/model/modelDownloader');
                     const importedPath = await importLiteRTFile(picked.path, picked.cleanName);
 
@@ -255,15 +289,58 @@ export const useNativeModels = (
                         liteRTModelId: 'imported',
                         liteRTModelPath: importedPath
                     });
-                    alert(`Successfully imported: ${picked.cleanName}`);
+                    alert(`Successfully imported LiteRT model: ${picked.cleanName}`);
                 } finally {
                     setIsImporting(false);
                 }
             }
-        } catch (e) {
+        } catch (e: any) {
             setIsImporting(false);
             logger.log('error', 'Failed to import LiteRT file', e);
-            alert('Failed to import file: ' + (e as any).message);
+            alert('Failed to import file: ' + e.message);
+        }
+    };
+
+    const handleImportGenieZipFile = async () => {
+        triggerHaptic();
+        try {
+            const picked = await fileImportService.pickFile({
+                types: ['*/*'],
+                extensions: ['zip', 'json', 'bin', 'raw'],
+                destinationDirectory: 'models'
+            });
+
+            if (picked && picked.success) {
+                setIsImporting(true);
+                try {
+                    const { Genie } = await import('genie-capacitor');
+                    const loadResult = await Genie.loadModel({
+                        modelPath: picked.path,
+                        runtime: 'npu'
+                    });
+
+                    if (loadResult.success) {
+                        const { models } = await Genie.listLocalModels();
+                        setDownloadedGenieModels(models || []);
+                        onLlmConfigSave({
+                            ...llmConfig,
+                            provider: 'genie-npu',
+                            engine: 'genie',
+                            nativeModelPath: picked.path,
+                            enableVision: loadResult.isVision || llmConfig.enableVision
+                        });
+                        alert(`Successfully imported Qualcomm NPU Model: ${loadResult.modelName || picked.cleanName}`);
+                    } else {
+                        alert(`Failed to load Qualcomm model: ${loadResult.error}`);
+                    }
+                } finally {
+                    setIsImporting(false);
+                }
+            }
+        } catch (e: any) {
+            setIsImporting(false);
+            logger.log('error', 'Failed to import Genie model', e);
+            alert('Failed to import model: ' + e.message);
         }
     };
 
@@ -271,6 +348,7 @@ export const useNativeModels = (
         downloadProgress, setDownloadProgress,
         downloadedModels, setDownloadedModels,
         importedModels, setImportedModels,
+        downloadedGenieModels, setDownloadedGenieModels,
         externalModels, setExternalModels,
         externalLiteRTModels, setExternalLiteRTModels,
         downloadedLiteRTModels, setDownloadedLiteRTModels,
@@ -282,6 +360,7 @@ export const useNativeModels = (
         handleDeleteLiteRTModel,
         handleDeleteExternalLiteRTModel,
         handleImportGgufFile,
-        handleImportLiteRTFile
+        handleImportLiteRTFile,
+        handleImportGenieZipFile
     };
 };

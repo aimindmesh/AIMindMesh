@@ -268,10 +268,10 @@ export async function initNativeModel(config: NativeLLMConfig, slot: ModelSlot =
     }
 }
 
-// Define global type for the mutex
+// Define global type for per-slot mutexes
 declare global {
     interface Window {
-        __NATIVE_LLM_MUTEX__?: Promise<void>;
+        __NATIVE_SLOT_MUTEXES__?: Record<string, Promise<void>>;
         __NATIVE_LLM_MODULE_ID__?: string;
     }
 }
@@ -288,10 +288,27 @@ if (typeof window !== 'undefined') {
     }
 }
 
-// Global mutex to prevent concurrent native generation calls
-// Attach to window to ensure singleton across module instances
-if (typeof window !== 'undefined' && !window.__NATIVE_LLM_MUTEX__) {
-    window.__NATIVE_LLM_MUTEX__ = Promise.resolve();
+// Per-slot mutexes to allow concurrent generation across different slots
+// Each slot (chat, tool, memory) gets its own promise chain.
+// Attach to window to ensure singleton across module instances.
+if (typeof window !== 'undefined' && !window.__NATIVE_SLOT_MUTEXES__) {
+    window.__NATIVE_SLOT_MUTEXES__ = {};
+}
+
+function getSlotMutex(slot: ModelSlot): Promise<void> {
+    if (typeof window !== 'undefined' && window.__NATIVE_SLOT_MUTEXES__) {
+        if (!window.__NATIVE_SLOT_MUTEXES__[slot]) {
+            window.__NATIVE_SLOT_MUTEXES__[slot] = Promise.resolve();
+        }
+        return window.__NATIVE_SLOT_MUTEXES__[slot];
+    }
+    return Promise.resolve();
+}
+
+function setSlotMutex(slot: ModelSlot, mutex: Promise<void>): void {
+    if (typeof window !== 'undefined' && window.__NATIVE_SLOT_MUTEXES__) {
+        window.__NATIVE_SLOT_MUTEXES__[slot] = mutex;
+    }
 }
 
 /**
@@ -312,27 +329,19 @@ export async function* generateNativeStream(
     const requestId = Math.random().toString(36).substring(7);
     logger.log('debug', `[NativeLLM] [Req:${requestId}] Requesting lock for ${slot} generation... (Module: ${MODULE_ID})`);
 
-    // Acquire lock
+    // Acquire per-slot lock
     let releaseLock: () => void = () => { };
 
-    // Use window mutex if available (browser/webview), else fallback to local (node/test)
-    let safeMutex = (typeof window !== 'undefined' && window.__NATIVE_LLM_MUTEX__)
-        ? window.__NATIVE_LLM_MUTEX__
-        : Promise.resolve();
+    const slotMutex = getSlotMutex(slot);
 
-    const previousLock = safeMutex!;
+    const previousLock = slotMutex;
     let currentLockResolve: () => void;
 
     const currentLock = new Promise<void>((resolve) => {
         currentLockResolve = resolve;
     });
 
-    // Update global mutex
-    if (typeof window !== 'undefined') {
-        window.__NATIVE_LLM_MUTEX__ = previousLock.then(() => currentLock);
-    } else {
-        // Fallback for non-window environments (shouldn't happen in app)
-    }
+    setSlotMutex(slot, previousLock.then(() => currentLock));
 
     try {
         await previousLock;
@@ -696,16 +705,17 @@ export async function getAvailableNativeModels(): Promise<Array<{ name: string; 
 }
 
 /**
- * Save KV cache state for a specific slot (GGUF/llama-server only)
+ * Save KV cache state for a specific slot using native in-process state serialization.
+ * Uses llama_state_seq_save_file via JNI — no external server required.
  */
-export async function saveNativeKvCache(slot: ModelSlot = 'chat', serverUrl?: string): Promise<boolean> {
+export async function saveNativeKvCache(slot: ModelSlot = 'chat'): Promise<boolean> {
     const context = modelContexts.get(slot);
     if (!context) return false;
 
     try {
         const result = await LlamaCpp.saveKvCache({
-            slotId: context.contextId,
-            serverUrl: serverUrl || "http://127.0.0.1:8080"
+            contextId: context.contextId,
+            slot: slot
         });
         return result.success;
     } catch (e) {
@@ -715,16 +725,17 @@ export async function saveNativeKvCache(slot: ModelSlot = 'chat', serverUrl?: st
 }
 
 /**
- * Restore KV cache state for a specific slot (GGUF/llama-server only)
+ * Restore KV cache state for a specific slot using native in-process state deserialization.
+ * Uses llama_state_seq_load_file via JNI — no external server required.
  */
-export async function restoreNativeKvCache(slot: ModelSlot = 'chat', serverUrl?: string): Promise<boolean> {
+export async function restoreNativeKvCache(slot: ModelSlot = 'chat'): Promise<boolean> {
     const context = modelContexts.get(slot);
     if (!context) return false;
 
     try {
         const result = await LlamaCpp.restoreKvCache({
-            slotId: context.contextId,
-            serverUrl: serverUrl || "http://127.0.0.1:8080"
+            contextId: context.contextId,
+            slot: slot
         });
         return result.success;
     } catch (e) {
@@ -734,7 +745,7 @@ export async function restoreNativeKvCache(slot: ModelSlot = 'chat', serverUrl?:
 }
 
 /**
- * Invalidate KV cache state for a specific slot (GGUF/llama-server only)
+ * Invalidate KV cache state for a specific slot by deleting the persisted state file.
  */
 export async function invalidateNativeKvCache(slot: ModelSlot = 'chat'): Promise<boolean> {
     const context = modelContexts.get(slot);
@@ -742,7 +753,8 @@ export async function invalidateNativeKvCache(slot: ModelSlot = 'chat'): Promise
 
     try {
         const result = await LlamaCpp.invalidateKvCache({
-            slotId: context.contextId
+            contextId: context.contextId,
+            slot: slot
         });
         return result.success;
     } catch (e) {

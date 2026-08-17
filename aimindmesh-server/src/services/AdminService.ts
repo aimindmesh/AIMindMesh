@@ -310,6 +310,37 @@ export class AdminService {
       const { InferenceRouter } = require('./InferenceRouter');
       const payload = JSON.parse(row.payload);
       
+      if (row.type === 'AGENT_TASK') {
+        const { VentureOrchestrator } = require('./organization/VentureOrchestrator');
+        const { repoId, repoName } = payload;
+        const repoRow = db.prepare('SELECT * FROM organization_repositories WHERE id = ?').get(repoId) as any;
+        if (repoRow) {
+          // Cancel the old stalled/failed task to clean up the registry/UI
+          InferenceRouter.cancelTask(id);
+          // Delete the old failed task row from the database
+          db.prepare("DELETE FROM inference_queue WHERE id = ?").run(id);
+
+          if (row.model === 'kasm-validation') {
+            const gitUrl = repoRow.gitea_url;
+            const gitUrlWithToken = process.env.GITEA_TOKEN
+              ? gitUrl.replace('http://', `http://token:${process.env.GITEA_TOKEN}@`)
+              : gitUrl;
+            void VentureOrchestrator.runKasmValidation(repoId, repoName, gitUrlWithToken);
+          } else if (row.model === 'openclaw') {
+            const ideaRow = db.prepare('SELECT * FROM organization_ideas WHERE id = ?').get(repoRow.created_from_idea_id) as any;
+            void VentureOrchestrator.triggerDevelopmentAgent(
+              repoId,
+              repoName,
+              repoRow.gitea_url,
+              ideaRow || { title: repoName },
+              ideaRow?.analysis_synthesis || null
+            );
+          }
+          Logger.info('AdminService', `Manually retrying AGENT_TASK [${id.slice(0,8)}]: ${row.task_name}`);
+          return true;
+        }
+      }
+
       // Reset retry count and routing for manual retry
       if (payload) {
         payload.retryCount = 0;
@@ -343,6 +374,35 @@ export class AdminService {
       for (const row of rows) {
         try {
           const payload = JSON.parse(row.payload);
+          
+          if (row.type === 'AGENT_TASK') {
+            const { VentureOrchestrator } = require('./organization/VentureOrchestrator');
+            const { repoId, repoName } = payload;
+            const repoRow = db.prepare('SELECT * FROM organization_repositories WHERE id = ?').get(repoId) as any;
+            if (repoRow) {
+              InferenceRouter.cancelTask(row.id);
+              db.prepare("DELETE FROM inference_queue WHERE id = ?").run(row.id);
+              
+              if (row.model === 'kasm-validation') {
+                const gitUrl = repoRow.gitea_url;
+                const gitUrlWithToken = process.env.GITEA_TOKEN
+                  ? gitUrl.replace('http://', `http://token:${process.env.GITEA_TOKEN}@`)
+                  : gitUrl;
+                void VentureOrchestrator.runKasmValidation(repoId, repoName, gitUrlWithToken);
+              } else if (row.model === 'openclaw') {
+                const ideaRow = db.prepare('SELECT * FROM organization_ideas WHERE id = ?').get(repoRow.created_from_idea_id) as any;
+                void VentureOrchestrator.triggerDevelopmentAgent(
+                  repoId,
+                  repoName,
+                  repoRow.gitea_url,
+                  ideaRow || { title: repoName },
+                  ideaRow?.analysis_synthesis || null
+                );
+              }
+            }
+            continue;
+          }
+
           if (payload) {
             payload.retryCount = 0;
             if (!payload.options) payload.options = {};

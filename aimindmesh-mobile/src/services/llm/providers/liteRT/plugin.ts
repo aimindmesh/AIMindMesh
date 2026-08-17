@@ -1,5 +1,6 @@
 import { registerPlugin, PluginListenerHandle } from '@capacitor/core';
 import { logger } from '../../../logger';
+import { getFormattedToolDefinitions } from '../../../toolDefinitions';
 import {
     LiteRTPlugin,
     LiteRTConfig,
@@ -61,6 +62,40 @@ export async function initLiteRTModel(config: LiteRTConfig): Promise<boolean> {
         }
     } catch (error: any) {
         logger.log('error', '[LiteRT] Init error:', error);
+        return false;
+    }
+}
+
+export async function registerLiteRTTools(toolRules?: Record<string, string>): Promise<boolean> {
+    try {
+        const tools = getFormattedToolDefinitions(toolRules);
+        if (!tools || tools.trim().length === 0) {
+            logger.log('warn', '[LiteRT] No tool definitions to register');
+            return false;
+        }
+
+        const toolDefs = tools.split('\n\n').filter(t => t.trim().length > 0).map(block => {
+            const lines = block.split('\n');
+            const name = lines.find(l => l.startsWith('function:'))?.replace('function:', '').trim() || 'unknown';
+            const description = lines.find(l => l.startsWith('description:'))?.replace('description:', '').trim() || '';
+            const paramsLine = lines.find(l => l.startsWith('parameters:'))?.replace('parameters:', '').trim() || '{}';
+            let params: Record<string, unknown> = {};
+            try { params = JSON.parse(paramsLine); } catch { params = {}; }
+            return { name, description, parameters: params };
+        });
+
+        if (toolDefs.length === 0) {
+            return false;
+        }
+
+        const result = await LiteRT.registerTools({ tools: toolDefs });
+        if (result.success) {
+            logger.log('info', `[LiteRT] Registered ${toolDefs.length} tools for native function calling`);
+            return true;
+        }
+        return false;
+    } catch (error: any) {
+        logger.log('error', '[LiteRT] Failed to register tools:', error);
         return false;
     }
 }

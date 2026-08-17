@@ -29,12 +29,17 @@ export const WhisperModelSection: React.FC<WhisperModelSectionProps> = ({
         <div className="space-y-4 bg-surface/30 p-4 rounded-lg border border-white/5">
             <div className="flex items-center justify-between mb-2">
                 <h4 className="text-sm font-semibold text-text-primary">Whisper Models (Post-Processing)</h4>
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 border border-blue-500/30">
-                    High Accuracy
-                </span>
+                <div className="flex items-center gap-1.5">
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30 font-medium">
+                        ⚡ Qualcomm NPU Active
+                    </span>
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 border border-blue-500/30">
+                        High Accuracy
+                    </span>
+                </div>
             </div>
             <p className="text-xs text-text-secondary mb-3">
-                Whisper provides higher accuracy transcription for post-processing or background correction.
+                Whisper provides higher accuracy transcription for post-processing or background correction with Hexagon NPU offload.
             </p>
 
             {/* STT Mode Selection */}
@@ -42,10 +47,11 @@ export const WhisperModelSection: React.FC<WhisperModelSectionProps> = ({
                 <label className="text-xs font-medium text-text-primary mb-2 block">STT Processing Mode</label>
                 <div className="grid grid-cols-1 gap-2">
                     {[
-                        { id: 'off' as SttMode, label: 'Off', desc: 'No post-processing (real-time only)' },
-                        { id: 'vosk-only' as SttMode, label: 'Vosk Only', desc: 'Fast, real-time transcription' },
+                        { id: 'whisper-only' as SttMode, label: 'Whisper Only', desc: 'Direct on-device Whisper transcription (NPU/CPU)' },
                         { id: 'hybrid' as SttMode, label: 'Hybrid', desc: 'Vosk real-time + Whisper background correction' },
+                        { id: 'vosk-only' as SttMode, label: 'Vosk Only', desc: 'Fast, real-time transcription' },
                         { id: 'whisper-post' as SttMode, label: 'Whisper Post-Processing', desc: 'High accuracy after recording' },
+                        { id: 'off' as SttMode, label: 'Off', desc: 'No Whisper transcription' },
                     ].map(mode => (
                         <div
                             key={mode.id}

@@ -23,6 +23,7 @@ interface ChatInputProps {
     onRemoveImage: (index: number) => void;
     onRemoveAudio: (index: number) => void;
     onRemoveFile: (index: number) => void;
+    onOpenImageStudio?: () => void;
 }
 
 export const ChatInput: React.FC<ChatInputProps> = ({
@@ -43,7 +44,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     pendingFiles,
     onRemoveImage,
     onRemoveAudio,
-    onRemoveFile
+    onRemoveFile,
+    onOpenImageStudio
 }) => {
     const inputRef = useRef<HTMLInputElement>(null);
     const { width } = useWindowSize();
@@ -146,6 +148,18 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                     >
                         <PhotoIcon className={isNarrow ? 'w-6 h-6' : 'w-7 h-7'} />
                     </button>
+                    {onOpenImageStudio && (
+                        <button
+                            type="button"
+                            onClick={() => { onOpenImageStudio(); triggerHaptic(); }}
+                            className="p-2 text-amber-400 hover:text-amber-300 transition-colors rounded-full hover:bg-amber-500/10 active:bg-amber-500/20"
+                            aria-label="AI Image Studio"
+                            title="Generate / Edit with Qualcomm NPU"
+                            disabled={isInputDisabled}
+                        >
+                            <span className={isNarrow ? 'text-lg' : 'text-xl'}>🎨</span>
+                        </button>
+                    )}
                     <button
                         type="button"
                         onClick={onAttachAudio}

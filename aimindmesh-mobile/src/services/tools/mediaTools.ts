@@ -1,9 +1,110 @@
-/**
- * Media Tool Implementations
- */
-
+import { Type } from '@google/genai';
 import { executeTermuxCommand } from '../termuxPlugin';
-import { ToolResult } from './types';
+import { ToolDefinition, ToolResult } from './types';
+import { imageGenService } from '../image/imageGenService';
+
+export const mediaTools: ToolDefinition[] = [
+    {
+        name: 'generate_image',
+        description: 'Generates or edits an image locally on device using the Qualcomm Hexagon NPU (Stable Diffusion). Use this whenever the user asks to draw, generate, visualize, or modify an image.',
+        parameters: {
+            type: Type.OBJECT,
+            properties: {
+                prompt: {
+                    type: Type.STRING,
+                    description: 'Detailed description of the image to generate or modification instructions'
+                },
+                negative_prompt: {
+                    type: Type.STRING,
+                    description: 'Negative prompt specifying elements to avoid (optional)'
+                },
+                source_image: {
+                    type: Type.STRING,
+                    description: 'Optional base64 or file path of the source image to modify (for image-to-image editing)'
+                },
+                strength: {
+                    type: Type.NUMBER,
+                    description: 'Denoising / edit intensity between 0.1 (subtle) and 0.9 (drastic), default 0.65'
+                }
+            },
+            required: ['prompt']
+        },
+        requiresConfirmation: false,
+        category: 'media'
+    },
+    {
+        name: 'take_photo',
+        description: 'Takes a photo using the device camera and saves it to storage.',
+        parameters: {
+            type: Type.OBJECT,
+            properties: {
+                camera_facing: {
+                    type: Type.STRING,
+                    description: 'Camera to use: "front" or "back"',
+                    enum: ['front', 'back']
+                }
+            },
+            required: ['camera_facing']
+        },
+        requiresConfirmation: true,
+        category: 'media'
+    },
+    {
+        name: 'record_audio',
+        description: 'Records audio from microphone for specified duration and saves to storage.',
+        parameters: {
+            type: Type.OBJECT,
+            properties: {
+                duration_seconds: {
+                    type: Type.INTEGER,
+                    description: 'Recording duration in seconds (max 60)'
+                },
+                filename: {
+                    type: Type.STRING,
+                    description: 'Optional custom filename (must end in .wav)'
+                }
+            },
+            required: ['duration_seconds']
+        },
+        requiresConfirmation: true,
+        category: 'media'
+    }
+];
+
+export async function executeGenerateImage(args: Record<string, unknown>): Promise<ToolResult> {
+    const prompt = (args.prompt as string) || '';
+    if (!prompt.trim()) {
+        return {
+            success: false,
+            message: 'Image prompt cannot be empty.'
+        };
+    }
+
+    try {
+        const result = await imageGenService.generateImage({
+            prompt: prompt.trim(),
+            negativePrompt: (args.negative_prompt as string) || undefined,
+            sourceImage: (args.source_image as string) || undefined,
+            strength: typeof args.strength === 'number' ? args.strength : undefined
+        });
+
+        return {
+            success: true,
+            message: `Image generated on Qualcomm Hexagon NPU (${result.generationTimeMs}ms) for prompt: "${prompt}"`,
+            data: {
+                base64Image: result.base64Image,
+                generationTimeMs: result.generationTimeMs,
+                width: result.width,
+                height: result.height
+            }
+        };
+    } catch (e: any) {
+        return {
+            success: false,
+            message: `Qualcomm NPU Image generation failed: ${e.message || 'Unknown error'}`
+        };
+    }
+}
 
 export async function executeRecordAudio(args: Record<string, unknown>): Promise<ToolResult> {
     const durationSeconds = Math.min((args.duration_seconds as number) || 10, 60);

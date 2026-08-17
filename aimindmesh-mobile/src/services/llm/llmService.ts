@@ -9,6 +9,7 @@ import { generateNativeGGUFStream } from "./providers/ggufProvider";
 import { generateLocalStream } from "./providers/localProvider";
 import { generateOpenRouterStream } from "./providers/openrouterProvider";
 import { generateLiteRTStream } from "./providers/liteRTProvider";
+import { generateGenieNPUStream, unloadGenieModel } from "./providers/genieProvider";
 import { callServerProvider } from "./providers/serverProvider";
 
 import { refineContext } from "./context/unifiedContextManager";
@@ -53,11 +54,10 @@ export async function* generateTextResponseStream(
     }
 
     // Prune history to avoid context overflow
-    // Estimate 4 chars per token. Reserve 10% for output/overhead.
-    // Strategy: Keep latest messages that fit.
-    // Use UnifiedContextManager to prune history and system prompt
+    // Skip pruning for providers that handle it internally with their actual system prompt
+    // (GGUF, LiteRT, and Genie-NPU do their own smartContextRefinement with the real prompt)
+    const skipProviderPruning = provider === 'native-gguf' || provider === 'litert' || provider === 'genie-npu';
     const { messages: effectiveHistory, systemPrompt: _prunedSysPrompt } = (() => {
-        // Pre-process history to inject file content for ALL providers
         const processedHistory = history.map(msg => {
             if (msg.files && msg.files.length > 0) {
                 let fileContext = '\n\n--- Attached Files ---\n';
@@ -70,8 +70,12 @@ export async function* generateTextResponseStream(
             return msg;
         });
 
-        // For now, we only prune the history here to maintain provider-level system prompt control (LiteRT/GGUF)
-        // But we use the unified logic for consistency
+        // GGUF and LiteRT providers handle context pruning internally
+        // with the real system prompt. Skip double-pruning here.
+        if (skipProviderPruning) {
+            return { messages: processedHistory, systemPrompt: "" };
+        }
+
         const result = refineContext(processedHistory, "", llmConfig, maxResponseLength || 512);
 
         if (result.truncated) {
@@ -217,6 +221,11 @@ export async function* generateTextResponseStream(
                 for await (const chunk of generateLiteRTStream(effectiveHistory, personality, llmConfig, memories, signal)) {
                     yield chunk;
                 }
+                break;
+
+            case 'genie-npu':
+                // Qualcomm Genie / QAIRT Hexagon NPU provider
+                yield* generateGenieNPUStream(effectiveHistory, personality, llmConfig, memories, signal, maxResponseLength);
                 break;
 
             default:
@@ -373,6 +382,11 @@ export async function unloadCurrentModel(llmConfig: LLMConfig): Promise<void> {
                 await releaseLiteRTModel();
                 logger.log('info', '[LLMService] LiteRT model released.');
             }
+        }
+
+        // Handle Qualcomm Genie NPU
+        if (llmConfig.provider === 'genie-npu' || llmConfig.engine === 'genie') {
+            await unloadGenieModel();
         }
 
     } catch (error) {

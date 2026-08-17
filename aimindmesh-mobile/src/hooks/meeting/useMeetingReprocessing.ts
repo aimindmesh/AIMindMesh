@@ -79,7 +79,7 @@ export const useMeetingReprocessing = ({
         try {
             abortProcessingRef.current = false;
             const sttMode = speechConfig?.sttMode || 'vosk-only';
-            const useWhisper = sttMode === 'whisper-post' || sttMode === 'hybrid';
+            const useWhisper = sttMode === 'whisper-only' || sttMode === 'whisper-post' || sttMode === 'hybrid';
 
             showToast(`Reprocessing in progress (${useWhisper ? 'Whisper' : 'Vosk'})...`, 'info');
             setIsReclustering(true);
@@ -144,7 +144,7 @@ export const useMeetingReprocessing = ({
                     }
 
                     // Vosk Fallback for File (Chunked)
-                    if (abortProcessingRef.current) throw new Error('Operazione annullata');
+                    if (abortProcessingRef.current) throw new Error('Operation cancelled');
 
                     await (Vosk as any).startProcessing();
                     setProcessingStatus('Streaming to Vosk...');
@@ -348,38 +348,9 @@ export const useMeetingReprocessing = ({
             const embeddings: Array<{ timestamp: number; embedding: number[] }> = [];
 
             // --- VAD / Silence Filtering ---
-            // Determine which audio regions contain speech to avoid extracting
-            // embeddings from silence/noise (which pollutes clustering).
-            let speechSegments: SpeechSegment[] | null = null;
             const vadEnabled = speechConfig?.enableVAD === true;
+            let speechSegments: SpeechSegment[] | null = null;
 
-            if (vadEnabled) {
-                try {
-                    const vadService = getVADService();
-                    const vadReady = await vadService.checkModelLoaded();
-                    if (vadReady) {
-                        // Process the full audio file through VAD to get speech regions
-                        // We need to write a temporary WAV for VAD.processFile()
-                        const int16Full = floatToInt16(floatData);
-                        const base64Full = arrayBufferToBase64(int16Full.buffer as ArrayBuffer);
-                        // Use processSamples for in-memory data instead of processFile
-                        const vadResult = await vadService.processSamples(base64Full);
-                        if (vadResult.isSpeech) {
-                            showToast('VAD: Speech detected, filtering windows...', 'info');
-                        }
-                        // For full-audio VAD, we use processFile if available, otherwise
-                        // fallback to RMS. Since processSamples is streaming-mode, we
-                        // fall back to RMS gating for now and use VAD as a future enhancement.
-                        logger.log('info', 'VAD model loaded but processFile requires file path; using RMS filter');
-                    } else {
-                        logger.log('info', 'VAD enabled but model not loaded, using RMS energy filter');
-                    }
-                } catch (vadErr) {
-                    logger.log('warn', 'VAD check failed, using RMS energy filter', vadErr);
-                }
-            }
-
-            // Use file-based VAD if we have a file path and VAD is ready
             if (vadEnabled && audioFilePathRef.current) {
                 try {
                     const vadService = getVADService();
@@ -391,11 +362,14 @@ export const useMeetingReprocessing = ({
                             logger.log('info', `VAD detected ${speechSegments.length} speech segments`);
                             showToast(`VAD: ${speechSegments.length} speech regions found`, 'info');
                         }
+                    } else {
+                        logger.log('info', 'VAD enabled but model not loaded, using RMS energy filter');
                     }
                 } catch (vadErr) {
-                    logger.log('warn', 'VAD file processing failed, using RMS filter', vadErr);
-                    speechSegments = null;
+                    logger.log('warn', 'VAD processing failed, using RMS energy filter', vadErr);
                 }
+            } else if (vadEnabled) {
+                logger.log('info', 'VAD enabled but no file path available (in-memory mode), using RMS filter');
             }
 
             let skippedWindows = 0;
@@ -534,130 +508,14 @@ export const useMeetingReprocessing = ({
 
             // PASS 3: Temporal Smoothing
             const smoothingAlgo = speechConfig?.diarizationSmoothingAlgorithm || 'median';
-            let smoothedTranscript = [...updatedTranscript];
-
-            if (smoothingAlgo === 'hmm' && updatedTranscript.length > 0) {
-                // HMM Viterbi Decoder for Temporal Smoothing
-                // States: Unique speakers from Pass 2
-                // Observations: Speaker IDs assigned in Pass 2
-                const uniqueSpeakersSet = new Set(updatedTranscript.map(s => s.speakerId));
-                const states = Array.from(uniqueSpeakersSet);
-                const nStates = states.length;
-
-                if (nStates > 1) {
-                    const T = updatedTranscript.length;
-
-                    // Transition Probabilities (A matrix)
-                    // High probability to stay on the same speaker, lower to switch
-                    const pStay = 0.95;
-                    const pSwitch = (1.0 - pStay) / (nStates - 1);
-
-                    // Emission / Observation Probabilities (B matrix)
-                    // High probability that Pass 2 assignment is correct, low otherwise
-                    const pCorrectObs = 0.85;
-                    const pWrongObs = (1.0 - pCorrectObs) / (nStates - 1);
-
-                    // Initialize Viterbi tables
-                    // viterbi[t][j] = probability of most likely path ending in state j at time t
-                    const viterbi: number[][] = Array(T).fill(0).map(() => Array(nStates).fill(0));
-                    // backpointer[t][j] = most likely state at time t-1 given we are in state j at time t
-                    const backpointer: number[][] = Array(T).fill(0).map(() => Array(nStates).fill(0));
-
-                    // Initialization (t = 0)
-                    const obs0 = updatedTranscript[0].speakerId;
-                    for (let s = 0; s < nStates; s++) {
-                        // Assuming uniform initial state distribution
-                        const initialProb = 1.0 / nStates;
-                        const emissionProb = states[s] === obs0 ? pCorrectObs : pWrongObs;
-                        // Use log probabilities to prevent underflow
-                        viterbi[0][s] = Math.log(initialProb) + Math.log(emissionProb);
-                        backpointer[0][s] = 0;
-                    }
-
-                    // Recursion (t = 1 to T-1)
-                    for (let t = 1; t < T; t++) {
-                        const obs = updatedTranscript[t].speakerId;
-
-                        for (let s = 0; s < nStates; s++) {
-                            let maxLogProb = -Infinity;
-                            let bestPrevState = 0;
-                            const emissionProb = states[s] === obs ? pCorrectObs : pWrongObs;
-
-                            for (let prevS = 0; prevS < nStates; prevS++) {
-                                const transProb = states[prevS] === states[s] ? pStay : pSwitch;
-                                const prob = viterbi[t - 1][prevS] + Math.log(transProb);
-
-                                if (prob > maxLogProb) {
-                                    maxLogProb = prob;
-                                    bestPrevState = prevS;
-                                }
-                            }
-
-                            viterbi[t][s] = maxLogProb + Math.log(emissionProb);
-                            backpointer[t][s] = bestPrevState;
-                        }
-                    }
-
-                    // Termination
-                    let bestLastState = 0;
-                    let maxFinalProb = -Infinity;
-                    for (let s = 0; s < nStates; s++) {
-                        if (viterbi[T - 1][s] > maxFinalProb) {
-                            maxFinalProb = viterbi[T - 1][s];
-                            bestLastState = s;
-                        }
-                    }
-
-                    // Path backtracking
-                    const bestPath = new Array(T);
-                    bestPath[T - 1] = bestLastState;
-                    for (let t = T - 1; t > 0; t--) {
-                        bestPath[t - 1] = backpointer[t][bestPath[t]];
-                    }
-
-                    // Apply the smoothed path to the transcript
-                    for (let t = 0; t < T; t++) {
-                        smoothedTranscript[t] = {
-                            ...updatedTranscript[t],
-                            speakerId: states[bestPath[t]]
-                        };
-                    }
-                }
-            } else {
-                // PASS 3: Temporal Median Filter (Original Logic)
-                // Smooth out spurious speaker label oscillations (e.g. [0,1,0,0,0] → [0,0,0,0,0])
-                const MEDIAN_WINDOW = 5;
-                smoothedTranscript = updatedTranscript.map((seg, idx) => {
-                    if (updatedTranscript.length < MEDIAN_WINDOW) return seg;
-
-                    // Collect speaker IDs in the window centered on this segment
-                    const halfW = Math.floor(MEDIAN_WINDOW / 2);
-                    const start = Math.max(0, idx - halfW);
-                    const end = Math.min(updatedTranscript.length - 1, idx + halfW);
-                    const windowIds = updatedTranscript.slice(start, end + 1).map(s => s.speakerId);
-
-                    // Find the mode (most frequent) speaker in the window
-                    const freq = new Map<number, number>();
-                    for (const id of windowIds) {
-                        freq.set(id, (freq.get(id) ?? 0) + 1);
-                    }
-                    let modeId = seg.speakerId;
-                    let maxFreq = 0;
-                    for (const [id, count] of freq) {
-                        if (count > maxFreq) {
-                            maxFreq = count;
-                            modeId = id;
-                        }
-                    }
-                    return { ...seg, speakerId: modeId };
-                });
-            }
+            const { applyTemporalSmoothing } = await import('../../services/speaker/diarizationSmoothing');
+            const smoothedTranscript = applyTemporalSmoothing(updatedTranscript, smoothingAlgo);
 
             setTranscript(smoothedTranscript);
             const uniqueSpeakers = new Set(smoothedTranscript.map(s => s.speakerId)).size;
             const smoothedCount = smoothedTranscript.filter((s, i) => s.speakerId !== updatedTranscript[i].speakerId).length;
             if (smoothedCount > 0) {
-                logger.log('info', `Median filter corrected ${smoothedCount} segments`);
+                logger.log('info', `Temporal smoothing corrected ${smoothedCount} segments`);
             }
             showToast(`Diarization complete (2-Pass + smoothing): ${uniqueSpeakers} speakers`, 'success');
             await saveMeeting();

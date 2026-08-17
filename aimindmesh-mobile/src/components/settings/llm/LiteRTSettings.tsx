@@ -90,9 +90,20 @@ const LiteRTSettings: React.FC<LiteRTSettingsProps> = ({
                             🧠 Use NPU (Hexagon QNN Delegate)
                         </span>
                         <p className="text-xs text-text-secondary mt-1">
-                            Offloads inference to the Qualcomm Hexagon NPU via the QNN delegate. Significant performance boost on Snapdragon 8 Gen 2+ devices (Z Fold 5, Z Fold 7).
+                            Offloads inference to the Qualcomm Hexagon NPU via the QNN delegate for .litertlm models.
                             <br />
-                            <span className="text-purple-400/80">⚠ Requires Qualcomm Snapdragon SoC. Auto-sets backend to CPU. Reload model after changing.</span>
+                            <span className="text-amber-400">💡 Tip: For Qualcomm AI Hub packages (.zip / Qwen 3.5), use </span>
+                            <button
+                                type="button"
+                                onClick={(e) => {
+                                    e.preventDefault();
+                                    triggerHaptic();
+                                    onLlmConfigSave({ ...llmConfig, engine: 'genie', provider: 'genie-npu' });
+                                }}
+                                className="text-amber-300 font-semibold underline hover:text-amber-200"
+                            >
+                                Genie NPU Engine ⚡
+                            </button>
                         </p>
                     </div>
                 </label>

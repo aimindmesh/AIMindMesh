@@ -62,6 +62,7 @@ export interface LiteRTPlugin {
     releaseModel(): Promise<void>;
     isModelLoaded(): Promise<{ isLoaded: boolean; modelPath?: string }>;
     getMessageCount(): Promise<{ count: number }>;
+    registerTools(options: { tools: Array<{ name: string; description: string; parameters: Record<string, unknown> }> }): Promise<{ success: boolean }>;
     saveKvCache(options: { conversationId: string }): Promise<{ success: boolean }>;
     restoreKvCache(options: { conversationId: string }): Promise<{ success: boolean; messageCount: number }>;
     invalidateKvCache(options: { conversationId: string }): Promise<{ success: boolean }>;

@@ -61,7 +61,17 @@ export function useMeetingInitialization({
                     const service = getWhisperSTTService();
                     const isLoaded = await service.checkModelLoaded();
                     if (!isLoaded) {
-                        await service.loadModel('ggml-base');
+                        let modelToLoad = 'ggml-base';
+                        try {
+                            const { listLocalWhisperModels } = await import('../../services/stt/whisperModelDownloader');
+                            const models = await listLocalWhisperModels();
+                            if (models.length > 0) {
+                                modelToLoad = models[0];
+                            }
+                        } catch (e) {
+                            logger.log('warn', 'Failed to get downloaded Whisper models', e);
+                        }
+                        await service.loadModel(modelToLoad);
                     }
                     setIsModelLoading(false);
                     showToast('Whisper model loaded', 'success');

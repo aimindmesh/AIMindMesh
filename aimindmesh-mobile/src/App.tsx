@@ -31,6 +31,7 @@ import MeetingMode from './components/meeting/MeetingMode';
 import AgendaMode from './components/agenda/AgendaMode';
 import TodoListView from './components/agenda/TodoListView';
 import ToolConfirmationModal from './components/modals/ToolConfirmationModal';
+import ImageGenModal from './components/modals/ImageGenModal';
 import { ChatArea } from './components/chat/ChatArea';
 import { PRESET_PERSONALITIES } from './constants';
 import { useProactiveSuggestions } from './hooks/useProactiveSuggestions';
@@ -313,8 +314,40 @@ const App: React.FC = () => {
     idleDetails: { isSettingsOpen, isVoiceMode, incomingCall: !!incomingCall, isProactiveThinking, isAppActive, keepAlive: !!llmConfig.keepAlive }
   });
 
-  // Extraction and summarization are handled by useAppServices
+  // --- Image Studio (Qualcomm NPU) State & Handlers ---
+  const [isImageGenModalOpen, setIsImageGenModalOpen] = useState(false);
+  const [imageGenSourceImage, setImageGenSourceImage] = useState<string | undefined>(undefined);
+  const [imageGenPrompt, setImageGenPrompt] = useState<string | undefined>(undefined);
 
+  const handleOpenImageStudio = useCallback(() => {
+    const attached = chat.pendingImages[0];
+    if (attached) {
+      const src = attached.base64 ? `data:${attached.mimeType};base64,${attached.base64}` : attached.webPath;
+      setImageGenSourceImage(src);
+    } else {
+      setImageGenSourceImage(undefined);
+    }
+    setImageGenPrompt(chat.input || undefined);
+    setIsImageGenModalOpen(true);
+  }, [chat.pendingImages, chat.input]);
+
+  const handleEditImageFromChat = useCallback((imgSrc: string) => {
+    setImageGenSourceImage(imgSrc);
+    setImageGenPrompt('Modify this image: ');
+    setIsImageGenModalOpen(true);
+  }, []);
+
+  const handleInsertGeneratedImage = useCallback((base64Image: string, prompt: string) => {
+    chat.addPendingImage({
+      name: `generated_${Date.now()}.png`,
+      base64: base64Image.replace(/^data:image\/\w+;base64,/, ''),
+      mimeType: 'image/png'
+    });
+    if (!chat.input.trim()) {
+      chat.setInput(`Generated with Qualcomm NPU: "${prompt}"`);
+    }
+    showToast('Image attached to chat! 🎨', 'success');
+  }, [chat, showToast]);
 
   // --- Render ---
   return (
@@ -346,6 +379,8 @@ const App: React.FC = () => {
               onRemoveFile={chat.removeFile}
               onResend={chat.handleResend}
               onRegenerate={chat.handleRegenerate}
+              onOpenImageStudio={handleOpenImageStudio}
+              onEditImage={handleEditImageFromChat}
               onOpenThreads={() => setIsThreadListOpen(true)}
               onNewChat={handleNewConversation}
               onOpenTodo={() => setIsTodoListOpen(true)}
@@ -634,6 +669,14 @@ const App: React.FC = () => {
           onCancel={() => chat.handleConfirmTool(false, false)}
         />
       )}
+
+      <ImageGenModal
+        isOpen={isImageGenModalOpen}
+        onClose={() => setIsImageGenModalOpen(false)}
+        initialImage={imageGenSourceImage}
+        initialPrompt={imageGenPrompt}
+        onInsertIntoChat={handleInsertGeneratedImage}
+      />
 
     </div>
   );

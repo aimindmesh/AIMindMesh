@@ -5,6 +5,7 @@ import { useNativeModelLoader } from '../../../hooks/useNativeModelLoader';
 import EngineSelector from './EngineSelector';
 import GGUFSettings from './GGUFSettings';
 import LiteRTSettings from './LiteRTSettings';
+import GenieSettings from './GenieSettings';
 
 interface NativeModelSettingsProps {
     llmConfig: LLMConfig;
@@ -32,7 +33,16 @@ const NativeModelSettings: React.FC<NativeModelSettingsProps> = ({
                 triggerHaptic={triggerHaptic}
             />
 
-            {llmConfig.engine === 'litert' ? (
+            {llmConfig.engine === 'genie' || (llmConfig as any).provider === 'genie-npu' ? (
+                <GenieSettings
+                    llmConfig={llmConfig}
+                    onLlmConfigSave={onLlmConfigSave}
+                    triggerHaptic={triggerHaptic}
+                    downloadedGenieModels={modelsState.downloadedGenieModels}
+                    isImporting={modelsState.isImporting}
+                    handleImportGenieZipFile={modelsState.handleImportGenieZipFile}
+                />
+            ) : llmConfig.engine === 'litert' ? (
                 <LiteRTSettings
                     llmConfig={llmConfig}
                     onLlmConfigSave={onLlmConfigSave}

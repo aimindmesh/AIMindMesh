@@ -52,9 +52,18 @@ public class BertTokenizer {
 
             // Handle HuggingFace tokenizer.json format
             if (root.has("model") && root.getAsJsonObject("model").has("vocab")) {
-                JsonObject vocabObj = root.getAsJsonObject("model").getAsJsonObject("vocab");
-                for (Map.Entry<String, JsonElement> entry : vocabObj.entrySet()) {
-                    vocab.put(entry.getKey(), entry.getValue().getAsInt());
+                JsonElement vocabElement = root.getAsJsonObject("model").get("vocab");
+                if (vocabElement.isJsonObject()) {
+                    JsonObject vocabObj = vocabElement.getAsJsonObject();
+                    for (Map.Entry<String, JsonElement> entry : vocabObj.entrySet()) {
+                        vocab.put(entry.getKey(), entry.getValue().getAsInt());
+                    }
+                } else if (vocabElement.isJsonArray()) {
+                    // Array format: index = token ID, value = token string
+                    JsonArray vocabArr = vocabElement.getAsJsonArray();
+                    for (int i = 0; i < vocabArr.size(); i++) {
+                        vocab.put(vocabArr.get(i).getAsString(), i);
+                    }
                 }
             } else if (root.has("vocab")) {
                 // Simple vocab format

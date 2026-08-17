@@ -528,6 +528,32 @@ public class LlamaCppInference {
     }
 
     /**
+     * Save KV cache state for a specific sequence to a file.
+     * @param filepath Path to save the state file
+     * @param seqId Sequence ID (0 for main conversation)
+     * @return true on success
+     */
+    public boolean saveState(String filepath, int seqId) {
+        if (nativePtr != 0L) {
+            return saveStateNative(nativePtr, filepath, seqId);
+        }
+        return false;
+    }
+
+    /**
+     * Load KV cache state for a specific sequence from a file.
+     * @param filepath Path to the state file
+     * @param seqId Destination sequence ID (0 for main conversation)
+     * @return true on success
+     */
+    public boolean loadState(String filepath, int seqId) {
+        if (nativePtr != 0L) {
+            return loadStateNative(nativePtr, filepath, seqId);
+        }
+        return false;
+    }
+
+    /**
      * Get formatted chat string directly from the LLM model using its template engine.
      */
     public String getFormattedChat(String messages, String chatTemplate) {
@@ -574,4 +600,8 @@ public class LlamaCppInference {
     private native void resetContextNative(long modelPtr);
 
     private native String getFormattedChatNative(long modelPtr, String messages, String chatTemplate);
+
+    private native boolean saveStateNative(long modelPtr, String filepath, int seqId);
+
+    private native boolean loadStateNative(long modelPtr, String filepath, int seqId);
 }

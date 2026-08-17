@@ -29,6 +29,7 @@ interface OrganizationState {
   createRepository: (repo: { namespace?: string; repoName: string; description?: string; visibility?: string; bootstrapTemplate?: string; enableCiCd?: boolean; createdFromIdeaId?: string }) => Promise<void>;
   bootstrapCiCd: (repoId: string) => Promise<void>;
   runValidation: (repoId: string) => Promise<void>;
+  forceDevelop: (repoId: string) => Promise<void>;
   fetchHRProposals: () => Promise<void>;
   analyzeRecruitment: () => Promise<void>;
   materializeProposal: (proposalId: string) => Promise<void>;
@@ -277,6 +278,20 @@ export const useOrganizationStore = create<OrganizationState>((set) => ({
       }
     } catch (e: any) {
       set({ error: e.message || 'Failed to run validation' });
+    } finally {
+      set({ loading: false });
+    }
+  },
+
+  forceDevelop: async (repoId) => {
+    set({ loading: true, error: null });
+    try {
+      const res = await organizationApi.forceDevelop(repoId);
+      if (res.data.success) {
+        await useOrganizationStore.getState().fetchRepositories();
+      }
+    } catch (e: any) {
+      set({ error: e.message || 'Failed to force development' });
     } finally {
       set({ loading: false });
     }

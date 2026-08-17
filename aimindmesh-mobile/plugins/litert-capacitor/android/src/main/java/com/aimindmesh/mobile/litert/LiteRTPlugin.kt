@@ -68,7 +68,10 @@ class LiteRTPlugin : Plugin() {
         private val conversationHistory = mutableListOf<Message>()
         private var persistenceManager: ConversationPersistenceManager? = null
         private var storeChats: Boolean = false
-        private var messageCount: Int = 0
+        
+        // Tool calling support (LiteRT v0.14+)
+        private var toolDefinitions: String? = null
+        private var toolCallingEnabled: Boolean = false
         
         // Mutex for non-blocking coroutine synchronization
         private val mutex = Mutex()
@@ -118,10 +121,8 @@ class LiteRTPlugin : Plugin() {
         val maxTokens = call.getInt("maxTokens") ?: 8192 // Default to 8k if not provided
         val enableAudio = call.getBoolean("enableAudio") ?: true
         
-        // Cancel any active generation before re-initializing
-        runBlocking {
+        scope.launch {
             activeGenerationJob?.cancel()
-            activeGenerationJob?.join()
         }
         
         scope.launch {
@@ -174,7 +175,7 @@ class LiteRTPlugin : Plugin() {
                             System.runFinalization()
                             kotlinx.coroutines.delay(200)
                         }
-                        messageCount = 0
+                        // messageCount tracking removed — use conversationHistory.size directly
                         
                         val backend = if (useGpu) Backend.GPU() else Backend.CPU()
                         // Bug #3: Pass null for vision/audio backends when not needed.
@@ -338,7 +339,7 @@ class LiteRTPlugin : Plugin() {
                                     )
                                 )
                             )
-                            messageCount = 0
+                            // messageCount tracking removed — use conversationHistory.size directly
                         }
                         currentConversation!!
                     }
@@ -372,7 +373,7 @@ class LiteRTPlugin : Plugin() {
                         mutex.withLock {
                             conversationHistory.add(message)
                             conversationHistory.add(response)
-                            messageCount = conversationHistory.size
+                            // conversationHistory updated
                         }
                     }
 
@@ -538,7 +539,7 @@ class LiteRTPlugin : Plugin() {
                                         throw e
                                     }
                                 }
-                                messageCount = 0
+                                // messageCount tracking removed — use conversationHistory.size directly
                             }
                             currentConversation!!
                         }
@@ -562,8 +563,14 @@ class LiteRTPlugin : Plugin() {
                         }
                         
                         // Add text last
-                        if (prompt.trim().isNotEmpty()) {
-                            contents.add(com.google.ai.edge.litertlm.Content.Text(prompt))
+                        val finalPrompt = if (toolCallingEnabled && toolDefinitions != null) {
+                            "$prompt\n\nYou have access to the following tools. To use a tool, output:\n<tool>function_name({\"key\": \"value\"})</tool>\n\nAvailable tools:\n$toolDefinitions"
+                        } else {
+                            prompt
+                        }
+
+                        if (finalPrompt.trim().isNotEmpty()) {
+                            contents.add(com.google.ai.edge.litertlm.Content.Text(finalPrompt))
                         }
 
                         val message = com.google.ai.edge.litertlm.Message.of(contents)
@@ -629,7 +636,7 @@ class LiteRTPlugin : Plugin() {
                                 )
                                 conversationHistory.add(message)
                                 conversationHistory.add(fullResponseMessage)
-                                messageCount = conversationHistory.size
+                                // conversationHistory updated
                              }
                         }
 
@@ -713,6 +720,36 @@ class LiteRTPlugin : Plugin() {
     }
 
     @PluginMethod
+    fun registerTools(call: PluginCall) {
+        val toolsArray = call.getArray("tools")
+        if (toolsArray == null) {
+            call.reject("tools array is required")
+            return
+        }
+
+        val sb = StringBuilder()
+        for (i in 0 until toolsArray.length()) {
+            val tool = toolsArray.getJSONObject(i)
+            val name = tool.getString("name") ?: "tool_$i"
+            val description = tool.getString("description") ?: "No description"
+            val params = tool.optString("parameters", "{}")
+            sb.append("""
+                |function: $name
+                |description: $description
+                |parameters: $params
+                |""".trimMargin())
+            if (i < toolsArray.length() - 1) sb.append("\n")
+        }
+
+        toolDefinitions = sb.toString()
+        toolCallingEnabled = true
+        Log.i(TAG, "Registered ${toolsArray.length()} tools for native function calling")
+
+        val result = JSObject().apply { put("success", true) }
+        call.resolve(result)
+    }
+
+    @PluginMethod
     fun getAvailableBackends(call: PluginCall) {
         val backends = JSObject().apply {
             put("backends", listOf("CPU", "GPU"))
@@ -732,7 +769,7 @@ class LiteRTPlugin : Plugin() {
                     }
                     currentConversation = null
                     conversationHistory.clear()
-                    messageCount = 0
+                    // messageCount tracking removed — use conversationHistory.size directly
                     System.gc()
                     System.runFinalization()
                     Log.i(TAG, "Session released and closed")
@@ -820,7 +857,7 @@ class LiteRTPlugin : Plugin() {
                         currentConversation = conversation
                         conversationHistory.clear()
                         conversationHistory.addAll(restoredMessages)
-                        messageCount = conversationHistory.size
+                        // conversationHistory updated
                     }
                 }
                 call.resolve(JSObject().apply { 
@@ -1349,58 +1386,6 @@ class LiteRTPlugin : Plugin() {
         header[43] = ((totalDataLen shr 24) and 0xff).toByte()
         
         return header + pcmData
-    }
-
-    /**
-     * Convert 16-bit PCM audio to Gemma 3n format:
-     * - Mono channel
-     * - 16 kHz sample rate
-     * - Float32 samples in range [-1, 1]
-     */
-    private fun convertToGemma3nFormat(pcmData: ByteArray, sampleRate: Int, channelCount: Int): ByteArray {
-        val TARGET_SAMPLE_RATE = 16000
-        
-        // Step 1: Convert bytes to 16-bit samples
-        val numSamples = pcmData.size / 2
-        val samples = ShortArray(numSamples)
-        for (i in 0 until numSamples) {
-            val lo = pcmData[i * 2].toInt() and 0xFF
-            val hi = pcmData[i * 2 + 1].toInt()
-            samples[i] = ((hi shl 8) or lo).toShort()
-        }
-        
-        // Step 2: Convert stereo to mono if needed
-        val monoSamples = if (channelCount > 1) {
-            val monoLen = samples.size / channelCount
-            ShortArray(monoLen) { i ->
-                var sum = 0
-                for (ch in 0 until channelCount) {
-                    sum += samples[i * channelCount + ch].toInt()
-                }
-                (sum / channelCount).toShort()
-            }
-        } else {
-            samples
-        }
-        
-        // Step 3: Resample to 16kHz if needed
-        val resampledSamples = if (sampleRate != TARGET_SAMPLE_RATE) {
-            resample(monoSamples, sampleRate, TARGET_SAMPLE_RATE)
-        } else {
-            monoSamples
-        }
-        
-        // Step 4: Convert to float32 in range [-1, 1]
-        val floatBuffer = java.nio.ByteBuffer.allocate(resampledSamples.size * 4)
-        floatBuffer.order(java.nio.ByteOrder.LITTLE_ENDIAN)
-        for (sample in resampledSamples) {
-            val normalized = sample.toFloat() / 32768f  // Normalize to [-1, 1]
-            floatBuffer.putFloat(normalized)
-        }
-        
-        val result = floatBuffer.array()
-        Log.d(TAG, "Converted to Gemma 3n format: ${result.size} bytes (${resampledSamples.size} float32 samples at 16kHz mono)")
-        return result
     }
     
     /**

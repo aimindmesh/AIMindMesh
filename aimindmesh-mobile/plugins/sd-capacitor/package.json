@@ -1,0 +1,37 @@
+{
+  "name": "sd-capacitor",
+  "version": "0.1.0",
+  "description": "Capacitor plugin for on-device Stable Diffusion image generation using Qualcomm QNN Hexagon NPU",
+  "main": "dist/plugin.cjs.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/esm/index.d.ts",
+  "unpkg": "dist/plugin.js",
+  "files": [
+    "android/src/main/",
+    "android/build.gradle",
+    "dist/",
+    "src/"
+  ],
+  "author": "AI Mind Mesh",
+  "license": "MIT",
+  "scripts": {
+    "build": "npm run clean && tsc && rollup -c rollup.config.mjs",
+    "clean": "rimraf ./dist",
+    "watch": "tsc --watch"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^7.0.0",
+    "@capacitor/core": "^7.4.4",
+    "rimraf": "^5.0.0",
+    "rollup": "^4.0.0",
+    "typescript": "~5.3.0"
+  },
+  "peerDependencies": {
+    "@capacitor/core": "^7.0.0"
+  },
+  "capacitor": {
+    "android": {
+      "src": "android"
+    }
+  }
+}

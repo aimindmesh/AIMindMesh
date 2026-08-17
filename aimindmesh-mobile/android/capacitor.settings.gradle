@@ -53,6 +53,9 @@ project(':audio-output-capacitor').projectDir = new File('../plugins/audio-outpu
 include ':background-service-capacitor'
 project(':background-service-capacitor').projectDir = new File('../plugins/background-service-capacitor/android')
 
+include ':genie-capacitor'
+project(':genie-capacitor').projectDir = new File('../plugins/genie-capacitor/android')
+
 include ':litert-capacitor'
 project(':litert-capacitor').projectDir = new File('../plugins/litert-capacitor/android')
 
@@ -61,6 +64,9 @@ project(':llama-cpp-capacitor').projectDir = new File('../plugins/llama-cpp-capa
 
 include ':piper-capacitor'
 project(':piper-capacitor').projectDir = new File('../plugins/piper-capacitor/android')
+
+include ':sd-capacitor'
+project(':sd-capacitor').projectDir = new File('../plugins/sd-capacitor/android')
 
 include ':speaker-embedding-capacitor'
 project(':speaker-embedding-capacitor').projectDir = new File('../plugins/speaker-embedding-capacitor/android')

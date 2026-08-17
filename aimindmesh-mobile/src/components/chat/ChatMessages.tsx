@@ -9,6 +9,7 @@ interface ChatMessagesProps {
     isLoading: boolean;
     onResend: (message: Message) => void;
     onRegenerate: (message: Message) => void;
+    onEditImage?: (image: string) => void;
 }
 
 export const ChatMessages: React.FC<ChatMessagesProps> = ({
@@ -17,6 +18,7 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
     isLoading,
     onResend,
     onRegenerate,
+    onEditImage,
 }) => {
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -42,6 +44,7 @@ export const ChatMessages: React.FC<ChatMessagesProps> = ({
                         message={message}
                         onResend={onResend}
                         onRegenerate={onRegenerate}
+                        onEditImage={onEditImage}
                     />
                 ))}
                 {isLoading && <TypingIndicator />}

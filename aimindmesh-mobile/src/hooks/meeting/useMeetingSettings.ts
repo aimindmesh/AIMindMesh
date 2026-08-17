@@ -31,6 +31,14 @@ export interface MeetingSettingsState {
     setTranscriptionMode: (mode: TranscriptionMode) => void;
     whisperChunkSize: number;
     setWhisperChunkSize: (value: number) => void;
+    whisperVadFilter: boolean;
+    setWhisperVadFilter: (value: boolean) => void;
+    whisperConditionOnPrevious: boolean;
+    setWhisperConditionOnPrevious: (value: boolean) => void;
+    whisperWordTimestamps: boolean;
+    setWhisperWordTimestamps: (value: boolean) => void;
+    whisperProfile: 'fast' | 'accurate';
+    setWhisperProfile: (value: 'fast' | 'accurate') => void;
     // Refs for callbacks that need current values
     recognitionModeRef: React.MutableRefObject<RecognitionMode>;
     embeddingDurationRef: React.MutableRefObject<number>;
@@ -106,6 +114,23 @@ export function useMeetingSettings(): MeetingSettingsState {
         return saved ? parseInt(saved) : 10;
     });
 
+    const [whisperVadFilter, setWhisperVadFilter] = useState(() => {
+        return localStorage.getItem('whisper-vad-filter') === 'true';
+    });
+
+    const [whisperConditionOnPrevious, setWhisperConditionOnPrevious] = useState(() => {
+        return localStorage.getItem('whisper-condition-previous') === 'true';
+    });
+
+    const [whisperWordTimestamps, setWhisperWordTimestamps] = useState(() => {
+        return localStorage.getItem('whisper-word-timestamps') === 'true';
+    });
+
+    const [whisperProfile, setWhisperProfile] = useState<'fast' | 'accurate'>(() => {
+        const saved = localStorage.getItem('whisper-profile');
+        return (saved === 'accurate' ? 'accurate' : 'fast');
+    });
+
     // Refs for use in callbacks
     const recognitionModeRef = useRef(recognitionMode);
     const embeddingDurationRef = useRef(embeddingDuration);
@@ -165,6 +190,22 @@ export function useMeetingSettings(): MeetingSettingsState {
         localStorage.setItem('whisper-chunk-size', whisperChunkSize.toString());
     }, [whisperChunkSize]);
 
+    useEffect(() => {
+        localStorage.setItem('whisper-vad-filter', whisperVadFilter.toString());
+    }, [whisperVadFilter]);
+
+    useEffect(() => {
+        localStorage.setItem('whisper-condition-previous', whisperConditionOnPrevious.toString());
+    }, [whisperConditionOnPrevious]);
+
+    useEffect(() => {
+        localStorage.setItem('whisper-word-timestamps', whisperWordTimestamps.toString());
+    }, [whisperWordTimestamps]);
+
+    useEffect(() => {
+        localStorage.setItem('whisper-profile', whisperProfile);
+    }, [whisperProfile]);
+
     // Enforce dependency: If transcription is off, speaker recognition must be off
     useEffect(() => {
         if (transcriptionMode === 'off' && recognitionMode !== 'off') {
@@ -199,6 +240,14 @@ export function useMeetingSettings(): MeetingSettingsState {
         setTranscriptionMode,
         whisperChunkSize,
         setWhisperChunkSize,
+        whisperVadFilter,
+        setWhisperVadFilter,
+        whisperConditionOnPrevious,
+        setWhisperConditionOnPrevious,
+        whisperWordTimestamps,
+        setWhisperWordTimestamps,
+        whisperProfile,
+        setWhisperProfile,
         recognitionModeRef,
         embeddingDurationRef
     };

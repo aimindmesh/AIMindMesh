@@ -61,7 +61,7 @@ class KokoroTTSEngine(private val context: Context) {
             text      = text,
             sid       = speakerId,
             speed     = speed
-        ) ?: throw IllegalStateException("TTS non inizializzato")
+        ) ?: throw IllegalStateException("TTS not initialized")
         return audio.samples
     }
 

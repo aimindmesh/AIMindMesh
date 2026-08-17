@@ -15,6 +15,7 @@ import { systemTools } from './tools/systemTools';
 import { agendaTools } from './tools/definitions/agendaToolDefinitions';
 import { documentTools } from './tools/documentTools';
 import { workspaceTools } from './tools/workspaceTools';
+import { mediaTools } from './tools/mediaTools';
 
 // Re-export types for consumers
 export * from './tools/types';
@@ -30,7 +31,8 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     ...systemTools,
     ...agendaTools,
     ...documentTools,
-    ...workspaceTools
+    ...workspaceTools,
+    ...mediaTools
 ];
 
 /**

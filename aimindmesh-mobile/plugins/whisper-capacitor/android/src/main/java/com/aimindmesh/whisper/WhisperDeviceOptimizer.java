@@ -22,8 +22,9 @@ public class WhisperDeviceOptimizer {
     private static final String TAG = "WhisperDeviceOptimizer";
 
     public enum SoC {
-        SNAPDRAGON_8_ELITE, // Z Fold 7 - SM8750
-        SNAPDRAGON_8_GEN_2, // Z Fold 5 - SM8550
+        SNAPDRAGON_8_ELITE, // Z Fold 7 - SM8750 (Hexagon HTP v79)
+        SNAPDRAGON_8_GEN_3, // SM8650 (Hexagon HTP v75)
+        SNAPDRAGON_8_GEN_2, // Z Fold 5 - SM8550 (Hexagon HTP v73)
         UNKNOWN
     }
 
@@ -32,6 +33,29 @@ public class WhisperDeviceOptimizer {
 
     public WhisperDeviceOptimizer(Context context) {
         this.context = context.getApplicationContext();
+    }
+
+    public boolean hasNpu() {
+        SoC soc = detectSoC();
+        return soc == SoC.SNAPDRAGON_8_ELITE || soc == SoC.SNAPDRAGON_8_GEN_3 || soc == SoC.SNAPDRAGON_8_GEN_2;
+    }
+
+    public String getNpuArch() {
+        SoC soc = detectSoC();
+        switch (soc) {
+            case SNAPDRAGON_8_ELITE:
+                return "v79";
+            case SNAPDRAGON_8_GEN_3:
+                return "v75";
+            case SNAPDRAGON_8_GEN_2:
+                return "v73";
+            default:
+                return "none";
+        }
+    }
+
+    public String getRecommendedBackend() {
+        return hasNpu() ? "npu" : "cpu";
     }
 
     /**

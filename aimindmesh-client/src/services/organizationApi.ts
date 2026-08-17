@@ -128,6 +128,9 @@ export const organizationApi = {
   runValidation: (repoId: string) =>
     serverApi.post<{ success: boolean; result: { status: string; summary: string; logs: string[] } }>(`/api/organization/repositories/${repoId}/validate`),
 
+  forceDevelop: (repoId: string) =>
+    serverApi.post<{ success: boolean }>(`/api/organization/repositories/${repoId}/force-develop`),
+
   getHRProposals: () =>
     serverApi.get<{ success: boolean; proposals: any[] }>('/api/organization/hr/proposals'),
 

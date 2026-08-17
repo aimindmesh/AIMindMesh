@@ -11,4 +11,12 @@ project(':fcm-capacitor').projectDir = new File('../plugins/fcm-capacitor/androi
 include ':litert-capacitor'
 project(':litert-capacitor').projectDir = new File('../plugins/litert-capacitor/android/')
 
+// Qualcomm Genie NPU Plugin
+include ':genie-capacitor'
+project(':genie-capacitor').projectDir = new File('../plugins/genie-capacitor/android/')
+
+// Qualcomm Stable Diffusion NPU Plugin
+include ':sd-capacitor'
+project(':sd-capacitor').projectDir = new File('../plugins/sd-capacitor/android/')
+
 apply from: 'capacitor.settings.gradle'

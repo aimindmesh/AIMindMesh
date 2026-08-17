@@ -55,7 +55,10 @@ const LLMSettings: React.FC<LLMSettingsProps> = ({
             {/* Provider Categories */}
             <ProviderSelector
                 currentProvider={llmConfig.provider}
-                onSelect={(provider) => onLlmConfigSave({ ...llmConfig, provider })}
+                onSelect={(provider) => {
+                    const engine = provider === 'genie-npu' ? 'genie' : (llmConfig.engine === 'genie' ? 'gguf' : llmConfig.engine);
+                    onLlmConfigSave({ ...llmConfig, provider, engine });
+                }}
                 serverSettings={serverSettings}
             />
 
@@ -87,8 +90,7 @@ const LLMSettings: React.FC<LLMSettingsProps> = ({
             />
 
             {/* Native Model Settings */}
-
-            {llmConfig.provider === 'native-gguf' && (
+            {(llmConfig.provider === 'native-gguf' || llmConfig.provider === 'genie-npu') && (
                 <NativeModelSettings
                     llmConfig={llmConfig}
                     onLlmConfigSave={onLlmConfigSave}

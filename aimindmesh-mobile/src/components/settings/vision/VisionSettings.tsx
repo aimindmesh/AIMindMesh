@@ -5,6 +5,8 @@ import { RECOMMENDED_PROJECTORS, downloadModel, cancelDownload, ModelDownloadPro
 import { logger } from '../../../services/logger';
 import { fileImportService } from '../../../services/file/fileImportService';
 
+import { StableDiffusionSection } from './StableDiffusionSection';
+
 interface VisionSettingsProps {
     llmConfig: LLMConfig;
     onLlmConfigSave: (newConfig: LLMConfig) => void;
@@ -79,7 +81,13 @@ const VisionSettings: React.FC<VisionSettingsProps> = ({
 
     return (
         <div className="space-y-6 animate-fade-in">
-            <h3 className="text-lg font-medium text-text-primary mb-4">Vision Capabilities</h3>
+            <h3 className="text-lg font-medium text-text-primary mb-4">Vision & Image Creation</h3>
+
+            {/* Stable Diffusion Qualcomm NPU Model Management Section */}
+            <StableDiffusionSection
+                llmConfig={llmConfig}
+                onLlmConfigSave={onLlmConfigSave}
+            />
 
             {/* Main Toggle */}
             <div className="bg-purple-500/5 p-4 rounded-lg border border-purple-500/20 mb-6">

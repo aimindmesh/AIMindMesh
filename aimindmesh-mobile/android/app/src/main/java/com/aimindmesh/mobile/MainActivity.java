@@ -61,6 +61,8 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(com.aimindmesh.mobile.proactive.ProactivePlugin.class);
         registerPlugin(FCMCapacitorPlugin.class);
         registerPlugin(com.aimindmesh.mobile.tts.kokoro.KokoroTTSPlugin.class);
+        registerPlugin(com.aimindmesh.mobile.genie.GeniePlugin.class);
+        registerPlugin(com.aimindmesh.mobile.sd.SDPlugin.class);
 
         super.onCreate(savedInstanceState);
 
@@ -104,14 +106,18 @@ public class MainActivity extends BridgeActivity {
 
         android.util.Log.d("ProactiveDebug", "proactiveEnabled: " + proactiveEnabled);
 
-        if (proactiveEnabled) {
-            android.util.Log.d("ProactiveDebug", "Attempting to start ProactiveBackgroundService");
-            Intent proactiveIntent = new Intent(this, com.aimindmesh.mobile.proactive.ProactiveBackgroundService.class);
-            startService(proactiveIntent);
-        } else {
-            android.util.Log.d("ProactiveDebug", "ProactiveBackgroundService not enabled, ensuring it is stopped");
-            Intent proactiveIntent = new Intent(this, com.aimindmesh.mobile.proactive.ProactiveBackgroundService.class);
-            stopService(proactiveIntent);
+        try {
+            if (proactiveEnabled) {
+                android.util.Log.d("ProactiveDebug", "Attempting to start ProactiveBackgroundService");
+                Intent proactiveIntent = new Intent(this, com.aimindmesh.mobile.proactive.ProactiveBackgroundService.class);
+                startService(proactiveIntent);
+            } else {
+                android.util.Log.d("ProactiveDebug", "ProactiveBackgroundService not enabled, ensuring it is stopped");
+                Intent proactiveIntent = new Intent(this, com.aimindmesh.mobile.proactive.ProactiveBackgroundService.class);
+                stopService(proactiveIntent);
+            }
+        } catch (Exception e) {
+            android.util.Log.w("ProactiveDebug", "BackgroundService start/stop handled", e);
         }
 
         getBridge().getWebView().setWebChromeClient(new WebChromeClient() {

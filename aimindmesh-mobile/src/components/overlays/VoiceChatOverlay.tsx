@@ -5,7 +5,8 @@ import { PhoneIcon, SpeakerIcon } from '../../constants';
 import { triggerHaptic } from '../../services/native';
 import { getOfflineSttService, getOnlineSttService } from '../../services/tts/speech';
 import { getVoskSttService } from '../../services/stt/voskSTT';
-import { getVoxtralSttService } from '../../services/stt/voxtralSTT'; // Import Voxtral
+import { getVoxtralSttService } from '../../services/stt/voxtralSTT';
+import { getWhisperSTTService } from '../../services/stt/whisperSTT';
 import { logger } from '../../services/logger';
 import { AudioOutput } from 'audio-output-capacitor';
 
@@ -64,11 +65,13 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
 
     const sttService = speechConfig?.sttProvider === 'voxtral'
         ? getVoxtralSttService()
-        : speechConfig?.sttProvider === 'vosk'
-            ? getVoskSttService()
-            : speechConfig?.sttProvider === 'offline'
-                ? getOfflineSttService()
-                : getOnlineSttService();
+        : speechConfig?.sttProvider === 'whisper'
+            ? getWhisperSTTService()
+            : speechConfig?.sttProvider === 'vosk'
+                ? getVoskSttService()
+                : speechConfig?.sttProvider === 'offline'
+                    ? getOfflineSttService()
+                    : getOnlineSttService();
 
     const handleTranscriptUpdate = useCallback((text: string) => {
         setTranscript(text);
@@ -88,7 +91,7 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
         }
     }, [sendMessage]);
 
-    // Load STT model if needed (Vosk or Voxtral)
+    // Load STT model if needed (Vosk, Voxtral, or Whisper)
     useEffect(() => {
         const checkAndLoadModel = async () => {
             if (speechConfig?.sttProvider === 'vosk' && speechConfig?.voskModelId) {
@@ -102,6 +105,44 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
                         setStatus('Ready');
                     } catch (err) {
                         logger.log('error', 'Failed to load Vosk model:', err);
+                        setStatus('Error: Failed to load model');
+                        setIsSttReady(false);
+                    }
+                } else {
+                    setIsSttReady(true);
+                }
+            } else if (speechConfig?.sttProvider === 'whisper') {
+                const whisperService = getWhisperSTTService();
+                let modelToLoad = speechConfig.whisperModelId;
+
+                if (!modelToLoad) {
+                    try {
+                        const { listLocalWhisperModels } = await import('../../services/stt/whisperModelDownloader');
+                        const models = await listLocalWhisperModels();
+                        if (models.length > 0) {
+                            modelToLoad = models[0];
+                            logger.log('info', `VoiceChatOverlay: Auto-selecting Whisper model: ${modelToLoad}`);
+                        }
+                    } catch (e) {
+                        logger.log('error', 'VoiceChatOverlay: Failed to discover Whisper models', e);
+                    }
+                }
+
+                if (!modelToLoad) {
+                    setStatus('Error: No Whisper models installed. Check Settings.');
+                    setIsSttReady(false);
+                    return;
+                }
+
+                if (!whisperService.isModelLoaded() || whisperService.getCurrentModelId() !== modelToLoad) {
+                    setStatus('Loading Whisper...');
+                    setIsSttReady(false);
+                    try {
+                        await whisperService.loadModel(modelToLoad);
+                        setIsSttReady(true);
+                        setStatus('Ready');
+                    } catch (err) {
+                        logger.log('error', 'Failed to load Whisper model:', err);
                         setStatus('Error: Failed to load model');
                         setIsSttReady(false);
                     }
@@ -160,7 +201,7 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
         };
 
         checkAndLoadModel();
-    }, [speechConfig?.sttProvider, speechConfig?.voskModelId, speechConfig?.voxtralModel, speechConfig?.voxtralLatency, speechConfig?.voxtralThreads]);
+    }, [speechConfig?.sttProvider, speechConfig?.voskModelId, speechConfig?.whisperModelId, speechConfig?.voxtralModel, speechConfig?.voxtralLatency, speechConfig?.voxtralThreads]);
 
     // Throttle audio level updates to reduce render pressure (10fps)
     const throttledSetAudioLevel = useCallback((level: number) => {
@@ -197,7 +238,7 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
         } else {
             // Only start listening if STT is ready
             if (!isSttReady) {
-                if (speechConfig?.sttProvider === 'vosk' || speechConfig?.sttProvider === 'voxtral') {
+                if (speechConfig?.sttProvider === 'vosk' || speechConfig?.sttProvider === 'voxtral' || speechConfig?.sttProvider === 'whisper') {
                     setStatus('Loading model...');
                     return;
                 }
@@ -206,12 +247,11 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
             // Initial state before listening
             setStatus('Connecting...');
 
-            // Delay to prevent picking up TTS echo + ensure TTS has fully stopped
-
+            // Delay to prevent picking up TTS echo
             const timer = setTimeout(() => {
                 setStatus('Listening');
                 sttService.start(handleTranscriptUpdate, apiKey, throttledSetAudioLevel);
-            }, 2500);
+            }, 1000);
 
             return () => {
                 clearTimeout(timer);

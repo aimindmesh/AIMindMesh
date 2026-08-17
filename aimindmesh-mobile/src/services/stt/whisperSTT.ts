@@ -27,106 +27,21 @@ async function initializeWhisperPlugin(): Promise<boolean> {
     }
 }
 
-/**
- * Whisper transcription result
- */
-export interface WhisperTranscriptResult {
-    text: string;
-    segments: WhisperSegment[];
-    processingTimeMs?: number;
-}
-
-/**
- * Individual transcript segment with timing
- */
-export interface WhisperSegment {
-    text: string;
-    startMs: number;
-    endMs: number;
-}
-
-/**
- * Whisper STT configuration
- * Extended parameters for optimal Italian transcription
- */
-export interface WhisperConfig {
-    language?: string;  // 'auto', 'en', 'it', etc.
-    translate?: boolean; // Translate to English
-    // Italian-optimized parameters
-    temperature?: number;     // 0.0 = deterministic decoding (best for Italian)
-    beamSize?: number;        // 5 = standard beam search for accuracy
-    bestOf?: number;          // Number of candidates to evaluate
-    initialPrompt?: string;   // Context prompt to reduce language mixing
-    // VAD parameters
-    vadFilter?: boolean;      // Enable silence filtering
-    minSilenceDurationMs?: number; // Silence threshold for splitting
-    speechPadMs?: number;     // Padding around speech segments
-    // Quality settings  
-    conditionOnPreviousText?: boolean; // Use previous context for better coherence
-    wordTimestamps?: boolean; // Enable word-level timestamps
-    chunkSize?: number;       // Chunk size in seconds for streaming
-}
-
-/**
- * Device optimization information from SoC detection.
- * Used to determine optimal thread count and recommended model.
- */
-export interface WhisperDeviceInfo {
-    soc: 'SNAPDRAGON_8_ELITE' | 'SNAPDRAGON_8_GEN_2' | 'UNKNOWN';
-    availableCores: number;
-    recommendedThreads: number;
-    recommendedModel: string;
-    deviceInfo: string;
-}
-
-/**
- * Segment callback data received during streaming transcription
- */
-export interface WhisperStreamingSegment {
-    text: string;
-    startMs: number;
-    endMs: number;
-    segmentIndex: number;
-}
-
-/**
- * Whisper transcription profiles for different use cases
- */
-export const whisperProfiles = {
-    // Fast preview for real-time/hybrid mode (greedy decoding)
-    fastPreview: {
-        temperature: 0.0,
-        beamSize: 1,
-        bestOf: 1,
-        vadFilter: false,
-        conditionOnPreviousText: false,
-        wordTimestamps: false
-    } as WhisperConfig,
-
-    // Maximum accuracy for post-processing
-    maxAccuracy: {
-        temperature: 0.0,
-        beamSize: 5,
-        bestOf: 5,
-        vadFilter: true,
-        minSilenceDurationMs: 1000,
-        speechPadMs: 400,
-        conditionOnPreviousText: true,
-        wordTimestamps: true
-    } as WhisperConfig,
-
-    // Italian-specific prompts by profile
-    italianPrompts: {
-        fastPreview: 'Trascrizione in italiano.',
-        maxAccuracy: 'Trascrizione professionale in italiano. Meeting di progetto con terminologia tecnica: task, issue, milestone, deploy, sprint, backlog.'
-    }
-};
+export * from './whisperTypes';
+import {
+    WhisperSegment,
+    WhisperTranscriptResult,
+    WhisperConfig,
+    WhisperDeviceInfo,
+    WhisperStreamingSegment,
+    whisperProfiles
+} from './whisperTypes';
 
 /**
  * Whisper STT Service
  */
 export class WhisperSTTService {
-    private isModelLoaded = false;
+    private _isModelLoaded = false;
     private currentModelId: string | null = null;
     private initialized = false;
 
@@ -135,7 +50,7 @@ export class WhisperSTTService {
     }
 
     /**
-     * Ensure the Whisper plugin is initialized
+     * Ensure the native plugin is initialized
      */
     private async ensureInitialized(): Promise<boolean> {
         if (this.initialized) return Whisper !== null;
@@ -155,16 +70,15 @@ export class WhisperSTTService {
     }
 
     /**
-     * Async check if Whisper is available (initializes plugin if needed)
+     * Ensure Whisper is available, initializing if necessary
      */
     public async ensureAvailable(): Promise<boolean> {
-        await this.ensureInitialized();
-        return Whisper !== null;
+        return await this.ensureInitialized();
     }
 
     /**
      * Load a Whisper model
-     * @param modelId Model ID from WHISPER_MODELS (e.g., 'ggml-base')
+     * @param modelId Model identifier (e.g., 'ggml-base', 'ggml-small') or full path
      */
     public async loadModel(modelId: string): Promise<void> {
         const available = await this.ensureAvailable();
@@ -172,35 +86,55 @@ export class WhisperSTTService {
             throw new Error('Whisper plugin not available');
         }
 
-        try {
-            // Log device optimization info on first model load
-            if (!this.isModelLoaded) {
-                const deviceInfo = await this.getDeviceOptimization();
-                logger.log('info', '========== WHISPER DEVICE OPTIMIZATION ==========');
-                logger.log('info', `Detected SoC: ${deviceInfo.soc}`);
-                logger.log('info', `Available Cores: ${deviceInfo.availableCores}`);
-                logger.log('info', `Recommended Threads: ${deviceInfo.recommendedThreads}`);
-                logger.log('info', `Recommended Model: ${deviceInfo.recommendedModel}`);
-                logger.log('info', '=================================================');
-            }
+        logger.log('info', `Loading Whisper model: ${modelId}`);
 
-            // Unload current model if different
-            if (this.isModelLoaded && this.currentModelId !== modelId) {
+        try {
+            // Unload current model if loaded
+            if (this._isModelLoaded) {
                 await this.unloadModel();
             }
 
-            const modelPath = `whisper-models/${modelId}.bin`;
-            logger.log('info', `Loading Whisper model: ${modelPath}`);
+            // In Whisper.cpp plugin, modelPath can be relative to whisper-models or absolute
+            const modelPath = modelId.includes('/') ? modelId : `whisper-models/${modelId}.bin`;
 
-            await Whisper.loadModel({ modelPath });
+            // Memory coordination: try to unload main LLM to free RAM
+            try {
+                const { releaseAllSmolLM, isSmolLMLoaded } = await import('../llm/smolLM');
+                if (isSmolLMLoaded('chat') || isSmolLMLoaded('tool')) {
+                    logger.log('info', '[WhisperSTT] Unloading main LLM to free memory for Whisper...');
+                    await releaseAllSmolLM();
+                    logger.log('info', '[WhisperSTT] Main LLM unloaded successfully');
+                }
+            } catch (e) {
+                // Not critical — LLM might not be loaded
+                logger.log('debug', '[WhisperSTT] LLM unload skipped (not loaded or unavailable)');
+            }
 
-            this.isModelLoaded = true;
+            // Determine optimal thread count based on device
+            const deviceInfo = await this.getDeviceOptimization();
+            const nThreads = deviceInfo.recommendedThreads;
+
+            logger.log('info', `Using ${nThreads} threads for Whisper model (SoC: ${deviceInfo.soc})`);
+
+            // Check if model exists before loading
+            const { whisperModelExists } = await import('./whisperModelDownloader');
+            const exists = await whisperModelExists(modelId);
+            if (!exists && !modelId.includes('/')) {
+                throw new Error(`Whisper model ${modelId} not found. Please download it first.`);
+            }
+
+            await Whisper.loadModel({
+                modelPath,
+                nThreads
+            });
+
+            this._isModelLoaded = true;
             this.currentModelId = modelId;
-            logger.log('info', 'Whisper model loaded successfully');
+            logger.log('info', `Whisper model loaded successfully: ${modelId}`);
         } catch (error) {
-            logger.log('error', `Failed to load Whisper model ${modelId}`, error);
-            this.isModelLoaded = false;
+            this._isModelLoaded = false;
             this.currentModelId = null;
+            logger.log('error', `Failed to load Whisper model: ${modelId}`, error);
             throw error;
         }
     }
@@ -210,13 +144,13 @@ export class WhisperSTTService {
      */
     public async unloadModel(): Promise<void> {
         const available = await this.ensureAvailable();
-        if (!available || !this.isModelLoaded) {
+        if (!available || !this._isModelLoaded) {
             return;
         }
 
         try {
             await Whisper.unloadModel();
-            this.isModelLoaded = false;
+            this._isModelLoaded = false;
             this.currentModelId = null;
             logger.log('info', 'Whisper model unloaded');
         } catch (error) {
@@ -235,10 +169,66 @@ export class WhisperSTTService {
 
         try {
             const result = await Whisper.isModelLoaded();
-            this.isModelLoaded = result.loaded;
+            this._isModelLoaded = result.loaded;
             return result.loaded;
         } catch {
             return false;
+        }
+    }
+
+    /**
+     * Check if a model is loaded (synchronous property check)
+     */
+    public isModelLoaded(): boolean {
+        return this._isModelLoaded;
+    }
+
+    private liveStreamManager: any = null;
+
+    /**
+     * Check if speech recognition is currently active
+     */
+    public isRecognitionActive(): boolean {
+        return this.liveStreamManager?.isRunning() ?? false;
+    }
+
+    /**
+     * Start live streaming speech recognition from microphone
+     */
+    public async start(
+        onUpdate: (transcript: string) => void,
+        _apiKey?: string,
+        onAudioLevel?: (level: number) => void
+    ): Promise<void> {
+        const available = await this.ensureAvailable();
+        if (!available) {
+            throw new Error('Whisper plugin not available');
+        }
+
+        if (!this._isModelLoaded) {
+            const { listLocalWhisperModels } = await import('./whisperModelDownloader');
+            const models = await listLocalWhisperModels();
+            if (models.length > 0) {
+                await this.loadModel(models[0]);
+            } else {
+                throw new Error('No Whisper model loaded. Please download or select a Whisper model in Settings > Speech & Audio.');
+            }
+        }
+
+        if (!this.liveStreamManager) {
+            const { WhisperLiveStreamManager } = await import('./whisperLiveStream');
+            this.liveStreamManager = new WhisperLiveStreamManager(this);
+        }
+
+        await this.liveStreamManager.start(onUpdate, onAudioLevel);
+    }
+
+    /**
+     * Stop live streaming speech recognition
+     */
+    public async stop(): Promise<void> {
+        if (this.liveStreamManager) {
+            await this.liveStreamManager.stop();
         }
     }
 

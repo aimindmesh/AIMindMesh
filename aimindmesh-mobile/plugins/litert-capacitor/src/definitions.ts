@@ -6,6 +6,15 @@
  */
 import type { PluginListenerHandle } from '@capacitor/core';
 
+export interface LiteRTToolDefinition {
+    /** Tool name (must be unique) */
+    name: string;
+    /** Description of what the tool does */
+    description: string;
+    /** JSON Schema for the tool's parameters */
+    parameters: Record<string, unknown>;
+}
+
 export interface LiteRTInitOptions {
     /** Path to the .litertlm or .task model file */
     modelPath: string;
@@ -21,6 +30,10 @@ export interface LiteRTInitOptions {
     enableVision?: boolean;
     enableAudio?: boolean;
     maxNumImages?: number;
+    /** Enable native tool calling (LiteRT v0.14+) */
+    enableToolCalling?: boolean;
+    /** Tool definitions for native function calling (LiteRT v0.14+) */
+    tools?: LiteRTToolDefinition[];
 }
 
 
@@ -47,6 +60,11 @@ export interface LiteRTGenerateResult {
     text: string;
     done: boolean;
     error?: string;
+    /** Native tool calls from LiteRT v0.14+ function calling */
+    toolCalls?: Array<{
+        name: string;
+        args: Record<string, unknown>;
+    }>;
 }
 
 export interface LiteRTTokenEvent {
@@ -90,10 +108,41 @@ export interface LiteRTPlugin {
     isModelLoaded(): Promise<{ loaded: boolean }>;
 
     /**
+     * Register tool definitions for native function calling (LiteRT v0.14+).
+     * Must be called after initModel and before generateResponse/Stream.
+     */
+    registerTools(options: { tools: LiteRTToolDefinition[] }): Promise<{ success: boolean }>;
+
+    /**
      * Add a listener for token streaming events
      */
     addListener(
         eventName: 'liteRTToken',
         listener: (event: LiteRTTokenEvent) => void
     ): Promise<PluginListenerHandle>;
+
+    /**
+     * Save current conversation KV cache to disk
+     */
+    saveKvCache(options: { conversationId: string }): Promise<{ success: boolean }>;
+
+    /**
+     * Restore conversation KV cache from disk
+     */
+    restoreKvCache(options: { conversationId: string }): Promise<{ success: boolean; messageCount?: number }>;
+
+    /**
+     * Invalidate/delete conversation KV cache from disk
+     */
+    invalidateKvCache(options: { conversationId: string }): Promise<{ success: boolean }>;
+
+    /**
+     * Release conversation session
+     */
+    releaseSession(): Promise<void>;
+
+    /**
+     * Get current message count
+     */
+    getMessageCount(): Promise<{ count: number }>;
 }

@@ -33,6 +33,8 @@ import { useMeetingAnalysis } from '../../hooks/meeting/useMeetingAnalysis';
 import { useMeetingReprocessing } from '../../hooks/meeting/useMeetingReprocessing';
 import { useVoskTranscription } from '../../hooks/meeting/useVoskTranscription';
 import { useWhisperTranscription } from '../../hooks/meeting/useWhisperTranscription';
+import { useOverlapDetection } from '../../hooks/meeting/useOverlapDetection';
+import { useHybridTranscription } from '../../hooks/meeting/useHybridTranscription';
 import { useMeetingInitialization } from '../../hooks/meeting/useMeetingInitialization';
 
 import { segmentAudioService } from '../../services/meeting/SegmentAudioService';
@@ -161,7 +163,10 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, personality, llmConf
         recognitionModeRef: settings.recognitionModeRef,
         transcriptionModeRef,
         showToast,
-        onRecordingStopped: handleRecordingStopped
+        onRecordingStopped: handleRecordingStopped,
+        setCurrentText,
+        setTranscript,
+        diarizationRef
     });
 
     const saveMeeting = useCallback(async () => {
@@ -246,7 +251,16 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, personality, llmConf
         settings,
         recording,
         setTranscript,
-        setIsWhisperTranscribing
+        setIsWhisperTranscribing,
+        diarizationRef,
+        recognitionModeRef: settings.recognitionModeRef
+    });
+
+    useHybridTranscription({
+        settings,
+        recording,
+        transcript,
+        setTranscript
     });
 
     const { isModelLoading } = useMeetingInitialization({
@@ -255,6 +269,9 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, personality, llmConf
         transcript,
         currentText
     });
+
+    // Overlap detection: marks segments where two speakers talk simultaneously
+    useOverlapDetection({ transcript, setTranscript });
 
     // ===== Effects =====
 
@@ -453,8 +470,16 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, personality, llmConf
                     transcriptionMode={settings.transcriptionMode}
                     setTranscriptionMode={settings.setTranscriptionMode}
                     whisperChunkSize={settings.whisperChunkSize}
-                    setWhisperChunkSize={settings.setWhisperChunkSize}
-                    // Advanced Diarization
+setWhisperChunkSize={settings.setWhisperChunkSize}
+                        whisperVadFilter={settings.whisperVadFilter}
+                        setWhisperVadFilter={settings.setWhisperVadFilter}
+                        whisperConditionOnPrevious={settings.whisperConditionOnPrevious}
+                        setWhisperConditionOnPrevious={settings.setWhisperConditionOnPrevious}
+                        whisperWordTimestamps={settings.whisperWordTimestamps}
+                        setWhisperWordTimestamps={settings.setWhisperWordTimestamps}
+                        whisperProfile={settings.whisperProfile}
+                        setWhisperProfile={settings.setWhisperProfile}
+                        // Advanced Diarization
                     embeddingThreshold={settings.embeddingThreshold}
                     setEmbeddingThreshold={settings.setEmbeddingThreshold}
                     embeddingRejectionThreshold={settings.embeddingRejectionThreshold}

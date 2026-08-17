@@ -333,6 +333,48 @@ Java_com_aimindmesh_llama_LlamaCppInference_resetContextNative(
 }
 
 /**
+ * Save KV cache state for a specific sequence to a file.
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_aimindmesh_llama_LlamaCppInference_saveStateNative(
+    JNIEnv* env, jobject thiz, jlong modelPtr, jstring filepath, jint seqId) {
+    
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_inferences.find(modelPtr);
+    if (it == g_inferences.end()) {
+        LOGe("Invalid model handle %ld for saveState", (long)modelPtr);
+        return JNI_FALSE;
+    }
+
+    jboolean isCopy = JNI_TRUE;
+    const char* filepathCstr = env->GetStringUTFChars(filepath, &isCopy);
+    bool result = it->second->saveState(filepathCstr, seqId);
+    env->ReleaseStringUTFChars(filepath, filepathCstr);
+    return result ? JNI_TRUE : JNI_FALSE;
+}
+
+/**
+ * Load KV cache state for a specific sequence from a file.
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_aimindmesh_llama_LlamaCppInference_loadStateNative(
+    JNIEnv* env, jobject thiz, jlong modelPtr, jstring filepath, jint seqId) {
+    
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_inferences.find(modelPtr);
+    if (it == g_inferences.end()) {
+        LOGe("Invalid model handle %ld for loadState", (long)modelPtr);
+        return JNI_FALSE;
+    }
+
+    jboolean isCopy = JNI_TRUE;
+    const char* filepathCstr = env->GetStringUTFChars(filepath, &isCopy);
+    bool result = it->second->loadState(filepathCstr, seqId);
+    env->ReleaseStringUTFChars(filepath, filepathCstr);
+    return result ? JNI_TRUE : JNI_FALSE;
+}
+
+/**
  * Get formatted chat string directly from the LLM model using its template engine.
  */
 JNIEXPORT jstring JNICALL

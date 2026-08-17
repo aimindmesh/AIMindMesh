@@ -1,6 +1,11 @@
 import db from '../../db/sqlite';
 import { Logger } from '../../utils/Logger';
 import { InferenceRouter } from '../InferenceRouter';
+import { InferenceRegistry } from '../InferenceRegistry';
+import crypto from 'node:crypto';
+import dns from 'node:dns/promises';
+import fs from 'node:fs';
+import path from 'node:path';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Healing Prompt — injected at the top of EVERY agent task for a venture repo
@@ -14,14 +19,15 @@ const HEALING_PREAMBLE = `
 You are working on a Gitea repository. Previous agent sessions may have left
 partial or empty files. Before writing a single line of code you MUST:
 
-1. Run: git status
-2. Detect empty source files:
+1. Clone the repository if you haven't already and cd into it.
+2. Run: git status
+3. Detect empty source files:
    find . \\( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \\) -not -path "*/node_modules/*" | xargs -I{} sh -c 'test -s "{}" || echo "EMPTY: {}"'
-3. If ANY empty/partial files are found:
+4. If ANY empty/partial files are found:
    a. Run: git log --oneline -5   (inspect last commits)
    b. If the repo has at least one commit: git reset --hard HEAD
    c. If the repo has NO commits yet (empty): rm -rf src && rm -f package.json tsconfig.json (start fresh)
-4. Verify the workspace is clean and coherent before proceeding.
+5. Verify the workspace is clean and coherent before proceeding.
 
 ## ⚠️ STRICT CONCRETE DEVELOPMENT PARADIGM
 
@@ -46,6 +52,7 @@ Before you declare your work finished, you MUST independently verify that the so
 
 // Stale threshold: repos stuck in "evolving" for more than 90 minutes
 // with no active OpenClaw session are considered stale and auto-retriggered.
+// Repos in "cooldown" state are re-triggered when their cooldown_until passes.
 const STALE_THRESHOLD_MS = 90 * 60 * 1000;
 
 export class VentureOrchestrator {
@@ -267,22 +274,33 @@ Format:
         Logger.warn('VentureOrchestrator', `Failed to check session history: ${e.message}`);
       }
 
+      let errorContext = '';
+      const errorLogPath = path.join(__dirname, `../../../data/validation-errors-${repoName}.log`);
+      if (fs.existsSync(errorLogPath)) {
+        try {
+          const rawError = fs.readFileSync(errorLogPath, 'utf8');
+          errorContext = `\n\n⚠️ PREVIOUS BUILD/TEST FAILURE DETAILS:\n${rawError}\nPlease fix these issues first. Ensure package.json, tsconfig.json, and all necessary dependencies and configs are properly set up and functional.`;
+        } catch (e) {}
+      }
+
       const developmentTask = isExistingSession
         ? `Please resume development for "${ideaRow.title}".
-Your previous session was interrupted. Resume from where you left off.
-Repository: ${gitUrl}
+Your previous session was interrupted or failed verification. Resume from where you left off.
+Repository: ${gitUrl}${errorContext}
 Current Strategic Directives:
-${directivesText}`
+${directivesText}
+
+IMPORTANT: Always explicitly use 'git clone ${gitUrl}' and 'cd ${slug}' first if the folder does not exist.`
         : `We have approved a new venture idea: "${ideaRow.title}"
 Problem Statement: ${ideaRow.problem_statement || ''}
 Debate Synthesis: ${synthesis || ''}
 
-A Git repository has been provisioned at: ${gitUrl}
+A Git repository has been provisioned at: ${gitUrl}${errorContext}
 
 Current Strategic Directives:
 ${directivesText}
 
-Please begin development. Initialize the project inside the repository, build the core functionalities, and push the code back to Gitea.`;
+Please begin development. First, run 'git clone ${gitUrl}' and 'cd ${slug}'. Then initialize the project inside the repository, build the core functionalities, and push the code back to Gitea.`;
 
       // Compose final prompt: healing preamble + actual task
       const agentPrompt = HEALING_PREAMBLE + developmentTask;
@@ -293,17 +311,49 @@ Please begin development. Initialize the project inside the repository, build th
         `UPDATE organization_repositories SET validation_status = 'evolving', agent_last_triggered_at = ? WHERE id = ?`
       ).run(now, repoId);
 
+      const inferenceId = crypto.randomUUID();
+      const inferenceTaskName = `AI Council: ${slug}`;
+
+      // Register in InferenceRegistry so it appears in Activity Queue
+      InferenceRegistry.register(
+        inferenceId,
+        'AGENT_TASK',
+        inferenceTaskName,
+        'openclaw',
+        { repoId, repoName: slug, sessionKey },
+        'freellmapi'
+      );
+      InferenceRegistry.setStatus(inferenceId, 'PROCESSING');
+
       Logger.info('VentureOrchestrator', `Triggering OpenClaw Agent (resume=${isExistingSession}) for: ${ideaRow.title}`);
 
-      runOpenClawTask(agentPrompt, sessionKey).then(() => {
-        // Mark as needs_verification when agent task completes
-        db.prepare(
-          `UPDATE organization_repositories SET validation_status = 'needs_verification' WHERE id = ? AND validation_status = 'evolving'`
-        ).run(repoId);
-        Logger.info('VentureOrchestrator', `Agent task completed for ${repoName}. Status → needs_verification`);
+      runOpenClawTask(agentPrompt, sessionKey).then((result) => {
+        // Detect if the agent output signals an error
+        const resultText = typeof result === 'object' ? (result as any).reply || '' : String(result || '');
+        const isAgentError = resultText.includes('\u26a0\ufe0f AGENT ERROR') ||
+          resultText.toLowerCase().includes('task execution failed') ||
+          resultText.toLowerCase().includes('aborted');
+
+        if (isAgentError) {
+          InferenceRegistry.finish(inferenceId, undefined, resultText.substring(0, 300));
+          VentureOrchestrator.handleTaskFailure(repoId, repoName, new Error(resultText.substring(0, 200)));
+        } else {
+          // Success: mark as verified and reset retry counter
+          db.prepare(
+            `UPDATE organization_repositories SET validation_status = 'needs_verification', retry_count = 0, cooldown_until = NULL WHERE id = ? AND validation_status = 'evolving'`
+          ).run(repoId);
+          InferenceRegistry.finish(inferenceId, 'Agent task completed successfully.');
+          Logger.info('VentureOrchestrator', `Agent task completed for ${repoName}. Status → needs_verification`);
+
+          // Trigger automatic Kasm validation
+          VentureOrchestrator.runKasmValidation(repoId, repoName, gitUrl).catch((err) => {
+            Logger.error('VentureOrchestrator', `Failed to initiate automatic Kasm validation: ${err.message}`);
+          });
+        }
       }).catch((e: any) => {
+        InferenceRegistry.finish(inferenceId, undefined, e.message);
         Logger.error('VentureOrchestrator', `OpenClaw Agent execution failed: ${e.message}`);
-        // Don't reset status — watchdog will detect stale state and retry
+        VentureOrchestrator.handleTaskFailure(repoId, repoName, e);
       });
 
     } catch (agentErr: any) {
@@ -312,8 +362,41 @@ Please begin development. Initialize the project inside the repository, build th
   }
 
   /**
+   * Handles a failed agent task by applying exponential backoff cooldown.
+   * Sets repo status to 'cooldown' and records a restart time.
+   * Cooldown schedule: 5m → 10m → 20m → 30m → 60m (capped)
+   */
+  private static handleTaskFailure(repoId: string, repoName: string, error: Error): void {
+    try {
+      const repo = db.prepare('SELECT retry_count FROM organization_repositories WHERE id = ?').get(repoId) as { retry_count: number } | undefined;
+      const nextRetryCount = (repo?.retry_count || 0) + 1;
+
+      // Exponential backoff: 5m, 10m, 20m, 30m... capped at 60 minutes
+      const cooldownMin = Math.min(5 * Math.pow(2, nextRetryCount - 1), 60);
+      const cooldownUntil = new Date(Date.now() + cooldownMin * 60 * 1000).toISOString();
+
+      db.prepare(
+        `UPDATE organization_repositories
+         SET validation_status = 'cooldown',
+             retry_count = ?,
+             cooldown_until = ?
+         WHERE id = ?`
+      ).run(nextRetryCount, cooldownUntil, repoId);
+
+      Logger.warn(
+        'VentureOrchestrator',
+        `Repo "${repoName}" entered cooldown (retry #${nextRetryCount}, ${cooldownMin}m). ` +
+        `Will auto-resume after ${cooldownUntil}. Reason: ${error.message.substring(0, 150)}`
+      );
+    } catch (err: any) {
+      Logger.error('VentureOrchestrator', `Failed to record task failure for ${repoName}: ${err.message}`);
+    }
+  }
+
+  /**
    * Watchdog: scans repos stuck in "evolving" state with no active OpenClaw session
-   * for longer than STALE_THRESHOLD_MS and auto-retriggers them.
+   * for longer than STALE_THRESHOLD_MS, and repos in "cooldown" whose cooldown_until
+   * has passed. Auto-retriggers them.
    * Should be called at server startup and periodically (e.g. every 30 min).
    */
   public static async runWatchdog(): Promise<void> {
@@ -322,20 +405,45 @@ Please begin development. Initialize the project inside the repository, build th
       const { isSessionActive } = await import('../OpenClawBridge');
 
       const staleThresholdIso = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
+      const verifyingThresholdIso = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+      const nowIso = new Date().toISOString();
+
       const staleRepos = db.prepare(`
         SELECT r.*, i.title, i.problem_statement, i.analysis_synthesis
         FROM organization_repositories r
         LEFT JOIN organization_ideas i ON r.created_from_idea_id = i.id
-        WHERE r.validation_status = 'evolving'
-          AND (r.agent_last_triggered_at IS NULL OR r.agent_last_triggered_at < ?)
-      `).all(staleThresholdIso) as any[];
+        WHERE
+          (r.validation_status = 'evolving'
+            AND (r.agent_last_triggered_at IS NULL OR r.agent_last_triggered_at < ?))
+          OR
+          (r.validation_status = 'cooldown'
+            AND r.cooldown_until IS NOT NULL
+            AND r.cooldown_until < ?)
+          OR
+          (r.validation_status = 'verifying'
+            AND (r.agent_last_triggered_at IS NULL OR r.agent_last_triggered_at < ?))
+      `).all(staleThresholdIso, nowIso, verifyingThresholdIso) as any[];
 
       if (staleRepos.length === 0) {
-        Logger.info('VentureOrchestrator', 'Watchdog: no stale repos found.');
+        Logger.info('VentureOrchestrator', 'Watchdog: no stale/cooldown/verifying repos found.');
         return;
       }
 
       for (const repo of staleRepos) {
+        if (repo.validation_status === 'verifying') {
+          Logger.warn('VentureOrchestrator', `Watchdog: repo "${repo.repo_name}" is stuck in verifying. Re-triggering Kasm validation...`);
+          try {
+            const gitUrl = repo.gitea_url;
+            const gitUrlWithToken = process.env.GITEA_TOKEN
+              ? gitUrl.replace('http://', `http://token:${process.env.GITEA_TOKEN}@`)
+              : gitUrl;
+            void VentureOrchestrator.runKasmValidation(repo.id, repo.repo_name, gitUrlWithToken);
+          } catch (valErr: any) {
+            Logger.error('VentureOrchestrator', `Watchdog: failed to re-trigger Kasm validation for ${repo.repo_name}: ${valErr.message}`);
+          }
+          continue;
+        }
+
         const sessionKey = `develop-${repo.repo_name}`;
         const active = isSessionActive(sessionKey);
 
@@ -398,6 +506,92 @@ Please begin development. Initialize the project inside the repository, build th
       }
     } catch (err: any) {
       Logger.error('VentureOrchestrator', `CI webhook handling error: ${err.message}`);
+    }
+  }
+
+  /**
+   * Automatically launches a new Kasm Ubuntu workspace, clones the repo,
+   * compiles and runs the tests, and updates the repository validation status.
+   */
+  public static async runKasmValidation(repoId: string, repoName: string, gitUrl: string): Promise<void> {
+    const inferenceId = crypto.randomUUID();
+    const inferenceTaskName = `Kasm Test: ${repoName}`;
+    const errorLogPath = path.join(__dirname, `../../../data/validation-errors-${repoName}.log`);
+    
+    try {
+      Logger.info('VentureOrchestrator', `Starting automatic Kasm validation for ${repoName}`);
+
+      // Register in InferenceRegistry so it shows up in the Activity Queue
+      InferenceRegistry.register(
+        inferenceId,
+        'AGENT_TASK',
+        inferenceTaskName,
+        'kasm-validation',
+        { repoId, repoName },
+        'freellmapi'
+      );
+      InferenceRegistry.setStatus(inferenceId, 'PROCESSING');
+
+      // Update status to 'verifying'
+      db.prepare(`UPDATE organization_repositories SET validation_status = 'verifying' WHERE id = ?`).run(repoId);
+
+      // Resolve Gitea hostname to IP if it matches 'gitea' (to bridge nested Kasm network mapping)
+      let resolvedGitUrl = gitUrl;
+      try {
+        const urlObj = new URL(gitUrl);
+        if (urlObj.hostname === 'gitea') {
+          const address = await dns.lookup('gitea');
+          urlObj.hostname = address.address;
+          resolvedGitUrl = urlObj.toString();
+        }
+      } catch (dnsErr: any) {
+        Logger.warn('VentureOrchestrator', `Failed to dynamically resolve Gitea IP: ${dnsErr.message}`);
+      }
+
+      const { KasmValidationService } = await import('./KasmValidationService');
+      const validationService = new KasmValidationService();
+      
+      const validationResult = await validationService.runValidation(resolvedGitUrl, 'smoke');
+      
+      const finalStatus = validationResult.status === 'passed' ? 'healthy' : 'broken';
+      db.prepare('UPDATE organization_repositories SET validation_status = ? WHERE id = ?').run(finalStatus, repoId);
+
+      const { OrganizationAuditService } = await import('./OrganizationAuditService');
+      const auditService = new OrganizationAuditService();
+      await auditService.log({
+        eventType: 'repo:validate',
+        actorType: 'system',
+        actorId: 'kasm-validation',
+        targetType: 'repository',
+        targetId: repoId,
+        payload: { status: finalStatus, summary: validationResult.summary }
+      });
+
+      if (validationResult.status === 'passed') {
+        // Clear previous error log if success
+        if (fs.existsSync(errorLogPath)) {
+          fs.unlinkSync(errorLogPath);
+        }
+        InferenceRegistry.finish(inferenceId, `Kasm validation passed successfully: ${validationResult.summary}`);
+        Logger.info('VentureOrchestrator', `Kasm validation passed for ${repoName}`);
+      } else {
+        // Save failure logs and trigger retry cooldown
+        const failureDetails = `Summary: ${validationResult.summary}\nLogs:\n${validationResult.logs.join('\n')}`;
+        fs.writeFileSync(errorLogPath, failureDetails, 'utf8');
+
+        InferenceRegistry.finish(inferenceId, undefined, `Kasm validation failed: ${validationResult.summary}`);
+        Logger.warn('VentureOrchestrator', `Kasm validation failed for ${repoName}. Invoking task failure / recovery.`);
+
+        VentureOrchestrator.handleTaskFailure(repoId, repoName, new Error(`Kasm validation failed: ${validationResult.summary}`));
+      }
+    } catch (err: any) {
+      Logger.error('VentureOrchestrator', `Automatic Kasm validation failed for ${repoName}: ${err.message}`);
+      fs.writeFileSync(errorLogPath, `Internal error: ${err.message}\n${err.stack || ''}`, 'utf8');
+      
+      db.prepare(`UPDATE organization_repositories SET validation_status = 'broken' WHERE id = ?`).run(repoId);
+      InferenceRegistry.finish(inferenceId, undefined, `Kasm validation internal error: ${err.message}`);
+      
+      VentureOrchestrator.handleTaskFailure(repoId, repoName, err);
     }
   }
 }

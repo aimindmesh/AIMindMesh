@@ -391,39 +391,34 @@ export class SpeakerEmbedding {
             }));
 
             const result = strategy.cluster(stored, {
-                distanceThreshold: 1 - this.threshold, // Convert similarity to distance
+                distanceThreshold: 1 - this.threshold,
                 logCallback: this.logCallback
             });
 
             // Update internal centroids with clustering results
             if (result.centroids.length > 0) {
-                // Preserve user profile at index 0 if enrolled
-                // Preserve user profile at index 0 if enrolled
                 const newSpeakers: number[][] = [];
-
                 if (this.hasUserEnrolled && this.userProfile) {
                     newSpeakers.push([...this.userProfile]);
                 }
-
                 for (const centroid of result.centroids) {
                     if (centroid.length > 0) {
                         newSpeakers.push([...centroid]);
                     }
                 }
-
-                // Only replace if clustering found a reasonable number of speakers
                 if (newSpeakers.length > 0 && newSpeakers.length <= this.sessionEmbeddings.length) {
                     this.speakers = newSpeakers;
-                    this.logCallback(`Centroids updated: ${this.speakers.length} speakers (was ${result.speakerCount})`);
+                    this.logCallback(`Centroids updated: ${newSpeakers.length} speakers (was ${result.speakerCount})`);
                 }
             }
 
-            // Build correction map: segmentId → new speakerId
+            // Build corrections map: segmentId → clusterId.
+            // The clusterId is offset by 1 if user profile occupies index 0,
+            // keeping speaker IDs consistent with the rest of the system.
             const corrections = new Map<string, number>();
+            const userProfileOffset = (this.hasUserEnrolled && this.userProfile) ? 1 : 0;
             for (const [embId, clusterId] of result.speakerAssignments) {
-                // Offset by 1 if user profile is at index 0
-                const offset = (this.hasUserEnrolled && this.userProfile) ? 1 : 0;
-                corrections.set(embId, clusterId + offset);
+                corrections.set(embId, clusterId + userProfileOffset);
             }
 
             return corrections;

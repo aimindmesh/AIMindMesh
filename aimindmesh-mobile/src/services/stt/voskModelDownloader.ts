@@ -47,11 +47,11 @@ export const VOSK_MODELS: VoskModel[] = [
     // Italian Models
     {
         id: 'vosk-model-it-0.22',
-        name: 'Italiano - Standard',
+        name: 'Italian - Standard',
         language: 'it',
         size: 128000000, // ~128MB
         url: 'https://alphacephei.com/vosk/models/vosk-model-it-0.22.zip',
-        description: 'Buon bilanciamento velocità/accuratezza',
+        description: 'Good balance of speed and accuracy',
         quality: 'medium'
     },
 ];
@@ -62,7 +62,7 @@ export const VOSK_SPEAKER_MODEL = {
     name: 'Speaker Model',
     size: 13000000, // ~13MB
     url: 'https://alphacephei.com/vosk/models/vosk-model-spk-0.4.zip',
-    description: 'Modello per identificazione speaker nelle meeting'
+    description: 'Speaker identification model for meetings'
 };
 
 // ONNX ECAPA models for high-accuracy speaker embedding
@@ -72,23 +72,23 @@ export const ONNX_SPEAKER_MODELS = [
         name: 'ECAPA-TDNN 512 (Standard)',
         size: 25000000, // ~25MB
         url: 'https://huggingface.co/Wespeaker/wespeaker-voxceleb-ecapa-tdnn512/resolve/main/voxceleb_ECAPA512.onnx?download=true',
-        description: 'ECAPA-TDNN 512 - Buona precisione',
+        description: 'ECAPA-TDNN 512 - Good accuracy',
         dimension: 512
     },
     {
         id: 'wespeaker-ecapa-tdnn512-LM',
-        name: 'ECAPA-TDNN 512 LM (Precisione Alta)',
+        name: 'ECAPA-TDNN 512 LM (High Precision)',
         size: 45000000, // ~45MB
         url: 'https://huggingface.co/Wespeaker/wespeaker-ecapa-tdnn512-LM/resolve/main/voxceleb_ECAPA512_LM.onnx?download=true',
-        description: 'ECAPA-TDNN con Large Margin - Massima precisione',
+        description: 'ECAPA-TDNN with Large Margin - Maximum accuracy',
         dimension: 512
     },
     {
         id: 'wespeaker-voxceleb-resnet34-LM',
-        name: 'ResNet34 LM (Alternativa)',
+        name: 'ResNet34 LM (Alternative)',
         size: 27000000, // ~27MB
         url: 'https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM/resolve/main/voxceleb_resnet34_LM.onnx?download=true',
-        description: 'ResNet34 con Large Margin',
+        description: 'ResNet34 with Large Margin',
         dimension: 256
     }
 ];

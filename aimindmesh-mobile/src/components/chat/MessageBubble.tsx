@@ -6,9 +6,10 @@ interface MessageBubbleProps {
   message: Message;
   onResend?: (message: Message) => void;
   onRegenerate?: (message: Message) => void;
+  onEditImage?: (image: string) => void;
 }
 
-const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onResend, onRegenerate }) => {
+const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onResend, onRegenerate, onEditImage }) => {
 
   const linkify = (text: string) => {
     const urlRegex = /(https?:\/\/[^\s]+)/g;
@@ -90,14 +91,32 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onResend, onRege
         >
           {message.images && message.images.length > 0 && (
             <div className="flex flex-wrap gap-2 mb-2">
-              {message.images.map((img, idx) => (
-                <img
-                  key={idx}
-                  src={img.webPath || (img.base64 ? `data:${img.mimeType};base64,${img.base64}` : '')}
-                  className="max-w-full max-h-48 rounded-lg object-contain"
-                  alt={img.name || `Image ${idx + 1}`}
-                />
-              ))}
+              {message.images.map((img, idx) => {
+                const imgSrc = img.webPath || (img.base64 ? `data:${img.mimeType};base64,${img.base64}` : '');
+                return (
+                  <div key={idx} className="relative group/img">
+                    <img
+                      src={imgSrc}
+                      className="max-w-full max-h-48 rounded-lg object-contain border border-white/10"
+                      alt={img.name || `Image ${idx + 1}`}
+                    />
+                    {onEditImage && imgSrc && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onEditImage(imgSrc);
+                        }}
+                        className="absolute bottom-1.5 right-1.5 px-2 py-0.5 rounded-full bg-black/70 hover:bg-amber-500 hover:text-black text-[10px] font-semibold text-amber-300 backdrop-blur-sm border border-white/15 transition-all opacity-0 group-hover/img:opacity-100 focus:opacity-100 flex items-center gap-1 shadow-md"
+                        title="Modify / Restyle with Qualcomm NPU"
+                      >
+                        <span>🎨</span>
+                        <span>Edit with AI</span>
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
           {message.audio && message.audio.length > 0 && (

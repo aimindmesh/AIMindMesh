@@ -15,7 +15,7 @@ const FALLBACK_STT_MODELS = [
 ];
 
 const LANGUAGE_OPTIONS = [
-    { code: 'it-IT', label: 'Italiano', flag: '🇮🇹' },
+    { code: 'it-IT', label: 'Italian', flag: '🇮🇹' },
     { code: 'en-US', label: 'English', flag: '🇺🇸' },
 ];
 

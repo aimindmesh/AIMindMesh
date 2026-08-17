@@ -292,6 +292,17 @@ export const organizationApi = {
     return await resp.json();
   },
 
+  async forceDevelop(settings: AIMindMeshServerSettings, repoId: string) {
+    const resp = await fetch(`${base(settings)}/api/organization/repositories/${repoId}/force-develop`, {
+      method: 'POST',
+      headers: headers(settings),
+      body: JSON.stringify({}),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!resp.ok) throw new Error(`Force develop failed: ${resp.status}`);
+    return await resp.json();
+  },
+
   async getHRProposals(settings: AIMindMeshServerSettings) {
     const resp = await fetch(`${base(settings)}/api/organization/hr/proposals`, {
       headers: headers(settings),

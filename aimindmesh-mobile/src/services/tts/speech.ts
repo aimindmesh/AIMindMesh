@@ -217,7 +217,8 @@ export const speak = async (text: string, provider: TtsProvider, llmConfig: LLMC
       return;
     }
     try {
-      await piperService.speak(text, onEnd);
+      // Use streaming TTS for lower perceived latency (starts speaking after first sentence)
+      await piperService.speakStreaming(text, () => {}, onEnd);
     } catch (error) {
       logger.log('error', "Error during Piper TTS", error);
       // Fallback to offline on error
@@ -269,10 +270,20 @@ export const stopSpeaking = () => {
   // Stop online TTS audio
   if (currentTtsSource) {
     logger.log('debug', 'Stopping online TTS audio source.');
-    currentTtsSource.onended = null; // Prevent onEnd from firing on manual stop
+    currentTtsSource.onended = null;
     currentTtsSource.stop();
     currentTtsSource = null;
   }
+  // Stop Piper TTS
+  try {
+    const { getPiperTtsService } = require('./piperTTS');
+    getPiperTtsService().stop();
+  } catch (e) { /* Piper not loaded, ignore */ }
+  // Stop Kokoro TTS
+  try {
+    const { getKokoroTtsService } = require('./kokoroTTS');
+    getKokoroTtsService().stop();
+  } catch (e) { /* Kokoro not loaded, ignore */ }
 };
 
 

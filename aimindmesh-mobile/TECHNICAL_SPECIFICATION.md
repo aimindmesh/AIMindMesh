@@ -77,6 +77,7 @@ The unique power of AI Mind Mesh comes from its extensive suite of custom native
 | **Voxtral** | `voxtral-capacitor` | **Real-time STT**. Mistral Voxtral Mini 4B Realtime via `mtmd` multimodal API (PCM→mel→CLIP→llama). Greedy token sampling (temperature=0). Auto-unloads main LLM for memory coordination. |
 | **Whisper** | `whisper-capacitor` | **High-Fidelity STT**. Runs OpenAI Whisper models (cpp port). Supports multilingual transcription and diarization preprocessing. |
 | **Piper** | `piper-capacitor` | **Neural TTS**. Synthesizes speech locally. Supports ONNX voice models with variable speech/pitch. |
+| **KokoroTTS** | `KokoroTTS` | **State-of-the-Art Neural TTS**. Offline multi-lingual speech synthesis powered by Sherpa-ONNX (`OfflineTts` / Kokoro-82M). Features in-JVM streaming archive decompression (Apache Commons Compress) supporting `.tar.bz2`, `.tar.gz`, `.zip`, `.tar` bundles with `content://` URI resolution and path normalization. Supports Italian (`if_sara`, `im_nicola`), English US (`af_sky`, `am_michael`), and English UK (`bf_emma`, `bm_george`). |
 | **Wakeword** | `wakeword-capacitor` | **Hotword Detection**. Runs `.tflite` models (e.g., "Hey Jarvis"). Monitoring usually 500ms intervals. |
 | **VAD** | `vad-capacitor` | **Voice Activity Detection**. Silero VAD based. Detects when user starts/stops speaking to handle turn-taking. |
 | **AudioOutput** | `audio-output-capacitor` | **Audio Routing**. Switches output between Earpiece (privacy) and Speakerphone. |
@@ -91,6 +92,8 @@ The unique power of AI Mind Mesh comes from its extensive suite of custom native
 | **SystemMonitor** | `system-monitor-cap` | **Diagnostics**. Real-time CPU/RAM usage tracking with granular visibility controls (RAM, CPU, GPU, App Mem). Floating overlay capability. |
 | **SpeakerEmbedding** | `speaker-embedding-capacitor` | **Biometrics**. Generates vector embeddings from voice audio for Speaker Diarization (Guest vs User 1 vs User 2). |
 | **TextEmbedding** | `text-embedding-capacitor` | **RAG Core**. Runs `all-MiniLM-L6-v2` to vectorize text for Semantic Memory storage and retrieval. |
+| **Genie** | `genie-capacitor` | **Qualcomm NPU LLM Runtime**. Executes Qwen 3.5, Qwen 2.5, and Gemma models directly on Hexagon NPU (HTP v79/v75) via Qualcomm AI Engine Direct (QNN) & GenieX SDK. 50+ tok/s at 2W power draw. |
+| **SD** | `sd-capacitor` | **Qualcomm NPU Image Generation**. Executes Stable Diffusion (v2.1 / v1.5) pipelines (`unet.bin`, `vae.bin`, `text_encoder.bin`) on Hexagon NPU in 2–4s per image. |
 
 ### 3.1 Vulkan Acceleration & Architecture Constraints
 The `llama-cpp-capacitor` plugin utilizes Vulkan for hardware-accelerated LLM inference. Due to Android NDK constraints and upstream `llama.cpp` divergence, the integration adheres to strict architectural patches:
@@ -137,6 +140,97 @@ LLMConfig.liteRTUseNPU (TS)
 ```
 
 **Device Requirements**: Snapdragon 8 Gen 2 or later. Falls back gracefully to selected CPU/GPU backend if `libQnnHtp.so` is not present on the device.
+
+### 3.4 Qualcomm Genie NPU LLM Subsystem (`genie-capacitor`)
+The `genie-capacitor` plugin provides dedicated native hardware execution for frontier generative models (including **Qwen 3.5**, **Qwen 2.5**, and **Gemma 2**) on Qualcomm Hexagon NPU.
+
+*   **Runtime Stack**: Interfaces directly with Qualcomm GenieX / QAIRT SDK (`com.qualcomm.qti:geniex-android` and `libGenie.so` + `libQnnHtp.so`).
+*   **Hardware Architecture & SoC Tuning**:
+    *   **Snapdragon 8 Elite (SM8750 / SoC 69 / Hexagon v79)** on Z Fold 7:
+        *   `perf_profile: "burst"`: Turbo clocking on HTP tensor processing units during token decoding.
+        *   `mem_type: "shared_buffer"`: Zero-copy DMA-BUF/ION buffer sharing between CPU and Hexagon NPU.
+        *   `rpc_control_latency: 100`: Microsecond target for FastRPC inter-process dispatch.
+        *   `cpu-mask: "0xe0"`: Pins FastRPC helper threads to Oryon/Kryo Prime + Gold performance cores (cores 5, 6, 7).
+        *   `poll: true`: Polling mode on FastRPC completion queues to eliminate Linux context switch overhead and minimize TTFT (Time To First Token).
+        *   `share_resources: true`: Shared group context for multi-part binary context graphs (`part_1_of_3`, etc.).
+*   **Model Package Lifecycle & Bundle Architecture**:
+    *   **Qualcomm AI Hub Archives (`.zip`)**: Models downloaded from Qualcomm AI Hub (e.g. `qwen3_vl_4b_instruct-geniex_qairt-w4a16-qualcomm_snapdragon_8_elite.zip`) are structured multi-file packages.
+    *   **Automatic Unpacking**: The native `GenieEngine` automatically extracts `.zip` bundles to `models/genie/<model_name>/` and detects internal directory trees.
+    *   **Dynamic Path Resolution**: Parses `genie_config.json` and dynamically resolves relative file references into absolute device filesystem paths for:
+        *   `dialog.tokenizer.path` -> `tokenizer.json`
+        *   `dialog.engine.model.binary.ctx-bins` -> `part1_of_N.bin`, `part2_of_N.bin`, ...
+        *   `dialog.embedding.lut-path` -> `embedding_weights.raw`
+        *   `dialog.engine.backend.extensions` -> `htp_backend_ext_config.json` / generated `htp_config.json`
+    *   **Multimodal Vision Support**: Automatically detects `vision_encoder.bin` or `visual.bin` in `metadata.json` for VL models (such as Qwen3-VL 4B Instruct), binding to `com.geniex.sdk.VlmWrapper` for zero-overhead multimodal projection on Hexagon HTP0 (`runtime_id: "qairt"`). Standard text models bind to `com.geniex.sdk.LlmWrapper`.
+    *   **UI Model Management**: `GenieSettings.tsx` provides single-tap ZIP file import, live hardware throughput stats, and memory management.
+*   **Energy & Throughput**: Delivers ~45–65 tok/s at ~1.5–2.5W power draw, preventing CPU thermal throttling during prolonged reasoning sessions.
+*   **Data Flow**:
+```
+User imports .zip / content:// URI
+  └─> filePicker / useNativeModels.ts
+        └─> Genie.loadModel({ modelPath })
+              └─> GenieEngine.kt / GenieConfigUtils.kt
+                    ├─> extractZipStream() (handles content:// and file:// URIs)
+                    ├─> resolveGenieConfig() (replaces relative paths with absolute)
+                    ├─> parseModelMetadata() (extracts w4a16, vision flags)
+                    └─> Builds VlmWrapper / LlmWrapper on Qualcomm Hexagon NPU (HTP0 / v79)
+                          └─> generateStreamFlow() token emission -> GeniePlugin.kt -> React Web UI
+```
+
+### 3.5 Whisper STT NPU Hardware Optimization & Model Bundle Management
+The `whisper-capacitor` plugin features automated hardware detection, versatile model importing, and SoC acceleration:
+*   **SoC Recognition**: Identifies Snapdragon 8 Elite (SM8750 / Hexagon v79) and Snapdragon 8 Gen 2/3.
+*   **NPU Offload**: Routes heavy encoder convolutions and attention blocks to Hexagon NPU, reducing transcription latency from ~3–5s on CPU down to ~150–300ms.
+*   **Dedicated "Whisper Only" STT Mode**:
+    *   **Assistant Voice Input (`VoiceChatOverlay`)**: Leverages `WhisperLiveStreamManager` and `HighQualityAudioRecorder` (16kHz PCM mono) with low-latency RMS energy speech activity chunking, providing instant on-device neural transcription without requiring Vosk models.
+    *   **Meeting Assistant**: Direct real-time audio chunk stream transcription (`transcriptionMode === 'whisper'`) bypassing Vosk overhead, paired with ONNX ECAPA-TDNN precise speaker diarization.
+*   **ZIP Bundle & Standalone Model Import**:
+    *   Supports single `.bin` model files (GGML format) and `.zip` archives (Qualcomm AI Hub QNN Context Binary packages containing `encoder.bin`, `decoder.bin`, `metadata.json` or GGML `.bin` archives).
+    *   `WhisperFileUtils` provides streaming ZIP extraction, path traversal security, and automatic directory flattening.
+    *   Dynamic binary path resolution (`resolveModelBinaryPath`) automatically indexes and resolves both root `.bin` files and nested directory bundles in `whisper-models/`.
+*   **Meeting Mode Efficiency**: Consumes up to 75% less battery during continuous meeting diarization.
+
+### 3.6 Stable Diffusion Qualcomm NPU Subsystem (`sd-capacitor`)
+The `sd-capacitor` plugin implements the high-performance on-device Stable Diffusion synthesis pipeline on Qualcomm Hexagon NPU:
+*   **Pre-compiled Graphs**: Loads `unet.bin`, `vae.bin`, and `text_encoder.bin` quantized for Hexagon HTP (`w8a16`) using Qualcomm AI Engine Direct (QNN / QAIRT).
+*   **Subsystem Components**:
+    *   `ClipTokenizer.kt`: High-precision 77-token OpenCLIP BPE tokenizer loading official `vocab.json` (49,408 tokens) and `merges.txt` (48,888 rules) with `<|endoftext|>` (`49407`) sequence padding matching OpenCLIP ViT-H/14.
+    *   `EulerAncestralScheduler.kt`: Exact $v$-prediction and $\epsilon$-prediction Euler discrete scheduler with continuous $\sigma$ schedule, model input scaling ($z_t / \sqrt{\sigma^2 + 1}$), and configurable Classifier-Free Guidance (CFG).
+    *   `QnnNativeBridge.kt`: Manages QNN native libraries (`libQnnHtp.so`, `libQnnSystem.so`), exact 144-byte ABI tensor descriptors, quantization parameters (`scale`, `zero_point`), and zero-overhead native memory mapping.
+    *   `SDEngine.kt`: Orchestrates the complete pipeline (Text-to-Image and Image-to-Image), executing TextEncoder, UNet denoising loop, and VAE decoding on Hexagon HTP NPU, converting decoded RGB byte tensors directly into full 512x512 ARGB Android Bitmaps and PNG base64 strings.
+*   **Model Bundle Management**:
+    *   `sdModelDownloader.ts` and `SDFileUtils.kt` provide complete model package import, streaming ZIP extraction, macOS metadata filtering (`__MACOSX`, `.DS_Store`), and automatic directory flattening into `sd-models/<modelName>/`.
+    *   Full model manager in **Settings > Vision & Image Creation** (`StableDiffusionSection.tsx`) with active model selection, model directory listing, and recursive deletion.
+*   **Path Resolution & Multi-Stage Auto-Load**:
+    *   `imageGenService.ts` automatically strips URI scheme prefixes (`file://`) and normalizes paths before communicating with the native layer, preventing path duplication bugs across Capacitor Filesystem bridges.
+    *   `SDEngine.kt` implements a robust multi-stage fallback lookup (direct path, `filesDir`, `sd-models/`, and recursive `findSDModelDirectory` up to depth 3) to seamlessly locate model binaries even in nested archive structures.
+    *   `imageGenService.generateImage()` verifies native engine status (`isLoaded`) and prioritizes the user-selected active model from settings before falling back to local installed models.
+*   **Safe Generation & Model Validation**:
+    *   Enforces explicit model loading verification prior to generation in both `SDEngine.kt`, `SDPlugin.kt`, and `imageGenService.ts`, preventing empty black image generation when no model is active.
+    *   `ImageGenModal` provides visual warning banners and shortcuts when no model is configured.
+*   **Performance & Flexibility**:
+    *   Executes full 512x512 diffusion on Hexagon NPU on Snapdragon 8 Elite (SM8750 / HTP v79).
+    *   Configurable inference steps (5–50 steps, default 25) and CFG scale (1.0–25.0, default 7.5).
+*   **Modal Studio & GUI**:
+    *   Dedicated `ImageGenModal` accessible via the 🎨 action button in the chat input bar, supporting Text-to-Image synthesis and Image-to-Image (img2img) restyling with real-time progress bars.
+    *   **Native Storage & Sharing**: One-tap **Save Image** to device storage (`AIMindMesh_SD_{timestamp}.png`) and **Share** via Android native Share Sheet (WhatsApp, Telegram, Gallery, etc.).
+*   **Conversational Chat Integration**: Supports instant slash commands (`/image <prompt>`, `/draw <prompt>`, `/edit <prompt>`) and autonomous tool calling via `generate_image(prompt, negative_prompt?, source_image?, strength?)`.
+*   **Source Image Input Channels**:
+    1. Direct context from Chat history ("🎨 Edit with AI" overlay button on message images).
+    2. File / Gallery / Camera picker inside `ImageGenModal` with configurable denoising strength (0.1–0.95).
+    3. Attached image in ChatInput automatically transferred to Image Studio upon opening.
+*   **Data Flow**:
+```
+Chat Input (🎨) / Slash Command (/image) / Tool Call (generate_image)
+  └─> imageGenService.generateImage({ prompt, sourceImage?, strength?, steps, cfgScale }) (TS)
+        └─> SD.generateImage(...) (sd-capacitor)
+              └─> SDPlugin.kt → SDEngine.kt
+                    ├─> ClipTokenizer.kt (OpenCLIP BPE, 77 tokens)
+                    ├─> QnnNativeBridge.kt (text_encoder.bin on Hexagon HTP)
+                    ├─> EulerAncestralScheduler.kt (Denoising loop: unet.bin)
+                    ├─> QnnNativeBridge.kt (vae.bin on Hexagon HTP)
+                    └─> RGB Float Array -> Bitmap (512x512 PNG base64)
+```
 
 ---
 
@@ -625,7 +719,7 @@ Vision capabilities require two components:
 
 ### 4.10.5 Architectural Constraints: Mutex & Context Protection
 The AI Mind Mesh heavily utilizes the LiteRT engine for on-device inference. To prevent memory exhaustion and concurrency crashes during asynchronous tasks (e.g., proactive generation, background context summarization):
-*   **Global Promise Mutex**: A strict queue `window.__MEDIAPIPE_MUTEX__` is enforced at the `liteRTProvider` level. If a background event triggers LLM interaction while the user is chatting, the UI gracefully enters a loading state and waits for the unlock.
+*   **Global Promise Mutex**: A strict queue `window.__LITERT_MUTEX__` is enforced at the `liteRTProvider` level. If a background event triggers LLM interaction while the user is chatting, the UI gracefully enters a loading state and waits for the unlock.
 *   **KV Cache Preservation**: Background tasks (like `PERFORM_MEMORY_MAINTENANCE` and `SUMMARIZE_CONTEXT`) explicitly abort if `litert` is the user's active foreground engine. This guarantees the user's active Conversation buffer is never destroyed or polluted by background extraction instructions, preventing "Context Thrashing".
 
 ### 4.11 AI Organization & Governance Layer
@@ -772,11 +866,12 @@ Located in **Settings -> Audio**.
 
 | Option | Type | Description |
 | :--- | :--- | :--- |
-| **STT Provider** | `Select` | **Vosk** (Offline, Fast), **Voxtral** (Offline, High-quality Real-time), **Whisper** (Offline, Best Accuracy), **Gemini** (Online). |
+| **STT Provider** | `Select` | **Whisper Only** (Offline, Ultra Fast NPU/CPU), **Vosk / Hybrid** (Offline, Lightweight + Post-refinement), **Voxtral** (Offline, High-quality Real-time), **Gemini** (Online). |
+| **STT Processing Mode** | `Radio` | `whisper-only` (Direct on-device Whisper), `hybrid` (Vosk live + Whisper background), `vosk-only` (Lightweight live), `whisper-post` (Post-recording refinement), `off`. |
 | **Vosk Model** | `Select` | `vosk-model-small-ex` (Light), `vosk-model-en-us` (Accurate). |
 | **Voxtral Model** | `File` | Path to `.gguf` file (e.g., `Voxtral-Mini-4B-Realtime-Q4_K_M.gguf`). |
 | **Voxtral Latency** | `Select` | **Fast** (240ms), **Balanced** (480ms, default), **Accurate** (960ms), **Best** (2400ms). |
-| **Whisper Model** | `Select` | `tiny`, `base`, `small`. Larger = Slower/Better. |
+| **Whisper Model** | `Select` | QNN Context Binary (NPU), Turbo v3, or GGML `.bin` (`tiny`, `base`, `small`, `turbo`). |
 | **Whisper Threads**| `Number` | Threads for encoder. Default: `4`. |
 | **Enable VAD** | `Toggle` | Voice Activity Detection. Fixes cutting off sentences too early. |
 | **VAD Sensitivity**| `0.0-1.0` | Higher = Triggers on quieter sounds. Default `0.5`. |
@@ -786,7 +881,8 @@ Located in **Settings -> Audio**.
 
 | Option | Type | Description |
 | :--- | :--- | :--- |
-| **TTS Provider** | `Select` | **Piper** (Offline quality), **System** (Android default), **Gemini** (Cloud). |
+| **TTS Provider** | `Select` | **Kokoro** (Offline, best quality), **Piper** (Fast offline neural), **System** (Android default), **Gemini** (Cloud). |
+| **Kokoro Voice** | `Select` | `Sara` / `Nicola` (IT), `Sky` / `Michael` (EN-US), `Emma` / `George` (EN-UK). |
 | **Piper Voice** | `Select` | Select specific `.onnx` voice model (e.g., `en_US-amy-medium`). |
 | **Default Output** | `Select` | **Speaker** (Media) vs **Earpiece** (Phone Call style). |
 

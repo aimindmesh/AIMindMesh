@@ -244,16 +244,34 @@ async function appendBufferToFile(path: string, buffer: Uint8Array): Promise<voi
 export async function deleteWhisperModel(modelId: string): Promise<void> {
     logger.log('info', `[WhisperDownloader] Deleting model: ${modelId}`);
 
+    let deleted = false;
     try {
         const filePath = `${MODELS_DIR}/${modelId}.bin`;
         await Filesystem.deleteFile({
             path: filePath,
             directory: Directory.Data
         });
+        deleted = true;
+    } catch {
+        // May be a directory model bundle
+    }
+
+    try {
+        const dirPath = `${MODELS_DIR}/${modelId}`;
+        await Filesystem.rmdir({
+            path: dirPath,
+            directory: Directory.Data,
+            recursive: true
+        });
+        deleted = true;
+    } catch {
+        // Ignore if not a directory
+    }
+
+    if (deleted) {
         logger.log('info', `[WhisperDownloader] Model deleted: ${modelId}`);
-    } catch (error) {
-        logger.log('error', `[WhisperDownloader] Error deleting model: ${(error as any).message}`);
-        throw error;
+    } else {
+        logger.log('warn', `[WhisperDownloader] Model file or directory not found for deletion: ${modelId}`);
     }
 }
 
@@ -269,12 +287,21 @@ export async function whisperModelExists(modelId: string): Promise<boolean> {
         });
         return true;
     } catch {
-        return false;
+        try {
+            const dirPath = `${MODELS_DIR}/${modelId}`;
+            const stat = await Filesystem.stat({
+                path: dirPath,
+                directory: Directory.Data
+            });
+            return !!stat;
+        } catch {
+            return false;
+        }
     }
 }
 
 /**
- * List all locally available Whisper models
+ * List all locally available Whisper models (both standalone .bin and unpacked directory bundles)
  */
 export async function listLocalWhisperModels(): Promise<string[]> {
     try {
@@ -283,9 +310,15 @@ export async function listLocalWhisperModels(): Promise<string[]> {
             directory: Directory.Data
         });
 
-        return result.files
-            .filter(file => file.type === 'file' && file.name.endsWith('.bin'))
-            .map(file => file.name.replace('.bin', ''));
+        const models: string[] = [];
+        for (const file of result.files) {
+            if (file.type === 'file' && file.name.endsWith('.bin')) {
+                models.push(file.name.replace('.bin', ''));
+            } else if (file.type === 'directory') {
+                models.push(file.name);
+            }
+        }
+        return models;
     } catch {
         return [];
     }
@@ -303,7 +336,16 @@ export async function getWhisperModelPath(modelId: string): Promise<string | nul
         });
         return stat.uri;
     } catch {
-        return null;
+        try {
+            const dirPath = `${MODELS_DIR}/${modelId}`;
+            const stat = await Filesystem.stat({
+                path: dirPath,
+                directory: Directory.Data
+            });
+            return stat.uri;
+        } catch {
+            return null;
+        }
     }
 }
 
@@ -328,11 +370,25 @@ export async function validateWhisperModel(modelId: string): Promise<{
             path: stat.uri,
             sizeBytes: stat.size
         };
-    } catch (error) {
-        return {
-            exists: false,
-            error: (error as any).message
-        };
+    } catch {
+        try {
+            const dirPath = `${MODELS_DIR}/${modelId}`;
+            const stat = await Filesystem.stat({
+                path: dirPath,
+                directory: Directory.Data
+            });
+
+            return {
+                exists: true,
+                path: stat.uri,
+                sizeBytes: stat.size
+            };
+        } catch (error) {
+            return {
+                exists: false,
+                error: (error as any).message
+            };
+        }
     }
 }
 
@@ -347,9 +403,8 @@ export function formatFileSize(bytes: number): string {
 }
 
 /**
- * Import a Whisper model from a .bin file in phone storage
+ * Import a Whisper model from a .bin or .zip file in device storage
  */
-
 export async function importWhisperModel(sourcePath: string, fileName?: string): Promise<string> {
     logger.log('info', `[WhisperDownloader] Importing model from: ${sourcePath}`);
 
@@ -375,13 +430,12 @@ export async function importWhisperModel(sourcePath: string, fileName?: string):
             targetFileName = sourcePath.split('/').pop() || 'imported-model.bin';
         }
 
-        // Ensure it ends with .bin
-        if (!targetFileName.endsWith('.bin')) {
-            // If it has no extension, append .bin
+        const isZip = targetFileName.toLowerCase().endsWith('.zip') || sourcePath.toLowerCase().endsWith('.zip');
+
+        if (!isZip && !targetFileName.endsWith('.bin')) {
             if (!targetFileName.includes('.')) {
                 targetFileName += '.bin';
             }
-            // If it has other extension, we might want to warn, but let's trust the input or the file type
         }
 
         // We will store it in whisper-models directory

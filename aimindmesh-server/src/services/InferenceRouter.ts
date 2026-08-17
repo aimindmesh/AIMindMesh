@@ -103,6 +103,51 @@ export class InferenceRouter {
       Logger.info('InferenceRouter', `Recovering ${rows.length} pending inferences...`);
       for (const row of rows) {
         try {
+          if (row.type === 'AGENT_TASK') {
+            const payload = JSON.parse(row.payload);
+            const { repoId, repoName } = payload;
+            Logger.info('InferenceRouter', `Recovering AGENT_TASK: ${row.task_name} for repo ${repoName}`);
+
+            // Re-register and mark as processing
+            InferenceRegistry.register(row.id, row.type, row.task_name, row.model, payload, row.provider || 'freellmapi');
+            InferenceRegistry.setStatus(row.id, 'PROCESSING');
+
+            setTimeout(async () => {
+              try {
+                const { VentureOrchestrator } = await import('./organization/VentureOrchestrator');
+                const repoRow = db.prepare('SELECT * FROM organization_repositories WHERE id = ?').get(repoId) as any;
+                if (repoRow) {
+                  if (row.model === 'kasm-validation') {
+                    const gitUrl = repoRow.gitea_url;
+                    const gitUrlWithToken = process.env.GITEA_TOKEN
+                      ? gitUrl.replace('http://', `http://token:${process.env.GITEA_TOKEN}@`)
+                      : gitUrl;
+                    VentureOrchestrator.runKasmValidation(repoId, repoName, gitUrlWithToken).catch((err) => {
+                      Logger.error('InferenceRouter', `Failed to resume Kasm validation for ${repoName}: ${err.message}`);
+                    });
+                  } else if (row.model === 'openclaw') {
+                    const ideaRow = db.prepare('SELECT * FROM organization_ideas WHERE id = ?').get(repoRow.created_from_idea_id) as any;
+                    VentureOrchestrator.triggerDevelopmentAgent(
+                      repoId,
+                      repoName,
+                      repoRow.gitea_url,
+                      ideaRow || { title: repoName },
+                      ideaRow?.analysis_synthesis || null
+                    ).catch((err) => {
+                      Logger.error('InferenceRouter', `Failed to resume OpenClaw agent for ${repoName}: ${err.message}`);
+                    });
+                  }
+                } else {
+                  InferenceRegistry.finish(row.id, undefined, 'Repository not found');
+                }
+              } catch (resumeErr: any) {
+                Logger.error('InferenceRouter', `Failed to import or execute resume of AGENT_TASK: ${resumeErr.message}`);
+                InferenceRegistry.finish(row.id, undefined, resumeErr.message);
+              }
+            }, 5000);
+            continue;
+          }
+
           const task = JSON.parse(row.payload) as TaskPayload;
           if (!task.options) task.options = {};
           InferenceRegistry.register(row.id, row.type, row.task_name, task.options?.model, task, task.options?.routing || 'AUTO');

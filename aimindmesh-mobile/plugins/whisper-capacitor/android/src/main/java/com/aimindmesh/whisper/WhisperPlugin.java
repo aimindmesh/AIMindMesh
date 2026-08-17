@@ -50,13 +50,17 @@ public class WhisperPlugin extends Plugin {
             // Resolve path relative to app's files directory
             File filesDir = getContext().getFilesDir();
             File modelFile = new File(filesDir, modelPath);
-
             if (!modelFile.exists()) {
-                call.reject("Model file not found: " + modelFile.getAbsolutePath());
+                modelFile = new File(modelPath);
+            }
+
+            File binaryFile = WhisperFileUtils.resolveModelBinaryPath(modelFile);
+            if (binaryFile == null || !binaryFile.exists()) {
+                call.reject("Model file or binary not found: " + modelFile.getAbsolutePath());
                 return;
             }
 
-            Log.i(TAG, "Loading Whisper model: " + modelFile.getAbsolutePath());
+            Log.i(TAG, "Loading Whisper model binary: " + binaryFile.getAbsolutePath());
 
             // Initialize whisper context
             if (whisperContext != null) {
@@ -64,7 +68,7 @@ public class WhisperPlugin extends Plugin {
             }
 
             whisperContext = new WhisperContext(getContext());
-            boolean success = whisperContext.loadModel(modelFile.getAbsolutePath());
+            boolean success = whisperContext.loadModel(binaryFile.getAbsolutePath());
 
             if (success) {
                 isModelLoaded = true;
@@ -268,6 +272,9 @@ public class WhisperPlugin extends Plugin {
             result.put("availableCores", optimizer.getCoreCount());
             result.put("recommendedThreads", optimizer.getRecommendedThreadCount(soc));
             result.put("recommendedModel", optimizer.getRecommendedModel(soc));
+            result.put("hasNpu", optimizer.hasNpu());
+            result.put("npuArch", optimizer.getNpuArch());
+            result.put("recommendedBackend", optimizer.getRecommendedBackend());
             result.put("deviceInfo", optimizer.getDeviceInfoString());
 
             Log.i(TAG, optimizer.getDeviceInfoString());
@@ -394,35 +401,58 @@ public class WhisperPlugin extends Plugin {
         }
 
         try {
-            android.net.Uri sourceUri = android.net.Uri.parse(sourcePath);
             File filesDir = getContext().getFilesDir();
-            File destFile = new File(filesDir, fileName);
+            boolean isZip = fileName.toLowerCase().endsWith(".zip") || sourcePath.toLowerCase().endsWith(".zip");
 
-            // Create parent directories if needed
+            if (isZip) {
+                String folderName = fileName;
+                if (folderName.toLowerCase().endsWith(".zip")) {
+                    folderName = folderName.substring(0, folderName.length() - 4);
+                }
+                File targetDir = new File(filesDir, folderName);
+                if (targetDir.exists()) {
+                    WhisperFileUtils.deleteRecursively(targetDir);
+                }
+                targetDir.mkdirs();
+
+                java.io.InputStream is = WhisperFileUtils.openInputStream(getContext(), sourcePath);
+                if (is == null) {
+                    call.reject("Could not open input stream for zip source: " + sourcePath);
+                    return;
+                }
+
+                boolean extracted = WhisperFileUtils.extractZipStream(is, targetDir);
+                if (!extracted) {
+                    call.reject("Failed to extract Whisper ZIP bundle to " + targetDir.getAbsolutePath());
+                    return;
+                }
+
+                JSObject ret = new JSObject();
+                ret.put("path", targetDir.getAbsolutePath());
+                call.resolve(ret);
+                return;
+            }
+
+            File destFile = new File(filesDir, fileName);
             if (destFile.getParentFile() != null) {
                 destFile.getParentFile().mkdirs();
             }
 
-            java.io.InputStream is = getContext().getContentResolver().openInputStream(sourceUri);
+            java.io.InputStream is = WhisperFileUtils.openInputStream(getContext(), sourcePath);
             if (is == null) {
-                // Try opening as a regular file if not a content URI
-                try {
-                    is = new java.io.FileInputStream(new File(sourcePath));
-                } catch (Exception e) {
-                    call.reject("Could not open input stream from source");
-                    return;
+                call.reject("Could not open input stream from source: " + sourcePath);
+                return;
+            }
+
+            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(destFile)) {
+                byte[] buffer = new byte[64 * 1024];
+                int length;
+                while ((length = is.read(buffer)) > 0) {
+                    fos.write(buffer, 0, length);
                 }
+            } finally {
+                is.close();
             }
-
-            java.io.FileOutputStream fos = new java.io.FileOutputStream(destFile);
-            byte[] buffer = new byte[8192];
-            int length;
-            while ((length = is.read(buffer)) > 0) {
-                fos.write(buffer, 0, length);
-            }
-
-            is.close();
-            fos.close();
 
             JSObject ret = new JSObject();
             ret.put("path", destFile.getAbsolutePath());
@@ -463,7 +493,7 @@ public class WhisperPlugin extends Plugin {
                     }
 
                     // Decode WAV to samples (simple WAV parser)
-                    float[] allSamples = readAudioSamples(audioFile);
+                    float[] allSamples = WhisperFileUtils.readAudioSamples(audioFile);
                     if (allSamples == null || allSamples.length == 0) {
                         call.reject("Failed to read audio samples or empty file");
                         return;
@@ -543,29 +573,6 @@ public class WhisperPlugin extends Plugin {
                 }
             }).start();
         });
-    }
-
-    // Helper to read simple WAV file (16-bit PCM, 16kHz)
-    private float[] readAudioSamples(File file) throws java.io.IOException {
-        java.io.FileInputStream fis = new java.io.FileInputStream(file);
-        // Skip header (simple assumption of 44 bytes regular WAV header)
-        // In production, a real WAV parser is better, but for this specific use case
-        // (audio recorded by app), it's predictable.
-        fis.skip(44);
-
-        byte[] buffer = new byte[(int) (file.length() - 44)];
-        int read = fis.read(buffer);
-        fis.close();
-
-        if (read <= 0)
-            return null;
-
-        float[] samples = new float[read / 2];
-        for (int i = 0; i < samples.length; i++) {
-            short sample = (short) ((buffer[i * 2 + 1] << 8) | (buffer[i * 2] & 0xFF));
-            samples[i] = sample / 32768.0f;
-        }
-        return samples;
     }
 
     @Override

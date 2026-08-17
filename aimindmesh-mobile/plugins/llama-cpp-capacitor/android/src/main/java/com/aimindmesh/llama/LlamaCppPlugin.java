@@ -1225,89 +1225,80 @@ public class LlamaCppPlugin extends Plugin {
 
     @PluginMethod
     public void saveKvCache(PluginCall call) {
-        int slotId = call.getInt("slotId", 0);
-        String serverUrl = call.getString("serverUrl", "http://127.0.0.1:8080");
-
-        OkHttpClient client = new OkHttpClient.Builder()
-            .connectTimeout(5, TimeUnit.SECONDS)
-            .writeTimeout(60, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS)
-            .build();
-
-        Request request = new Request.Builder()
-            .url(serverUrl + "/slots/" + slotId + "?action=save")
-            .post(RequestBody.create("", null))
-            .build();
-
-        client.newCall(request).enqueue(new Callback() {
-            @Override
-            public void onFailure(Call callReq, IOException e) {
-                Log.e(TAG, "Failed to save llama slot: " + e.getMessage());
-                call.reject("Failed to save llama slot: " + e.getMessage());
-            }
-
-            @Override
-            public void onResponse(Call callReq, Response response) throws IOException {
-                if (response.isSuccessful()) {
-                    Log.i(TAG, "Successfully saved llama slot " + slotId);
-                    JSObject ret = new JSObject();
-                    ret.put("success", true);
-                    call.resolve(ret);
-                } else {
-                    String errorBody = response.body() != null ? response.body().string() : "No error body";
-                    Log.e(TAG, "Server returned error during save: " + response.code() + " - " + errorBody);
-                    call.reject("Server returned error: " + response.code());
-                }
-                response.close();
-            }
-        });
+        int contextId = call.getInt("contextId", 0);
+        String slotName = call.getString("slot", "chat");
+        
+        LlamaCppInference inference = inferenceInstances.get(contextId);
+        if (inference == null) {
+            call.reject("No inference instance for contextId " + contextId);
+            return;
+        }
+        
+        String filepath = getContext().getFilesDir() + "/kv_cache/" + slotName + "_" + contextId + ".bin";
+        new File(getContext().getFilesDir(), "kv_cache").mkdirs();
+        
+        boolean success = inference.saveState(filepath, 0);
+        if (success) {
+            Log.i(TAG, "KV cache saved for context " + contextId + " to " + filepath);
+            JSObject ret = new JSObject();
+            ret.put("success", true);
+            ret.put("filepath", filepath);
+            call.resolve(ret);
+        } else {
+            call.reject("Failed to save KV cache for context " + contextId);
+        }
     }
 
     @PluginMethod
     public void restoreKvCache(PluginCall call) {
-        int slotId = call.getInt("slotId", 0);
-        String serverUrl = call.getString("serverUrl", "http://127.0.0.1:8080");
-
-        OkHttpClient client = new OkHttpClient.Builder()
-            .connectTimeout(5, TimeUnit.SECONDS)
-            .writeTimeout(60, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS)
-            .build();
-
-        Request request = new Request.Builder()
-            .url(serverUrl + "/slots/" + slotId + "?action=restore")
-            .post(RequestBody.create("", null))
-            .build();
-
-        client.newCall(request).enqueue(new Callback() {
-            @Override
-            public void onFailure(Call callReq, IOException e) {
-                Log.e(TAG, "Failed to restore llama slot: " + e.getMessage());
-                call.reject("Failed to restore llama slot: " + e.getMessage());
-            }
-
-            @Override
-            public void onResponse(Call callReq, Response response) throws IOException {
-                if (response.isSuccessful()) {
-                    Log.i(TAG, "Successfully restored llama slot " + slotId);
-                    JSObject ret = new JSObject();
-                    ret.put("success", true);
-                    call.resolve(ret);
-                } else {
-                    String errorBody = response.body() != null ? response.body().string() : "No error body";
-                    Log.e(TAG, "Server returned error during restore: " + response.code() + " - " + errorBody);
-                    call.reject("Server returned error: " + response.code());
-                }
-                response.close();
-            }
-        });
+        int contextId = call.getInt("contextId", 0);
+        String slotName = call.getString("slot", "chat");
+        
+        LlamaCppInference inference = inferenceInstances.get(contextId);
+        if (inference == null) {
+            call.reject("No inference instance for contextId " + contextId);
+            return;
+        }
+        
+        String filepath = getContext().getFilesDir() + "/kv_cache/" + slotName + "_" + contextId + ".bin";
+        File stateFile = new File(filepath);
+        
+        if (!stateFile.exists()) {
+            JSObject ret = new JSObject();
+            ret.put("success", false);
+            ret.put("reason", "file_not_found");
+            call.resolve(ret);
+            return;
+        }
+        
+        boolean success = inference.loadState(filepath, 0);
+        if (success) {
+            Log.i(TAG, "KV cache restored for context " + contextId + " from " + filepath);
+            JSObject ret = new JSObject();
+            ret.put("success", true);
+            call.resolve(ret);
+        } else {
+            call.reject("Failed to restore KV cache for context " + contextId);
+        }
     }
 
     @PluginMethod
     public void invalidateKvCache(PluginCall call) {
-        // For llama.cpp server, invalidating means deleting the slot file or clearing the slot
-        // Currently we'll just return success as the server handles slot management
-        call.resolve(new JSObject().put("success", true));
+        int contextId = call.getInt("contextId", 0);
+        String slotName = call.getString("slot", "chat");
+        
+        String filepath = getContext().getFilesDir() + "/kv_cache/" + slotName + "_" + contextId + ".bin";
+        File stateFile = new File(filepath);
+        
+        boolean deleted = false;
+        if (stateFile.exists()) {
+            deleted = stateFile.delete();
+            Log.i(TAG, "KV cache invalidated for context " + contextId + ": " + (deleted ? "deleted" : "delete failed"));
+        }
+        
+        JSObject ret = new JSObject();
+        ret.put("success", deleted || !stateFile.exists());
+        call.resolve(ret);
     }
 
     /**

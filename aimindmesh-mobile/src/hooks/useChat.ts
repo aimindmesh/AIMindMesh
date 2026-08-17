@@ -8,6 +8,7 @@ import { triggerHaptic } from '../services/native';
 import { fileToBase64 } from '../utils/fileUtils';
 import { stopSpeaking } from '../services/tts/speech';
 import { getOrInitializeSemanticMemoryRetriever } from '../services/memory/semanticMemoryRetriever';
+import { imageGenService } from '../services/image/imageGenService';
 import { ChatContext, ApiKeys } from './chat/types';
 import { useAgenticLoop } from './chat/useAgenticLoop';
 
@@ -200,6 +201,11 @@ export const useChat = (
         runAgenticLoop(history);
     }, [runAgenticLoop]);
 
+    const addPendingImage = useCallback((img: ImageAttachment) => {
+        setPendingImages(prev => [...prev, img]);
+        triggerHaptic();
+    }, []);
+
     const sendMessage = useCallback(async (textToSend: string, options?: { hidden?: boolean, role?: 'user' | 'system' }) => {
         if (!textToSend && pendingImages.length === 0 && pendingAudio.length === 0 && pendingFiles.length === 0) return;
 
@@ -218,18 +224,91 @@ export const useChat = (
             hidden: options?.hidden
         };
 
+        const currentPendingImages = [...pendingImages];
+
         // Clear input state immediately
         setInput('');
         setPendingImages([]);
         setPendingAudio([]);
         setPendingFiles([]);
 
+        const trimmed = textToSend.trim();
+
+        // Handle /image or /draw command on NPU
+        if (trimmed.startsWith('/image ') || trimmed.startsWith('/draw ')) {
+            const prompt = trimmed.replace(/^\/(image|draw)\s+/, '').trim();
+            setMessages(prev => [...prev, userInput]);
+            setIsLoading(true);
+            try {
+                const genResult = await imageGenService.generateImage({ prompt });
+                const aiResponse: Message = {
+                    id: (Date.now() + 1).toString(),
+                    role: 'model',
+                    text: `Generated on Qualcomm Hexagon NPU (${genResult.generationTimeMs}ms): "${prompt}"`,
+                    timestamp: new Date(),
+                    images: [{
+                        name: 'generated.png',
+                        base64: genResult.base64Image.replace(/^data:image\/\w+;base64,/, ''),
+                        mimeType: 'image/png'
+                    }]
+                };
+                setMessages(prev => [...prev, aiResponse]);
+            } catch (err: any) {
+                const errResponse: Message = {
+                    id: (Date.now() + 1).toString(),
+                    role: 'model',
+                    text: `⚠️ Image generation failed: ${err.message || 'Unknown error'}`,
+                    timestamp: new Date()
+                };
+                setMessages(prev => [...prev, errResponse]);
+            } finally {
+                setIsLoading(false);
+            }
+            return;
+        }
+
+        // Handle /edit command on NPU
+        if (trimmed.startsWith('/edit ')) {
+            const prompt = trimmed.replace(/^\/edit\s+/, '').trim();
+            const sourceImg = currentPendingImages[0]?.base64
+                ? `data:${currentPendingImages[0].mimeType};base64,${currentPendingImages[0].base64}`
+                : (currentPendingImages[0]?.webPath || undefined);
+            setMessages(prev => [...prev, userInput]);
+            setIsLoading(true);
+            try {
+                const genResult = await imageGenService.generateImage({ prompt, sourceImage: sourceImg });
+                const aiResponse: Message = {
+                    id: (Date.now() + 1).toString(),
+                    role: 'model',
+                    text: `Modified on Qualcomm Hexagon NPU (${genResult.generationTimeMs}ms): "${prompt}"`,
+                    timestamp: new Date(),
+                    images: [{
+                        name: 'modified.png',
+                        base64: genResult.base64Image.replace(/^data:image\/\w+;base64,/, ''),
+                        mimeType: 'image/png'
+                    }]
+                };
+                setMessages(prev => [...prev, aiResponse]);
+            } catch (err: any) {
+                const errResponse: Message = {
+                    id: (Date.now() + 1).toString(),
+                    role: 'model',
+                    text: `⚠️ Image modification failed: ${err.message || 'Unknown error'}`,
+                    timestamp: new Date()
+                };
+                setMessages(prev => [...prev, errResponse]);
+            } finally {
+                setIsLoading(false);
+            }
+            return;
+        }
+
         const newHistory = [...messages, userInput];
         // Save user message to semantic memory FIRST to prevent concurrent ONNX/LiteRT embedding calls
         await saveToSemanticMemory('user', textToSend);
 
         triggerAIResponse(newHistory);
-    }, [pendingImages, pendingAudio, pendingFiles, messages, triggerAIResponse, setInput, llmConfig, activeThreadId]);
+    }, [pendingImages, pendingAudio, pendingFiles, messages, triggerAIResponse, setInput, llmConfig, activeThreadId, setMessages]);
 
     const handleResend = useCallback((message: Message) => {
         sendMessage(message.text);
@@ -254,7 +333,7 @@ export const useChat = (
         input, setInput,
         isLoading,
         isSpeaking,
-        pendingImages, removeImage, handleAttachImage,
+        pendingImages, removeImage, handleAttachImage, addPendingImage,
         pendingAudio, removeAudio, handleAttachAudio,
         pendingFiles, removeFile, handleAttachFile,
         pendingToolCall, setPendingToolCall,

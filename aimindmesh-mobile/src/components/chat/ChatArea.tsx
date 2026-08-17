@@ -26,6 +26,8 @@ interface ChatAreaProps {
     onRemoveFile: (idx: number) => void;
     onResend: (msg: Message) => void;
     onRegenerate: (msg: Message) => void;
+    onOpenImageStudio?: () => void;
+    onEditImage?: (img: string) => void;
 
     // Header Actions
     onOpenThreads: () => void;
@@ -80,6 +82,7 @@ export const ChatArea: React.FC<ChatAreaProps> = (props) => {
                 isLoading={props.isLoading}
                 onResend={props.onResend}
                 onRegenerate={props.onRegenerate}
+                onEditImage={props.onEditImage}
             />
 
             <ChatInput
@@ -101,6 +104,7 @@ export const ChatArea: React.FC<ChatAreaProps> = (props) => {
                 onRemoveImage={props.onRemoveImage}
                 onRemoveAudio={props.onRemoveAudio}
                 onRemoveFile={props.onRemoveFile}
+                onOpenImageStudio={props.onOpenImageStudio}
             />
         </div>
     );

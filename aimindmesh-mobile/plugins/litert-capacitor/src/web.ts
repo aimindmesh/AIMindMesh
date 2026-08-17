@@ -4,7 +4,7 @@ import type {
     LiteRTPlugin,
     LiteRTInitOptions,
     LiteRTInitResult,
-
+    LiteRTToolDefinition,
     LiteRTGenerateOptions,
     LiteRTGenerateResult,
     LiteRTTokenEvent,
@@ -27,14 +27,36 @@ export class LiteRTWeb extends WebPlugin implements LiteRTPlugin {
         throw new Error('LiteRT is not available on web platform');
     }
 
-
-
     async releaseModel(): Promise<void> {
         throw new Error('LiteRT is not available on web platform');
     }
 
     async isModelLoaded(): Promise<{ loaded: boolean }> {
         return { loaded: false };
+    }
+
+    async registerTools(_options: { tools: LiteRTToolDefinition[] }): Promise<{ success: boolean }> {
+        throw new Error('LiteRT is not available on web platform');
+    }
+
+    async saveKvCache(_options: { conversationId: string }): Promise<{ success: boolean }> {
+        throw new Error('LiteRT is not available on web platform');
+    }
+
+    async restoreKvCache(_options: { conversationId: string }): Promise<{ success: boolean; messageCount?: number }> {
+        throw new Error('LiteRT is not available on web platform');
+    }
+
+    async invalidateKvCache(_options: { conversationId: string }): Promise<{ success: boolean }> {
+        throw new Error('LiteRT is not available on web platform');
+    }
+
+    async releaseSession(): Promise<void> {
+        throw new Error('LiteRT is not available on web platform');
+    }
+
+    async getMessageCount(): Promise<{ count: number }> {
+        throw new Error('LiteRT is not available on web platform');
     }
 
     async addListener(

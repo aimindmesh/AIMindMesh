@@ -546,6 +546,17 @@ try {
   } catch (err: any) {
     // Column already exists, ignore
   }
+  // ★ NEW [v7.1]: Autonomous cooldown & restart support
+  try {
+    db.exec("ALTER TABLE organization_repositories ADD COLUMN cooldown_until TEXT;");
+  } catch (err: any) {
+    // Column already exists, ignore
+  }
+  try {
+    db.exec("ALTER TABLE organization_repositories ADD COLUMN retry_count INTEGER DEFAULT 0;");
+  } catch (err: any) {
+    // Column already exists, ignore
+  }
 } catch (err: any) {
   console.error('[DB] Migration failed for Organization Layer:', err.message);
 }

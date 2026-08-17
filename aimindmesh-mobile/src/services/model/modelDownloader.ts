@@ -60,6 +60,46 @@ export const RECOMMENDED_MODELS = [
     },
 ];
 
+// Recommended Qualcomm NPU Models (Genie / QAIRT for Snapdragon 8 Elite & 8 Gen 3)
+export const RECOMMENDED_GENIE_MODELS = [
+    {
+        name: 'Qwen 3.5 2B (Qualcomm Genie) ⚡',
+        id: 'qwen3.5-2b-npu',
+        url: 'https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_0.gguf',
+        size: 1400000000, // ~1.4GB
+        description: 'Ultra-fast Qwen 3.5 on Snapdragon Hexagon NPU (60+ tok/s)',
+        category: 'chat',
+        engine: 'genie',
+    },
+    {
+        name: 'Qwen 3 4B (Qualcomm AI Hub NPU) ⚡',
+        id: 'qwen3-4b-npu',
+        url: 'https://huggingface.co/unsloth/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_0.gguf',
+        size: 2600000000, // ~2.6GB
+        description: 'Official Qualcomm AI Hub Qwen3 compiled for SM8750 HTP v79',
+        category: 'chat',
+        engine: 'genie',
+    },
+    {
+        name: 'Qwen 2.5-VL 7B Vision (Qualcomm NPU) 👁️⚡',
+        id: 'qwen2.5-vl-7b-npu',
+        url: 'https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/qwen2.5-vl-7b-instruct-q4_k_m.gguf',
+        size: 4700000000, // ~4.7GB
+        description: 'Multimodal Vision-Language model on Hexagon NPU',
+        category: 'multimodal',
+        engine: 'genie',
+    },
+    {
+        name: 'Gemma 2 2B (Qualcomm NPU) ⚡',
+        id: 'gemma2-2b-npu',
+        url: 'https://huggingface.co/google/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf',
+        size: 1600000000, // ~1.6GB
+        description: 'Optimized Google Gemma model for mobile NPU',
+        category: 'chat',
+        engine: 'genie',
+    },
+];
+
 export const RECOMMENDED_PROJECTORS = [
     {
         name: 'LLaVA v1.5 Projector (f16)',

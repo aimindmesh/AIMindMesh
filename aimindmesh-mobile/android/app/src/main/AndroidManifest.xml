@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-sdk tools:overrideLibrary="com.getcapacitor.android, com.geniex.sdk" />
 
     <application
         android:name=".MainApplication"
@@ -11,7 +14,7 @@
         android:theme="@style/AppTheme"
         android:hardwareAccelerated="true"
         android:usesCleartextTraffic="true"
-        android:extractNativeLibs="false"
+        android:extractNativeLibs="true"
         android:largeHeap="true">
 
         <service android:name=".proactive.ProactiveBackgroundService" android:enabled="true" android:exported="false" />

@@ -102,8 +102,15 @@ const ProviderSelector: React.FC<ProviderSelectorProps> = ({ currentProvider, on
                 <div className="space-y-3 pl-2 border-l-2 border-green-500/30">
                     {[
                         {
+                            id: 'genie-npu',
+                            label: 'Qualcomm NPU (Genie)',
+                            desc: 'Hardware accelerated on Snapdragon Hexagon NPU. Qwen 3.5 / Gemma at 50+ tok/s.',
+                            badge: '⚡ Hexagon NPU',
+                            badgeColor: 'bg-amber-500/20 text-amber-400 border-amber-500/30'
+                        },
+                        {
                             id: 'native-gguf',
-                            label: 'Native Offline',
+                            label: 'Native Offline (GGUF / LiteRT)',
                             desc: 'Runs on device (llama.cpp/LiteRT). Complete privacy.',
                             badge: 'Private',
                             badgeColor: 'bg-green-500/20 text-green-400 border-green-500/30'

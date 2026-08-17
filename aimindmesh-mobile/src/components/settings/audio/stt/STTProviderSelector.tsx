@@ -15,10 +15,17 @@ const STTProviderSelector: React.FC<STTProviderSelectorProps> = ({ speechConfig,
 
     const options = [
         {
+            id: 'whisper',
+            label: 'Whisper Only (Offline)',
+            desc: 'Ultra-fast on-device speech recognition via Whisper (NPU / CPU accelerated).',
+            badge: 'Ultra Fast',
+            badgeColor: 'bg-purple-500/20 text-purple-400 border-purple-500/30'
+        },
+        {
             id: 'vosk',
-            label: 'Vosk/Whisper (Offline)',
-            desc: 'Completely offline. Fast. Requires model download.',
-            badge: 'Private',
+            label: 'Vosk / Hybrid (Offline)',
+            desc: 'Lightweight offline STT with optional Whisper post-refinement.',
+            badge: 'Lightweight',
             badgeColor: 'bg-green-500/20 text-green-400 border-green-500/30'
         },
         {

@@ -26,6 +26,8 @@ export interface TranscriptSegment {
     originalText?: string;
     isEdited?: boolean;
     editedAt?: number;
+    // Overlap detection
+    overlap?: boolean;
 }
 
 export interface SavedMeeting {
@@ -50,4 +52,4 @@ export interface MeetingModeProps {
 
 export type RecognitionMode = 'off' | 'fast' | 'precise';
 
-export type TranscriptionMode = 'off' | 'vosk' | 'whisper' | 'voxtral';
+export type TranscriptionMode = 'off' | 'vosk' | 'whisper' | 'voxtral' | 'hybrid';

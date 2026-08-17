@@ -441,6 +441,40 @@ void LLMInference::resetContext() {
     LOGi("Context explicitly reset");
 }
 
+bool LLMInference::saveState(const char* filepath, int seqId) {
+    if (!_ctx) {
+        LOGe("Cannot save state: no context loaded");
+        return false;
+    }
+
+    LOGi("Saving KV cache state for seq %d to: %s", seqId, filepath);
+    size_t written = llama_state_seq_save_file(_ctx, filepath, seqId, nullptr, 0);
+    if (written > 0) {
+        LOGi("KV cache state saved successfully (%zu bytes)", written);
+        return true;
+    } else {
+        LOGe("Failed to save KV cache state");
+        return false;
+    }
+}
+
+bool LLMInference::loadState(const char* filepath, int seqId) {
+    if (!_ctx) {
+        LOGe("Cannot load state: no context loaded");
+        return false;
+    }
+
+    LOGi("Loading KV cache state for seq %d from: %s", seqId, filepath);
+    size_t read = llama_state_seq_load_file(_ctx, filepath, seqId, nullptr, 0, nullptr);
+    if (read > 0) {
+        LOGi("KV cache state loaded successfully (%zu bytes)", read);
+        return true;
+    } else {
+        LOGe("Failed to load KV cache state");
+        return false;
+    }
+}
+
 
 std::string LLMInference::completionLoop() {
     // Check for interrupt

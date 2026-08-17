@@ -15,6 +15,19 @@ export class WhisperWeb extends WebPlugin implements WhisperPlugin {
         return { loaded: false };
     }
 
+    async getDeviceOptimization(): Promise<any> {
+        return {
+            soc: 'UNKNOWN',
+            availableCores: 4,
+            recommendedThreads: 4,
+            recommendedModel: 'ggml-tiny',
+            hasNpu: false,
+            npuArch: 'none',
+            recommendedBackend: 'cpu',
+            deviceInfo: 'Web/Browser'
+        };
+    }
+
     async transcribe(_options: {
         audioPath: string;
         language?: string;

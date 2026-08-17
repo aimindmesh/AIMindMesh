@@ -208,6 +208,21 @@ export function useOrganizationState() {
     }
   }, []);
 
+  const forceDevelop = useCallback(async (settings: AIMindMeshServerSettings, repoId: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      await organizationApi.forceDevelop(settings, repoId);
+      const data = await organizationApi.getRepositories(settings);
+      setRepositories(data);
+    } catch (e: any) {
+      setError(e.message || 'Failed to force development');
+      throw e;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
   const fetchHRProposals = useCallback(async (settings: AIMindMeshServerSettings) => {
     setLoading(true);
     setError(null);
@@ -448,6 +463,7 @@ export function useOrganizationState() {
     createRepository,
     bootstrapCiCd,
     runValidation,
+    forceDevelop,
     fetchHRProposals,
     analyzeRecruitment,
     materializeProposal,

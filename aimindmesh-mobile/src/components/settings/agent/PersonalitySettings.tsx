@@ -118,7 +118,7 @@ const PersonalitySettings: React.FC<PersonalitySettingsProps> = ({
                                     <button
                                         onClick={(e) => {
                                             e.stopPropagation();
-                                            if (window.confirm(`Eliminare la personalità "${preset.name}"?`)) {
+                                            if (window.confirm(`Delete personality "${preset.name}"?`)) {
                                                 triggerHaptic();
                                                 onDeleteCustomPersonality(id);
                                                 // If we're deleting the currently selected personality, switch to default
@@ -129,7 +129,7 @@ const PersonalitySettings: React.FC<PersonalitySettingsProps> = ({
                                             }
                                         }}
                                         className="ml-2 p-1.5 text-red-400 hover:bg-red-500/10 rounded transition-colors"
-                                        title="Elimina personalità"
+                                        title="Delete personality"
                                     >
                                         <TrashIcon className="w-4 h-4" />
                                     </button>

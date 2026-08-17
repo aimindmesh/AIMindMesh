@@ -132,7 +132,7 @@ export interface Personality {
   };
 }
 
-export type LLMProvider = 'gemini' | 'perplexity' | 'claude' | 'openrouter' | 'local' | 'in-browser-downloaded' | 'native-gguf' | 'local-model' | 'litert' | 'aimindmesh-server';
+export type LLMProvider = 'gemini' | 'perplexity' | 'claude' | 'openrouter' | 'local' | 'in-browser-downloaded' | 'native-gguf' | 'local-model' | 'litert' | 'genie-npu' | 'aimindmesh-server';
 
 export interface CustomGGUFModel {
   id: string;
@@ -155,7 +155,14 @@ export interface LLMConfig {
   contextSize?: number; // Configurable context size (default: 2048 or model specific)
   customModels?: CustomGGUFModel[];
   // LLM Engine selection (hybrid approach)
-  engine?: 'gguf' | 'litert';  // 'gguf' = llama.cpp, 'litert' = Google AI Edge
+  engine?: 'gguf' | 'litert' | 'genie';  // 'gguf' = llama.cpp, 'litert' = Google AI Edge, 'genie' = Qualcomm NPU
+  // Qualcomm Genie NPU configuration
+  genieModelPath?: string;     // Path to Qualcomm AI Hub / Genie NPU model
+  genieModelId?: string;       // Model identifier (e.g. qwen3.5, qwen2.5, gemma2)
+  genieRuntime?: 'npu' | 'gpu' | 'cpu'; // Execution runtime (default: npu)
+  // Stable Diffusion Qualcomm NPU / Local configuration
+  sdModelPath?: string;        // Path to Stable Diffusion model bundle (.zip or directory)
+  sdModelId?: string;          // Model identifier / folder name (e.g. stable_diffusion_v2_1)
   // LiteRT configuration
   liteRTModelPath?: string;    // Path to .litertlm model file
   liteRTModelId?: string;      // ID of downloaded LiteRT model
@@ -225,7 +232,7 @@ export interface LLMConfig {
 export type SttProvider = 'offline' | 'online' | 'vosk' | 'whisper' | 'voxtral';
 
 // STT processing mode
-export type SttMode = 'off' | 'vosk-only' | 'hybrid' | 'whisper-post';
+export type SttMode = 'off' | 'vosk-only' | 'whisper-only' | 'hybrid' | 'whisper-post';
 
 // Clustering algorithm for speaker diarization
 export type ClusteringAlgorithm = 'ahc' | 'spectral' | 'incremental';

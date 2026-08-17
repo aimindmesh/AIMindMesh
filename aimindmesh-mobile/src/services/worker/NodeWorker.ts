@@ -187,6 +187,11 @@ class MobileNodeWorker {
                                     durationMs: Date.now() - start,
                                     node: this.serverSettings?.deviceName || 'Mobile Node'
                                 }));
+
+                                // Persist KV cache after each task so context survives between remote requests
+                                this.flushCache().catch(e =>
+                                    logger.log('warn', '[NodeWorker] Failed to persist KV cache after task:', e)
+                                );
                             }
                         } catch (taskError: any) {
                             if (this.activeTaskAbort?.signal.aborted) {

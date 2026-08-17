@@ -610,6 +610,34 @@ Format:
     }
   });
 
+  app.post('/repositories/:repoId/force-develop', async (request: FastifyRequest, reply: FastifyReply) => {
+    try {
+      const { repoId } = request.params as { repoId: string };
+      const repo = db.prepare('SELECT * FROM organization_repositories WHERE id = ?').get(repoId) as any;
+      if (!repo) {
+        return reply.status(404).send({ error: 'Repository not found' });
+      }
+
+      const ideaRow = db.prepare('SELECT * FROM organization_ideas WHERE id = ?').get(repo.created_from_idea_id) as any;
+      if (!ideaRow) {
+        return reply.status(404).send({ error: 'Associated idea not found' });
+      }
+
+      const { VentureOrchestrator } = await import('../../services/organization/VentureOrchestrator');
+      await VentureOrchestrator.triggerDevelopmentAgent(
+        repo.id,
+        repo.repo_name,
+        repo.gitea_url,
+        ideaRow,
+        ideaRow.analysis_synthesis
+      );
+
+      return { success: true };
+    } catch (e: any) {
+      reply.status(500).send({ error: e.message });
+    }
+  });
+
   app.post('/repositories', async (request: FastifyRequest, reply: FastifyReply) => {
     try {
       const body = request.body as any;

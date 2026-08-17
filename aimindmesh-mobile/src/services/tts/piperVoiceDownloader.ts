@@ -50,45 +50,45 @@ export const PIPER_VOICES: PiperVoiceModel[] = [
     // Italian Voices - Male
     {
         id: 'it_IT-riccardo_bella-medium',
-        name: 'Riccardo Bella (Italiano) - Standard',
+        name: 'Riccardo Bella (Italian) - Standard',
         language: 'it',
         gender: 'male',
         quality: 'medium',
         size: 40000000, // ~40MB
         url: 'https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/it/it_IT/riccardo_bella/medium/it_IT-riccardo_bella-medium.onnx',
-        description: 'Voce maschile, qualità standard'
+        description: 'Male voice, standard quality'
     },
     {
         id: 'it_IT-riccardo_bella-high',
-        name: 'Riccardo Bella (Italiano) - Alta Qualità',
+        name: 'Riccardo Bella (Italian) - High Quality',
         language: 'it',
         gender: 'male',
         quality: 'high',
         size: 95000000, // ~95MB
         url: 'https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/it/it_IT/riccardo_bella/high/it_IT-riccardo_bella-high.onnx',
-        description: 'Voce maschile, massima qualità'
+        description: 'Male voice, maximum quality'
     },
 
     // Italian Voices - Female
     {
         id: 'it_IT-paola-medium',
-        name: 'Paola (Italiano) - Standard',
+        name: 'Paola (Italian) - Standard',
         language: 'it',
         gender: 'female',
         quality: 'medium',
         size: 40000000, // ~40MB
         url: 'https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/it/it_IT/paola/medium/it_IT-paola-medium.onnx',
-        description: 'Voce femminile, qualità standard - Raccomandata'
+        description: 'Female voice, standard quality - Recommended'
     },
     {
         id: 'it_IT-mls_1840-low',
-        name: 'MLS 1840 (Italiano)',
+        name: 'MLS 1840 (Italian)',
         language: 'it',
         gender: 'female',
         quality: 'low',
         size: 25000000, // ~25MB
         url: 'https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/it/it_IT/mls_1840/low/it_IT-mls_1840-low.onnx',
-        description: 'Voce femminile alternativa'
+        description: 'Alternative female voice'
     },
 ];
 

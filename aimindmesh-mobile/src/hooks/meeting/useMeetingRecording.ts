@@ -2,12 +2,13 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import { Vosk } from 'vosk-capacitor';
 import { isVoskSpeakerModelInstalled } from '../../services/speaker/speakerModelDownloader';
 import { logger } from '../../services/logger';
-import { RecognitionMode, TranscriptionMode } from '../../types/meeting';
+import { RecognitionMode, TranscriptionMode, TranscriptSegment } from '../../types/meeting';
 import { HighQualityAudioRecorder, RecordingResult, pcmToBase64 } from '../../services/audio/highQualityAudioRecorder';
 import { floatToInt16, arrayBufferToBase64 } from '../../services/audio/audioUtils';
 import AudioConverter from '../../services/audio/audioConverter';
+import { SpeakerEmbedding as SpeakerEmbeddingPlugin } from 'speaker-embedding-capacitor';
 
-const MAX_BUFFER_DURATION = 5; // Keep last 5 seconds approx for ONNX analysis
+const MAX_BUFFER_DURATION = 10; // Extended from 5s to 10s: ONNX embeddings need 2.5s window + Vosk finalResult latency
 const MAX_WHISPER_BUFFER_DURATION = 60 * 5; // Keep last 5 minutes for Whisper lookback context during active meeting
 
 export interface MeetingRecordingState {
@@ -37,6 +38,10 @@ interface UseMeetingRecordingOptions {
     transcriptionModeRef: React.MutableRefObject<TranscriptionMode>;
     showToast: (message: string, type: 'success' | 'error' | 'info') => void;
     onRecordingStopped?: (audioChunks: Blob[], mimeType: string, pcmBlob?: Blob | null, durationMs?: number, filePath?: string) => Promise<void>;
+    /** Transcript setters for Voxtral real-time transcription */
+    setCurrentText?: (text: string) => void;
+    setTranscript?: React.Dispatch<React.SetStateAction<TranscriptSegment[]>>;
+    diarizationRef?: React.MutableRefObject<any>;
 }
 
 /**
@@ -49,7 +54,10 @@ export function useMeetingRecording({
     recognitionModeRef,
     transcriptionModeRef,
     showToast,
-    onRecordingStopped
+    onRecordingStopped,
+    setCurrentText,
+    setTranscript,
+    diarizationRef
 }: UseMeetingRecordingOptions): MeetingRecordingState {
     const [isRecording, setIsRecording] = useState(false);
     const [isPaused, setIsPaused] = useState(false);
@@ -104,8 +112,79 @@ export function useMeetingRecording({
                     const voxtralService = getVoxtralSttService();
 
                     // Start Voxtral streaming with transcript callback
-                    await voxtralService.start((transcript: string, tokens: any[]) => {
-                        logger.log('debug', `Voxtral transcript: ${transcript.substring(0, 50)}... tokens: ${tokens?.length}`);
+                    let voxtralSegCount = 0;
+                    let lastVoxtralEmbedTime = 0;
+                    await voxtralService.start(async (transcript: string, tokens: any[]) => {
+                        setCurrentText?.(transcript);
+
+                        if (tokens && tokens.length > 0 && setTranscript) {
+                            // Extract ONNX embedding for speaker ID when precise mode is active
+                            let speakerId = diarizationRef?.current?.identifySpeaker() ?? 0;
+                            const isPrecise = recognitionModeRef?.current === 'precise';
+
+                            if (isPrecise && diarizationRef?.current && audioBufferRef.current.length > 0) {
+                                const now = Date.now();
+                                // Extract embedding at most every 3 seconds to avoid overloading
+                                if (now - lastVoxtralEmbedTime > 3000) {
+                                    try {
+                                        const flattened = new Float32Array(audioBufferRef.current.reduce((acc, c) => acc + c.length, 0));
+                                        let offset = 0;
+                                        audioBufferRef.current.forEach(c => { flattened.set(c, offset); offset += c.length; });
+                                        const samplesToTake = Math.min(flattened.length, Math.ceil(4.0 * 16000));
+                                        const rawSegment = flattened.slice(Math.max(0, flattened.length - samplesToTake));
+                                        const downsampled = rawSegment;
+                                        const int16 = floatToInt16(downsampled);
+                                        const base64Audio = arrayBufferToBase64(int16.buffer as ArrayBuffer);
+                                        const embedResult = await SpeakerEmbeddingPlugin.extractEmbedding({ audioData: base64Audio });
+                                        if (embedResult?.embedding?.length > 0) {
+                                            speakerId = diarizationRef.current.identifySpeaker(embedResult.embedding);
+                                            diarizationRef.current.getEmbeddingService().storeEmbedding(
+                                                `voxtral_embed_${Date.now()}`, embedResult.embedding, Date.now(), speakerId
+                                            );
+                                            voxtralSegCount++;
+                                            lastVoxtralEmbedTime = now;
+                                        }
+                                    } catch (e) {
+                                        // ONNX extraction failed, use fallback speakerId
+                                    }
+                                }
+                            }
+
+                            const lastToken = tokens[tokens.length - 1];
+                            setTranscript(prev => {
+                                const lastSeg = prev[prev.length - 1];
+                                const startMs = lastToken.startMs ?? lastToken.timestampMs ?? Date.now();
+                                const endMs = lastToken.endMs ?? (lastToken.timestampMs ?? Date.now());
+                                if (lastSeg && lastSeg.stt_provider === 'voxtral' && lastSeg.speakerId === speakerId) {
+                                    const updated = [...prev];
+                                    updated[updated.length - 1] = {
+                                        ...lastSeg,
+                                        text: transcript,
+                                        end_ms: endMs
+                                    };
+                                    return updated;
+                                }
+                                return [...prev, {
+                                    id: `voxtral_${Date.now()}_${tokens.length}`,
+                                    speakerId,
+                                    text: transcript,
+                                    timestamp: Date.now(),
+                                    start_ms: startMs,
+                                    end_ms: endMs,
+                                    stt_provider: 'voxtral'
+                                } as TranscriptSegment];
+                            });
+
+                            // Periodic re-clustering every ~30s or 10 Voxtral segments
+                            if (isPrecise && voxtralSegCount >= 10) {
+                                try {
+                                    diarizationRef?.current?.getEmbeddingService().periodicRecluster();
+                                    voxtralSegCount = 0;
+                                } catch (e) {
+                                    logger.log('warn', 'Voxtral periodic recluster failed', e);
+                                }
+                            }
+                        }
                     });
                     logger.log('info', 'Voxtral STT started successfully');
                 } catch (voxtralError) {

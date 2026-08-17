@@ -29,6 +29,14 @@ interface MeetingHeaderProps {
     setTranscriptionMode: (mode: TranscriptionMode) => void;
     whisperChunkSize: number;
     setWhisperChunkSize: (value: number) => void;
+    whisperVadFilter: boolean;
+    setWhisperVadFilter: (value: boolean) => void;
+    whisperConditionOnPrevious: boolean;
+    setWhisperConditionOnPrevious: (value: boolean) => void;
+    whisperWordTimestamps: boolean;
+    setWhisperWordTimestamps: (value: boolean) => void;
+    whisperProfile: 'fast' | 'accurate';
+    setWhisperProfile: (value: 'fast' | 'accurate') => void;
 
     // Advanced Diarization
     embeddingThreshold: number;
@@ -63,6 +71,14 @@ const MeetingHeader: React.FC<MeetingHeaderProps> = ({
     setTranscriptionMode,
     whisperChunkSize,
     setWhisperChunkSize,
+    whisperVadFilter,
+    setWhisperVadFilter,
+    whisperConditionOnPrevious,
+    setWhisperConditionOnPrevious,
+    whisperWordTimestamps,
+    setWhisperWordTimestamps,
+    whisperProfile,
+    setWhisperProfile,
 
     embeddingThreshold,
     setEmbeddingThreshold,
@@ -103,8 +119,8 @@ const MeetingHeader: React.FC<MeetingHeaderProps> = ({
                                 <span className={`w-1.5 h-1.5 rounded-full ${transcriptionMode === 'off' ? 'bg-gray-500' : 'bg-red-500 animate-pulse'}`}></span>
 
                                 {/* Transcription Mode Info */}
-                                <span className={transcriptionMode === 'whisper' ? 'text-purple-300' : transcriptionMode === 'voxtral' ? 'text-fuchsia-300' : transcriptionMode === 'vosk' ? 'text-blue-300' : 'text-gray-400'}>
-                                    {transcriptionMode === 'off' ? 'Audio Rec' : transcriptionMode === 'whisper' ? 'Whisper Live' : transcriptionMode === 'voxtral' ? 'Voxtral Live' : 'Vosk Live'}
+                                <span className={transcriptionMode === 'whisper' ? 'text-purple-300' : transcriptionMode === 'voxtral' ? 'text-fuchsia-300' : transcriptionMode === 'hybrid' ? 'text-indigo-300' : transcriptionMode === 'vosk' ? 'text-blue-300' : 'text-gray-400'}>
+                                    {transcriptionMode === 'off' ? 'Audio Rec' : transcriptionMode === 'whisper' ? 'Whisper Live' : transcriptionMode === 'voxtral' ? 'Voxtral Live' : transcriptionMode === 'hybrid' ? 'Hybrid Live' : 'Vosk Live'}
                                 </span>
 
                                 <span className="text-white/20">•</span>
@@ -199,25 +215,75 @@ const MeetingHeader: React.FC<MeetingHeaderProps> = ({
                                 <div className={`w-1.5 h-1.5 rounded-full ${transcriptionMode === 'whisper' ? 'bg-white' : 'bg-purple-500'}`} />
                                 Whisper
                             </button>
+                            <button
+                                onClick={() => setTranscriptionMode('hybrid')}
+                                className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all flex items-center gap-2 ${transcriptionMode === 'hybrid'
+                                    ? 'bg-gradient-to-r from-blue-600/80 to-purple-600/80 text-white shadow-sm ring-1 ring-white/10'
+                                    : 'text-text-secondary hover:text-white'
+                                    }`}
+                                title="Hybrid (Vosk + Whisper) - Vosk real-time, Whisper refines every 30s"
+                            >
+                                <div className={`w-1.5 h-1.5 rounded-full ${transcriptionMode === 'hybrid' ? 'bg-white' : 'bg-gradient-to-r from-blue-500 to-purple-500'}`} />
+                                Hybrid
+                            </button>
                         </div>
                     </div>
 
                     {/* Whisper Chunk Size Slider (Only visible if Whisper is selected) */}
-                    {transcriptionMode === 'whisper' && (
-                        <div className="flex items-center gap-3 p-2 bg-purple-500/10 rounded-lg border border-purple-500/20 animate-fade-in">
-                            <span className="text-xs text-purple-200 whitespace-nowrap w-24">Chunk Size:</span>
-                            <input
-                                type="range"
-                                min="2"
-                                max="10"
-                                step="5"
-                                value={whisperChunkSize}
-                                onChange={(e) => setWhisperChunkSize(parseInt(e.target.value))}
-                                className="w-full h-1.5 bg-surface-hover rounded-lg appearance-none cursor-pointer accent-purple-500"
-                                title={`Transcribe every ${whisperChunkSize} seconds`}
-                            />
-                            <span className="text-xs text-purple-200 font-mono w-8 text-right">{whisperChunkSize}s</span>
-                        </div>
+                    {(transcriptionMode === 'whisper' || transcriptionMode === 'hybrid') && (
+                        <>
+                            <div className="flex items-center gap-3 p-2 bg-purple-500/10 rounded-lg border border-purple-500/20 animate-fade-in">
+                                <span className="text-xs text-purple-200 whitespace-nowrap w-24">Chunk Size:</span>
+                                <input
+                                    type="range"
+                                    min="2"
+                                    max="10"
+                                    step="5"
+                                    value={whisperChunkSize}
+                                    onChange={(e) => setWhisperChunkSize(parseInt(e.target.value))}
+                                    className="w-full h-1.5 bg-surface-hover rounded-lg appearance-none cursor-pointer accent-purple-500"
+                                    title={`Transcribe every ${whisperChunkSize} seconds`}
+                                />
+                                <span className="text-xs text-purple-200 font-mono w-8 text-right">{whisperChunkSize}s</span>
+                            </div>
+
+                            {/* Whisper Profile Selector */}
+                            <div className="flex items-center justify-between p-2 bg-purple-500/10 rounded-lg border border-purple-500/20 animate-fade-in">
+                                <span className="text-xs text-purple-200 whitespace-nowrap">Profile:</span>
+                                <div className="flex bg-surface rounded-lg p-1 border border-white/5">
+                                    <button
+                                        onClick={() => setWhisperProfile('fast')}
+                                        className={`px-2 py-1 rounded-md text-xs font-medium transition-all ${whisperProfile === 'fast' ? 'bg-purple-500 text-white shadow-sm' : 'text-text-secondary hover:text-white'}`}
+                                        title="Fast: greedy decoding, no VAD (best for real-time)"
+                                    >
+                                        Fast
+                                    </button>
+                                    <button
+                                        onClick={() => setWhisperProfile('accurate')}
+                                        className={`px-2 py-1 rounded-md text-xs font-medium transition-all ${whisperProfile === 'accurate' ? 'bg-purple-500 text-white shadow-sm' : 'text-text-secondary hover:text-white'}`}
+                                        title="Accurate: beam search 5, VAD filter, word timestamps"
+                                    >
+                                        Accurate
+                                    </button>
+                                </div>
+                            </div>
+
+                            {/* Whisper Advanced Toggles */}
+                            <div className="flex flex-wrap gap-2 p-2 bg-purple-500/10 rounded-lg border border-purple-500/20 animate-fade-in">
+                                <label className="flex items-center gap-1.5 cursor-pointer" title="Filter silence before transcription">
+                                    <input type="checkbox" checked={whisperVadFilter} onChange={(e) => setWhisperVadFilter(e.target.checked)} className="accent-purple-500 w-3 h-3" />
+                                    <span className="text-xs text-purple-200">VAD</span>
+                                </label>
+                                <label className="flex items-center gap-1.5 cursor-pointer" title="Use previous chunk text for context continuity">
+                                    <input type="checkbox" checked={whisperConditionOnPrevious} onChange={(e) => setWhisperConditionOnPrevious(e.target.checked)} className="accent-purple-500 w-3 h-3" />
+                                    <span className="text-xs text-purple-200">Context</span>
+                                </label>
+                                <label className="flex items-center gap-1.5 cursor-pointer" title="Enable word-level timestamps">
+                                    <input type="checkbox" checked={whisperWordTimestamps} onChange={(e) => setWhisperWordTimestamps(e.target.checked)} className="accent-purple-500 w-3 h-3" />
+                                    <span className="text-xs text-purple-200">Words</span>
+                                </label>
+                            </div>
+                        </>
                     )}
 
                     {/* Speaker ID Mode Selector */}
@@ -279,7 +345,7 @@ const MeetingHeader: React.FC<MeetingHeaderProps> = ({
                                 >
                                     <option value="auto">Auto Detect</option>
                                     <option value="en">English</option>
-                                    <option value="it">Italiano</option>
+                                    <option value="it">Italian</option>
                                 </select>
                             </div>
                         </div>

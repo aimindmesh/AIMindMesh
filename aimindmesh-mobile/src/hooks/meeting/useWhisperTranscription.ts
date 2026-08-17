@@ -1,36 +1,39 @@
 import { useEffect, useRef } from 'react';
 import { logger } from '../../services/logger';
 import { getWhisperSTTService } from '../../services/stt/whisperSTT';
+import { SpeakerEmbedding as SpeakerEmbeddingPlugin } from 'speaker-embedding-capacitor';
 import { MeetingRecordingState } from './useMeetingRecording';
 import { MeetingSettingsState } from './useMeetingSettings';
 import { TranscriptSegment } from '../../types/meeting';
+import { RecognitionMode } from '../../types/meeting';
 
 interface UseWhisperTranscriptionProps {
     settings: MeetingSettingsState;
     recording: MeetingRecordingState;
     setTranscript: React.Dispatch<React.SetStateAction<TranscriptSegment[]>>;
     setIsWhisperTranscribing: (isTranscribing: boolean) => void;
+    diarizationRef?: React.MutableRefObject<any>;
+    recognitionModeRef?: React.MutableRefObject<RecognitionMode>;
 }
 
 export function useWhisperTranscription({
     settings,
     recording,
     setTranscript,
-    setIsWhisperTranscribing
+    setIsWhisperTranscribing,
+    diarizationRef,
+    recognitionModeRef
 }: UseWhisperTranscriptionProps) {
-    // Last processed sample offset for Whisper chunking
     const lastProcessedSampleOffsetRef = useRef(0);
-
-    // Whisper Loop
-    // Mutex to prevent concurrent transcriptions (native context is NOT thread-safe)
     const isTranscribingRef = useRef(false);
+    const segmentCounterRef = useRef(0);
+    const previousTextRef = useRef('');
 
     useEffect(() => {
         if (settings.transcriptionMode !== 'whisper' || !recording.isRecording || recording.isPaused) {
             return;
         }
 
-        // Clamp to 10s max to match native safety limit
         const safeChunkSize = Math.min(settings.whisperChunkSize, 10);
         const intervalMs = safeChunkSize * 1000;
         logger.log('info', `Starting Whisper loop with interval ${intervalMs}ms`);
@@ -38,69 +41,110 @@ export function useWhisperTranscription({
         const intervalId = setInterval(async () => {
             if (!recording.isRecording || recording.isPaused) return;
 
-            // Skip if a transcription is already in progress (native context is not thread-safe)
             if (isTranscribingRef.current) {
                 logger.log('warn', 'Skipping chunk: previous transcription still in progress');
                 return;
             }
 
-            // Extract audio since last offset, limiting to 10 seconds (160000 samples) to prevent native crash
             const { base64, newOffset } = recording.getAudioSince(lastProcessedSampleOffsetRef.current, 160000);
 
             if (!base64 || base64.length === 0) return;
 
-            // Update offset immediately to avoid reprocessing
             const startOffset = lastProcessedSampleOffsetRef.current;
             lastProcessedSampleOffsetRef.current = newOffset;
 
-            // Set lock and UI state
             isTranscribingRef.current = true;
             setIsWhisperTranscribing(true);
 
-            try {
-                logger.log('info', `Sending chunk to Whisper: ${(newOffset - startOffset) / 16000}s`);
-                const service = getWhisperSTTService();
+            let speakerId = 0;
 
-                // Model should be pre-loaded by useMeetingInitialization
-                const result = await service.transcribeAudio(base64, {
+            try {
+                // Extract speaker embedding for diarization (precise mode only)
+                if (diarizationRef && recognitionModeRef?.current === 'precise') {
+                    try {
+                        const embedResult = await SpeakerEmbeddingPlugin.extractEmbedding({ audioData: base64 });
+                        if (embedResult && embedResult.embedding && embedResult.embedding.length > 0) {
+                            speakerId = diarizationRef.current.identifySpeaker(embedResult.embedding);
+
+                            // Store embedding for session clustering
+                            const segmentId = `whisper_embed_${Date.now()}_${segmentCounterRef.current}`;
+                            diarizationRef.current.getEmbeddingService().storeEmbedding(
+                                segmentId, embedResult.embedding, Date.now(), speakerId
+                            );
+                            logger.log('debug', `Whisper chunk speaker ID: ${speakerId}`);
+                        }
+                    } catch (e) {
+                        logger.log('warn', 'Whisper ONNX embedding extraction failed, using default speaker', e);
+                    }
+                }
+
+                const service = getWhisperSTTService();
+                const transcribeConfig: any = {
                     language: settings.transcriptionLanguage,
-                    temperature: 0.0,
-                    beamSize: 1 // Use fast settings for chunks
-                }, 'fast');
+                    temperature: settings.whisperProfile === 'accurate' ? 0.0 : 0.0,
+                    beamSize: settings.whisperProfile === 'accurate' ? 5 : 1,
+                    vadFilter: settings.whisperVadFilter || settings.whisperProfile === 'accurate',
+                    conditionOnPreviousText: settings.whisperConditionOnPrevious || settings.whisperProfile === 'accurate',
+                    wordTimestamps: settings.whisperWordTimestamps || settings.whisperProfile === 'accurate'
+                };
+
+                // Pass previous text for continuity if enabled
+                if (transcribeConfig.conditionOnPreviousText && previousTextRef.current) {
+                    transcribeConfig.initialPrompt = previousTextRef.current;
+                }
+
+                const result = await service.transcribeAudio(base64, transcribeConfig, settings.whisperProfile === 'accurate' ? 'accurate' : 'fast');
 
                 if (result.text && result.text.trim().length > 0) {
-                    logger.log('info', `[Whisper] Chunk result: "${result.text}"`);
+                    logger.log('info', `[Whisper] Chunk result: "${result.text}" (speaker ${speakerId})`);
+                    previousTextRef.current = result.text.trim();
 
-                    const speakerId = 0; // Default/Unknown
-                    const offsetMs = startOffset / 16; // 16kHz audio
+                    const offsetMs = startOffset / 16;
+                    const chunkId = `${Date.now().toString(36)}_${segmentCounterRef.current++}`;
+
+                    // Build word timestamps if available
+                    const rawWords: any[] | undefined = (result as any).words;
+                    const words = rawWords?.map((w: any) => ({
+                        word: w.word || w.text,
+                        start_ms: Math.floor(offsetMs + (w.startMs ?? w.start_ms ?? 0)),
+                        end_ms: Math.floor(offsetMs + (w.endMs ?? w.end_ms ?? 0)),
+                        confidence: w.confidence ?? w.probability ?? 0
+                    }));
 
                     if (result.segments && result.segments.length > 0) {
                         setTranscript(prev => {
                             const newSegments = result.segments.map((seg, i) => ({
-                                id: Date.now().toString() + '_' + i,
+                                id: `${chunkId}_${i}`,
                                 speakerId,
                                 text: seg.text.trim(),
                                 timestamp: Date.now(),
                                 start_ms: Math.floor(offsetMs + seg.startMs),
-                                end_ms: Math.floor(offsetMs + seg.endMs)
+                                end_ms: Math.floor(offsetMs + seg.endMs),
+                                stt_provider: 'whisper',
+                                confidence: seg.confidence ?? 0,
+                                words: words?.filter((w: any) =>
+                                    w.start_ms >= Math.floor(offsetMs + seg.startMs) && w.end_ms <= Math.floor(offsetMs + seg.endMs)
+                                ) ?? undefined
                             }));
                             return [...prev, ...newSegments];
                         });
                     } else {
                         setTranscript(prev => [...prev, {
-                            id: Date.now().toString(),
+                            id: chunkId,
                             speakerId,
                             text: result.text.trim(),
                             timestamp: Date.now(),
                             start_ms: Math.floor(offsetMs),
-                            end_ms: Math.floor(offsetMs + (newOffset - startOffset) / 16)
+                            end_ms: Math.floor(offsetMs + (newOffset - startOffset) / 16),
+                            stt_provider: 'whisper',
+                            confidence: 0,
+                            words: words?.length ? words : undefined
                         }]);
                     }
                 }
             } catch (error) {
                 logger.log('error', 'Whisper chunk transcription failed', error);
             } finally {
-                // Release lock and UI state
                 isTranscribingRef.current = false;
                 setIsWhisperTranscribing(false);
             }
@@ -112,12 +156,11 @@ export function useWhisperTranscription({
         };
     }, [settings.transcriptionMode, recording.isRecording, recording.isPaused, settings.whisperChunkSize, settings.transcriptionLanguage, recording.getAudioSince]);
 
-    // Reset offset when recording starts
     useEffect(() => {
         if (recording.isRecording) {
-            // If starting fresh
             if (recording.totalBufferedDurationRef.current === 0) {
                 lastProcessedSampleOffsetRef.current = 0;
+                segmentCounterRef.current = 0;
             }
         }
     }, [recording.isRecording]);

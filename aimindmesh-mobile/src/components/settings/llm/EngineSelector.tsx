@@ -17,35 +17,49 @@ const EngineSelector: React.FC<EngineSelectorProps> = ({
             <label className="block text-sm font-medium text-text-primary mb-2">
                 🔧 LLM Engine
             </label>
-            <div className="grid grid-cols-2 gap-2">
+            <div className="grid grid-cols-3 gap-2">
                 <button
                     type="button"
-                    onClick={() => { triggerHaptic(); onLlmConfigSave({ ...llmConfig, engine: 'gguf' }); }}
-                    className={`py-3 px-4 rounded-lg border transition-all flex flex-col items-center gap-1
-            ${(llmConfig.engine || 'gguf') === 'gguf'
+                    onClick={() => { triggerHaptic(); onLlmConfigSave({ ...llmConfig, engine: 'gguf', provider: 'native-gguf' }); }}
+                    className={`py-3 px-2 rounded-lg border transition-all flex flex-col items-center gap-1
+            ${(llmConfig.engine || 'gguf') === 'gguf' && llmConfig.provider !== 'genie-npu'
                             ? 'bg-green-500/20 border-green-400 text-green-300'
                             : 'bg-surface border-white/10 text-text-secondary hover:border-white/20'}`}
                 >
                     <span className="text-xl">🦙</span>
-                    <span className="text-sm font-medium">GGUF</span>
-                    <span className="text-[10px] opacity-70">llama.cpp</span>
+                    <span className="text-xs font-medium">GGUF</span>
+                    <span className="text-[9px] opacity-70">llama.cpp</span>
                 </button>
                 <button
                     type="button"
-                    onClick={() => { triggerHaptic(); onLlmConfigSave({ ...llmConfig, engine: 'litert' }); }}
-                    className={`py-3 px-4 rounded-lg border transition-all flex flex-col items-center gap-1
-            ${llmConfig.engine === 'litert'
+                    onClick={() => { triggerHaptic(); onLlmConfigSave({ ...llmConfig, engine: 'litert', provider: 'native-gguf' }); }}
+                    className={`py-3 px-2 rounded-lg border transition-all flex flex-col items-center gap-1
+            ${llmConfig.engine === 'litert' && llmConfig.provider !== 'genie-npu'
                             ? 'bg-blue-500/20 border-blue-400 text-blue-300'
                             : 'bg-surface border-white/10 text-text-secondary hover:border-white/20'}`}
                 >
                     <span className="text-xl">🏷️</span>
-                    <span className="text-sm font-medium">LiteRT</span>
-                    <span className="text-[10px] opacity-70">Gemma 3n</span>
+                    <span className="text-xs font-medium">LiteRT</span>
+                    <span className="text-[9px] opacity-70">Gemma 3n</span>
+                </button>
+                <button
+                    type="button"
+                    onClick={() => { triggerHaptic(); onLlmConfigSave({ ...llmConfig, engine: 'genie', provider: 'genie-npu' }); }}
+                    className={`py-3 px-2 rounded-lg border transition-all flex flex-col items-center gap-1
+            ${llmConfig.engine === 'genie' || llmConfig.provider === 'genie-npu'
+                            ? 'bg-amber-500/20 border-amber-400 text-amber-300'
+                            : 'bg-surface border-white/10 text-text-secondary hover:border-white/20'}`}
+                >
+                    <span className="text-xl">⚡</span>
+                    <span className="text-xs font-medium">Genie NPU</span>
+                    <span className="text-[9px] opacity-70">Hexagon v79</span>
                 </button>
             </div>
             <p className="text-xs text-text-tertiary mt-2">
-                {(llmConfig.engine || 'gguf') === 'gguf'
-                    ? 'llama.cpp: Runs GGUF models locally.'
+                {llmConfig.engine === 'genie' || llmConfig.provider === 'genie-npu'
+                    ? 'Qualcomm Genie: Hardware accelerated on Snapdragon Hexagon NPU (50+ tok/s at 2W).'
+                    : (llmConfig.engine || 'gguf') === 'gguf'
+                    ? 'llama.cpp: Runs GGUF models locally on CPU/GPU.'
                     : 'LiteRT: Google AI Edge with Gemma models. Native multimodal support.'}
             </p>
 
