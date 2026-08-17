@@ -152,3 +152,9 @@ gallery-main/
 aimindmesh-mobile/android/scripts/validate_litert_libs.sh
 aimindmesh-server/scripts/update_freellmapi.sh
 diff.txt
+aimindmesh-mobile/scripts/export_vae_encoder.py
+aimindmesh-mobile/scripts/exported_vae_encoder/job_jpxx2z33p_optimized_bin_mmxg52kjq.bin
+aimindmesh-mobile/scripts/exported_vae_encoder/vae_encoder.bin
+aimindmesh-mobile/scripts/export_realesrgan.py
+aimindmesh-mobile/scripts/download_realesrgan_job.py
+aimindmesh-mobile/scripts/exported_realesrgan/

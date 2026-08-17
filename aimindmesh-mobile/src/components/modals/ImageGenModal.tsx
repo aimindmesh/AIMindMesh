@@ -30,6 +30,8 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
     const [steps, setSteps] = useState(25);
     const [cfgScale, setCfgScale] = useState(7.5);
     const [strength, setStrength] = useState(0.65);
+    const [aspectRatio, setAspectRatio] = useState<'1:1' | '16:9' | '9:16' | '4:3'>('1:1');
+    const [upscale, setUpscale] = useState<1 | 2 | 4>(1);
     const [sourceImage, setSourceImage] = useState<string | null>(initialImage || null);
     const [isGenerating, setIsGenerating] = useState(false);
     const [progress, setProgress] = useState<{ step: number; total: number; percent: number } | null>(null);
@@ -126,6 +128,8 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                 strength: mode === 'img2img' ? strength : undefined,
                 steps,
                 cfgScale,
+                aspectRatio,
+                upscale,
                 onProgress: (ev: SDProgressEvent) => {
                     const percent = Math.round((ev.step / ev.totalSteps) * 100);
                     setProgress({ step: ev.step, total: ev.totalSteps, percent });
@@ -149,21 +153,16 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
         triggerHaptic();
         try {
             const rawBase64 = result.base64Image.replace(/^data:image\/\w+;base64,/, '');
-            const now = new Date();
-            const timestamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
-            const fileName = `AIMindMesh_SD_${timestamp}.png`;
-
+            const timestamp = new Date().toISOString().replace(/\D/g, '').slice(0, 14);
             await Filesystem.writeFile({
-                path: fileName,
+                path: `AIMindMesh_SD_${timestamp}.png`,
                 data: rawBase64,
                 directory: Directory.Documents,
                 recursive: true,
             });
-
             setSaveStatus('Saved to Documents!');
             setTimeout(() => setSaveStatus(null), 3000);
-        } catch (err: any) {
-            logger.log('error', '[ImageGenModal] Save error', err);
+        } catch (err) {
             try {
                 const link = document.createElement('a');
                 link.href = result.base64Image;
@@ -173,7 +172,7 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                 document.body.removeChild(link);
                 setSaveStatus('Saved to Downloads!');
                 setTimeout(() => setSaveStatus(null), 3000);
-            } catch (fallbackErr) {
+            } catch {
                 setError('Failed to save image.');
             }
         } finally {
@@ -187,23 +186,19 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
         triggerHaptic();
         try {
             const rawBase64 = result.base64Image.replace(/^data:image\/\w+;base64,/, '');
-            const fileName = `AIMindMesh_SD_share_${Date.now()}.png`;
-
-            const fileResult = await Filesystem.writeFile({
-                path: fileName,
+            const fileRes = await Filesystem.writeFile({
+                path: `AIMindMesh_SD_share_${Date.now()}.png`,
                 data: rawBase64,
                 directory: Directory.Cache,
                 recursive: true,
             });
-
             await Share.share({
                 title: 'AI MindMesh Generation',
                 text: prompt || 'Generated with Qualcomm NPU on AI MindMesh',
-                url: fileResult.uri,
+                url: fileRes.uri,
                 dialogTitle: 'Share AI Image',
             });
         } catch (err: any) {
-            logger.log('warn', '[ImageGenModal] Share error', err);
             if (err?.message && !err.message.includes('canceled') && !err.message.includes('dismissed')) {
                 setError('Failed to share image.');
             }
@@ -269,9 +264,7 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                             type="button"
                             onClick={() => { setMode('txt2img'); triggerHaptic(); }}
                             className={`flex-1 py-2 rounded-lg text-xs font-semibold transition-all flex items-center justify-center gap-1.5 ${
-                                mode === 'txt2img'
-                                    ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow-sm'
-                                    : 'text-text-secondary hover:text-text-primary'
+                                mode === 'txt2img' ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow-sm' : 'text-text-secondary hover:text-text-primary'
                             }`}
                         >
                             ✨ Text to Image
@@ -280,9 +273,7 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                             type="button"
                             onClick={() => { setMode('img2img'); triggerHaptic(); }}
                             className={`flex-1 py-2 rounded-lg text-xs font-semibold transition-all flex items-center justify-center gap-1.5 ${
-                                mode === 'img2img'
-                                    ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow-sm'
-                                    : 'text-text-secondary hover:text-text-primary'
+                                mode === 'img2img' ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow-sm' : 'text-text-secondary hover:text-text-primary'
                             }`}
                         >
                             🖌️ Edit Image (img2img)
@@ -293,38 +284,20 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                     {mode === 'img2img' && (
                         <div className="p-3 bg-surface/40 rounded-xl border border-white/10 space-y-3">
                             <div className="flex items-center justify-between">
-                                <label className="text-xs font-medium text-text-primary flex items-center gap-1.5">
-                                    🖼️ Source Image
-                                </label>
+                                <label className="text-xs font-medium text-text-primary flex items-center gap-1.5">🖼️ Source Image</label>
                                 <span className="text-[10px] text-text-tertiary">To modify or restyle</span>
                             </div>
 
                             {sourceImage ? (
                                 <div className="flex items-center gap-3 bg-surface/60 p-2 rounded-lg border border-white/5">
-                                    <img
-                                        src={sourceImage}
-                                        alt="Source preview"
-                                        className="w-16 h-16 object-cover rounded-md border border-white/10 bg-black"
-                                    />
+                                    <img src={sourceImage} alt="Source preview" className="w-16 h-16 object-cover rounded-md border border-white/10 bg-black" />
                                     <div className="flex-1 min-w-0">
                                         <p className="text-xs font-medium text-text-primary truncate">Source Image Loaded</p>
                                         <p className="text-[10px] text-text-tertiary">512x512 normalized</p>
                                         <div className="mt-1 flex items-center gap-2">
-                                            <button
-                                                type="button"
-                                                onClick={handlePickImage}
-                                                className="text-[11px] text-amber-300 hover:underline"
-                                            >
-                                                Change
-                                            </button>
+                                            <button type="button" onClick={handlePickImage} className="text-[11px] text-amber-300 hover:underline">Change</button>
                                             <span className="text-text-tertiary">•</span>
-                                            <button
-                                                type="button"
-                                                onClick={() => setSourceImage(null)}
-                                                className="text-[11px] text-red-400 hover:underline"
-                                            >
-                                                Remove
-                                            </button>
+                                            <button type="button" onClick={() => setSourceImage(null)} className="text-[11px] text-red-400 hover:underline">Remove</button>
                                         </div>
                                     </div>
                                 </div>
@@ -339,13 +312,7 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                                 </button>
                             )}
 
-                            <input
-                                ref={fileInputRef}
-                                type="file"
-                                accept="image/*"
-                                onChange={handleFileSelect}
-                                className="hidden"
-                            />
+                            <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFileSelect} className="hidden" />
 
                             {/* Strength Slider */}
                             {sourceImage && (
@@ -354,22 +321,69 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                                         <span className="text-text-secondary">Transformation Strength:</span>
                                         <span className="text-amber-300 font-mono">{Math.round(strength * 100)}%</span>
                                     </div>
-                                    <input
-                                        type="range"
-                                        min="0.1"
-                                        max="0.95"
-                                        step="0.05"
-                                        value={strength}
-                                        onChange={(e) => setStrength(parseFloat(e.target.value))}
-                                        className="w-full accent-amber-400"
-                                    />
-                                    <p className="text-[10px] text-text-tertiary">
-                                        Lower preserves original shape; higher invents new details.
-                                    </p>
+                                    <input type="range" min="0.1" max="0.95" step="0.05" value={strength} onChange={(e) => setStrength(parseFloat(e.target.value))} className="w-full accent-amber-400" />
+                                    <p className="text-[10px] text-text-tertiary">Lower preserves original shape; higher invents new details.</p>
                                 </div>
                             )}
                         </div>
                     )}
+
+                    {/* Aspect Ratio & Super-Resolution Selectors */}
+                    <div className="grid grid-cols-2 gap-2">
+                        <div className="p-2.5 bg-surface/40 rounded-xl border border-white/5 space-y-1.5">
+                            <div className="flex items-center justify-between">
+                                <label className="text-[11px] font-semibold text-text-primary flex items-center gap-1">
+                                    📐 Aspect Ratio
+                                </label>
+                                <span className="text-[10px] text-amber-300 font-mono">{aspectRatio}</span>
+                            </div>
+                            <div className="grid grid-cols-4 gap-1">
+                                {(['1:1', '16:9', '9:16', '4:3'] as const).map((ratio) => (
+                                    <button
+                                        key={ratio}
+                                        type="button"
+                                        onClick={() => { setAspectRatio(ratio); triggerHaptic(); }}
+                                        className={`py-1.5 rounded-lg text-[10px] font-semibold transition-all border ${
+                                            aspectRatio === ratio
+                                                ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 shadow-sm'
+                                                : 'bg-surface/60 text-text-secondary border-transparent hover:border-white/10'
+                                        }`}
+                                    >
+                                        {ratio}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+
+                        <div className="p-2.5 bg-surface/40 rounded-xl border border-white/5 space-y-1.5">
+                            <div className="flex items-center justify-between">
+                                <label className="text-[11px] font-semibold text-text-primary flex items-center gap-1">
+                                    ⚡ AI Super-Res
+                                </label>
+                                <span className="text-[10px] text-amber-300 font-mono">{upscale === 1 ? '512px' : upscale === 2 ? '1024px' : '2048px'}</span>
+                            </div>
+                            <div className="grid grid-cols-3 gap-1">
+                                {([
+                                    { s: 1 as const, l: '1x' },
+                                    { s: 2 as const, l: '2x' },
+                                    { s: 4 as const, l: '4x' }
+                                ]).map(({ s, l }) => (
+                                    <button
+                                        key={s}
+                                        type="button"
+                                        onClick={() => { setUpscale(s); triggerHaptic(); }}
+                                        className={`py-1.5 rounded-lg text-[10px] font-semibold transition-all border ${
+                                            upscale === s
+                                                ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 shadow-sm'
+                                                : 'bg-surface/60 text-text-secondary border-transparent hover:border-white/10'
+                                        }`}
+                                    >
+                                        {l}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
 
                     {/* Prompt input */}
                     <div className="space-y-1.5">

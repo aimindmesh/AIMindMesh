@@ -40,7 +40,20 @@ void QnnSdEngine::release() {
             m_fnContextFree(m_vaeCtx, nullptr);
             m_vaeCtx = nullptr;
         }
+        if (m_vaeEncCtx) {
+            m_fnContextFree(m_vaeEncCtx, nullptr);
+            m_vaeEncCtx = nullptr;
+        }
+        if (m_srCtx) {
+            m_fnContextFree(m_srCtx, nullptr);
+            m_srCtx = nullptr;
+        }
     }
+    m_textEncGraph = nullptr;
+    m_unetGraph = nullptr;
+    m_vaeGraph = nullptr;
+    m_vaeEncGraph = nullptr;
+    m_srGraph = nullptr;
     if (m_backend && m_fnBackendFree) {
         m_fnBackendFree(m_backend);
         m_backend = nullptr;
@@ -206,20 +219,52 @@ bool QnnSdEngine::loadContextBinary(const std::string& path, Qnn_ContextHandle_t
     }
 
     if (m_fnGraphRetrieve && *outCtx) {
+        // --- Step 1: scan first 4KB of binary for 'graph_*' names ---
+        // Qualcomm AI Hub compiled binaries embed the graph name as a plain ASCII
+        // string in the header (confirmed by direct inspection of vae_encoder.bin).
+        std::vector<std::string> candidateNames;
+        {
+            const size_t scanLen = std::min(buffer.size(), static_cast<size_t>(4096));
+            const char* prefix = "graph_";
+            const size_t prefixLen = 6;
+            for (size_t i = 0; i + prefixLen < scanLen; ++i) {
+                if (memcmp(buffer.data() + i, prefix, prefixLen) == 0) {
+                    // Read the full name (alphanumeric + underscore)
+                    std::string name;
+                    for (size_t j = i; j < scanLen; ++j) {
+                        char c = buffer[j];
+                        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+                            name += c;
+                        } else {
+                            break;
+                        }
+                    }
+                    if (name.size() > prefixLen) {
+                        // Avoid duplicates
+                        if (std::find(candidateNames.begin(), candidateNames.end(), name)
+                            == candidateNames.end()) {
+                            candidateNames.push_back(name);
+                            LOGI("Binary scan found graph name: '%s'", name.c_str());
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Step 2: append classic fallback names ---
         std::string baseName = path.substr(path.find_last_of("/\\") + 1);
         size_t dotPos = baseName.find_last_of('.');
         if (dotPos != std::string::npos) baseName = baseName.substr(0, dotPos);
+        candidateNames.push_back("stable_diffusion_v2_1_" + baseName);
+        candidateNames.push_back(baseName);
+        candidateNames.push_back("main");
+        candidateNames.push_back("model");
 
-        std::vector<std::string> candidateNames = {
-            "stable_diffusion_v2_1_" + baseName,
-            baseName,
-            "main",
-            "model"
-        };
-
+        // --- Step 3: try each name ---
         for (const auto& name : candidateNames) {
             Qnn_ErrorHandle_t rErr = m_fnGraphRetrieve(*outCtx, name.c_str(), outGraph);
-            LOGI("graphRetrieve ('%s') for %s returned: 0x%x, graph: %p", name.c_str(), path.c_str(), rErr, *outGraph);
+            LOGI("graphRetrieve ('%s') for %s returned: 0x%x, graph: %p",
+                 name.c_str(), path.c_str(), rErr, *outGraph);
             if (rErr == QNN_SUCCESS && *outGraph) {
                 break;
             }
@@ -249,20 +294,71 @@ bool QnnSdEngine::init(const std::string& modelDir, const std::string& nativeLib
     std::string textEncPath = modelDir + "/text_encoder.bin";
     std::string unetPath = modelDir + "/unet.bin";
     std::string vaePath = modelDir + "/vae.bin";
+    std::string vaeEncPath = modelDir + "/vae_encoder.bin";
+    std::string srPath = modelDir + "/realesrgan_x4plus.bin";
 
     bool textOk = loadContextBinary(textEncPath, &m_textEncCtx, &m_textEncGraph);
     bool unetOk = loadContextBinary(unetPath, &m_unetCtx, &m_unetGraph);
     bool vaeOk = loadContextBinary(vaePath, &m_vaeCtx, &m_vaeGraph);
+    bool vaeEncOk = loadContextBinary(vaeEncPath, &m_vaeEncCtx, &m_vaeEncGraph);
+    bool srOk = loadContextBinary(srPath, &m_srCtx, &m_srGraph);
+    if (!srOk) {
+        // Fallback name check
+        srOk = loadContextBinary(modelDir + "/sr.bin", &m_srCtx, &m_srGraph);
+    }
 
+    // VAE encoder and Super Resolution are optional modules
     m_isReady = textOk && unetOk && vaeOk;
-    LOGI("QnnSdEngine init complete. isReady: %d (text: %d, unet: %d, vae: %d)", m_isReady ? 1 : 0, textOk ? 1 : 0, unetOk ? 1 : 0, vaeOk ? 1 : 0);
+    LOGI("QnnSdEngine init complete. isReady: %d (text: %d, unet: %d, vae: %d, vaeEnc: %d, sr: %d)",
+         m_isReady ? 1 : 0, textOk ? 1 : 0, unetOk ? 1 : 0, vaeOk ? 1 : 0, vaeEncOk ? 1 : 0, srOk ? 1 : 0);
+    if (!vaeEncOk) {
+        LOGW("VAE encoder not loaded - img2img will not be available");
+    }
+    if (!srOk) {
+        LOGW("Real-ESRGAN not loaded - AI super-resolution will use bilinear fallback");
+    }
     return m_isReady;
 }
 
+static inline Qnn_Tensor_t makeQuantTensor(uint32_t id, const char* name, Qnn_TensorType_t type,
+                                           uint32_t rank, uint32_t* dims, void* data, size_t dataSize,
+                                           float scale, int32_t offset) {
+    Qnn_Tensor_t t = {};
+    t.version = QNN_TENSOR_VERSION_1;
+    t.v1.id = id;
+    t.v1.name = name;
+    t.v1.type = type;
+    t.v1.dataFormat = QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER;
+    t.v1.dataType = QNN_DATATYPE_UFIXED_POINT_16;
+    t.v1.quantization.encodingDefinition = QNN_QUANTIZATION_ENCODING_SCALE_OFFSET;
+    t.v1.quantization.scaleOffsetEncoding.scale = scale;
+    t.v1.quantization.scaleOffsetEncoding.offset = offset;
+    t.v1.rank = rank;
+    t.v1.dimensions = dims;
+    t.v1.clientBuf.data = data;
+    t.v1.clientBuf.dataSize = dataSize;
+    return t;
+}
+
+static inline Qnn_Tensor_t makeFloat32Tensor(uint32_t id, const char* name, Qnn_TensorType_t type,
+                                             uint32_t rank, uint32_t* dims, void* data, size_t dataSize) {
+    Qnn_Tensor_t t = {};
+    t.version = QNN_TENSOR_VERSION_2;
+    t.v1.id = id;
+    t.v1.name = name;
+    t.v1.type = type;
+    t.v1.dataFormat = QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER;
+    t.v1.dataType = QNN_DATATYPE_FLOAT_32;
+    t.v1.quantization.encodingDefinition = QNN_QUANTIZATION_ENCODING_UNDEFINED;
+    t.v1.rank = rank;
+    t.v1.dimensions = dims;
+    t.v1.clientBuf.data = data;
+    t.v1.clientBuf.dataSize = dataSize;
+    return t;
+}
+
 bool QnnSdEngine::runTextEncoder(const int32_t* tokens, float* outEmbedding) {
-    if (!m_isReady || !m_textEncGraph || !m_fnGraphExecute) {
-        return false;
-    }
+    if (!m_isReady || !m_textEncGraph || !m_fnGraphExecute) return false;
 
     uint32_t inDims[2] = {1, 77};
     uint32_t outDims[3] = {1, 77, 1024};
@@ -275,212 +371,81 @@ bool QnnSdEngine::runTextEncoder(const int32_t* tokens, float* outEmbedding) {
     inTensor.v1.type = QNN_TENSOR_TYPE_APP_WRITE;
     inTensor.v1.dataFormat = QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER;
     inTensor.v1.dataType = QNN_DATATYPE_INT_32;
+    inTensor.v1.quantization.encodingDefinition = QNN_QUANTIZATION_ENCODING_UNDEFINED;
     inTensor.v1.rank = 2;
     inTensor.v1.dimensions = inDims;
     inTensor.v1.clientBuf.data = const_cast<int32_t*>(tokens);
     inTensor.v1.clientBuf.dataSize = 77 * sizeof(int32_t);
 
-    Qnn_Tensor_t outTensor = {};
-    outTensor.version = QNN_TENSOR_VERSION_1;
-    outTensor.v1.id = 1505;
-    outTensor.v1.name = "text_embedding";
-    outTensor.v1.type = QNN_TENSOR_TYPE_APP_READ;
-    outTensor.v1.dataFormat = QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER;
-    outTensor.v1.dataType = QNN_DATATYPE_UFIXED_POINT_16;
-    outTensor.v1.quantization.encodingDefinition = QNN_QUANTIZATION_ENCODING_SCALE_OFFSET;
-    outTensor.v1.quantization.scaleOffsetEncoding.scale = 0.00036118616f;
-    outTensor.v1.quantization.scaleOffsetEncoding.offset = 25953;
-    outTensor.v1.rank = 3;
-    outTensor.v1.dimensions = outDims;
-    outTensor.v1.clientBuf.data = rawOutput.data();
-    outTensor.v1.clientBuf.dataSize = rawOutput.size() * sizeof(uint16_t);
+    Qnn_Tensor_t outTensor = makeQuantTensor(1505, "text_embedding", QNN_TENSOR_TYPE_APP_READ,
+                                             3, outDims, rawOutput.data(), rawOutput.size() * sizeof(uint16_t),
+                                             0.00036118616f, 25953);
 
-    Qnn_ErrorHandle_t err = m_fnGraphExecute(
-        m_textEncGraph,
-        &inTensor,
-        1,
-        &outTensor,
-        1,
-        nullptr,
-        nullptr
-    );
-
+    Qnn_ErrorHandle_t err = m_fnGraphExecute(m_textEncGraph, &inTensor, 1, &outTensor, 1, nullptr, nullptr);
     if (err == QNN_SUCCESS) {
-        for (size_t i = 0; i < rawOutput.size(); ++i) {
+        for (size_t i = 0; i < 77 * 1024; ++i) {
             outEmbedding[i] = dequantizeFromU16(rawOutput[i], 0.00036118616f, 25953);
         }
         return true;
     }
-
-    LOGE("TextEncoder graphExecute failed with error 0x%x", err);
+    LOGE("TextEncoder graphExecute failed: 0x%x", err);
     return false;
 }
 
 bool QnnSdEngine::runUnet(const float* inLatent, float timestep, const float* inTextEmb, float* outLatent) {
-    if (!m_isReady || !m_unetGraph || !m_fnGraphExecute) {
-        return false;
-    }
+    if (!m_isReady || !m_unetGraph || !m_fnGraphExecute) return false;
 
     uint32_t latentDims[4] = {1, 64, 64, 4};
     uint32_t timestepDims[2] = {1, 1};
     uint32_t textEmbDims[3] = {1, 77, 1024};
-
     size_t latentSize = 1 * 64 * 64 * 4;
     size_t textEmbSize = 1 * 77 * 1024;
 
-    std::vector<uint16_t> qLatent(latentSize);
-    std::vector<uint16_t> qTimestep(1);
-    std::vector<uint16_t> qTextEmb(textEmbSize);
-    std::vector<uint16_t> qOutLatent(latentSize);
-
-    for (size_t i = 0; i < latentSize; ++i) {
-        qLatent[i] = quantizeToU16(inLatent[i], 0.0003935263f, 36942);
-    }
+    std::vector<uint16_t> qLatent(latentSize), qTimestep(1), qTextEmb(textEmbSize), qOutLatent(latentSize);
+    for (size_t i = 0; i < latentSize; ++i) qLatent[i] = quantizeToU16(inLatent[i], 0.0003935263f, 36942);
     qTimestep[0] = quantizeToU16(timestep, 0.01451133f, 0);
-    for (size_t i = 0; i < textEmbSize; ++i) {
-        qTextEmb[i] = quantizeToU16(inTextEmb[i], 0.0003388274f, 23954);
-    }
+    for (size_t i = 0; i < textEmbSize; ++i) qTextEmb[i] = quantizeToU16(inTextEmb[i], 0.0003388274f, 23954);
 
-    Qnn_Tensor_t inTensors[3] = {};
-    // 0: timestep
-    inTensors[0].version = QNN_TENSOR_VERSION_1;
-    inTensors[0].v1.id = 1;
-    inTensors[0].v1.name = "timestep";
-    inTensors[0].v1.type = QNN_TENSOR_TYPE_APP_WRITE;
-    inTensors[0].v1.dataFormat = QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER;
-    inTensors[0].v1.dataType = QNN_DATATYPE_UFIXED_POINT_16;
-    inTensors[0].v1.quantization.encodingDefinition = QNN_QUANTIZATION_ENCODING_SCALE_OFFSET;
-    inTensors[0].v1.quantization.scaleOffsetEncoding.scale = 0.01451133f;
-    inTensors[0].v1.quantization.scaleOffsetEncoding.offset = 0;
-    inTensors[0].v1.rank = 2;
-    inTensors[0].v1.dimensions = timestepDims;
-    inTensors[0].v1.clientBuf.data = qTimestep.data();
-    inTensors[0].v1.clientBuf.dataSize = sizeof(uint16_t);
+    Qnn_Tensor_t inTensors[3] = {
+        makeQuantTensor(1, "timestep", QNN_TENSOR_TYPE_APP_WRITE, 2, timestepDims, qTimestep.data(), sizeof(uint16_t), 0.01451133f, 0),
+        makeQuantTensor(20, "latent", QNN_TENSOR_TYPE_APP_WRITE, 4, latentDims, qLatent.data(), latentSize * sizeof(uint16_t), 0.0003935263f, 36942),
+        makeQuantTensor(229, "text_emb", QNN_TENSOR_TYPE_APP_WRITE, 3, textEmbDims, qTextEmb.data(), textEmbSize * sizeof(uint16_t), 0.0003388274f, 23954)
+    };
 
-    // 1: latent
-    inTensors[1].version = QNN_TENSOR_VERSION_1;
-    inTensors[1].v1.id = 20;
-    inTensors[1].v1.name = "latent";
-    inTensors[1].v1.type = QNN_TENSOR_TYPE_APP_WRITE;
-    inTensors[1].v1.dataFormat = QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER;
-    inTensors[1].v1.dataType = QNN_DATATYPE_UFIXED_POINT_16;
-    inTensors[1].v1.quantization.encodingDefinition = QNN_QUANTIZATION_ENCODING_SCALE_OFFSET;
-    inTensors[1].v1.quantization.scaleOffsetEncoding.scale = 0.0003935263f;
-    inTensors[1].v1.quantization.scaleOffsetEncoding.offset = 36942;
-    inTensors[1].v1.rank = 4;
-    inTensors[1].v1.dimensions = latentDims;
-    inTensors[1].v1.clientBuf.data = qLatent.data();
-    inTensors[1].v1.clientBuf.dataSize = latentSize * sizeof(uint16_t);
+    Qnn_Tensor_t outTensor = makeQuantTensor(12793, "output_latent", QNN_TENSOR_TYPE_APP_READ,
+                                             4, latentDims, qOutLatent.data(), latentSize * sizeof(uint16_t),
+                                             0.0003243993f, 26599);
 
-    // 2: text_emb
-    inTensors[2].version = QNN_TENSOR_VERSION_1;
-    inTensors[2].v1.id = 229;
-    inTensors[2].v1.name = "text_emb";
-    inTensors[2].v1.type = QNN_TENSOR_TYPE_APP_WRITE;
-    inTensors[2].v1.dataFormat = QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER;
-    inTensors[2].v1.dataType = QNN_DATATYPE_UFIXED_POINT_16;
-    inTensors[2].v1.quantization.encodingDefinition = QNN_QUANTIZATION_ENCODING_SCALE_OFFSET;
-    inTensors[2].v1.quantization.scaleOffsetEncoding.scale = 0.0003388274f;
-    inTensors[2].v1.quantization.scaleOffsetEncoding.offset = 23954;
-    inTensors[2].v1.rank = 3;
-    inTensors[2].v1.dimensions = textEmbDims;
-    inTensors[2].v1.clientBuf.data = qTextEmb.data();
-    inTensors[2].v1.clientBuf.dataSize = textEmbSize * sizeof(uint16_t);
-
-    Qnn_Tensor_t outTensor = {};
-    outTensor.version = QNN_TENSOR_VERSION_1;
-    outTensor.v1.id = 12793;
-    outTensor.v1.name = "output_latent";
-    outTensor.v1.type = QNN_TENSOR_TYPE_APP_READ;
-    outTensor.v1.dataFormat = QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER;
-    outTensor.v1.dataType = QNN_DATATYPE_UFIXED_POINT_16;
-    outTensor.v1.quantization.encodingDefinition = QNN_QUANTIZATION_ENCODING_SCALE_OFFSET;
-    outTensor.v1.quantization.scaleOffsetEncoding.scale = 0.0003243993f;
-    outTensor.v1.quantization.scaleOffsetEncoding.offset = 26599;
-    outTensor.v1.rank = 4;
-    outTensor.v1.dimensions = latentDims;
-    outTensor.v1.clientBuf.data = qOutLatent.data();
-    outTensor.v1.clientBuf.dataSize = latentSize * sizeof(uint16_t);
-
-    Qnn_ErrorHandle_t err = m_fnGraphExecute(
-        m_unetGraph,
-        inTensors,
-        3,
-        &outTensor,
-        1,
-        nullptr,
-        nullptr
-    );
-
+    Qnn_ErrorHandle_t err = m_fnGraphExecute(m_unetGraph, inTensors, 3, &outTensor, 1, nullptr, nullptr);
     if (err == QNN_SUCCESS) {
         for (size_t i = 0; i < latentSize; ++i) {
             outLatent[i] = dequantizeFromU16(qOutLatent[i], 0.0003243993f, 26599);
         }
         return true;
     }
-
-    LOGE("UNet graphExecute failed with error 0x%x", err);
+    LOGE("UNet graphExecute failed: 0x%x", err);
     return false;
 }
 
 bool QnnSdEngine::runVae(const float* inLatent, uint8_t* outRgb) {
-    if (!m_isReady || !m_vaeGraph || !m_fnGraphExecute) {
-        return false;
-    }
+    if (!m_isReady || !m_vaeGraph || !m_fnGraphExecute) return false;
 
     uint32_t latentDims[4] = {1, 64, 64, 4};
     uint32_t imageDims[4] = {1, 512, 512, 3};
-
     size_t latentSize = 1 * 64 * 64 * 4;
     size_t imageSize = 1 * 512 * 512 * 3;
 
-    std::vector<uint16_t> qLatent(latentSize);
-    std::vector<uint16_t> qImage(imageSize);
+    std::vector<uint16_t> qLatent(latentSize), qImage(imageSize);
+    for (size_t i = 0; i < latentSize; ++i) qLatent[i] = quantizeToU16(inLatent[i], 0.0004164104f, 34999);
 
-    for (size_t i = 0; i < latentSize; ++i) {
-        qLatent[i] = quantizeToU16(inLatent[i], 0.0004164104f, 34999);
-    }
+    Qnn_Tensor_t inTensor = makeQuantTensor(1, "latent", QNN_TENSOR_TYPE_APP_WRITE,
+                                           4, latentDims, qLatent.data(), latentSize * sizeof(uint16_t),
+                                           0.0004164104f, 34999);
+    Qnn_Tensor_t outTensor = makeQuantTensor(434, "image", QNN_TENSOR_TYPE_APP_READ,
+                                            4, imageDims, qImage.data(), imageSize * sizeof(uint16_t),
+                                            0.000015259021893143654f, 0);
 
-    Qnn_Tensor_t inTensor = {};
-    inTensor.version = QNN_TENSOR_VERSION_1;
-    inTensor.v1.id = 1;
-    inTensor.v1.name = "latent";
-    inTensor.v1.type = QNN_TENSOR_TYPE_APP_WRITE;
-    inTensor.v1.dataFormat = QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER;
-    inTensor.v1.dataType = QNN_DATATYPE_UFIXED_POINT_16;
-    inTensor.v1.quantization.encodingDefinition = QNN_QUANTIZATION_ENCODING_SCALE_OFFSET;
-    inTensor.v1.quantization.scaleOffsetEncoding.scale = 0.0004164104f;
-    inTensor.v1.quantization.scaleOffsetEncoding.offset = 34999;
-    inTensor.v1.rank = 4;
-    inTensor.v1.dimensions = latentDims;
-    inTensor.v1.clientBuf.data = qLatent.data();
-    inTensor.v1.clientBuf.dataSize = latentSize * sizeof(uint16_t);
-
-    Qnn_Tensor_t outTensor = {};
-    outTensor.version = QNN_TENSOR_VERSION_1;
-    outTensor.v1.id = 434;
-    outTensor.v1.name = "image";
-    outTensor.v1.type = QNN_TENSOR_TYPE_APP_READ;
-    outTensor.v1.dataFormat = QNN_TENSOR_DATA_FORMAT_FLAT_BUFFER;
-    outTensor.v1.dataType = QNN_DATATYPE_UFIXED_POINT_16;
-    outTensor.v1.quantization.encodingDefinition = QNN_QUANTIZATION_ENCODING_SCALE_OFFSET;
-    outTensor.v1.quantization.scaleOffsetEncoding.scale = 0.000015259021893143654f;
-    outTensor.v1.quantization.scaleOffsetEncoding.offset = 0;
-    outTensor.v1.rank = 4;
-    outTensor.v1.dimensions = imageDims;
-    outTensor.v1.clientBuf.data = qImage.data();
-    outTensor.v1.clientBuf.dataSize = imageSize * sizeof(uint16_t);
-
-    Qnn_ErrorHandle_t err = m_fnGraphExecute(
-        m_vaeGraph,
-        &inTensor,
-        1,
-        &outTensor,
-        1,
-        nullptr,
-        nullptr
-    );
-
+    Qnn_ErrorHandle_t err = m_fnGraphExecute(m_vaeGraph, &inTensor, 1, &outTensor, 1, nullptr, nullptr);
     if (err == QNN_SUCCESS) {
         for (size_t i = 0; i < imageSize; ++i) {
             float pixelFloat = dequantizeFromU16(qImage[i], 0.00001525902f, 0);
@@ -489,7 +454,49 @@ bool QnnSdEngine::runVae(const float* inLatent, uint8_t* outRgb) {
         }
         return true;
     }
+    LOGE("VAE graphExecute failed: 0x%x", err);
+    return false;
+}
 
-    LOGE("VAE graphExecute failed with error 0x%x", err);
+bool QnnSdEngine::runVaeEncoder(const float* inRgb, float* outLatent) {
+    if (!m_isReady || !m_vaeEncGraph || !m_fnGraphExecute) return false;
+
+    uint32_t inDims[4]  = {1, 512, 512, 3};
+    uint32_t outDims[4] = {1, 64, 64, 4};
+
+    Qnn_Tensor_t inTensor = makeFloat32Tensor(1, "image", QNN_TENSOR_TYPE_APP_WRITE,
+                                             4, inDims, const_cast<float*>(inRgb), 512 * 512 * 3 * sizeof(float));
+    Qnn_Tensor_t outTensor = makeFloat32Tensor(375, "output_0", QNN_TENSOR_TYPE_APP_READ,
+                                              4, outDims, outLatent, 64 * 64 * 4 * sizeof(float));
+
+    Qnn_ErrorHandle_t err = m_fnGraphExecute(m_vaeEncGraph, &inTensor, 1, &outTensor, 1, nullptr, nullptr);
+    if (err == QNN_SUCCESS) {
+        LOGI("VAE Encoder OK: latent[0]=%f latent[1]=%f", outLatent[0], outLatent[1]);
+        return true;
+    }
+    LOGE("VAE Encoder graphExecute failed: 0x%x", err);
+    return false;
+}
+
+bool QnnSdEngine::runSuperResolution(const float* inRgb512, float* outRgb2048) {
+    if (!m_isReady || !m_srGraph || !m_fnGraphExecute) {
+        LOGE("SuperResolution engine not ready or graph missing");
+        return false;
+    }
+
+    uint32_t inDims[4]  = {1, 512, 512, 3};
+    uint32_t outDims[4] = {1, 2048, 2048, 3};
+
+    Qnn_Tensor_t inTensor = makeFloat32Tensor(1, "image", QNN_TENSOR_TYPE_APP_WRITE,
+                                             4, inDims, const_cast<float*>(inRgb512), 512 * 512 * 3 * sizeof(float));
+    Qnn_Tensor_t outTensor = makeFloat32Tensor(3062, "output_0", QNN_TENSOR_TYPE_APP_READ,
+                                              4, outDims, outRgb2048, 2048 * 2048 * 3 * sizeof(float));
+
+    Qnn_ErrorHandle_t err = m_fnGraphExecute(m_srGraph, &inTensor, 1, &outTensor, 1, nullptr, nullptr);
+    if (err == QNN_SUCCESS) {
+        LOGI("SuperResolution OK: out[0]=%f out[1]=%f", outRgb2048[0], outRgb2048[1]);
+        return true;
+    }
+    LOGE("SuperResolution graphExecute failed: 0x%x", err);
     return false;
 }

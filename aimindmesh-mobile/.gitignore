@@ -67,6 +67,7 @@ logs
 **/*.pyc
 **/*.pyo
 **/*.pyd
+scripts/qai_venv/
 
 # Binary artifacts (excluding tracked ones in lib/)
 **/bin/

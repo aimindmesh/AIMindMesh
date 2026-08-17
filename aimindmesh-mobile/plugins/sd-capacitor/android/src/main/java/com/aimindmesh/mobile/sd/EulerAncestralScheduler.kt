@@ -208,19 +208,16 @@ class EulerAncestralScheduler(
 
     /**
      * Add noise to an initial latent for Image-to-Image (img2img) editing.
+     * In Euler Discrete Scheduler: noisy_samples = original_samples + noise * sigma
      */
     fun addNoise(
         initialLatents: FloatArray,
         noise: FloatArray,
-        timestep: Int
+        sigma: Float
     ): FloatArray {
-        val alphaCumprod = alphasCumprod[timestep.coerceIn(0, numTrainTimesteps - 1)]
-        val sqrtAlpha = sqrt(alphaCumprod)
-        val sqrtOneMinusAlpha = sqrt(1.0f - alphaCumprod)
-
         val noisy = FloatArray(initialLatents.size)
         for (i in noisy.indices) {
-            noisy[i] = sqrtAlpha * initialLatents[i] + sqrtOneMinusAlpha * noise[i]
+            noisy[i] = initialLatents[i] + noise[i] * sigma
         }
         return noisy
     }

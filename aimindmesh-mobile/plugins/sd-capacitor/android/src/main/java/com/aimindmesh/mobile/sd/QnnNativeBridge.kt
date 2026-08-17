@@ -30,6 +30,10 @@ class QnnNativeBridge(private val context: Context) {
     private external fun nativeRunTextEncoder(tokens: IntArray): FloatArray?
     private external fun nativeRunUnet(latent: FloatArray, timestep: Float, textEmb: FloatArray): FloatArray?
     private external fun nativeRunVae(latent: FloatArray): ByteArray?
+    private external fun nativeRunVaeEncoder(rgbBytes: ByteArray): FloatArray?
+    private external fun nativeHasVaeEncoder(): Boolean
+    private external fun nativeRunSuperResolution(inRgb512: ByteArray): ByteArray?
+    private external fun nativeHasSuperResolution(): Boolean
     private external fun nativeRelease()
 
     private var modelDir: File? = null
@@ -131,6 +135,52 @@ class QnnNativeBridge(private val context: Context) {
         Log.w(TAG, "Native VAE returned null")
         return ByteArray(512 * 512 * 3)
     }
+
+    /**
+     * Run VAE Encoder graph (vae_encoder.bin): RGB image [512, 512, 3] bytes -> latent [1, 64, 64, 4]
+     * Returns null if the encoder model was not loaded.
+     */
+    fun runVaeEncoder(rgbBytes: ByteArray): FloatArray? {
+        if (!isJniLoaded || !isNativeReady) {
+            Log.w(TAG, "runVaeEncoder: engine not ready")
+            return null
+        }
+        if (!nativeHasVaeEncoder()) {
+            Log.w(TAG, "runVaeEncoder: VAE encoder model not loaded")
+            return null
+        }
+        val result = nativeRunVaeEncoder(rgbBytes)
+        if (result == null) {
+            Log.e(TAG, "nativeRunVaeEncoder returned null")
+        }
+        return result
+    }
+
+    /** Returns true if the VAE encoder binary was successfully loaded. */
+    fun hasVaeEncoder(): Boolean = isJniLoaded && isNativeReady && nativeHasVaeEncoder()
+
+    /**
+     * Run Real-ESRGAN x4plus Super-Resolution on Qualcomm Hexagon NPU:
+     * inRgb512 [512, 512, 3] -> outRgb2048 [2048, 2048, 3] bytes.
+     */
+    fun runSuperResolution(rgb512: ByteArray): ByteArray? {
+        if (!isJniLoaded || !isNativeReady) {
+            Log.w(TAG, "runSuperResolution: engine not ready")
+            return null
+        }
+        if (!nativeHasSuperResolution()) {
+            Log.w(TAG, "runSuperResolution: Real-ESRGAN model not loaded")
+            return null
+        }
+        val result = nativeRunSuperResolution(rgb512)
+        if (result == null) {
+            Log.e(TAG, "nativeRunSuperResolution returned null")
+        }
+        return result
+    }
+
+    /** Returns true if the Real-ESRGAN super resolution binary was successfully loaded. */
+    fun hasSuperResolution(): Boolean = isJniLoaded && isNativeReady && nativeHasSuperResolution()
 
     fun release() {
         if (isJniLoaded) {

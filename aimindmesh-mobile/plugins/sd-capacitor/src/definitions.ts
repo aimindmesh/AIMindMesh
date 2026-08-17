@@ -15,6 +15,8 @@ export interface SDGenerateOptions {
   seed?: number;         // Default: -1 (random)
   width?: number;        // Default: 512
   height?: number;       // Default: 512
+  aspectRatio?: '1:1' | '16:9' | '9:16' | '4:3' | '3:4'; // Default: '1:1'
+  upscale?: 1 | 2 | 4;   // Default: 1 (Standard 512, 2 = 1024 HD, 4 = 2048 Ultra HD)
 }
 
 export interface SDProgressEvent {
@@ -28,6 +30,8 @@ export interface SDGenerateResult {
   generationTimeMs: number;
   width: number;
   height: number;
+  aspectRatio?: string;
+  upscale?: number;
 }
 
 export interface SDCapabilities {

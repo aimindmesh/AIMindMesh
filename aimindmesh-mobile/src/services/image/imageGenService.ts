@@ -12,6 +12,8 @@ export interface ImageGenerationRequest {
     seed?: number;
     width?: number;
     height?: number;
+    aspectRatio?: '1:1' | '16:9' | '9:16' | '4:3' | '3:4';
+    upscale?: 1 | 2 | 4;
     onProgress?: (event: SDProgressEvent) => void;
 }
 
@@ -162,6 +164,8 @@ export class ImageGenService {
                 seed: req.seed ?? -1,
                 width: req.width || 512,
                 height: req.height || 512,
+                aspectRatio: req.aspectRatio || '1:1',
+                upscale: req.upscale || 1,
             };
 
             const modeDesc = req.sourceImage ? 'Image-to-Image Edit' : 'Text-to-Image';

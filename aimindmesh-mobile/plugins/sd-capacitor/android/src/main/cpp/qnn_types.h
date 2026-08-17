@@ -29,6 +29,9 @@ typedef enum {
     QNN_DATATYPE_FLOAT_32 = 0x0332,
     QNN_DATATYPE_UFIXED_POINT_8 = 0x0408,
     QNN_DATATYPE_UFIXED_POINT_16 = 0x0416,
+    QNN_DATATYPE_SFIXED_POINT_8 = 0x0508,
+    QNN_DATATYPE_SFIXED_POINT_16 = 0x0516,
+    QNN_DATATYPE_SFIXED_POINT_32 = 0x0532,
 } Qnn_DataType_t;
 
 typedef enum {
@@ -204,6 +207,49 @@ typedef struct {
 } QnnInterface_t;
 
 typedef Qnn_ErrorHandle_t (*QnnInterfaceGetProvidersFn_t)(const QnnInterface_t***, uint32_t*);
+
+// QNN System Interface provider - libQnnSystem.so exports QnnSystemInterface_getProviders
+// The provider vtable layout (observed from SDK): each entry is a function pointer
+// SystemContext functions are accessed at fixed offsets within the interface struct
+typedef struct {
+    Qnn_ApiVersion_t apiVersion;
+    uint32_t backendId;
+    uint32_t reserved;
+    uint64_t interfaceVersion;
+    struct {
+        void* systemContextCreate;           // offset 0x00
+        void* systemContextGetBinaryInfo;    // offset 0x08 - QnnSystemContext_getMetadataFromBinary
+        void* systemContextFree;             // offset 0x10
+    } QNN_SYSTEM_INTERFACE_VER_NAME;
+} QnnSystemInterface_t;
+typedef Qnn_ErrorHandle_t (*QnnSystemInterfaceGetProvidersFn_t)(const QnnSystemInterface_t***, uint32_t*);
+
+// Graph info structures returned by systemContextGetBinaryInfo
+typedef enum {
+    QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_1 = 1,
+} QnnSystemContextGraphInfoVersion_t;
+typedef struct {
+    const char* graphName;
+    const void* graphInputs;
+    uint32_t    numGraphInputs;
+    const void* graphOutputs;
+    uint32_t    numGraphOutputs;
+} QnnSystemContext_GraphInfo_v1_t;
+typedef struct {
+    QnnSystemContextGraphInfoVersion_t version;
+    union {
+        QnnSystemContext_GraphInfo_v1_t v1;
+    };
+} QnnSystemContext_GraphInfo_t;
+typedef Qnn_ErrorHandle_t (*QnnSystemContext_CreateFn_t)(QnnSystemContext_Handle_t*);
+typedef Qnn_ErrorHandle_t (*QnnSystemContext_GetBinaryInfoFn_t)(
+    QnnSystemContext_Handle_t,
+    const void*,
+    uint64_t,
+    const QnnSystemContext_GraphInfo_t**,
+    uint32_t*
+);
+typedef Qnn_ErrorHandle_t (*QnnSystemContext_FreeFn_t)(QnnSystemContext_Handle_t);
 
 #ifdef __cplusplus
 }

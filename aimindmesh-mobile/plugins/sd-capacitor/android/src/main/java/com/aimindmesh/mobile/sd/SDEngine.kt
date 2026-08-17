@@ -138,6 +138,8 @@ class SDEngine(private val context: Context) {
         seed: Long = -1,
         width: Int = 512,
         height: Int = 512,
+        aspectRatio: String = "1:1",
+        upscale: Int = 1,
         progressCallback: ((step: Int, totalSteps: Int, timePerStep: Float) -> Unit)? = null
     ): Map<String, Any> = withContext(Dispatchers.IO) {
         if (!isLoaded() || activeModelDir == null) {
@@ -147,7 +149,7 @@ class SDEngine(private val context: Context) {
         val startTime = System.currentTimeMillis()
         val numSteps = steps.coerceIn(1, 100)
         val modeStr = if (sourceImage != null) "Image-to-Image (strength: $strength)" else "Text-to-Image"
-        Log.i(TAG, "Starting on-device Qualcomm NPU synthesis [$modeStr]: '$prompt' | Neg: '$negativePrompt' (${width}x${height}, steps: $numSteps, cfg: $cfgScale)")
+        Log.i(TAG, "Starting on-device Qualcomm NPU synthesis [$modeStr]: '$prompt' | Neg: '$negativePrompt' (ratio: $aspectRatio, upscale: ${upscale}x, steps: $numSteps, cfg: $cfgScale)")
 
         // 1. CLIP Text Encoding
         val posTokens = clipTokenizer.encode(prompt)
@@ -170,8 +172,9 @@ class SDEngine(private val context: Context) {
 
             startStep = ((1.0f - strength.coerceIn(0.05f, 0.95f)) * numSteps).toInt().coerceIn(0, numSteps - 1)
             val startTimestep = timesteps[startStep]
-            latents = scheduler.addNoise(sourceLatents, initNoise, startTimestep)
-            Log.i(TAG, "img2img initialized at step $startStep/$numSteps (t=$startTimestep)")
+            val startSigma = stepSigmas[startStep]
+            latents = scheduler.addNoise(sourceLatents, initNoise, startSigma)
+            Log.i(TAG, "img2img initialized at step $startStep/$numSteps (t=$startTimestep, sigma=$startSigma)")
         } else {
             startStep = 0
             latents = scheduler.generateInitialLatents(seed, stepSigmas[0])
@@ -204,22 +207,38 @@ class SDEngine(private val context: Context) {
         Log.i(TAG, "Decoding final latents through VAE on Qualcomm NPU...")
         val rgbBytes = qnnBridge.runVaeDecoder(latents)
 
-        // 6. Convert RGB byte tensor to Android Bitmap
-        val outputBitmap = rgbBytesToBitmap(rgbBytes, 512, 512)
+        // 6. Convert RGB byte tensor to Android Bitmap (512x512)
+        var outputBitmap = rgbBytesToBitmap(rgbBytes, 512, 512)
 
-        // 7. Compress to PNG Base64
+        // 7. Apply Aspect Ratio Framing (1:1, 16:9, 9:16, 4:3, 3:4)
+        if (aspectRatio != "1:1") {
+            outputBitmap = applyAspectRatioFraming(outputBitmap, aspectRatio)
+        }
+
+        // 8. Apply AI Super-Resolution (Real-ESRGAN x4plus on Hexagon NPU)
+        if (upscale > 1) {
+            val srStart = System.currentTimeMillis()
+            outputBitmap = applySuperResolution(outputBitmap, upscale)
+            Log.i(TAG, "Super-Resolution ${upscale}x complete in ${System.currentTimeMillis() - srStart}ms -> ${outputBitmap.width}x${outputBitmap.height}")
+        }
+
+        // 9. Compress to PNG Base64
         val outputStream = ByteArrayOutputStream()
         outputBitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
         val base64 = Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
 
         val totalTime = System.currentTimeMillis() - startTime
-        Log.i(TAG, "Stable Diffusion synthesis complete on Qualcomm NPU in ${totalTime}ms")
+        Log.i(TAG, "Stable Diffusion synthesis complete on Qualcomm NPU in ${totalTime}ms (final size: ${outputBitmap.width}x${outputBitmap.height})")
 
         mapOf(
             "base64Image" to "data:image/png;base64,$base64",
             "generationTimeMs" to totalTime,
-            "width" to 512,
-            "height" to 512
+            "width" to outputBitmap.width,
+            "height" to outputBitmap.height,
+            "steps" to numSteps,
+            "seed" to seed,
+            "aspectRatio" to aspectRatio,
+            "upscale" to upscale
         )
     }
 
@@ -242,26 +261,48 @@ class SDEngine(private val context: Context) {
         }
     }
 
+    /**
+     * Encode a 512x512 Bitmap into SD latent space using the VAE Encoder NPU model.
+     * Output: FloatArray of shape [1, 64, 64, 4] (NHWC), values in latent space.
+     */
     private fun bitmapToLatents(bitmap: Bitmap): FloatArray {
-        val latents = FloatArray(64 * 64 * 4)
-        for (ly in 0 until 64) {
-            for (lx in 0 until 64) {
-                val px = lx * 8 + 4
-                val py = ly * 8 + 4
-                val pixel = bitmap.getPixel(px, py)
+        // Use the compiled VAE encoder on the Hexagon NPU
+        if (qnnBridge.hasVaeEncoder()) {
+            return try {
+                val bmp512 = if (bitmap.width != 512 || bitmap.height != 512) {
+                    Bitmap.createScaledBitmap(bitmap, 512, 512, true)
+                } else {
+                    bitmap
+                }
 
-                val r = ((pixel shr 16) and 0xFF) / 255.0f * 2.0f - 1.0f
-                val g = ((pixel shr 8) and 0xFF) / 255.0f * 2.0f - 1.0f
-                val b = (pixel and 0xFF) / 255.0f * 2.0f - 1.0f
+                // Extract raw RGB bytes [512 * 512 * 3]
+                val rgbBytes = ByteArray(512 * 512 * 3)
+                val pixels = IntArray(512 * 512)
+                bmp512.getPixels(pixels, 0, 512, 0, 0, 512, 512)
+                for (i in pixels.indices) {
+                    val px = pixels[i]
+                    rgbBytes[i * 3]     = ((px shr 16) and 0xFF).toByte()
+                    rgbBytes[i * 3 + 1] = ((px shr 8)  and 0xFF).toByte()
+                    rgbBytes[i * 3 + 2] = (px           and 0xFF).toByte()
+                }
 
-                val baseIdx = (ly * 64 + lx) * 4
-                latents[baseIdx] = (r + g + b) / 3.0f * 0.18215f
-                latents[baseIdx + 1] = (r - b) * 0.18215f
-                latents[baseIdx + 2] = (g - (r + b) / 2.0f) * 0.18215f
-                latents[baseIdx + 3] = (b - g) * 0.18215f
+                val latent = qnnBridge.runVaeEncoder(rgbBytes)
+                if (latent != null && latent.size == 64 * 64 * 4) {
+                    Log.i(TAG, "VAE Encoder succeeded: latent shape [1,64,64,4], sample[0]=${latent[0]}")
+                    latent
+                } else {
+                    Log.e(TAG, "VAE Encoder returned null or wrong size (${latent?.size}), falling back to zeros")
+                    FloatArray(64 * 64 * 4)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Exception in VAE Encoder, falling back to zeros", e)
+                FloatArray(64 * 64 * 4)
             }
+        } else {
+            // VAE encoder not available - return zero latents (img2img won't work correctly)
+            Log.w(TAG, "VAE encoder not loaded, using zero latents for img2img")
+            return FloatArray(64 * 64 * 4)
         }
-        return latents
     }
 
     private fun rgbBytesToBitmap(rgb: ByteArray, width: Int, height: Int): Bitmap {
@@ -278,4 +319,63 @@ class SDEngine(private val context: Context) {
         bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
         return bitmap
     }
+
+    private fun applyAspectRatioFraming(src: Bitmap, aspectRatio: String): Bitmap {
+        val srcW = src.width
+        val srcH = src.height
+
+        val (targetW, targetH) = when (aspectRatio) {
+            "16:9" -> Pair(srcW, (srcW * 9) / 16)       // 512 x 288
+            "9:16" -> Pair((srcH * 9) / 16, srcH)       // 288 x 512
+            "4:3"  -> Pair(srcW, (srcW * 3) / 4)        // 512 x 384
+            "3:4"  -> Pair((srcH * 3) / 4, srcH)        // 384 x 512
+            else   -> Pair(srcW, srcH)
+        }
+
+        val cropX = ((srcW - targetW) / 2).coerceAtLeast(0)
+        val cropY = ((srcH - targetH) / 2).coerceAtLeast(0)
+        return Bitmap.createBitmap(src, cropX, cropY, targetW, targetH)
+    }
+
+    private fun applySuperResolution(src: Bitmap, scaleFactor: Int): Bitmap {
+        if (qnnBridge.hasSuperResolution()) {
+            try {
+                val inputSquare = if (src.width != 512 || src.height != 512) {
+                    Bitmap.createScaledBitmap(src, 512, 512, true)
+                } else {
+                    src
+                }
+
+                val rgbBytes = ByteArray(512 * 512 * 3)
+                val pixels = IntArray(512 * 512)
+                inputSquare.getPixels(pixels, 0, 512, 0, 0, 512, 512)
+                for (i in pixels.indices) {
+                    val px = pixels[i]
+                    rgbBytes[i * 3]     = ((px shr 16) and 0xFF).toByte()
+                    rgbBytes[i * 3 + 1] = ((px shr 8)  and 0xFF).toByte()
+                    rgbBytes[i * 3 + 2] = (px           and 0xFF).toByte()
+                }
+
+                val outRgb = qnnBridge.runSuperResolution(rgbBytes)
+                if (outRgb != null && outRgb.size == 2048 * 2048 * 3) {
+                    val out2048 = rgbBytesToBitmap(outRgb, 2048, 2048)
+                    val finalW = src.width * scaleFactor
+                    val finalH = src.height * scaleFactor
+                    return if (finalW == 2048 && finalH == 2048) {
+                        out2048
+                    } else {
+                        Bitmap.createScaledBitmap(out2048, finalW, finalH, true)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "NPU Real-ESRGAN super-resolution exception, falling back to bicubic scaling", e)
+            }
+        }
+
+        // Fallback high-quality bilinear/bicubic scaling
+        val targetW = src.width * scaleFactor
+        val targetH = src.height * scaleFactor
+        return Bitmap.createScaledBitmap(src, targetW, targetH, true)
+    }
 }
+

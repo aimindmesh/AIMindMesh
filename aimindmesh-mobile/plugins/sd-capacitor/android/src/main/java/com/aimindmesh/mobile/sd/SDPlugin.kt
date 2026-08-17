@@ -178,6 +178,8 @@ class SDPlugin : Plugin() {
         val seed = call.getDouble("seed")?.toLong() ?: -1L
         val width = call.getInt("width") ?: 512
         val height = call.getInt("height") ?: 512
+        val aspectRatio = call.getString("aspectRatio") ?: "1:1"
+        val upscale = call.getInt("upscale") ?: 1
 
         scope.launch {
             try {
@@ -190,7 +192,9 @@ class SDPlugin : Plugin() {
                     cfgScale,
                     seed,
                     width,
-                    height
+                    height,
+                    aspectRatio,
+                    upscale
                 ) { step, totalSteps, timePerStep ->
                     val progressObj = JSObject().apply {
                         put("step", step)
@@ -206,6 +210,8 @@ class SDPlugin : Plugin() {
                         put("generationTimeMs", result["generationTimeMs"])
                         put("width", result["width"])
                         put("height", result["height"])
+                        put("aspectRatio", result["aspectRatio"])
+                        put("upscale", result["upscale"])
                     }
                     call.resolve(resObj)
                 } else {
