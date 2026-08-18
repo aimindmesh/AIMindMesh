@@ -7,6 +7,9 @@ import { imageGenService } from '../../services/image/imageGenService';
 import { triggerHaptic } from '../../services/native';
 import { SDProgressEvent, SDGenerateResult } from 'sd-capacitor';
 import { logger } from '../../services/logger';
+import { StylePreset, STYLE_PRESETS } from './imageGenPresets';
+import { ImageGenResultCard } from './ImageGenResultCard';
+import { ImageGenAdvancedControls } from './ImageGenAdvancedControls';
 
 interface ImageGenModalProps {
     isOpen: boolean;
@@ -25,7 +28,8 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
 }) => {
     const [mode, setMode] = useState<'txt2img' | 'img2img'>(initialImage ? 'img2img' : 'txt2img');
     const [prompt, setPrompt] = useState(initialPrompt);
-    const [negativePrompt, setNegativePrompt] = useState('blurry, distorted, low quality, bad anatomy, deformed');
+    const [selectedPreset, setSelectedPreset] = useState<StylePreset>('photorealistic');
+    const [negativePrompt, setNegativePrompt] = useState(STYLE_PRESETS[0].negative);
     const [showAdvanced, setShowAdvanced] = useState(false);
     const [steps, setSteps] = useState(25);
     const [cfgScale, setCfgScale] = useState(7.5);
@@ -109,6 +113,15 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
         reader.readAsDataURL(file);
     };
 
+    const handleSelectPreset = (presetId: StylePreset) => {
+        setSelectedPreset(presetId);
+        const preset = STYLE_PRESETS.find(p => p.id === presetId);
+        if (preset) {
+            setNegativePrompt(preset.negative);
+        }
+        triggerHaptic();
+    };
+
     const handleGenerate = async () => {
         if (!prompt.trim()) {
             setError('Please enter a description for the image.');
@@ -121,8 +134,14 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
         triggerHaptic();
 
         try {
+            const preset = STYLE_PRESETS.find(p => p.id === selectedPreset);
+            let finalPrompt = prompt.trim();
+            if (preset && preset.promptSuffix && !finalPrompt.toLowerCase().includes(preset.promptSuffix.toLowerCase().trim())) {
+                finalPrompt += preset.promptSuffix;
+            }
+
             const genResult = await imageGenService.generateImage({
-                prompt: prompt.trim(),
+                prompt: finalPrompt,
                 negativePrompt: negativePrompt.trim(),
                 sourceImage: mode === 'img2img' ? (sourceImage || undefined) : undefined,
                 strength: mode === 'img2img' ? strength : undefined,
@@ -385,11 +404,42 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                         </div>
                     </div>
 
+                    {/* Style Presets */}
+                    <div className="space-y-1.5">
+                        <div className="flex items-center justify-between">
+                            <label className="text-[11px] font-semibold text-text-primary flex items-center gap-1.5">
+                                🎨 Style Preset
+                            </label>
+                            <span className="text-[10px] text-amber-300 font-mono">
+                                {STYLE_PRESETS.find(p => p.id === selectedPreset)?.label}
+                            </span>
+                        </div>
+                        <div className="grid grid-cols-3 gap-1.5">
+                            {STYLE_PRESETS.map((p) => (
+                                <button
+                                    key={p.id}
+                                    type="button"
+                                    onClick={() => handleSelectPreset(p.id)}
+                                    className={`py-1.5 px-2 rounded-lg text-[10px] font-semibold flex items-center justify-center gap-1.5 transition-all border ${
+                                        selectedPreset === p.id
+                                            ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 shadow-sm'
+                                            : 'bg-surface/60 text-text-secondary border-transparent hover:border-white/10'
+                                    }`}
+                                >
+                                    <span>{p.icon}</span>
+                                    <span>{p.label}</span>
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+
                     {/* Prompt input */}
                     <div className="space-y-1.5">
                         <label className="text-xs font-medium text-text-primary flex items-center justify-between">
                             <span>Image Prompt</span>
-                            <span className="text-[10px] text-text-tertiary">{prompt.length}/500</span>
+                            <span className="text-[10px] text-text-tertiary">
+                                {prompt.length}/500 • Tip: (word:1.3) boosts weight
+                            </span>
                         </label>
                         <textarea
                             value={prompt}
@@ -402,58 +452,16 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                     </div>
 
                     {/* Advanced Settings Accordion */}
-                    <div>
-                        <button
-                            type="button"
-                            onClick={() => setShowAdvanced(!showAdvanced)}
-                            className="text-xs text-text-secondary hover:text-text-primary flex items-center gap-1 transition-colors"
-                        >
-                            <span>{showAdvanced ? '▼' : '▶'}</span>
-                            <span>Advanced Controls (Steps, CFG Scale, Negative Prompt)</span>
-                        </button>
-
-                        {showAdvanced && (
-                            <div className="mt-3 space-y-3 p-3 bg-surface/30 rounded-xl border border-white/5 text-xs">
-                                <div className="space-y-1">
-                                    <label className="text-text-secondary">Negative Prompt:</label>
-                                    <input
-                                        type="text"
-                                        value={negativePrompt}
-                                        onChange={(e) => setNegativePrompt(e.target.value)}
-                                        className="w-full bg-input text-text-primary rounded-lg p-2 text-xs border border-white/10"
-                                    />
-                                </div>
-                                <div className="grid grid-cols-2 gap-3">
-                                    <div>
-                                        <label className="text-text-secondary block mb-1">Steps: {steps}</label>
-                                        <input
-                                            type="range"
-                                            min="5"
-                                            max="50"
-                                            step="1"
-                                            value={steps}
-                                            onChange={(e) => setSteps(parseInt(e.target.value))}
-                                            className="w-full accent-amber-400"
-                                        />
-                                    </div>
-                                    <div>
-                                        <label className="text-text-secondary block mb-1">
-                                            CFG: {cfgScale} {cfgScale >= 6.5 && cfgScale <= 9.0 ? '✨ (Optimal)' : cfgScale > 15 ? '🔥 (High)' : ''}
-                                        </label>
-                                        <input
-                                            type="range"
-                                            min="1"
-                                            max="25"
-                                            step="0.5"
-                                            value={cfgScale}
-                                            onChange={(e) => setCfgScale(parseFloat(e.target.value))}
-                                            className="w-full accent-amber-400"
-                                        />
-                                    </div>
-                                </div>
-                            </div>
-                        )}
-                    </div>
+                    <ImageGenAdvancedControls
+                        showAdvanced={showAdvanced}
+                        setShowAdvanced={setShowAdvanced}
+                        negativePrompt={negativePrompt}
+                        setNegativePrompt={setNegativePrompt}
+                        steps={steps}
+                        setSteps={setSteps}
+                        cfgScale={cfgScale}
+                        setCfgScale={setCfgScale}
+                    />
 
                     {/* Error display */}
                     {error && (
@@ -485,48 +493,14 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
 
                     {/* Result Card */}
                     {result && !isGenerating && (
-                        <div className="p-3 bg-surface/50 rounded-xl border border-white/10 space-y-3">
-                            <div className="flex items-center justify-between text-xs">
-                                <span className="font-semibold text-text-primary">Generated Result:</span>
-                                <span className="text-amber-300 text-[10px] font-mono">
-                                    ⚡ {result.generationTimeMs}ms ({result.width}x{result.height})
-                                </span>
-                            </div>
-                            <div className="rounded-xl overflow-hidden border border-white/10 shadow-lg relative group">
-                                <img
-                                    src={result.base64Image}
-                                    alt="Generated output"
-                                    className="w-full h-auto object-contain max-h-72 mx-auto bg-black"
-                                />
-                                {saveStatus && (
-                                    <div className="absolute top-2 right-2 px-3 py-1.5 rounded-lg bg-emerald-600/90 text-white text-[11px] font-medium shadow-lg backdrop-blur-sm animate-in fade-in flex items-center gap-1.5">
-                                        <span>✅</span> {saveStatus}
-                                    </div>
-                                )}
-                            </div>
-
-                            {/* Quick Actions for Result */}
-                            <div className="grid grid-cols-2 gap-2 pt-1">
-                                <button
-                                    type="button"
-                                    onClick={handleSaveImage}
-                                    disabled={isSaving}
-                                    className="py-2 px-3 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-medium text-text-primary transition-all flex items-center justify-center gap-1.5"
-                                >
-                                    <span>💾</span>
-                                    <span>{isSaving ? 'Saving...' : 'Save Image'}</span>
-                                </button>
-                                <button
-                                    type="button"
-                                    onClick={handleShareImage}
-                                    disabled={isSharing}
-                                    className="py-2 px-3 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-medium text-text-primary transition-all flex items-center justify-center gap-1.5"
-                                >
-                                    <span>📤</span>
-                                    <span>{isSharing ? 'Sharing...' : 'Share'}</span>
-                                </button>
-                            </div>
-                        </div>
+                        <ImageGenResultCard
+                            result={result}
+                            saveStatus={saveStatus}
+                            isSaving={isSaving}
+                            isSharing={isSharing}
+                            onSave={handleSaveImage}
+                            onShare={handleShareImage}
+                        />
                     )}
                 </div>
 

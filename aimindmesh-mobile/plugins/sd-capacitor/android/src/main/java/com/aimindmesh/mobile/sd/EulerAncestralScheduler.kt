@@ -101,7 +101,7 @@ class EulerAncestralScheduler(
         noiseUncond: FloatArray,
         noiseCond: FloatArray,
         cfgScale: Float,
-        guidanceRescale: Float = 0.7f
+        guidanceRescale: Float = 0.0f
     ): FloatArray {
         val result = FloatArray(noiseCond.size)
         var sumCond = 0.0

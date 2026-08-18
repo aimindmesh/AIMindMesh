@@ -151,12 +151,25 @@ class SDEngine(private val context: Context) {
         val modeStr = if (sourceImage != null) "Image-to-Image (strength: $strength)" else "Text-to-Image"
         Log.i(TAG, "Starting on-device Qualcomm NPU synthesis [$modeStr]: '$prompt' | Neg: '$negativePrompt' (ratio: $aspectRatio, upscale: ${upscale}x, steps: $numSteps, cfg: $cfgScale)")
 
-        // 1. CLIP Text Encoding
-        val posTokens = clipTokenizer.encode(prompt)
-        val negTokens = clipTokenizer.encode(negativePrompt)
+        // 1. CLIP Text Encoding with Attention Weights
+        val posTokenized = clipTokenizer.encodeWithWeights(prompt)
+        val negTokenized = clipTokenizer.encodeWithWeights(negativePrompt)
 
-        val posEmbeddings = qnnBridge.runTextEncoder(posTokens)
-        val negEmbeddings = qnnBridge.runTextEncoder(negTokens)
+        val posEmbeddings = qnnBridge.runTextEncoder(posTokenized.tokens)
+        val negEmbeddings = qnnBridge.runTextEncoder(negTokenized.tokens)
+
+        // 1.1 Apply Attention Weights: e_i = neg_e_i + weight * (pos_e_i - neg_e_i)
+        for (i in 0 until 77) {
+            val weight = posTokenized.weights[i]
+            if (weight != 1.0f) {
+                val offset = i * 1024
+                for (d in 0 until 1024) {
+                    val pos = posEmbeddings[offset + d]
+                    val neg = negEmbeddings[offset + d]
+                    posEmbeddings[offset + d] = neg + weight * (pos - neg)
+                }
+            }
+        }
 
         // 2. Scheduler & Timesteps setup
         val (timesteps, stepSigmas) = scheduler.setTimesteps(numSteps)

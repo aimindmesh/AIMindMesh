@@ -7,6 +7,24 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.util.regex.Pattern
 
+data class TokenizedPrompt(
+    val tokens: IntArray,
+    val weights: FloatArray
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+        other as TokenizedPrompt
+        return tokens.contentEquals(other.tokens) && weights.contentEquals(other.weights)
+    }
+
+    override fun hashCode(): Int {
+        var result = tokens.contentHashCode()
+        result = 31 * result + weights.contentHashCode()
+        return result
+    }
+}
+
 /**
  * High-precision OpenCLIP BPE Tokenizer for Stable Diffusion v1.5 & v2.1.
  * Matches OpenAI / OpenCLIP ViT-H/14 and ViT-L/14 tokenization exactly.
@@ -108,36 +126,85 @@ class ClipTokenizer(private val context: Context? = null) {
         }
     }
 
-    /**
-     * Tokenize input text prompt into an IntArray of length 77 matching OpenCLIP padding with 49407.
-     */
-    fun encode(text: String): IntArray {
-        val tokens = IntArray(CONTEXT_LENGTH) { END_TOKEN_ID }
-        tokens[0] = START_TOKEN_ID
+    private data class WeightedChunk(val text: String, val weight: Float)
 
-        if (text.isBlank()) {
-            return tokens
+    private fun parsePromptWeights(prompt: String): List<WeightedChunk> {
+        val chunks = mutableListOf<WeightedChunk>()
+        val regex = Regex("""\(([^():]+):([0-9.]+)\)|\(([^()]+)\)|\[([^\[\]]+)\]|([^\(\)\[\]]+)""")
+        val matches = regex.findAll(prompt)
+
+        for (m in matches) {
+            val g1 = m.groups[1]?.value?.trim()
+            val g2 = m.groups[2]?.value?.trim()
+            val g3 = m.groups[3]?.value?.trim()
+            val g4 = m.groups[4]?.value?.trim()
+            val g5 = m.groups[5]?.value?.trim()
+
+            if (!g1.isNullOrEmpty() && !g2.isNullOrEmpty()) {
+                val weight = g2.toFloatOrNull() ?: 1.0f
+                chunks.add(WeightedChunk(g1, weight))
+            } else if (!g3.isNullOrEmpty()) {
+                chunks.add(WeightedChunk(g3, 1.15f))
+            } else if (!g4.isNullOrEmpty()) {
+                chunks.add(WeightedChunk(g4, 0.9f))
+            } else if (!g5.isNullOrEmpty()) {
+                chunks.add(WeightedChunk(g5, 1.0f))
+            }
         }
 
-        val cleaned = text.lowercase().trim().replace(Regex("\\s+"), " ")
-        val matcher = PATTERN.matcher(cleaned)
+        if (chunks.isEmpty() && prompt.isNotBlank()) {
+            chunks.add(WeightedChunk(prompt.trim(), 1.0f))
+        }
+        return chunks
+    }
+
+    /**
+     * Tokenize prompt with attention weights: e.g. `(small mouse:1.4)` -> weight 1.4.
+     * Output format: tokens [1, 77] and weights [1, 77].
+     */
+    fun encodeWithWeights(text: String): TokenizedPrompt {
+        val tokens = IntArray(CONTEXT_LENGTH) { PAD_TOKEN_ID }
+        val weights = FloatArray(CONTEXT_LENGTH) { 1.0f }
+        tokens[0] = START_TOKEN_ID
+        weights[0] = 1.0f
+
+        if (text.isBlank()) {
+            tokens[1] = END_TOKEN_ID
+            weights[1] = 1.0f
+            return TokenizedPrompt(tokens, weights)
+        }
+
+        val chunks = parsePromptWeights(text)
         var tokenIdx = 1
 
-        while (matcher.find() && tokenIdx < CONTEXT_LENGTH - 1) {
-            val word = matcher.group()
-            val wordTokens = tokenizeWord(word)
-
-            for (tid in wordTokens) {
-                if (tokenIdx < CONTEXT_LENGTH - 1) {
-                    tokens[tokenIdx++] = tid
-                } else {
-                    break
+        for (chunk in chunks) {
+            val cleaned = chunk.text.lowercase().trim().replace(Regex("\\s+"), " ")
+            val matcher = PATTERN.matcher(cleaned)
+            while (matcher.find() && tokenIdx < CONTEXT_LENGTH - 1) {
+                val word = matcher.group()
+                val wordTokens = tokenizeWord(word)
+                for (tid in wordTokens) {
+                    if (tokenIdx < CONTEXT_LENGTH - 1) {
+                        tokens[tokenIdx] = tid
+                        weights[tokenIdx] = chunk.weight
+                        tokenIdx++
+                    } else {
+                        break
+                    }
                 }
             }
         }
 
         tokens[tokenIdx] = END_TOKEN_ID
-        return tokens
+        weights[tokenIdx] = 1.0f
+        return TokenizedPrompt(tokens, weights)
+    }
+
+    /**
+     * Tokenize input text prompt into an IntArray of length 77 matching OpenCLIP/CLIP padding with 0.
+     */
+    fun encode(text: String): IntArray {
+        return encodeWithWeights(text).tokens
     }
 
     private fun tokenizeWord(word: String): List<Int> {
