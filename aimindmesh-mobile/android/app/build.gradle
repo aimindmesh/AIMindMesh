@@ -34,19 +34,25 @@ android {
             version "3.22.1"
         }
     }
+    // Release signing only where the MYAPP_RELEASE_* properties exist (~/.gradle/gradle.properties):
+    // debug builds work on any machine and in CI, an unsigned release is produced elsewhere
+    def hasReleaseSigning = ['MYAPP_RELEASE_STORE_FILE', 'MYAPP_RELEASE_STORE_PASSWORD',
+                             'MYAPP_RELEASE_KEY_ALIAS', 'MYAPP_RELEASE_KEY_PASSWORD'].every { project.hasProperty(it) }
     signingConfigs {
-        release {
-            storeFile file(MYAPP_RELEASE_STORE_FILE)
-            storePassword MYAPP_RELEASE_STORE_PASSWORD
-            keyAlias MYAPP_RELEASE_KEY_ALIAS
-            keyPassword MYAPP_RELEASE_KEY_PASSWORD
+        if (hasReleaseSigning) {
+            release {
+                storeFile file(MYAPP_RELEASE_STORE_FILE)
+                storePassword MYAPP_RELEASE_STORE_PASSWORD
+                keyAlias MYAPP_RELEASE_KEY_ALIAS
+                keyPassword MYAPP_RELEASE_KEY_PASSWORD
+            }
         }
     }
     buildTypes {
         release {
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
-            signingConfig signingConfigs.release
+            if (hasReleaseSigning) signingConfig signingConfigs.release
         }
     }
     packagingOptions {
@@ -66,12 +72,9 @@ android {
         pickFirst '**/libLiteRtTopKOpenClSampler.so'
         pickFirst '**/libtensorflowlite_gpu_delegate.so'
         pickFirst '**/libtensorflowlite_gpu_jni.so'
-        // GGML / Whisper native libs - pick first to avoid duplicate with GenieX SDK
-        pickFirst '**/libggml*.so'
-        pickFirst '**/libggml-base.so'
-        pickFirst '**/libggml-cpu.so'
-        pickFirst '**/libggml-blas.so'
-        pickFirst '**/libwhisper.so'
+        // libggml*.so come only from the GenieX SDK: whisper links its own ggml statically
+        // (a pickFirst here used to replace GenieX's ggml with whisper's older one).
+        // OpenMP runtime: shipped by more than one native module
         pickFirst '**/libomp.so'
     }
 }
@@ -125,9 +128,18 @@ dependencies {
     // ONNX Runtime for TextEmbedding
     implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.26.0'
 
-    // Sherpa-ONNX per Kokoro TTS v2 (local aar, statically linked to avoid ONNX conflicts)
-    implementation files('libs/sherpa-onnx-static-link-onnxruntime-1.13.2.aar')
+    // Sherpa-ONNX per Kokoro TTS v2 (local aar, statically linked to avoid ONNX conflicts).
+    // Not versioned in git (38 MB): fetched and SHA-256 checked by aimindmesh-mobile/scripts/fetch-native-deps.sh
+    def sherpaAar = file('libs/sherpa-onnx-static-link-onnxruntime-1.13.2.aar')
+    if (!sherpaAar.exists()) {
+        throw new GradleException("Missing ${sherpaAar}: run aimindmesh-mobile/scripts/fetch-native-deps.sh")
+    }
+    implementation files(sherpaAar)
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+    // Periodic proactive checks that survive background limits (proactive/ProactiveWorker.kt)
+    implementation 'androidx.work:work-runtime-ktx:2.10.5'
+    // Real org.json on the JVM for unit tests (the Android one is a stub there)
+    testImplementation 'org.json:json:20240303'
     implementation 'org.apache.commons:commons-compress:1.26.1'
 
     // Firebase Cloud Messaging (v4.0.0 — push notifications for Feed/insights)

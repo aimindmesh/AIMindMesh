@@ -22,13 +22,15 @@ import { TranscriptSegment, SavedMeeting } from '../../types/meeting';
 
 import { SpeakerDiarization } from '../../services/speaker/speakerDiarization';
 import { logger } from '../../services/logger';
-import { saveMeeting as saveMeetingToStorage, getMeetingAudioFile } from '../../services/meeting/meetingStorage';
-
-
+import { resolveMeetingAudio } from '../../services/meeting/meetingStorage';
+import { registerBackHandler } from '../../services/native/backButtonRegistry';
+import { onMeetingDeleted } from '../../services/meeting/meetingDeletions';
+import { describeRecoveredRecording, recoverInterruptedRecordings } from '../../services/meeting/recordingRecovery';
 
 import { useMeetingSettings } from '../../hooks/meeting/useMeetingSettings';
 import { useAudioPlayback } from '../../hooks/meeting/useAudioPlayback';
-import { useMeetingRecording } from '../../hooks/meeting/useMeetingRecording';
+import { useMeetingRecording, RecordingStopResult } from '../../hooks/meeting/useMeetingRecording';
+import { useMeetingSession } from '../../hooks/meeting/useMeetingSession';
 import { useMeetingAnalysis } from '../../hooks/meeting/useMeetingAnalysis';
 import { useMeetingReprocessing } from '../../hooks/meeting/useMeetingReprocessing';
 import { useVoskTranscription } from '../../hooks/meeting/useVoskTranscription';
@@ -38,10 +40,12 @@ import { useHybridTranscription } from '../../hooks/meeting/useHybridTranscripti
 import { useMeetingInitialization } from '../../hooks/meeting/useMeetingInitialization';
 
 import { segmentAudioService } from '../../services/meeting/SegmentAudioService';
+import { hasSegmentTiming } from '../../services/speaker/segmentAssignment';
 import { MeetingHeader, MeetingTranscript, MeetingAnalysisPanel, MeetingControls, ExportBottomSheet } from '.';
 import MeetingHistory from './MeetingHistory';
 import AudioMiniPlayer from './AudioMiniPlayer';
 import Toast from '../ui/Toast';
+import { enterActivity, leaveActivity } from '../../services/model/modelOrchestrator';
 
 interface MeetingModeProps {
     onClose: () => void;
@@ -54,11 +58,8 @@ interface MeetingModeProps {
 
 const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, personality, llmConfig, apiKey, memories, speechConfig }) => {
     // ===== State =====
-    const [transcript, setTranscript] = useState<TranscriptSegment[]>([]);
     const [currentText, setCurrentText] = useState('');
-    const [speakerNames, setSpeakerNames] = useState<Record<number, string>>({});
     const [isHistoryOpen, setIsHistoryOpen] = useState(false);
-    const [currentMeetingId, setCurrentMeetingId] = useState<string | null>(null);
     const [toast, setToast] = useState<{ message: string; isVisible: boolean; type: 'success' | 'error' | 'info' }>({
         message: '',
         isVisible: false,
@@ -70,10 +71,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, personality, llmConf
     // ===== Refs =====
     const diarizationRef = useRef<SpeakerDiarization>(new SpeakerDiarization());
     const transcriptEndRef = useRef<HTMLDivElement>(null);
-
-    // Ref to holds the raw PCM blob for reprocessing (bypassing potentially buggy decoding)
-    const pcmAudioBlobRef = useRef<Blob | null>(null);
-    const audioFilePathRef = useRef<string | null>(null);
+    const closingRef = useRef(false);
 
     // Audio Playback state tracking
     const [segmentAudioState, setSegmentAudioState] = useState(segmentAudioService.getState());
@@ -91,127 +89,51 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, personality, llmConf
     }, []);
 
     const settings = useMeetingSettings();
-
     const playback = useAudioPlayback({ showToast });
+    // Transcript, names, meeting id and saving (always from the latest values)
+    const session = useMeetingSession(showToast);
+    const { transcript, setTranscript, speakerNames, setSpeakerNames, audioFilePathRef, pcmAudioBlobRef } = session;
+    const { setRecordedAudioUrl, setAudioDuration } = playback;
 
-    // Ref to break circular dependency with saveMeeting
-    const saveMeetingRef = useRef<() => Promise<void>>(async () => { });
-
-    // Ref refs
     const transcriptionModeRef = useRef(settings.transcriptionMode);
     useEffect(() => {
         transcriptionModeRef.current = settings.transcriptionMode;
     }, [settings.transcriptionMode]);
 
-
-
-    const handleRecordingStopped = useCallback(async (audioChunks: Blob[], mimeType: string, pcmBlob?: Blob | null, durationMs?: number, filePath?: string) => {
+    const handleRecordingStopped = useCallback(async ({ filePath, pcmBlob, durationMs }: RecordingStopResult) => {
         try {
-            // New optimized path: Streaming to file
-            if (filePath) {
-                audioFilePathRef.current = filePath;
-                const audioUrl = Capacitor.convertFileSrc(filePath);
-                playback.setRecordedAudioUrl(audioUrl);
-                logger.log('info', `Set playback URL from file: ${filePath}`);
-
-                if (durationMs && durationMs > 0) {
-                    playback.setAudioDuration(durationMs / 1000);
-                }
+            // The recording is moved into meeting storage: play it from there
+            const storedPath = await session.attachRecording(filePath, pcmBlob, durationMs);
+            if (storedPath) {
+                setRecordedAudioUrl(Capacitor.convertFileSrc(storedPath));
+            } else if (pcmBlob && pcmBlob.size > 0) {
+                setRecordedAudioUrl(URL.createObjectURL(pcmBlob));
+            } else {
+                showToast('The audio could not be saved: the transcript is kept', 'error');
             }
-            // Prefer pcmBlob (WAV from AudioWorklet) over audioChunks (legacy MediaRecorder)
-            else if (pcmBlob && pcmBlob.size > 0) {
-                // New AudioWorklet path: use the WAV blob directly
-                const audioUrl = URL.createObjectURL(pcmBlob);
-                playback.setRecordedAudioUrl(audioUrl);
-                logger.log('info', `Created playback URL from WAV blob: ${pcmBlob.size} bytes`);
-
-                // Use passed duration or calculate from blob size
-                if (durationMs && durationMs > 0) {
-                    playback.setAudioDuration(durationMs / 1000);
-                }
-            } else if (audioChunks.length > 0) {
-                // Legacy MediaRecorder path (fallback)
-                const audioBlob = new Blob(audioChunks, { type: mimeType });
-                const audioUrl = URL.createObjectURL(audioBlob);
-                playback.setRecordedAudioUrl(audioUrl);
-
-                // Use passed duration or 0
-                if (durationMs && durationMs > 0) {
-                    playback.setAudioDuration(durationMs / 1000);
-                }
-            }
-
-            // Store pcmBlob reference for reprocessing (still needed if not using file)
-            // If we have file, we might not have pcmBlob populated if we disabled accumulation
-            pcmAudioBlobRef.current = pcmBlob || null;
-
-            if (pcmBlob) {
-                logger.log('info', `Received raw PCM blob for reprocessing: ${pcmBlob.size} bytes`);
-            }
-
-            // Auto-save via ref to break cycle
-            if (saveMeetingRef.current) {
-                await saveMeetingRef.current();
-            }
+            if (durationMs > 0) setAudioDuration(durationMs / 1000);
+            await session.save();
         } catch (error) {
             logger.log('error', 'Error handling stopped recording', error);
             showToast('Error saving recording', 'error');
         }
-    }, [playback, showToast]);
+    }, [session.attachRecording, session.save, setRecordedAudioUrl, setAudioDuration, showToast]);
 
     const recording = useMeetingRecording({
         recognitionModeRef: settings.recognitionModeRef,
         transcriptionModeRef,
         showToast,
         onRecordingStopped: handleRecordingStopped,
-        setCurrentText,
         setTranscript,
-        diarizationRef
+        diarizationRef,
+        getMeetingId: session.getMeetingId
     });
-
-    const saveMeeting = useCallback(async () => {
-        const hasTranscript = transcript.length > 0;
-        const hasLegacyAudio = recording.audioChunksRef.current.length > 0;
-        const hasWavAudio = !!pcmAudioBlobRef.current;
-        const hasAudio = hasLegacyAudio || hasWavAudio;
-
-        if (!hasTranscript && !hasAudio) {
-            logger.log('info', 'No transcript or audio to save');
-            return;
-        }
-
-        try {
-            const meetingId = currentMeetingId || Date.now().toString();
-            if (!currentMeetingId && (playback.recordedAudioUrl || hasAudio)) {
-                setCurrentMeetingId(meetingId);
-            }
-
-            // Prepare audio chunks for storage (legacy expects array of blobs)
-            let audioForStorage: Blob[] | undefined;
-            if (hasWavAudio && pcmAudioBlobRef.current) {
-                audioForStorage = [pcmAudioBlobRef.current];
-            } else if (hasLegacyAudio) {
-                audioForStorage = recording.audioChunksRef.current;
-            }
-
-            await saveMeetingToStorage({
-                id: meetingId,
-                timestamp: Date.now(),
-                transcript,
-                speakerNames,
-                duration: playback.audioDuration,
-                hasAudio: !!audioForStorage || !!playback.recordedAudioUrl
-            }, audioForStorage, undefined, audioFilePathRef.current || undefined);
-
-        } catch (error) {
-            logger.log('error', 'Failed to save meeting', error);
-        }
-    }, [transcript, recording.audioChunksRef, currentMeetingId, playback.recordedAudioUrl, playback.audioDuration, speakerNames]);
 
     const analysis = useMeetingAnalysis({
         transcript,
         speakerNames,
         playback,
+        audioFilePathRef,
         llmConfig,
         personality,
         memories,
@@ -222,20 +144,22 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, personality, llmConf
     const reprocessing = useMeetingReprocessing({
         playback,
         speechConfig,
-        transcript,
+        getTranscript: session.getTranscript,
         setTranscript,
+        getMeetingTimestamp: session.getMeetingTimestamp,
         diarizationRef,
         settings,
         showToast,
-        saveMeeting,
+        saveMeeting: session.save,
+        suspendAutosave: session.suspendAutosave,
         pcmAudioBlobRef,
         audioFilePathRef
     });
 
-    // Update ref for circular dependency handling
+    // Edits, renames and late results are saved without an explicit call
     useEffect(() => {
-        saveMeetingRef.current = saveMeeting;
-    }, [saveMeeting]);
+        session.scheduleAutosave(recording.isRecording);
+    }, [transcript, speakerNames, recording.isRecording, session.scheduleAutosave]);
 
     // ===== Sub-Hooks for Transcriptions =====
     useVoskTranscription({
@@ -263,12 +187,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, personality, llmConf
         setTranscript
     });
 
-    const { isModelLoading } = useMeetingInitialization({
-        settings,
-        showToast,
-        transcript,
-        currentText
-    });
+    const { isModelLoading } = useMeetingInitialization({ settings, showToast });
 
     // Overlap detection: marks segments where two speakers talk simultaneously
     useOverlapDetection({ transcript, setTranscript });
@@ -307,28 +226,87 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, personality, llmConf
         transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, [transcript, currentText]);
 
-    // Memory Management: Unload LLM if Voxtral is active
+    // RAM: Stable Diffusion leaves while the meeting is open; a heavy speech model (Voxtral,
+    // Whisper medium/large) frees the LLM when it loads; closing frees them and restores the LLM
     useEffect(() => {
-        if (speechConfig?.sttProvider === 'voxtral') {
-            import('../../services/llm/llmService').then(({ unloadCurrentModel }) => {
-                unloadCurrentModel(llmConfig);
-            });
-        }
-    }, [speechConfig?.sttProvider, llmConfig]);
-
+        void enterActivity('meeting', ['gguf', 'litert', 'genie', 'whisper', 'voxtral']).catch(() => { });
+        return () => { void leaveActivity('meeting'); };
+    }, []);
 
     // ===== Handlers =====
 
-    const handleStartRecording = async () => {
-        // Unload LLM if Voxtral is active to free memory
-        if (speechConfig?.sttProvider === 'voxtral') {
-            try {
-                const { unloadCurrentModel } = await import('../../services/llm/llmService');
-                await unloadCurrentModel(llmConfig);
-            } catch (e) {
-                logger.log('error', 'Failed to unload LLM before recording', e);
-            }
+    /**
+     * Closing (X or Android Back) never drops a recording: it asks, stops, finishes the file and
+     * saves before leaving. Overlays close first.
+     */
+    const requestClose = async () => {
+        if (closingRef.current) return;
+        if (isExportSheetOpen) return setIsExportSheetOpen(false);
+        if (isHistoryOpen) return setIsHistoryOpen(false);
+        if ((recording.isRecordingRef.current || recording.isBusyRef.current) &&
+            !window.confirm('A meeting is being recorded. Stop the recording, save it and close?')) return;
+        if (reprocessing.isReclustering) {
+            if (!window.confirm('Processing is still running. Close anyway? The meeting keeps its previous transcript.')) return;
+            reprocessing.handleCancelProcessing();
         }
+        closingRef.current = true;
+        try {
+            await recording.stopRecording();
+            await session.flush();
+        } catch (error) {
+            logger.log('error', 'Error while closing the meeting', error);
+        } finally {
+            onClose();
+        }
+    };
+    const requestCloseRef = useRef(requestClose);
+    requestCloseRef.current = requestClose;
+
+    useEffect(() => registerBackHandler('meeting', () => {
+        void requestCloseRef.current();
+        return true;
+    }), []);
+
+    // The open meeting deleted in History or on another device: an autosave must not recreate it
+    const handleOpenMeetingDeletedRef = useRef<(meetingId: string) => void>(() => { });
+    handleOpenMeetingDeletedRef.current = (meetingId: string) => {
+        const result = session.handleMeetingDeleted(meetingId, recording.isRecordingRef.current || recording.isBusyRef.current);
+        if (result === 'none') return;
+        if (result === 'detached') {
+            showToast('This meeting was deleted: the recording continues as a new meeting', 'info');
+            return;
+        }
+        if (reprocessing.isReclustering) reprocessing.handleCancelProcessing();
+        void segmentAudioService.stop();
+        diarizationRef.current.clear();
+        setCurrentText('');
+        setRecordedAudioUrl(null);
+        setAudioDuration(0);
+        showToast('The open meeting was deleted', 'info');
+    };
+    useEffect(() => onMeetingDeleted(id => handleOpenMeetingDeletedRef.current(id)), []);
+
+    // Recordings cut short by the app being killed are recovered and announced once
+    useEffect(() => {
+        let cancelled = false;
+        recoverInterruptedRecordings()
+            .then(recovered => {
+                if (cancelled || recovered.length === 0) return;
+                const message = recovered.map(r => describeRecoveredRecording(r)).join('\n');
+                showToast(message, 'success');
+            })
+            .catch(e => logger.log('warn', 'Recovery of interrupted recordings failed', e));
+        return () => { cancelled = true; };
+    }, [showToast]);
+
+    const handleStartRecording = async () => {
+        if (recording.isRecordingRef.current || recording.isBusyRef.current || reprocessing.isReclustering) return;
+        // Every recording is a new meeting (the previous one is already saved)
+        session.beginNewMeeting();
+        diarizationRef.current.clear();
+        setCurrentText('');
+        setRecordedAudioUrl(null);
+        setAudioDuration(0);
         await recording.startRecording();
     };
 
@@ -341,7 +319,7 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, personality, llmConf
     };
 
     const handleExport = async () => {
-        if (transcript.length === 0) {
+        if (transcript.length === 0 && !session.meta.hasAudio) {
             showToast('No transcript to export', 'info');
             return;
         }
@@ -349,29 +327,28 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, personality, llmConf
     };
 
     const handleSegmentPlay = async (segment: TranscriptSegment) => {
-        // If the current meeting doesn't have a saved audio file yet (is ongoing without file)
-        // or we don't have start_ms, we can't play it
-        if (!audioFilePathRef.current || segment.start_ms === undefined || segment.end_ms === undefined) {
+        // Needs the saved audio file and the segment's position in it
+        if (!audioFilePathRef.current || !hasSegmentTiming(segment)) {
             showToast('Audio file not ready for this segment', 'info');
             return;
         }
 
-        const currentState = segmentAudioService.getState();
-        if (currentState.activeSegmentId === segment.id && currentState.state === 'playing') {
-            await segmentAudioService.pause();
-        } else if (currentState.activeSegmentId === segment.id && currentState.state === 'paused') {
-            await segmentAudioService.resume();
-        } else {
-            await segmentAudioService.playSegment(
-                segment.id,
-                audioFilePathRef.current,
-                segment.start_ms,
-                segment.end_ms
-            );
+        try {
+            const currentState = segmentAudioService.getState();
+            if (currentState.activeSegmentId === segment.id && currentState.state === 'playing') {
+                await segmentAudioService.pause();
+            } else if (currentState.activeSegmentId === segment.id && currentState.state === 'paused') {
+                await segmentAudioService.resume();
+            } else {
+                await segmentAudioService.playSegment(segment.id, audioFilePathRef.current, segment.start_ms, segment.end_ms);
+            }
+        } catch (error) {
+            showToast('Could not play this segment', 'error');
         }
     };
 
     const handleSegmentEdit = (segment: TranscriptSegment, newText: string) => {
+        // Autosave persists it (an explicit save here used to write the pre-edit transcript)
         setTranscript(prev => prev.map(t => {
             if (t.id === segment.id) {
                 return {
@@ -384,65 +361,31 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, personality, llmConf
             }
             return t;
         }));
-
-        // Save the updated transcript
-        if (saveMeetingRef.current) {
-            saveMeetingRef.current();
-        }
     };
 
     const handleHistoryReprocess = async (meeting: SavedMeeting) => {
-        let hasAudio = false;
-
-        // Try to load optimized audio file first
+        if (recording.isRecordingRef.current || recording.isBusyRef.current || reprocessing.isReclustering) {
+            showToast('Stop the recording before opening another meeting', 'info');
+            return;
+        }
+        let audio: { url: string; filePath: string | null } | null = null;
         try {
-            const audioFile = await getMeetingAudioFile(meeting.id);
-            if (audioFile && audioFile.path) {
-                // Set the file path for reprocessing
-                audioFilePathRef.current = audioFile.path;
-
-                // Convert to playback URL
-                const audioUrl = Capacitor.convertFileSrc(audioFile.path);
-                playback.setRecordedAudioUrl(audioUrl);
-
-                hasAudio = true;
-                logger.log('info', `Loaded optimized audio file for meeting ${meeting.id}`);
-            }
+            audio = await resolveMeetingAudio(meeting);
         } catch (e) {
-            logger.log('warn', 'Failed to load optimized audio file', e);
+            logger.log('warn', 'Failed to load the meeting audio', e);
         }
+        const audioUrl = audio?.url ?? null;
 
-        // Fallback to legacy audio data if no file found
-        if (!hasAudio && meeting.audioData && meeting.audioMimeType) {
-            try {
-                const binaryString = atob(meeting.audioData);
-                const bytes = new Uint8Array(binaryString.length);
-                for (let i = 0; i < binaryString.length; i++) {
-                    bytes[i] = binaryString.charCodeAt(i);
-                }
-                const blob = new Blob([bytes], { type: meeting.audioMimeType });
-                const url = URL.createObjectURL(blob);
-
-                playback.setRecordedAudioUrl(url);
-                audioFilePathRef.current = null; // No file path for legacy
-                pcmAudioBlobRef.current = null; // No raw PCM available
-
-                hasAudio = true;
-                logger.log('info', 'Loaded legacy audio data');
-            } catch (e) {
-                logger.log('error', 'Failed to load legacy audio data', e);
-            }
-        }
-
-        if (hasAudio) {
-            setCurrentMeetingId(meeting.id);
-            setSpeakerNames(meeting.speakerNames || {});
-            setTranscript(meeting.transcript || []);
-            setIsHistoryOpen(false);
-            showToast('Meeting loaded. Press "Reprocess Audio" to process.', 'info');
-        } else {
+        if (!audioUrl) {
             showToast('This meeting has no saved audio.', 'error');
+            return;
         }
+        session.openMeeting(meeting, audio?.filePath ?? null);
+        diarizationRef.current.clear();
+        setRecordedAudioUrl(audioUrl);
+        setAudioDuration(meeting.duration || 0);
+        setIsHistoryOpen(false);
+        showToast('Meeting loaded. Press "Reprocess Audio" to process.', 'info');
     };
 
     // ===== Render =====
@@ -450,7 +393,8 @@ const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, personality, llmConf
         <>
             <div className="fixed inset-0 bg-background z-50 flex flex-col pt-safe pb-safe">
                 <MeetingHeader
-                    onClose={onClose}
+                    onClose={() => void requestClose()}
+                    isRecording={recording.isRecording || recording.isBusy}
                     onOpenHistory={() => setIsHistoryOpen(true)}
                     recognitionMode={settings.recognitionMode}
                     setRecognitionMode={settings.setRecognitionMode}
@@ -521,7 +465,7 @@ setWhisperChunkSize={settings.setWhisperChunkSize}
                 <MeetingControls
                     isRecording={recording.isRecording}
                     isPaused={recording.isPaused}
-                    isLoading={isModelLoading}
+                    isLoading={isModelLoading || recording.isBusy}
                     audioLevel={recording.audioLevel}
                     onStartRecording={handleStartRecording}
                     onStopRecording={recording.stopRecording}
@@ -567,12 +511,19 @@ setWhisperChunkSize={settings.setWhisperChunkSize}
                 onReprocess={handleHistoryReprocess}
             />
 
-            <ExportBottomSheet
+            {isExportSheetOpen && <ExportBottomSheet
                 isOpen={isExportSheetOpen}
                 onClose={() => setIsExportSheetOpen(false)}
                 transcript={transcript}
                 speakerNames={speakerNames}
-            />
+                meeting={session.meta.id ? {
+                    id: session.meta.id,
+                    timestamp: session.meta.timestamp,
+                    duration: session.meta.duration,
+                    hasAudio: session.meta.hasAudio && !recording.isRecording,
+                    audioMimeType: session.meta.audioMimeType
+                } : undefined}
+            />}
         </>
     );
 };

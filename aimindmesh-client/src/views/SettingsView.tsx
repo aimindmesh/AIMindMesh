@@ -4,6 +4,7 @@ import { useConfigStore, AppConfig } from '../store/configStore';
 import { Save, Activity, Terminal, Download, RefreshCw, CheckCircle2, AlertCircle, Sparkles } from 'lucide-react';
 import { Dropdown } from '../components/ui/Dropdown';
 import { Logger, LogLevel } from '../utils/logger';
+import { withoutRedacted } from '../utils/redaction';
 import pkg from '../../package.json';
 import { openUrl } from '@tauri-apps/plugin-opener';
 
@@ -30,8 +31,7 @@ export default function SettingsView() {
     const parts1 = v1.split('.').map(Number);
     const parts2 = v2.split('.').map(Number);
     for (let i = 0; i < 3; i++) {
-      if ((parts1[i] || 0) > (parts2[i] || 0)) return 1;
-      if ((parts1[i] || 0) < (parts2[i] || 0)) return -1;
+      if ((parts1[i] || 0) !== (parts2[i] || 0)) return (parts1[i] || 0) > (parts2[i] || 0) ? 1 : -1;
     }
     return 0;
   };
@@ -129,7 +129,7 @@ export default function SettingsView() {
         headers: { 'x-api-key': currentLocal.server.api_key }
       });
       if (resp.ok) {
-        const data = await resp.json();
+        const data = withoutRedacted(await resp.json()); // masked secrets dropped: local keys are kept
         if (data.config) {
           setLocalConfig(prev => {
             if (!prev) return prev;

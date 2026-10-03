@@ -1,5 +1,7 @@
 import { registerPlugin, Capacitor } from '@capacitor/core';
 import { logger } from '../logger';
+import { StopTokenBuffer } from './nativeStopBuffer';
+import { ensureResident, markUnloaded } from '../model/modelOrchestrator';
 
 // TokenData type definition
 export type TokenData = {
@@ -99,6 +101,9 @@ export async function initNativeModel(config: NativeLLMConfig, slot: ModelSlot =
         console.log('[NativeLLM-DEBUG] isNativePlatform:', Capacitor.isNativePlatform());
         console.log('[NativeLLM-DEBUG] config.modelPath:', config.modelPath);
 
+        // No other heavy model (Stable Diffusion, another LLM engine, a large STT) stays in RAM
+        await ensureResident('gguf');
+
         // [Native Persistence] Check if model is ALREADY loaded in native layer
         if (Capacitor.isNativePlatform()) {
             console.log('[NativeLLM-DEBUG] Inside native platform check');
@@ -178,7 +183,7 @@ export async function initNativeModel(config: NativeLLMConfig, slot: ModelSlot =
         // Initialize context with the model
         // CRITICAL FIX: Use simple integers (0 and 1) for context IDs. 
         // Using Date.now() causes Integer Overflow in Java/C++ layer, mapping different IDs to 0.
-        const contextId = slot === 'chat' ? 0 : 1;
+        const contextId = slot === 'chat' ? 0 : (slot === 'tool' ? 1 : 2); // Same mapping as the persistence check above
 
         try {
             const { isDesktop } = await import('../../utils/platform');
@@ -343,6 +348,12 @@ export async function* generateNativeStream(
 
     setSlotMutex(slot, previousLock.then(() => currentLock));
 
+    // Native generation still running: waited for (after an interrupt) before the slot is released,
+    // since the native context rejects a new completion while one is in progress
+    let nativeSettled = true;
+    let nativeDone: Promise<unknown> = Promise.resolve();
+    let desktop = false;
+
     try {
         await previousLock;
         releaseLock = currentLockResolve!;
@@ -356,18 +367,15 @@ export async function* generateNativeStream(
         const tokenQueue: string[] = [];
         let generationError: any = null;
         let isComplete = false;
-
-        let localBuffer = '';
-        const defaultStopTokens = ['<|im_end|>', '<|eot_id|>', '</s>', '<end_of_turn>', '<|end_of_text|>', '<|eom_id|>'];
-        const allStopTokens = [...(options.stop || []), ...defaultStopTokens];
-        const maxStopTokenLength = Math.max(...allStopTokens.map(t => t.length));
+        const stopBuffer = new StopTokenBuffer(options.stop);
 
         const { isDesktop } = await import('../../utils/platform');
+        desktop = isDesktop();
         let unlistenDesktop: (() => void) | undefined;
 
         // Native Chat Formatting
         let finalPrompt = options.prompt || "";
-        if (options.messages && options.messages.length > 0 && !isDesktop()) {
+        if (options.messages && options.messages.length > 0 && !desktop) {
             try {
                 logger.log('debug', `[NativeLLM] [Req:${requestId}] Formatting chat messages natively...`);
                 // Use getFormattedChat from Capacitor plugin to apply GGUF template directly in C++
@@ -396,11 +404,11 @@ export async function* generateNativeStream(
             }
         }
 
-        if (!finalPrompt && !isDesktop()) {
+        if (!finalPrompt && !desktop) {
             throw new Error("No prompt or messages provided for generation.");
         }
 
-        if (isDesktop()) {
+        if (desktop) {
             const { invoke } = await import('@tauri-apps/api/core');
             const { listen } = await import('@tauri-apps/api/event');
 
@@ -435,20 +443,27 @@ export async function* generateNativeStream(
                 }
             });
 
-            // Start streaming completion
+            // Start streaming completion. Limits and sampling are optional native params:
+            // absent ones keep the native defaults (no token limit, load-time sampling)
             logger.log('info', `[LLM_CHAIN] [Req:${requestId}] Calling streamingCompletion for contextId=${context.contextId}, promptLen=${finalPrompt.length}`);
-            LlamaCpp.streamingCompletion({
+            nativeSettled = false;
+            nativeDone = LlamaCpp.streamingCompletion({
                 contextId: context.contextId,
                 prompt: finalPrompt,
-                images: options.images // Pass images to native layer if present
+                images: options.images, // Pass images to native layer if present
+                nPredict: options.maxTokens,
+                temperature: options.temperature,
+                topP: options.topP,
+                stop: options.stop,
             }).then(() => {
                 logger.log('debug', `[NativeLLM] [Req:${requestId}] ${slot} generation complete.`);
                 isComplete = true;
-                listener.remove();
             }).catch((err: any) => {
                 logger.log('error', `[NativeLLM] [Req:${requestId}] ${slot} generation error:`, err);
                 generationError = err;
                 isComplete = true;
+            }).finally(() => {
+                nativeSettled = true;
                 listener.remove();
             });
         }
@@ -457,93 +472,32 @@ export async function* generateNativeStream(
         logger.log('debug', `[LLM_CHAIN] [Req:${requestId}] Starting token yield loop...`);
         while (!isComplete || tokenQueue.length > 0) {
             if (options.signal?.aborted) {
-                if (isDesktop()) {
-                    // TODO: Implement cancel for desktop
-                } else {
-                    logger.log('debug', `[LLM_CHAIN] [Req:${requestId}] Aborting native generation...`);
-                    await LlamaCpp.interruptSmolLM({ contextId: context.contextId });
-                }
+                // TODO: Implement cancel for desktop; native generation is interrupted in finally
                 throw new DOMException('Generation aborted by user', 'AbortError');
             }
 
             if (generationError) throw generationError;
 
-            if (tokenQueue.length > 0) {
-                const token = tokenQueue.shift();
-                if (token) {
-                    localBuffer += token;
-
-                    // 1. Check if we fully matched a stop token
-                    let stopped = false;
-                    for (const stopToken of allStopTokens) {
-                        if (localBuffer.includes(stopToken)) {
-                            logger.log('info', `[LLM_CHAIN] [Req:${requestId}] Manual stop token detected: ${stopToken}`);
-                            const safePart = localBuffer.split(stopToken)[0];
-                            if (safePart) {
-                                yield safePart;
-                            }
-                            stopped = true;
-                            break;
-                        }
-                    }
-
-                    if (stopped) {
-                        isComplete = true;
-                        if (!isDesktop()) {
-                            LlamaCpp.interruptSmolLM({ contextId: context.contextId }).catch(() => {});
-                        }
-                        break;
-                    }
-
-                    // 2. Check if localBuffer might be the PREFIX of a stop token
-                    let potentialStopMatch = false;
-                    for (const stopToken of allStopTokens) {
-                        for (let i = 0; i < localBuffer.length; i++) {
-                            const suffix = localBuffer.substring(i);
-                            if (stopToken.startsWith(suffix)) {
-                                potentialStopMatch = true;
-                                break;
-                            }
-                        }
-                        if (potentialStopMatch) break;
-                    }
-
-                    if (!potentialStopMatch) {
-                        // Safe to yield the entire buffer
-                        logger.log('debug', `[LLM_CHAIN] [Req:${requestId}] Yielding buffer to UI: [${localBuffer.replace(/\n/g, '\\n')}]`);
-                        yield localBuffer;
-                        localBuffer = '';
-                    } else {
-                        // We have a partial match. If buffer is longer than max stop token, yield the oldest part.
-                        if (localBuffer.length > maxStopTokenLength) {
-                            const safeToYield = localBuffer.substring(0, localBuffer.length - maxStopTokenLength);
-                            if (safeToYield) {
-                                yield safeToYield;
-                                localBuffer = localBuffer.substring(localBuffer.length - maxStopTokenLength);
-                            }
-                        }
-                    }
-                }
-            } else {
+            const token = tokenQueue.shift();
+            if (token === undefined) {
                 // Wait a bit to avoid busy loop
                 await new Promise(r => setTimeout(r, 10));
+                continue;
+            }
+
+            const { text, stopped } = stopBuffer.push(token);
+            if (text) yield text;
+            if (stopped) {
+                logger.log('info', `[LLM_CHAIN] [Req:${requestId}] Manual stop token detected`);
+                isComplete = true;
+                break;
             }
         }
-        
+
         // Yield any remaining safe buffer at the end
-        if (localBuffer) {
-            let containsStop = false;
-            for (const stopToken of allStopTokens) {
-                if (localBuffer.includes(stopToken)) {
-                    containsStop = true;
-                    break;
-                }
-            }
-            if (!containsStop) {
-                yield localBuffer;
-            }
-        }
-        
+        const rest = stopBuffer.flush();
+        if (rest) yield rest;
+
         logger.log('debug', `[LLM_CHAIN] [Req:${requestId}] Token yield loop finished. isComplete=${isComplete}, queueLen=${tokenQueue.length}`);
 
         if (unlistenDesktop) {
@@ -558,6 +512,12 @@ export async function* generateNativeStream(
         logger.log('error', `[NativeLLM] [Req:${requestId}] ${slot} generation error:`, error);
         throw new Error(`Native LLM generation failed: ${error.message}`);
     } finally {
+        // Reached on abort, on a stop marker and when the caller stops reading early (tool call):
+        // the native loop only ends on end-of-generation or interrupt
+        if (!nativeSettled && !desktop) {
+            await LlamaCpp.interruptSmolLM({ contextId: context.contextId }).catch(() => {});
+            await Promise.race([nativeDone, new Promise(r => setTimeout(r, 5000))]);
+        }
         logger.log('debug', `[NativeLLM] [Req:${requestId}] Releasing lock for ${slot}`);
         releaseLock();
     }
@@ -588,6 +548,7 @@ export async function unloadNativeModelSlot(slot: ModelSlot): Promise<void> {
     }
 
     modelContexts.delete(slot);
+    if (modelContexts.size === 0) markUnloaded('gguf');
 
     logger.log('debug', `[NativeLLM] ${slot} model unloaded`);
 }
@@ -606,6 +567,7 @@ export async function forceReleaseAllContexts(): Promise<void> {
         }
     }
     modelContexts.clear();
+    markUnloaded('gguf');
     logger.log('warn', '[NativeLLM] All contexts force released');
 }
 

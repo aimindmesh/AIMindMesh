@@ -24,6 +24,7 @@ if (!rootElement) {
 }
 
 import { PersistenceService } from './services/config/persistenceService';
+import { initSecretStore } from './services/security/secretStore';
 
 console.log('[AI Mind Mesh] Creating React root...');
 const root = createRoot(rootElement);
@@ -36,6 +37,8 @@ const root = createRoot(rootElement);
   } catch (e) {
     console.error('[AI Mind Mesh] Failed to hydrate settings:', e);
   }
+  // API keys are read synchronously by the first render: load them first (never throws)
+  await initSecretStore();
 
   console.log('[AI Mind Mesh] React root created. Rendering App...');
   root.render(

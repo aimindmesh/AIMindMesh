@@ -11,6 +11,8 @@ import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
 import java.io.File;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Capacitor plugin for Whisper.cpp speech recognition.
@@ -27,8 +29,11 @@ import java.io.File;
 public class WhisperPlugin extends Plugin {
     private static final String TAG = "WhisperPlugin";
 
-    private WhisperContext whisperContext;
-    private boolean isModelLoaded = false;
+    private volatile WhisperContext whisperContext;
+    private volatile boolean isModelLoaded = false;
+    // Loads take seconds: running them on Capacitor's single plugin thread stalled every other
+    // plugin call. One executor also keeps load/unload ordered as JS issued them.
+    private final ExecutorService modelExecutor = Executors.newSingleThreadExecutor();
 
     @Override
     public void load() {
@@ -46,58 +51,67 @@ public class WhisperPlugin extends Plugin {
             return;
         }
 
-        try {
-            // Resolve path relative to app's files directory
-            File filesDir = getContext().getFilesDir();
-            File modelFile = new File(filesDir, modelPath);
-            if (!modelFile.exists()) {
-                modelFile = new File(modelPath);
+        modelExecutor.execute(() -> {
+            try {
+                // Resolve path relative to app's files directory
+                File filesDir = getContext().getFilesDir();
+                File modelFile = new File(filesDir, modelPath);
+                if (!modelFile.exists()) {
+                    modelFile = new File(modelPath);
+                }
+
+                File binaryFile = WhisperFileUtils.resolveModelBinaryPath(modelFile);
+                if (binaryFile == null || !binaryFile.exists()) {
+                    call.reject("Model file or binary not found: " + modelFile.getAbsolutePath());
+                    return;
+                }
+
+                Log.i(TAG, "Loading Whisper model binary: " + binaryFile.getAbsolutePath());
+
+                // Release (deferred until any running transcription returns) before loading
+                WhisperContext previous = whisperContext;
+                whisperContext = null;
+                isModelLoaded = false;
+                if (previous != null) {
+                    previous.release();
+                }
+
+                WhisperContext context = new WhisperContext(getContext());
+                boolean success = context.loadModel(binaryFile.getAbsolutePath());
+
+                if (success) {
+                    whisperContext = context;
+                    isModelLoaded = true;
+                    Log.i(TAG, "Whisper model loaded successfully");
+                    call.resolve();
+                } else {
+                    call.reject("Failed to load Whisper model");
+                }
+
+            } catch (Exception e) {
+                Log.e(TAG, "Error loading model", e);
+                call.reject("Failed to load model: " + e.getMessage());
             }
-
-            File binaryFile = WhisperFileUtils.resolveModelBinaryPath(modelFile);
-            if (binaryFile == null || !binaryFile.exists()) {
-                call.reject("Model file or binary not found: " + modelFile.getAbsolutePath());
-                return;
-            }
-
-            Log.i(TAG, "Loading Whisper model binary: " + binaryFile.getAbsolutePath());
-
-            // Initialize whisper context
-            if (whisperContext != null) {
-                whisperContext.release();
-            }
-
-            whisperContext = new WhisperContext(getContext());
-            boolean success = whisperContext.loadModel(binaryFile.getAbsolutePath());
-
-            if (success) {
-                isModelLoaded = true;
-                Log.i(TAG, "Whisper model loaded successfully");
-                call.resolve();
-            } else {
-                call.reject("Failed to load Whisper model");
-            }
-
-        } catch (Exception e) {
-            Log.e(TAG, "Error loading model", e);
-            call.reject("Failed to load model: " + e.getMessage());
-        }
+        });
     }
 
     @PluginMethod
     public void unloadModel(PluginCall call) {
-        try {
-            if (whisperContext != null) {
-                whisperContext.release();
+        modelExecutor.execute(() -> {
+            try {
+                WhisperContext previous = whisperContext;
                 whisperContext = null;
+                isModelLoaded = false;
+                if (previous != null) {
+                    previous.release();
+                }
+                Log.i(TAG, "Whisper model unloaded");
+                call.resolve();
+            } catch (Exception e) {
+                Log.e(TAG, "Error unloading model", e);
+                call.reject("Failed to unload model: " + e.getMessage());
             }
-            isModelLoaded = false;
-            Log.i(TAG, "Whisper model unloaded");
-            call.resolve();
-        } catch (Exception e) {
-            Log.e(TAG, "Error unloading model", e);
-            call.reject("Failed to unload model: " + e.getMessage());
-        }
+        });
     }
 
     @PluginMethod
@@ -109,7 +123,9 @@ public class WhisperPlugin extends Plugin {
 
     @PluginMethod
     public void transcribe(PluginCall call) {
-        if (!isModelLoaded || whisperContext == null) {
+        // Captured once: the field can be swapped by a concurrent load/unload
+        final WhisperContext context = whisperContext;
+        if (!isModelLoaded || context == null) {
             call.reject("Model not loaded. Call loadModel first.");
             return;
         }
@@ -124,60 +140,50 @@ public class WhisperPlugin extends Plugin {
         }
 
         // Run transcription on background thread
-        getActivity().runOnUiThread(() -> {
-            new Thread(() -> {
-                try {
-                    long startTime = System.currentTimeMillis();
+        new Thread(() -> {
+            try {
+                long startTime = System.currentTimeMillis();
 
-                    // Resolve path
-                    File filesDir = getContext().getFilesDir();
-                    File audioFile = new File(
-                            audioPath.startsWith("/") ? audioPath : new File(filesDir, audioPath).getAbsolutePath());
+                // Resolve path
+                File filesDir = getContext().getFilesDir();
+                File audioFile = new File(
+                        audioPath.startsWith("/") ? audioPath : new File(filesDir, audioPath).getAbsolutePath());
 
-                    if (!audioFile.exists()) {
-                        call.reject("Audio file not found: " + audioFile.getAbsolutePath());
-                        return;
-                    }
-
-                    Log.i(TAG, "Transcribing: " + audioFile.getAbsolutePath());
-
-                    // Perform transcription
-                    WhisperContext.TranscriptResult result = whisperContext.transcribe(
-                            audioFile.getAbsolutePath(),
-                            language,
-                            translate);
-
-                    long processingTime = System.currentTimeMillis() - startTime;
-
-                    // Build response
-                    JSObject response = new JSObject();
-                    response.put("text", result.text);
-                    response.put("processingTimeMs", processingTime);
-
-                    // Add segments
-                    JSArray segments = new JSArray();
-                    for (WhisperContext.Segment seg : result.segments) {
-                        JSObject segObj = new JSObject();
-                        segObj.put("text", seg.text);
-                        segObj.put("startMs", seg.startMs);
-                        segObj.put("endMs", seg.endMs);
-                        segments.put(segObj);
-                    }
-                    response.put("segments", segments);
-
-                    call.resolve(response);
-
-                } catch (Exception e) {
-                    Log.e(TAG, "Transcription failed", e);
-                    call.reject("Transcription failed: " + e.getMessage());
+                if (!audioFile.exists()) {
+                    call.reject("Audio file not found: " + audioFile.getAbsolutePath());
+                    return;
                 }
-            }).start();
-        });
+
+                Log.i(TAG, "Transcribing: " + audioFile.getAbsolutePath());
+
+                // Perform transcription
+                WhisperContext.TranscriptResult result = context.transcribe(
+                        audioFile.getAbsolutePath(),
+                        language,
+                        translate);
+
+                long processingTime = System.currentTimeMillis() - startTime;
+
+                // Build response
+                JSObject response = new JSObject();
+                response.put("text", result.text);
+                response.put("processingTimeMs", processingTime);
+
+                response.put("segments", segmentsToJson(result));
+
+                call.resolve(response);
+
+            } catch (Exception e) {
+                Log.e(TAG, "Transcription failed", e);
+                call.reject("Transcription failed: " + e.getMessage());
+            }
+        }).start();
     }
 
     @PluginMethod
     public void transcribeAudio(PluginCall call) {
-        if (!isModelLoaded || whisperContext == null) {
+        final WhisperContext context = whisperContext;
+        if (!isModelLoaded || context == null) {
             call.reject("Model not loaded. Call loadModel first.");
             return;
         }
@@ -220,7 +226,7 @@ public class WhisperPlugin extends Plugin {
                         ", temperature=" + temperature + ", beamSize=" + beamSize + ", threads=" + threads);
 
                 // Perform transcription with optimized parameters
-                WhisperContext.TranscriptResult result = whisperContext.transcribeAudioOptimized(
+                WhisperContext.TranscriptResult result = context.transcribeAudioOptimized(
                         samples,
                         language,
                         threads,
@@ -238,15 +244,7 @@ public class WhisperPlugin extends Plugin {
                 JSObject response = new JSObject();
                 response.put("text", result.text);
 
-                JSArray segments = new JSArray();
-                for (WhisperContext.Segment seg : result.segments) {
-                    JSObject segObj = new JSObject();
-                    segObj.put("text", seg.text);
-                    segObj.put("startMs", seg.startMs);
-                    segObj.put("endMs", seg.endMs);
-                    segments.put(segObj);
-                }
-                response.put("segments", segments);
+                response.put("segments", segmentsToJson(result));
 
                 call.resolve(response);
 
@@ -293,7 +291,8 @@ public class WhisperPlugin extends Plugin {
      */
     @PluginMethod
     public void transcribeAudioStreaming(PluginCall call) {
-        if (!isModelLoaded || whisperContext == null) {
+        final WhisperContext context = whisperContext;
+        if (!isModelLoaded || context == null) {
             call.reject("Model not loaded. Call loadModel first.");
             return;
         }
@@ -346,7 +345,7 @@ public class WhisperPlugin extends Plugin {
                 };
 
                 // Perform streaming transcription
-                WhisperContext.TranscriptResult result = whisperContext.transcribeAudioStreaming(
+                WhisperContext.TranscriptResult result = context.transcribeAudioStreaming(
                         samples,
                         language,
                         threads,
@@ -362,15 +361,7 @@ public class WhisperPlugin extends Plugin {
                 JSObject response = new JSObject();
                 response.put("text", result.text);
 
-                JSArray segments = new JSArray();
-                for (WhisperContext.Segment seg : result.segments) {
-                    JSObject segObj = new JSObject();
-                    segObj.put("text", seg.text);
-                    segObj.put("startMs", seg.startMs);
-                    segObj.put("endMs", seg.endMs);
-                    segments.put(segObj);
-                }
-                response.put("segments", segments);
+                response.put("segments", segmentsToJson(result));
                 response.put("complete", true);
 
                 // Notify completion
@@ -465,7 +456,8 @@ public class WhisperPlugin extends Plugin {
 
     @PluginMethod
     public void transcribeStream(PluginCall call) {
-        if (!isModelLoaded || whisperContext == null) {
+        final WhisperContext context = whisperContext;
+        if (!isModelLoaded || context == null) {
             call.reject("Model not loaded. Call loadModel first.");
             return;
         }
@@ -479,109 +471,123 @@ public class WhisperPlugin extends Plugin {
             return;
         }
 
-        getActivity().runOnUiThread(() -> {
-            new Thread(() -> {
-                try {
-                    // 1. Read audio file samples
-                    File filesDir = getContext().getFilesDir();
-                    File audioFile = new File(
-                            audioPath.startsWith("/") ? audioPath : new File(filesDir, audioPath).getAbsolutePath());
+        new Thread(() -> {
+            try {
+                // 1. Read audio file samples
+                File filesDir = getContext().getFilesDir();
+                File audioFile = new File(
+                        audioPath.startsWith("/") ? audioPath : new File(filesDir, audioPath).getAbsolutePath());
 
-                    if (!audioFile.exists()) {
-                        call.reject("Audio file not found: " + audioFile.getAbsolutePath());
-                        return;
-                    }
-
-                    // Decode WAV to samples (simple WAV parser)
-                    float[] allSamples = WhisperFileUtils.readAudioSamples(audioFile);
-                    if (allSamples == null || allSamples.length == 0) {
-                        call.reject("Failed to read audio samples or empty file");
-                        return;
-                    }
-
-                    // 2. Process in chunks
-                    int sampleRate = 16000;
-                    int samplesPerChunk = chunkSizeSeconds * sampleRate;
-                    int totalSamples = allSamples.length;
-                    int numChunks = (int) Math.ceil((double) totalSamples / samplesPerChunk);
-
-                    JSArray allResults = new JSArray();
-
-                    Log.i(TAG, "Starting stream transcription: " + totalSamples + " samples, " + numChunks + " chunks");
-
-                    for (int i = 0; i < numChunks; i++) {
-                        int startSample = i * samplesPerChunk;
-                        int endSample = Math.min(startSample + samplesPerChunk, totalSamples);
-                        int chunkLength = endSample - startSample;
-
-                        // Copy chunk samples
-                        float[] chunkSamples = new float[chunkLength];
-                        System.arraycopy(allSamples, startSample, chunkSamples, 0, chunkLength);
-
-                        // Transcribe chunk using optimized parameters (defaults for now)
-                        // Using 'fast' parameters for speed
-                        WhisperContext.TranscriptResult result = whisperContext.transcribeAudioOptimized(
-                                chunkSamples,
-                                language,
-                                4, // threads
-                                0.0f, // temperature
-                                1, // beamSize
-                                1, // bestOf
-                                "", // initialPrompt
-                                false, // vadFilter
-                                500, // minSilence
-                                400, // speechPad
-                                false, // conditionOnPreviousText
-                                false // wordTimestamps
-                        );
-
-                        // Create chunk result
-                        JSObject chunkResult = new JSObject();
-                        chunkResult.put("chunkIndex", i);
-                        chunkResult.put("text", result.text);
-
-                        // Create segments with time offset
-                        JSArray segmentsArr = new JSArray();
-                        long timeOffsetMs = (long) i * chunkSizeSeconds * 1000;
-
-                        for (WhisperContext.Segment seg : result.segments) {
-                            JSObject segObj = new JSObject();
-                            segObj.put("text", seg.text);
-                            segObj.put("startMs", seg.startMs + timeOffsetMs);
-                            segObj.put("endMs", seg.endMs + timeOffsetMs);
-                            segmentsArr.put(segObj);
-                        }
-                        chunkResult.put("segments", segmentsArr);
-                        chunkResult.put("startTimeMs", timeOffsetMs);
-
-                        allResults.put(chunkResult);
-
-                        // Notify listeners
-                        notifyListeners("transcriptionChunk", chunkResult);
-                    }
-
-                    // Final resolve
-                    JSObject finalResult = new JSObject();
-                    finalResult.put("complete", true);
-                    finalResult.put("chunks", allResults);
-
-                    call.resolve(finalResult);
-
-                } catch (Exception e) {
-                    Log.e(TAG, "Streaming failed", e);
-                    call.reject("Streaming failed: " + e.getMessage());
+                if (!audioFile.exists()) {
+                    call.reject("Audio file not found: " + audioFile.getAbsolutePath());
+                    return;
                 }
-            }).start();
-        });
+
+                // Decode WAV to samples (simple WAV parser)
+                float[] allSamples = WhisperFileUtils.readAudioSamples(audioFile);
+                if (allSamples == null || allSamples.length == 0) {
+                    call.reject("Failed to read audio samples or empty file");
+                    return;
+                }
+
+                // 2. Process in chunks
+                int sampleRate = 16000;
+                int samplesPerChunk = chunkSizeSeconds * sampleRate;
+                int totalSamples = allSamples.length;
+                int numChunks = (int) Math.ceil((double) totalSamples / samplesPerChunk);
+
+                JSArray allResults = new JSArray();
+
+                Log.i(TAG, "Starting stream transcription: " + totalSamples + " samples, " + numChunks + " chunks");
+
+                for (int i = 0; i < numChunks; i++) {
+                    int startSample = i * samplesPerChunk;
+                    int endSample = Math.min(startSample + samplesPerChunk, totalSamples);
+                    int chunkLength = endSample - startSample;
+
+                    // Copy chunk samples
+                    float[] chunkSamples = new float[chunkLength];
+                    System.arraycopy(allSamples, startSample, chunkSamples, 0, chunkLength);
+
+                    // Transcribe chunk using optimized parameters (defaults for now)
+                    // Using 'fast' parameters for speed
+                    WhisperContext.TranscriptResult result = context.transcribeAudioOptimized(
+                            chunkSamples,
+                            language,
+                            4, // threads
+                            0.0f, // temperature
+                            1, // beamSize
+                            1, // bestOf
+                            "", // initialPrompt
+                            false, // vadFilter
+                            500, // minSilence
+                            400, // speechPad
+                            false, // conditionOnPreviousText
+                            false // wordTimestamps
+                    );
+
+                    // Create chunk result
+                    JSObject chunkResult = new JSObject();
+                    chunkResult.put("chunkIndex", i);
+                    chunkResult.put("text", result.text);
+
+                    // Create segments with time offset
+                    JSArray segmentsArr = new JSArray();
+                    long timeOffsetMs = (long) i * chunkSizeSeconds * 1000;
+
+                    for (WhisperContext.Segment seg : result.segments) {
+                        JSObject segObj = new JSObject();
+                        segObj.put("text", seg.text);
+                        segObj.put("startMs", seg.startMs + timeOffsetMs);
+                        segObj.put("endMs", seg.endMs + timeOffsetMs);
+                        segmentsArr.put(segObj);
+                    }
+                    chunkResult.put("segments", segmentsArr);
+                    chunkResult.put("startTimeMs", timeOffsetMs);
+
+                    allResults.put(chunkResult);
+
+                    // Notify listeners
+                    notifyListeners("transcriptionChunk", chunkResult);
+                }
+
+                // Final resolve
+                JSObject finalResult = new JSObject();
+                finalResult.put("complete", true);
+                finalResult.put("chunks", allResults);
+
+                call.resolve(finalResult);
+
+            } catch (Exception e) {
+                Log.e(TAG, "Streaming failed", e);
+                call.reject("Streaming failed: " + e.getMessage());
+            }
+        }).start();
+    }
+
+    private static JSArray segmentsToJson(WhisperContext.TranscriptResult result) {
+        JSArray segments = new JSArray();
+        for (WhisperContext.Segment seg : result.segments) {
+            JSObject segObj = new JSObject();
+            segObj.put("text", seg.text);
+            segObj.put("startMs", seg.startMs);
+            segObj.put("endMs", seg.endMs);
+            segments.put(segObj);
+        }
+        return segments;
     }
 
     @Override
     protected void handleOnDestroy() {
-        if (whisperContext != null) {
-            whisperContext.release();
-            whisperContext = null;
-        }
+        WhisperContext previous = whisperContext;
+        whisperContext = null;
         isModelLoaded = false;
+        if (previous != null) {
+            // Deferred to the end of a running transcription (a foreground meeting service can
+            // keep the process alive after the activity is destroyed)
+            previous.release();
+        }
+        modelExecutor.shutdown();
         super.handleOnDestroy();
     }
 }

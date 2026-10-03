@@ -23,6 +23,12 @@ export interface AudioRecorderConfig {
     autoGainControl?: boolean;
     /** Disable internal memory accumulation (default: false) - use for streaming/long recordings */
     disableInternalStorage?: boolean;
+    /**
+     * Samples per chunk delivered to onAudioData (default: 80000 = 5 s at 16 kHz, suited to
+     * long recordings). Live transcription needs short chunks (e.g. 1600 = 100 ms) to detect
+     * pauses; with 5 s chunks utterances were split at arbitrary boundaries.
+     */
+    chunkIntervalSamples?: number;
 }
 
 /**
@@ -89,7 +95,8 @@ export class HighQualityAudioRecorder {
             echoCancellation: config.echoCancellation ?? false,
             noiseSuppression: config.noiseSuppression ?? false,
             autoGainControl: config.autoGainControl ?? false,
-            disableInternalStorage: config.disableInternalStorage ?? false
+            disableInternalStorage: config.disableInternalStorage ?? false,
+            chunkIntervalSamples: config.chunkIntervalSamples ?? 80000
         };
 
         logger.log('info', 'HighQualityAudioRecorder created', this.config);
@@ -269,10 +276,10 @@ export class HighQualityAudioRecorder {
         this.recordingStartTime = Date.now();
         this.isRecording = true;
 
-        // Start the worklet recording with 5s buffering (16000 * 5)
+        // Start the worklet recording (default 5s buffering, 16000 * 5)
         this.workletNode?.port.postMessage({
             command: 'start',
-            chunkInterval: 80000
+            chunkInterval: this.config.chunkIntervalSamples
         });
 
         // Start audio level monitoring

@@ -1,11 +1,11 @@
 import { FastifyInstance } from 'fastify';
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import util from 'util';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
 
-const execAsync = util.promisify(exec);
+const execFileAsync = util.promisify(execFile);
 
 export default async function (fastify: FastifyInstance) {
   fastify.post('/v1/audio/transcriptions', async (request, reply) => {
@@ -17,17 +17,19 @@ export default async function (fastify: FastifyInstance) {
 
       const tempDir = os.tmpdir();
       const fileName = `audio_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-      const ext = path.extname(data.filename) || '.wav';
+      // The extension comes from the client: accept only plain alphanumeric ones
+      const rawExt = path.extname(data.filename || '');
+      const ext = /^\.[a-z0-9]{1,5}$/i.test(rawExt) ? rawExt : '.wav';
       const inputFilePath = path.join(tempDir, fileName + ext);
       
       const buffer = await data.toBuffer();
       fs.writeFileSync(inputFilePath, buffer);
 
-      // Execute local whisper CLI
-      const cmd = `whisper ${inputFilePath} --model medium --output_format txt --output_dir ${tempDir}`;
-      console.log(`Executing local STT: ${cmd}`);
+      // Execute local whisper CLI (no shell: arguments are passed verbatim)
+      const args = [inputFilePath, '--model', 'medium', '--output_format', 'txt', '--output_dir', tempDir];
+      console.log(`Executing local STT: whisper ${args.join(' ')}`);
       
-      await execAsync(cmd);
+      await execFileAsync('whisper', args);
       
       const txtFilePath = path.join(tempDir, fileName + '.txt');
       let transcribedText = '';

@@ -33,6 +33,11 @@ function createClient(): AxiosInstance {
   });
 }
 
+/** The UI's "model" selector picks a provider: send it as `provider` too, so the server routes it */
+function withProvider<T extends { model?: string }>(payload: T): T & { provider?: string } {
+  return payload.model ? { ...payload, provider: payload.model } : payload;
+}
+
 // ── API ────────────────────────────────────────────────────────────────────
 
 export const aiTaskService = {
@@ -51,13 +56,13 @@ export const aiTaskService = {
 
   /** Create a new AI task */
   async createTask(payload: AiTaskCreatePayload): Promise<ServerAiTask> {
-    const { data } = await createClient().post<ServerAiTask>('/api/ai-tasks', payload);
+    const { data } = await createClient().post<ServerAiTask>('/api/ai-tasks', withProvider(payload));
     return data;
   },
 
-  /** Update an existing task */
+  /** Update an existing task (the server exposes PATCH, not PUT) */
   async updateTask(taskId: string, payload: AiTaskUpdatePayload): Promise<ServerAiTask> {
-    const { data } = await createClient().put<ServerAiTask>(`/api/ai-tasks/${taskId}`, payload);
+    const { data } = await createClient().patch<ServerAiTask>(`/api/ai-tasks/${taskId}`, withProvider(payload));
     return data;
   },
 

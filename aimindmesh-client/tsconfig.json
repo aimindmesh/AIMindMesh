@@ -12,6 +12,9 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
+
+    /* HTTP API contract shared with the server (type-only imports) */
+    "paths": { "@aimindmesh/api-types": ["../aimindmesh-server/src/types/api.ts"] },
     "jsx": "react-jsx",
 
     /* Linting */

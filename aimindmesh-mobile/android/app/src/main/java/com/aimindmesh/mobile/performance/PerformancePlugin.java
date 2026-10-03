@@ -1,11 +1,15 @@
 package com.aimindmesh.mobile.performance;
 
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.net.Uri;
 import android.os.Build;
 import android.os.PowerManager;
 import android.provider.Settings;
+
+import androidx.core.content.ContextCompat;
 
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
@@ -18,6 +22,57 @@ public class PerformancePlugin extends Plugin {
 
     private static final String PREFS_NAME = "PerformancePrefs";
     private static final String KEY_KEEP_ALIVE = "keepAliveEnabled";
+
+    /** Action of the launch intent (e.g. "voice" for the assistant), kept until the web app reads it */
+    private static volatile String pendingLaunchAction = null;
+
+    private BroadcastReceiver trimReceiver;
+
+    public static void setPendingLaunchAction(String action) {
+        pendingLaunchAction = action;
+    }
+
+    @Override
+    public void load() {
+        // MemoryPressureManager broadcasts which model to unload on onTrimMemory: forward to JS
+        trimReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                String component = intent.getStringExtra("component");
+                if (component == null)
+                    return;
+                JSObject data = new JSObject();
+                data.put("component", component);
+                notifyListeners("trimComponent", data);
+            }
+        };
+        ContextCompat.registerReceiver(getContext(), trimReceiver,
+                new IntentFilter(MemoryPressureManager.ACTION_TRIM_COMPONENT),
+                ContextCompat.RECEIVER_NOT_EXPORTED);
+    }
+
+    @Override
+    protected void handleOnDestroy() {
+        if (trimReceiver != null) {
+            try {
+                getContext().unregisterReceiver(trimReceiver);
+            } catch (IllegalArgumentException ignored) {
+                // Already unregistered
+            }
+            trimReceiver = null;
+        }
+        super.handleOnDestroy();
+    }
+
+    /** Returns the pending launch action once (null when there is none) */
+    @PluginMethod
+    public void consumeLaunchAction(PluginCall call) {
+        String action = pendingLaunchAction;
+        pendingLaunchAction = null;
+        JSObject ret = new JSObject();
+        ret.put("action", action);
+        call.resolve(ret);
+    }
 
     @PluginMethod
     public void requestIgnoreBatteryOptimizations(PluginCall call) {

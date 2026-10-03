@@ -11,6 +11,7 @@ export class KokoroTextToSpeechService {
 
     private currentVoiceId: string | null = null;
     private isSpeaking: boolean = false;
+    private sessionId = 0;
 
     constructor() {
         logger.log('info', 'Kokoro TTS Service initialized');
@@ -120,10 +121,13 @@ export class KokoroTextToSpeechService {
         }
 
         logger.log('info', 'Starting Kokoro TTS', { text: text.substring(0, 50) });
+        // A stop() or a newer speak() bumps the session: the stale call must not report onEnd
+        const session = ++this.sessionId;
         this.isSpeaking = true;
 
         try {
             await Kokoro.speak({ text });
+            if (session !== this.sessionId) return;
 
             this.isSpeaking = false;
             logger.log('info', 'Kokoro TTS finished');
@@ -132,22 +136,25 @@ export class KokoroTextToSpeechService {
 
             if (onEnd) onEnd();
         } catch (error) {
-            this.isSpeaking = false;
-            this.resetIdleTimer();
+            if (session === this.sessionId) {
+                this.isSpeaking = false;
+                this.resetIdleTimer();
+            }
             logger.log('error', 'Failed to synthesize speech', error);
             throw error;
         }
     }
 
     public async stop(): Promise<void> {
+        this.sessionId++;
         if (!this.isSpeaking) return;
 
         logger.log('info', 'Stopping Kokoro TTS');
+        this.isSpeaking = false;
         this.resetIdleTimer();
 
         try {
             await Kokoro.stop();
-            this.isSpeaking = false;
             logger.log('info', 'Kokoro TTS stopped');
         } catch (error) {
             logger.log('error', 'Failed to stop Kokoro TTS', error);

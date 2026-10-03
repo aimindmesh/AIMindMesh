@@ -1,9 +1,14 @@
 package com.aimindmesh.mobile.voxtral
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.getcapacitor.*
 import com.getcapacitor.annotation.CapacitorPlugin
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 
 @CapacitorPlugin(name = "Voxtral")
@@ -11,9 +16,12 @@ class VoxtralPlugin : Plugin() {
 
     private var inferenceEngine: VoxtralInferenceEngine? = null
     private var audioProcessor: AudioStreamProcessor? = null
+    @Volatile
     private var isStreaming = false
     private var currentModelPath: String? = null  // Track loaded model path
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    // Orders init/start/stop/unload/reset: a model is never swapped or freed under the capture thread
+    private val lifecycle = Mutex()
 
     companion object {
         private const val TAG = "VoxtralPlugin"
@@ -69,6 +77,8 @@ class VoxtralPlugin : Plugin() {
         if (mmprojPath == null) {
              return call.reject("mmprojPath required (could not infer from model path)")
         }
+        val mmproj: String = mmprojPath
+        val resolvedModelPath: String = modelPath
 
         val nThreads = call.getInt("nThreads", 4) ?: 4
         
@@ -78,32 +88,35 @@ class VoxtralPlugin : Plugin() {
 
         scope.launch {
             try {
-                // Initialize inference engine
-                inferenceEngine = VoxtralInferenceEngine()
-                
-                val success = inferenceEngine?.initModel(
-                    modelPath = modelPath,
-                    mmprojPath = mmprojPath!!,
-                    nThreads = nThreads
-                ) ?: false
+                val success = lifecycle.withLock {
+                    // A previous model (e.g. kept across a WebView reload) is freed before loading
+                    // the next one: two multi-GB models do not fit in RAM
+                    stopStreamingLocked()
+                    inferenceEngine?.release()
+                    inferenceEngine = null
+                    currentModelPath = null
 
-                withContext(Dispatchers.Main) {
-                    if (success) {
-                        currentModelPath = modelPath  // Track loaded model path
-                        call.resolve(JSObject().apply {
-                            put("success", true)
-                            put("modelPath", modelPath)
-                            put("mmprojPath", mmprojPath)
-                        })
-                    } else {
-                        call.reject("Failed to initialize model")
+                    val engine = VoxtralInferenceEngine()
+                    val ok = engine.initModel(modelPath = resolvedModelPath, mmprojPath = mmproj, nThreads = nThreads)
+                    if (ok) {
+                        inferenceEngine = engine
+                        currentModelPath = resolvedModelPath
                     }
+                    ok
+                }
+
+                if (success) {
+                    call.resolve(JSObject().apply {
+                        put("success", true)
+                        put("modelPath", resolvedModelPath)
+                        put("mmprojPath", mmproj)
+                    })
+                } else {
+                    call.reject("Failed to initialize model")
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Model init failed", e)
-                withContext(Dispatchers.Main) {
-                    call.reject("Init error: ${e.message}")
-                }
+                call.reject("Init error: ${e.message}")
             }
         }
     }
@@ -115,75 +128,88 @@ class VoxtralPlugin : Plugin() {
     @PluginMethod
     fun startRealtimeTranscription(call: PluginCall) {
         android.util.Log.i("VoxtralPlugin", "startRealtimeTranscription called")
-        if (inferenceEngine == null || inferenceEngine?.isInitialized() != true) {
-            return call.reject("Model not initialized. Call initModel first.")
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED) {
+            return call.reject("Microphone permission (RECORD_AUDIO) not granted")
         }
-
-        if (isStreaming) {
-            return call.reject("Already streaming")
-        }
-
-        // Reset context for clean transcription session
-        inferenceEngine?.resetContext()
-        val sessionStartTimeMs = System.currentTimeMillis()
 
         scope.launch {
             try {
-                // Start audio capture
-                audioProcessor = AudioStreamProcessor(
-                    sampleRate = 16000,
-                    channels = 1
-                )
-
-                audioProcessor?.startCapture { audioChunk ->
-                    // Process audio chunk with Voxtral
-                    val numTokens = inferenceEngine?.processAudioChunk(audioChunk)
-                        ?: VoxtralInferenceEngine.VOXTRAL_ERR_NULL_HANDLE
-
-                    when {
-                        numTokens > 0 -> {
-                            val tokens = inferenceEngine?.drainTokens() ?: emptyList()
-                            if (tokens.isNotEmpty()) {
-                                val now = System.currentTimeMillis()
-                                val relativeTimeMs = now - sessionStartTimeMs
-                                val results = tokens.map { text ->
-                                    TokenResult(
-                                        text = text,
-                                        timestampMs = now,
-                                        confidence = 1.0f,
-                                        startMs = relativeTimeMs - 500, // Approximate for streaming token
-                                        endMs = relativeTimeMs
-                                    )
-                                }
-                                notifyTokens(results)
-                            }
-                        }
-                        numTokens < 0 -> {
-                            // Emit error event to frontend
-                            notifyListeners("voxtralError", JSObject().apply {
-                                put("code", numTokens)
-                                put("message", VoxtralInferenceEngine.errorCodeToString(numTokens))
-                            })
-                        }
-                        // numTokens == 0 or 1 (buffering) — no action needed
+                lifecycle.withLock {
+                    val engine = inferenceEngine
+                    if (engine == null || !engine.isInitialized()) {
+                        call.reject("Model not initialized. Call initModel first.")
+                        return@withLock
                     }
-                }
+                    if (isStreaming) {
+                        call.reject("Already streaming")
+                        return@withLock
+                    }
 
-                isStreaming = true
+                    // Reset context for clean transcription session
+                    engine.resetContext()
+                    val sessionStartTimeMs = System.currentTimeMillis()
+                    val processor = AudioStreamProcessor(sampleRate = 16000, channels = 1)
 
-                withContext(Dispatchers.Main) {
+                    val started = processor.startCapture { audioChunk ->
+                        handleAudioChunk(engine, audioChunk, sessionStartTimeMs)
+                    }
+                    if (!started) {
+                        call.reject("Microphone unavailable: permission denied or in use by another app")
+                        return@withLock
+                    }
+
+                    audioProcessor = processor
+                    isStreaming = true
                     call.resolve(JSObject().apply {
                         put("streaming", true)
                     })
                 }
-
             } catch (e: Exception) {
                 Log.e(TAG, "Streaming failed", e)
-                withContext(Dispatchers.Main) {
-                    call.reject("Streaming error: ${e.message}")
-                }
+                call.reject("Streaming error: ${e.message}")
             }
         }
+    }
+
+    /** Runs on the capture thread: transcribes one chunk and forwards tokens or errors */
+    private fun handleAudioChunk(engine: VoxtralInferenceEngine, audioChunk: FloatArray, sessionStartTimeMs: Long) {
+        val numTokens = engine.processAudioChunk(audioChunk)
+
+        when {
+            numTokens > 0 -> {
+                val tokens = engine.drainTokens()
+                if (tokens.isNotEmpty()) {
+                    val now = System.currentTimeMillis()
+                    val relativeTimeMs = now - sessionStartTimeMs
+                    val results = tokens.map { text ->
+                        TokenResult(
+                            text = text,
+                            timestampMs = now,
+                            confidence = 1.0f,
+                            startMs = relativeTimeMs - 500, // Approximate for streaming token
+                            endMs = relativeTimeMs
+                        )
+                    }
+                    notifyTokens(results)
+                }
+            }
+            numTokens < 0 -> {
+                // Emit error event to frontend
+                notifyListeners("voxtralError", JSObject().apply {
+                    put("code", numTokens)
+                    put("message", VoxtralInferenceEngine.errorCodeToString(numTokens))
+                })
+            }
+            // numTokens == 0 or 1 (buffering) — no action needed
+        }
+    }
+
+    /** Stops the microphone and waits for the chunk in flight; caller holds [lifecycle] */
+    private fun stopStreamingLocked() {
+        audioProcessor?.stopCapture()
+        audioProcessor = null
+        isStreaming = false
     }
 
     /**
@@ -191,13 +217,12 @@ class VoxtralPlugin : Plugin() {
      */
     @PluginMethod
     fun stopRealtimeTranscription(call: PluginCall) {
-        audioProcessor?.stopCapture()
-        audioProcessor = null
-        isStreaming = false
-
-        call.resolve(JSObject().apply {
-            put("streaming", false)
-        })
+        scope.launch {
+            lifecycle.withLock { stopStreamingLocked() }
+            call.resolve(JSObject().apply {
+                put("streaming", false)
+            })
+        }
     }
 
     /**
@@ -214,14 +239,17 @@ class VoxtralPlugin : Plugin() {
      */
     @PluginMethod
     fun unloadModel(call: PluginCall) {
-        stopRealtimeTranscription(call)
-        inferenceEngine?.release()
-        inferenceEngine = null
-        currentModelPath = null  // Clear tracked path
-
-        call.resolve(JSObject().apply {
-            put("unloaded", true)
-        })
+        scope.launch {
+            lifecycle.withLock {
+                stopStreamingLocked()
+                inferenceEngine?.release()
+                inferenceEngine = null
+                currentModelPath = null  // Clear tracked path
+            }
+            call.resolve(JSObject().apply {
+                put("unloaded", true)
+            })
+        }
     }
 
     /**
@@ -241,10 +269,12 @@ class VoxtralPlugin : Plugin() {
      */
     @PluginMethod
     fun resetContext(call: PluginCall) {
-        inferenceEngine?.resetContext()
-        call.resolve(JSObject().apply {
-            put("reset", true)
-        })
+        scope.launch {
+            lifecycle.withLock { inferenceEngine?.resetContext() }
+            call.resolve(JSObject().apply {
+                put("reset", true)
+            })
+        }
     }
 
     /**
@@ -281,6 +311,11 @@ class VoxtralPlugin : Plugin() {
             return
         }
 
+        // Model files are GBs: copy off the shared Capacitor plugin thread
+        scope.launch(Dispatchers.IO) { copyFileBlocking(call, sourcePath, fileName) }
+    }
+
+    private fun copyFileBlocking(call: PluginCall, sourcePath: String, fileName: String) {
         try {
             val context = bridge.context
             val inputStream = if (sourcePath.startsWith("content://")) {
@@ -333,9 +368,17 @@ class VoxtralPlugin : Plugin() {
 
     override fun handleOnDestroy() {
         super.handleOnDestroy()
-        audioProcessor?.stopCapture()
-        inferenceEngine?.release()
         scope.cancel()
+        val processor = audioProcessor
+        val engine = inferenceEngine
+        audioProcessor = null
+        inferenceEngine = null
+        isStreaming = false
+        // stopCapture waits for the chunk in flight: not on the main thread
+        Thread({
+            processor?.stopCapture()
+            engine?.release()
+        }, "Voxtral-Teardown").start()
     }
 }
 

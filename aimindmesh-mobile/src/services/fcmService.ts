@@ -25,6 +25,8 @@ export interface FCMMessage {
 export interface FCMPlugin {
     getFCMToken(): Promise<{ token: string }>;
     requestPermission(): Promise<{ granted: boolean }>;
+    /** Work FCM asked for while the app was not running (cleared once read) */
+    getPendingActions(): Promise<{ syncRequested: boolean }>;
     addListener(event: 'fcm:message', handler: (data: FCMMessage) => void): Promise<PluginListenerHandle>;
     addListener(event: 'fcm:tokenRefresh', handler: (data: { token: string }) => void): Promise<PluginListenerHandle>;
 }
@@ -60,12 +62,22 @@ function emitFeedEvent(event: FeedEvent) {
 
 // ─── Quiet Hours Check ────────────────────────────────────────────────────────
 
+/** An hour setting as a fractional hour: the settings store numbers (22), older ones "22:00" */
+export function toFractionalHour(value: unknown, fallback: number): number {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string') {
+        const [h, m] = value.split(':').map(Number);
+        if (Number.isFinite(h)) return h + (Number.isFinite(m) ? m : 0) / 60;
+    }
+    return fallback;
+}
+
 /**
- * Returns true if the current time is within the user-configured quiet hours.
+ * Returns true if `now` is within the user-configured quiet hours.
  * Reads proactive-settings from localStorage to respect the same setting used
  * for local proactive actions.
  */
-function isQuietHoursActive(): boolean {
+export function isQuietHoursActive(now: Date = new Date()): boolean {
     try {
         const raw = localStorage.getItem('proactive-settings');
         if (!raw) return false;
@@ -73,19 +85,10 @@ function isQuietHoursActive(): boolean {
         const qh = settings?.quietHours;
         if (!qh?.enabled) return false;
 
-        const now = new Date();
-        const hour = now.getHours();
-        const min = now.getMinutes();
         // Treat time as fractional hour for comparison
-        const currentH = hour + min / 60;
-
-        const parseH = (str: string) => {
-            const [h, m] = str.split(':').map(Number);
-            return h + (m || 0) / 60;
-        };
-
-        const startH = parseH(qh.start ?? '22:00');
-        const endH = parseH(qh.end ?? '08:00');
+        const currentH = now.getHours() + now.getMinutes() / 60;
+        const startH = toFractionalHour(qh.start, 22);
+        const endH = toFractionalHour(qh.end, 8);
 
         // Cross-midnight window (e.g. 22:00 → 08:00)
         if (startH > endH) {
@@ -151,11 +154,11 @@ async function registerTokenWithServer(
 function dispatchMessage(msg: FCMMessage) {
     logger.log('info', `[FCMService] FCM message: type=${msg.type} title="${msg.title}"`);
 
-    // Enforce quiet hours for foreground in-app notifications.
+    // Enforce quiet hours for foreground in-app insight events.
     // NOTE: Background/killed-app FCM notifications delivered by the OS tray
     // are NOT suppressible here — they are handled by the FCM SDK natively.
-    // Quiet hours suppression only applies to the foreground in-app event bus.
-    if (isQuietHoursActive()) {
+    // Control messages (wake, sync, mark read...) are never held back: they are not notifications.
+    if (msg.type === 'NEW_INSIGHT' && isQuietHoursActive()) {
         logger.log('info', `[FCMService] Quiet hours active — suppressing foreground FCM event: ${msg.type}`);
         return;
     }
@@ -200,6 +203,8 @@ function dispatchMessage(msg: FCMMessage) {
  * Token registration is always re-attempted on init (not gated by this flag).
  */
 let _listenersAttached = false;
+/** Latest server settings: the token-refresh listener is attached once and must not keep the first ones */
+let _currentSettings: AIMindMeshServerSettings | null = null;
 
 /**
  * Call once each time the server settings are activated (app startup or re-enable).
@@ -213,6 +218,7 @@ export async function initFCMService(serverSettings: AIMindMeshServerSettings): 
         return;
     }
 
+    _currentSettings = serverSettings;
     try {
         // 1. Request notification permission (Android 13+)
         const { granted } = await FCMCapacitor.requestPermission();
@@ -230,13 +236,21 @@ export async function initFCMService(serverSettings: AIMindMeshServerSettings): 
             // 3. Listen for token refreshes (FCM rotates tokens periodically)
             await FCMCapacitor.addListener('fcm:tokenRefresh', async ({ token: newToken }) => {
                 logger.log('info', '[FCMService] Token refreshed — re-registering');
-                await registerTokenWithServer(newToken, serverSettings);
+                if (_currentSettings) await registerTokenWithServer(newToken, _currentSettings);
             });
 
             // 4. Listen for foreground messages (app open)
             await FCMCapacitor.addListener('fcm:message', dispatchMessage);
 
             _listenersAttached = true;
+        }
+
+        // 5. A SYNC_REQUEST that arrived while the app was closed is run now
+        const pending = await FCMCapacitor.getPendingActions().catch(() => ({ syncRequested: false }));
+        if (pending.syncRequested) {
+            import('./GlobalSyncService').then(m => m.GlobalSyncService.performSync(serverSettings)).catch(e => {
+                logger.log('error', '[FCMService] Pending sync failed', e);
+            });
         }
 
         logger.log('info', '[FCMService] Initialized (token registered)');
@@ -247,6 +261,7 @@ export async function initFCMService(serverSettings: AIMindMeshServerSettings): 
 
 /** Re-registers token if server settings change (e.g. URL or API key updated) */
 export async function refreshFCMRegistration(serverSettings: AIMindMeshServerSettings): Promise<void> {
+    _currentSettings = serverSettings;
     try {
         const { token } = await FCMCapacitor.getFCMToken();
         await registerTokenWithServer(token, serverSettings);

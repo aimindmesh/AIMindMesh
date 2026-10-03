@@ -14,8 +14,10 @@ add_definitions(-DNDEBUG)
 add_definitions(-DGGML_USE_CPU)
 add_definitions(-DLM_GGML_OPENCL_SOA_Q)
 
-# Enabling ARMv8.2-A features (fp16, dotprod) is CRITICAL for inference speed on modern Android
-add_compile_options(-O3 -ffast-math -march=armv8.2-a+fp16+dotprod)
+# No -march here: every variant below sets its own ISA (fp16/dotprod/i8mm/sve are what make
+# inference fast), and the universal fallback must stay on the baseline ISA.
+# -fno-finite-math-only: -ffast-math alone breaks the INFINITY/NaN handling ggml relies on.
+add_compile_options(-O3 -ffast-math -fno-finite-math-only)
 set(LLAMACPP_LIB_DIR ${CMAKE_SOURCE_DIR}/../../../cpp)
 
 include_directories(
@@ -305,6 +307,7 @@ set(
     # llama.cpp Native Inference JNI
     ${CMAKE_SOURCE_DIR}/cpp/llama_inference_jni.cpp
     ${CMAKE_SOURCE_DIR}/cpp/LLMInference.cpp
+    ${CMAKE_SOURCE_DIR}/cpp/LLMInferenceSampling.cpp
 )
 
 # Find Android libraries
@@ -481,10 +484,14 @@ endfunction()
 # Build all library variants
 # =============================================================================
 
-# Universal fallback (for emulators and unsupported devices)
+# Universal fallback (emulators, unknown CPUs, a variant that fails to load): baseline ISA
+# only, so it never hits SIGILL. NativeLibrarySelector.java loads the best variant first.
 build_llama_cpp_library("llama_cpp")
 # Rename to llama-cpp-arm64 for backward compatibility with Java loading code
 set_target_properties(llama_cpp PROPERTIES OUTPUT_NAME "llama-cpp-arm64")
+if (${ANDROID_ABI} STREQUAL "arm64-v8a")
+    target_compile_options(llama_cpp PUBLIC -march=armv8-a)
+endif()
 
 if (${ANDROID_ABI} STREQUAL "armeabi-v7a")
     # 32-bit ARM
@@ -503,7 +510,7 @@ if (${ANDROID_ABI} STREQUAL "arm64-v8a")
     build_llama_cpp_arm64_v8_4_fp16_dotprod_i8mm_sve("llama_cpp_v8_4_fp16_dotprod_i8mm_sve")
     
     message(STATUS "Building LlamaCpp for ARM64 with multiple CPU optimization variants:")
-    message(STATUS "  - smollm (universal fallback)")
+    message(STATUS "  - llama-cpp-arm64 (universal fallback, ARMv8-A)")
     message(STATUS "  - llama_cpp_v8 (ARMv8-A base)")
     message(STATUS "  - llama_cpp_v8_2_fp16 (ARMv8.2-A + FP16)")
     message(STATUS "  - llama_cpp_v8_2_fp16_dotprod (ARMv8.2-A + FP16 + DotProd)")

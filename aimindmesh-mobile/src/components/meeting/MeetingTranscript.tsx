@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { TranscriptSegment } from '../../types/meeting';
 import { MicrophoneIcon, PlayIcon, PauseIcon } from '../../constants';
+import { hasSegmentTiming } from '../../services/speaker/segmentAssignment';
 
 interface MeetingTranscriptProps {
     transcript: TranscriptSegment[];
@@ -61,6 +62,8 @@ const MeetingTranscript: React.FC<MeetingTranscriptProps> = ({
             {transcript.map((segment) => {
                 const isActive = activeSegmentId === segment.id;
                 const isEditing = editingSegmentId === segment.id;
+                // Segments without a position in the audio (start = end) used to play the whole file
+                const canPlay = !!onSegmentPlay && hasSegmentTiming(segment);
 
                 return (
                     <div
@@ -87,9 +90,9 @@ const MeetingTranscript: React.FC<MeetingTranscriptProps> = ({
 
                             {/* Action Buttons */}
                             <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                                {onSegmentPlay && segment.start_ms !== undefined && (
+                                {canPlay && (
                                     <button
-                                        onClick={() => onSegmentPlay(segment)}
+                                        onClick={() => onSegmentPlay!(segment)}
                                         className={`p-1.5 rounded-full transition-colors ${isActive && isPlaying
                                             ? 'bg-primary text-white'
                                             : 'bg-surface-hover text-text-secondary hover:text-primary'
@@ -144,8 +147,8 @@ const MeetingTranscript: React.FC<MeetingTranscriptProps> = ({
                         ) : (
                             <p
                                 className="text-white pl-2 border-l-2 border-surface cursor-pointer"
-                                onClick={() => onSegmentPlay && segment.start_ms !== undefined && onSegmentPlay(segment)}
-                                title={segment.start_ms !== undefined ? "Tap to play audio" : ""}
+                                onClick={() => canPlay && onSegmentPlay!(segment)}
+                                title={canPlay ? "Tap to play audio" : ""}
                             >
                                 {segment.text}
                             </p>

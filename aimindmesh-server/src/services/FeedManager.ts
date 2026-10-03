@@ -2,23 +2,8 @@ import crypto from 'crypto';
 import db from '../db/sqlite';
 import { Logger } from '../utils/Logger';
 
-export interface FeedItem {
-  id: string;
-  type: 'INSIGHT' | 'SYSTEM' | 'NOTIFICATION';
-  content: string;
-  source_node_ids?: string;
-  created_at: number;
-  read_at: number | null;
-  reply_thread_id: string | null;
-}
-
-export interface FeedReply {
-  id: string;
-  feed_item_id: string;
-  role: 'user' | 'assistant';
-  content: string;
-  created_at: number;
-}
+import type { FeedItem, FeedReply } from '../types/api';
+export type { FeedItem, FeedReply };
 
 export class FeedManager {
   public static getFeed(limit: number = 20, offset: number = 0, unreadOnly: boolean = false): { items: FeedItem[], total: number } {
@@ -68,6 +53,16 @@ export class FeedManager {
     });
     Logger.info('Feed', `New reply synchronized for thread ${feedItemId} (Role: ${role})`);
     return reply;
+  }
+
+  /** Deletes an item and its replies. Returns false if the item did not exist. */
+  /** Deletes an item with its replies and queued deliveries (pending_delivery has a FK on it). */
+  public static deleteItem(id: string): boolean {
+    return db.transaction(() => {
+      db.prepare(`DELETE FROM pending_delivery WHERE insight_id = ?`).run(id);
+      db.prepare(`DELETE FROM feed_replies WHERE feed_item_id = ?`).run(id);
+      return db.prepare(`DELETE FROM feed_items WHERE id = ?`).run(id).changes > 0;
+    })();
   }
 
   public static getThread(feedItemId: string): { item: FeedItem, replies: FeedReply[] } {

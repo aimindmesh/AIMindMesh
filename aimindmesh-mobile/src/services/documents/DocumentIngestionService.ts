@@ -1,13 +1,14 @@
 import { DocumentParser } from './DocumentParser';
 import { DocumentChunker, Chunk } from './DocumentChunker';
-import { getKnowledgeDatabase } from '../database/knowledgeDatabase';
-import { TextEmbedding } from 'text-embedding-capacitor';
+import { getKnowledgeDatabase, INGESTING_CHUNK_COUNT } from '../database/knowledgeDatabase';
 import { FileSystemAdapter as Filesystem } from '../../utils/fileSystemAdapter';
 import { logger } from '../logger';
-
-import { getOrInitializeSemanticMemoryRetriever } from '../memory/semanticMemoryRetriever';
+import { readSetting } from '../security/secretStore';
+import { embedText, ensureEmbeddingModel, ensureEmbeddingModelFromSettings, getActiveEmbeddingModel, getEmbeddingLoadError } from '../model/embedding/embeddingRuntime';
+import { float32ToHex } from '../memory/embeddingCodec';
+import { memoryTaskConfig } from '../memory/memoryLlmConfig';
 import { generateTextResponseStream } from '../llm/llmService';
-import { LLMConfig, Personality } from '../../types';
+import { AIMindMeshServerSettings, LLMConfig, Personality } from '../../types';
 
 export interface IngestionOptions {
     chunkSize?: number;
@@ -19,11 +20,38 @@ export interface IngestionOptions {
 }
 
 export interface IngestionResult {
+    /** Local document id; -1 when the document is not stored locally */
     id: number;
     chunks: number;
     status: 'indexed' | 'failed';
     jobId?: string;
+    /** Sent to the AIMindMesh server: no local row, nothing to link to a local workspace */
+    remote?: boolean;
+    /** DEEP mode: concepts extracted locally */
+    concepts?: string[];
     error?: string;
+}
+
+/** Chunks written per transaction */
+const CHUNK_INSERT_BATCH = 50;
+/** DEEP mode: concepts come from at most this many chunks, spread over the document */
+const MAX_CONCEPT_CHUNKS = 20;
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+/** Server settings as the app stores them (the API key lives in the secret store) */
+function readServerSettings(): AIMindMeshServerSettings | null {
+    const settings = readSetting<AIMindMeshServerSettings | null>('aimindmesh-server-settings', null);
+    return settings && settings.enabled && settings.serverUrl ? settings : null;
+}
+
+/** Chat model settings and the API key of their provider */
+function readLlmSettings(): { config: LLMConfig | null; apiKey?: string } {
+    const config = readSetting<LLMConfig | null>('llm-config', null);
+    if (!config) return { config: null };
+    const keyName = config.provider === 'perplexity' ? 'perplexity-api-key'
+        : config.provider === 'claude' ? 'claude-api-key' : 'gemini-api-key';
+    return { config, apiKey: readSetting<string>(keyName, '') || undefined };
 }
 
 export class DocumentIngestionService {
@@ -42,26 +70,23 @@ export class DocumentIngestionService {
         logger.log('info', `[Ingestion] Starting ingestion for: ${filePath}`);
 
         try {
-            // 0a. Check AIMindMesh Server Mode
-            const rawSettings = localStorage.getItem('app-settings');
-            if (rawSettings) {
-                const settings = JSON.parse(rawSettings);
-                const serverSettings = settings.aimindmeshServer;
-                if (serverSettings && serverSettings.enabled && serverSettings.serverUrl && !options.localNeural) {
-                    logger.log('info', `[Ingestion] Routing to Server Ingestion (Mode: ${options.mode || 'STANDARD'})`);
-                    return await this.ingestToServer(filePath, metadata, serverSettings, options);
-                }
+            // 0a. AIMindMesh Server Mode
+            const server = readServerSettings();
+            if (server && !options.localNeural) {
+                logger.log('info', `[Ingestion] Routing to Server Ingestion (Mode: ${options.mode || 'STANDARD'})`);
+                return await this.ingestToServer(filePath, metadata, server, options);
             }
 
             // 0b. Check Database Connection (Force Ping)
             await getKnowledgeDatabase();
 
-            // 0c. Ensure Embedding Model is Loaded
-            if (options.embeddingModelId) {
-                await getOrInitializeSemanticMemoryRetriever({
-                    enableSemanticMemory: true,
-                    embeddingModelId: options.embeddingModelId
-                });
+            // 0c. Embedding model: the requested one, else the one selected in the settings
+            const loaded = options.embeddingModelId
+                ? await ensureEmbeddingModel(options.embeddingModelId)
+                : (await ensureEmbeddingModelFromSettings()) || !!getActiveEmbeddingModel();
+            if (!loaded) {
+                const reason = getEmbeddingLoadError(options.embeddingModelId);
+                throw new Error(`Embedding model not loaded${reason ? `: ${reason}` : ' (select one in Settings > Memory)'}`);
             }
 
             // 1. Validation & File Info
@@ -83,40 +108,26 @@ export class DocumentIngestionService {
             const chunkOverlap = options.chunkOverlap || 200;
 
             const chunks = await this.chunker.chunk(rawText, strategy, chunkSize, chunkOverlap);
+            if (chunks.length === 0) throw new Error('No text chunks extracted');
             logger.log('info', `[Ingestion] Created ${chunks.length} chunks`);
 
             // 4. Embedding Generation
-            const embeddings = await this.generateEmbeddings(chunks);
+            const { embeddings, key } = await this.generateEmbeddings(chunks);
 
-            // 5. Storage (Atomic Transaction)
-            const docId = await this.saveToDatabase(fileInfo, chunks, embeddings, metadata);
+            // 5. Storage (document finalized only once every chunk is written)
+            const docId = await this.saveToDatabase(fileInfo, chunks, embeddings, metadata, key);
 
-            // 6. Local Concept Extraction (Hybrid Neural)
+            // 6. Local Concept Extraction (Hybrid Neural): kept in the document metadata;
+            //    ingestHybrid also sends them to the server job
+            let concepts: string[] | undefined;
             if (options.mode === 'DEEP') {
                 logger.log('info', '[Ingestion] Starting Local Concept Extraction...');
-                const allConcepts = new Set<string>();
-                for (const chunk of chunks) {
-                    const extracted = await this.extractConceptsLocally(chunk.content);
-                    extracted.forEach(c => allConcepts.add(c));
-                }
-                const conceptList = Array.from(allConcepts);
-                logger.log('info', `[Ingestion] Extracted ${conceptList.length} concepts locally`);
-                
-                // Sync with Server if applicable
-                const rawSettings = localStorage.getItem('app-settings');
-                if (rawSettings) {
-                    const settings = JSON.parse(rawSettings);
-                    const server = settings.aimindmeshServer;
-                    if (server && server.enabled && server.serverUrl) {
-                        // Priority identification for sync: server jobId or local docId
-                        // Note: If we just uploaded, we might have a jobId from a concurrent server-ingest result.
-                        // For hybrid robustness, we can combine.
-                        await this.syncConceptsToServer(String(docId), conceptList, server);
-                    }
-                }
+                concepts = await this.extractConcepts(chunks);
+                logger.log('info', `[Ingestion] Extracted ${concepts.length} concepts locally`);
+                if (concepts.length > 0) await this.storeConcepts(docId, metadata, concepts);
             }
 
-            return { id: docId, chunks: chunks.length, status: 'indexed' };
+            return { id: docId, chunks: chunks.length, status: 'indexed', concepts };
         } catch (error: any) {
             logger.log('error', '[Ingestion] Failed to ingest document', error);
             return { id: -1, chunks: 0, status: 'failed', error: error.message };
@@ -124,54 +135,38 @@ export class DocumentIngestionService {
     }
 
     /**
-     * Specialized Hybrid Ingestion: 
-     * Ingest locally AND sync concepts to server using server jobId.
+     * Specialized Hybrid Ingestion:
+     * Ingest locally AND sync the locally extracted concepts to the server job.
      */
     async ingestHybrid(filePath: string, metadata: any = {}, options: IngestionOptions = {}): Promise<IngestionResult> {
-        const rawSettings = localStorage.getItem('app-settings');
-        const settings = rawSettings ? JSON.parse(rawSettings) : {};
-        const server = settings.aimindmeshServer;
-
+        const server = readServerSettings();
         let serverJobId: string | undefined;
 
-        // 1. If server is enabled, start server ingestion in STANDARD mode (Lite)
-        if (server && server.enabled) {
-            try {
-                // We use options.mode === 'DEEP' ? 'STANDARD' : options.mode because we handle DEEP locally
-                const serverOptions = { ...options, mode: options.mode === 'DEEP' ? 'STANDARD' : options.mode };
-                const serverRes = await this.ingestToServer(filePath, metadata, server, serverOptions);
-                serverJobId = serverRes.jobId;
-            } catch (e) {
-                logger.log('warn', '[Ingestion] Server-side branch of hybrid ingest failed', e);
-            }
+        // 1. If server is enabled, start server ingestion in STANDARD mode (DEEP is done locally)
+        if (server) {
+            const serverOptions = { ...options, mode: options.mode === 'DEEP' ? 'STANDARD' as const : options.mode };
+            const serverRes = await this.ingestToServer(filePath, metadata, server, serverOptions);
+            if (serverRes.status === 'indexed') serverJobId = serverRes.jobId;
+            else logger.log('warn', '[Ingestion] Server-side branch of hybrid ingest failed', serverRes.error);
         }
 
-        // 2. Perform local ingestion (Parsing, Embedding, Local Concept Extraction)
-        // Note: we pass options as is, ingestDocument will handle local extraction if mode is DEEP
+        // 2. Local ingestion (parsing, embedding, concept extraction in DEEP mode)
         const result = await this.ingestDocument(filePath, metadata, { ...options, localNeural: true });
 
-        // 3. If we have a server jobId AND we are in DEEP mode (so we extracted concepts locally)
-        // We sync those concepts to the server job reference.
-        if (serverJobId && options.mode === 'DEEP' && result.status === 'indexed') {
-            // Documentingester must have finished or be in progress.
-            // We can re-extract or reuse if we saved them during ingestDocument.
-            // For simplicity, let's assume ingestDocument already did it but we need to re-sync with jobId.
-            // (Re-extraction is fast locally)
-            const rawText = await this.parser.parse(filePath, 'txt'); // Mock extension
-            const concepts = await this.extractConceptsLocally(rawText.slice(0, 5000));
-            if (concepts.length > 0) {
-                await this.syncConceptsToServer(serverJobId, concepts, server);
-            }
+        // 3. The concepts extracted from the real text go to the server job (the local
+        //    document id means nothing on the server)
+        if (server && serverJobId && result.status === 'indexed' && result.concepts?.length) {
+            await this.syncConceptsToServer(serverJobId, result.concepts, server);
         }
 
         return { ...result, jobId: serverJobId };
     }
 
-    private async ingestToServer(filePath: string, metadata: any, serverSettings: any, options: IngestionOptions = {}): Promise<IngestionResult> {
+    private async ingestToServer(filePath: string, metadata: any, serverSettings: AIMindMeshServerSettings, options: IngestionOptions = {}): Promise<IngestionResult> {
         try {
             const fileInfo = await this.getFileInfo(filePath);
             const fileData = await Filesystem.readFile({ path: filePath });
-            
+
             // Convert base64 to Blob
             const byteCharacters = atob(fileData.data as string);
             const byteNumbers = new Array(byteCharacters.length);
@@ -194,9 +189,9 @@ export class DocumentIngestionService {
 
             if (!resp.ok) throw new Error(`Server ingestion failed: ${resp.status}`);
             const { jobId } = await resp.json();
-            
-            // Server returns no local ID, we mock success for tool continuation
-            return { id: Math.floor(Math.random() * 100000), chunks: 1, status: 'indexed', jobId };
+
+            // The document is indexed by the server job: there is no local row (id -1)
+            return { id: -1, chunks: 0, status: 'indexed', jobId, remote: true };
         } catch (error: any) {
             logger.log('error', '[Ingestion] Server upload failed', error);
             return { id: -1, chunks: 0, status: 'failed', error: error.message };
@@ -217,45 +212,35 @@ export class DocumentIngestionService {
         };
     }
 
-    private async generateEmbeddings(chunks: Chunk[]): Promise<Float32Array[]> {
+    /** Passage embeddings of every chunk, all from the same model (its key is stored with them) */
+    private async generateEmbeddings(chunks: Chunk[]): Promise<{ embeddings: Float32Array[]; key: string }> {
+        const key = getActiveEmbeddingModel()?.key;
+        if (!key) throw new Error('Embedding model not loaded');
+
         const embeddings: Float32Array[] = [];
-
-        // Ensure model is loaded (idempotent usually, but good practice)
-        const status = await TextEmbedding.isModelLoaded();
-        if (!status.loaded) {
-            // Warning: This assumes a default model is available or configured
-            // In a real app, might need to trigger download or fail
-            logger.log('warn', '[Ingestion] Embedding model not loaded. Attempting to load default...');
-            // Should rely on external initialization, but failing that:
-            // await TextEmbedding.loadModel({ modelDir: ... });
-            throw new Error('Embedding model not loaded');
-        }
-
-        // Batch processing
-        const BATCH_SIZE = 10;
-        for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
-            const batch = chunks.slice(i, i + BATCH_SIZE);
-
-            for (const chunk of batch) {
-                const result = await TextEmbedding.generateEmbedding({
-                    text: chunk.content
-                    // model: 'all-MiniLM-L6-v2' // managed by plugin state usually
-                });
-                embeddings.push(new Float32Array(result.embedding));
-            }
+        for (let i = 0; i < chunks.length; i++) {
+            const { vector, key: usedKey } = await embedText(chunks[i].content, 'passage');
+            if (usedKey !== key) throw new Error('The embedding model changed during ingestion');
+            embeddings.push(vector);
 
             // Yield to event loop to avoid freezing UI
-            await new Promise(resolve => setTimeout(resolve, 50));
+            if (i % 10 === 9) await sleep(50);
         }
 
-        return embeddings;
+        return { embeddings, key };
     }
 
+    /**
+     * The document row is marked "ingesting" (total_chunks = -1) until every chunk is written in
+     * batched transactions. On failure it is deleted with its chunks; after an app kill the
+     * next start removes it (initKnowledgeDatabase).
+     */
     async saveToDatabase(
         fileInfo: any,
         chunks: Chunk[],
         embeddings: Float32Array[],
-        metadata: any
+        metadata: any,
+        modelKey: string
     ): Promise<number> {
         // Force check connection again before writing to ensure reliability
         const db = await getKnowledgeDatabase();
@@ -263,7 +248,7 @@ export class DocumentIngestionService {
         // Insert Document
         const docResult = await db.run(
             `INSERT INTO documents (
-        filename, title, file_path, file_type, file_size, 
+        filename, title, file_path, file_type, file_size,
         total_chunks, created_at, metadata
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
             [
@@ -272,7 +257,7 @@ export class DocumentIngestionService {
                 fileInfo.path,
                 fileInfo.type,
                 fileInfo.size,
-                chunks.length,
+                INGESTING_CHUNK_COUNT,
                 Date.now(),
                 JSON.stringify(metadata)
             ]
@@ -281,57 +266,74 @@ export class DocumentIngestionService {
         const docId = docResult.changes?.lastId;
         if (!docId) throw new Error('Failed to insert document');
 
-        // Insert Chunks
-        // CapacitorSQLite run() with transaction:true (default) auto-manages transactions
-        // No need for manual BEGIN/COMMIT
-        for (let i = 0; i < chunks.length; i++) {
-            const chunk = chunks[i];
-            const embedding = embeddings[i];
-
-            // Convert Float32Array to Hex Blob string
-            const embeddingBlob = new Uint8Array(embedding.buffer);
-            const embeddingHex = Array.from(embeddingBlob)
-                .map(b => b.toString(16).padStart(2, '0'))
-                .join('');
-
-            await db.run(
-                `INSERT INTO document_chunks (
-            document_id, chunk_index, content, embedding, 
-            token_count, page_number, chunk_metadata
-          ) VALUES (?, ?, ?, X'${embeddingHex}', ?, ?, ?)`,
-                [
-                    docId,
-                    chunk.chunk_index,
-                    chunk.content,
-                    chunk.content.length / 4, // Rough token est
-                    chunk.page_number || null,
-                    JSON.stringify({})
-                ]
-            );
+        try {
+            for (let start = 0; start < chunks.length; start += CHUNK_INSERT_BATCH) {
+                const set = chunks.slice(start, start + CHUNK_INSERT_BATCH).map((chunk, offset) => ({
+                    statement: `INSERT INTO document_chunks (
+            document_id, chunk_index, content, embedding,
+            token_count, page_number, chunk_metadata, embedding_model
+          ) VALUES (?, ?, ?, X'${float32ToHex(embeddings[start + offset])}', ?, ?, ?, ?)`,
+                    values: [
+                        docId,
+                        chunk.chunk_index,
+                        chunk.content,
+                        Math.ceil(chunk.content.length / 4), // Rough token est
+                        chunk.page_number ?? null,
+                        JSON.stringify({}),
+                        modelKey
+                    ]
+                }));
+                await db.executeSet(set, true);
+            }
+            await db.run('UPDATE documents SET total_chunks = ? WHERE id = ?', [chunks.length, docId]);
+        } catch (error) {
+            // Never leave a half-written document (chunks go with it: ON DELETE CASCADE)
+            await db.run('DELETE FROM documents WHERE id = ?', [docId])
+                .catch(e => logger.log('warn', '[Ingestion] Could not remove partial document', e));
+            throw error;
         }
 
         return docId;
     }
 
+    /** Concepts of up to MAX_CONCEPT_CHUNKS chunks spread over the document (one LLM call each) */
+    private async extractConcepts(chunks: Chunk[]): Promise<string[]> {
+        const allConcepts = new Set<string>();
+        const step = Math.max(1, Math.ceil(chunks.length / MAX_CONCEPT_CHUNKS));
+        for (let i = 0; i < chunks.length; i += step) {
+            const extracted = await this.extractConceptsLocally(chunks[i].content);
+            extracted.forEach(c => allConcepts.add(c));
+        }
+        return Array.from(allConcepts);
+    }
+
+    private async storeConcepts(docId: number, metadata: any, concepts: string[]): Promise<void> {
+        try {
+            const db = await getKnowledgeDatabase();
+            await db.run('UPDATE documents SET metadata = ? WHERE id = ?', [JSON.stringify({ ...metadata, concepts }), docId]);
+        } catch (e) {
+            logger.log('warn', '[Ingestion] Could not store concepts', e);
+        }
+    }
+
     private async extractConceptsLocally(text: string): Promise<string[]> {
-        const prompt = `Extract exactly 5 key concepts, entities, or technical terms from this text. 
+        const prompt = `Extract exactly 5 key concepts, entities, or technical terms from this text.
         You MUST output ONLY a JSON array of strings. Do not include any explanation or markdown.
         Format: ["Concept1", "Concept2", "Concept3", "Concept4", "Concept5"]
-        
+
         Text: ${text.slice(0, 1500)}`;
 
         const dummyPersonality: Personality = { name: 'Extractor', description: 'Concepts Extractor', systemPrompt: 'Return JSON', traits: [] };
-        
+
         // Use configured settings for LLM selection
-        const rawSettings = localStorage.getItem('app-settings');
-        const settings = rawSettings ? JSON.parse(rawSettings) : {};
-        const llmConfig = (settings.llmConfig || {}) as LLMConfig;
+        const { config, apiKey } = readLlmSettings();
+        if (!config) return [];
 
         try {
             let fullResponse = '';
             const history = [{ role: 'user' as const, text: prompt, id: 'ext-' + Date.now().toString(), timestamp: new Date() }];
             // generateTextResponseStream handles provider abstraction (LiteRT/GGUF/etc)
-            for await (const chunk of generateTextResponseStream(history, dummyPersonality, { ...llmConfig, enableThinking: false, enableToolCalling: false }, [], undefined, undefined, 256, undefined)) {
+            for await (const chunk of generateTextResponseStream(history, dummyPersonality, memoryTaskConfig(config), [], apiKey, undefined, 256, undefined)) {
                 if (typeof chunk === 'string') fullResponse += chunk;
                 else if (chunk.type === 'text') fullResponse += chunk.content;
             }
@@ -340,7 +342,9 @@ export class DocumentIngestionService {
             if (match) {
                 try {
                     const concepts = JSON.parse(match[0]);
-                    return Array.isArray(concepts) ? concepts.slice(0, 5) : [];
+                    return Array.isArray(concepts)
+                        ? concepts.filter((c: unknown): c is string => typeof c === 'string' && c.trim().length > 0).slice(0, 5)
+                        : [];
                 } catch (e) {
                     return [];
                 }
@@ -351,19 +355,21 @@ export class DocumentIngestionService {
         return [];
     }
 
-    private async syncConceptsToServer(docId: string, concepts: string[], server: any) {
+    private async syncConceptsToServer(jobId: string, concepts: string[], server: AIMindMeshServerSettings) {
         try {
             logger.log('info', `[Ingestion] Syncing ${concepts.length} concepts to server...`);
-            const resp = await fetch(`${server.serverUrl}/api/documents/${docId}/sync-concepts`, {
+            const resp = await fetch(`${server.serverUrl}/api/documents/${jobId}/sync-concepts`, {
                 method: 'POST',
-                headers: { 
+                headers: {
                     'Content-Type': 'application/json',
-                    'x-api-key': server.apiKey 
+                    'x-api-key': server.apiKey
                 },
                 body: JSON.stringify({ concepts })
             });
             if (resp.ok) {
                 logger.log('info', '[Ingestion] Concepts synced successfully');
+            } else {
+                logger.log('warn', `[Ingestion] Concept sync failed: ${resp.status}`);
             }
         } catch (e) {
             logger.log('warn', '[Ingestion] Concept sync failed', e);

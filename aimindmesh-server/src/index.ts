@@ -1,3 +1,5 @@
+// Must stay the first import: applies a staged backup restore before config and DB load
+import './db/restoreAtBoot';
 import Fastify from 'fastify';
 import axios from 'axios';
 import websocketPlugin from '@fastify/websocket';
@@ -7,6 +9,8 @@ import fastifyStatic from '@fastify/static';
 import path from 'path';
 import fs_sync from 'fs';
 import { config } from './config';
+import { authHook, redactUrl } from './middleware/auth';
+import { registerLenientJsonParser } from './utils/lenientJsonParser';
 import db from './db/sqlite';
 import { initNeo4j } from './db/neo4j';
 import { NodeRegistry } from './services/NodeRegistry';
@@ -28,6 +32,7 @@ import deliveryRoutes from './api/routes/delivery';
 import wikiRoutes from './api/routes/wiki';
 import syncRoutes from './api/routes/sync';
 import evolutionRoutes from './api/routes/evolution';
+import giteaWebhookRoutes, { giteaCiWebhookRoutes } from './api/routes/giteaWebhook';
 import aiTasksRoutes from './api/routes/aiTasksRouter';
 import webRoutes from './api/routes/web';
 import kasmRoutes from './api/routes/kasm';
@@ -37,6 +42,7 @@ import { researchRoutes } from './api/routes/research';
 import { AiTaskScheduler } from './services/AiTaskScheduler';
 import { InferenceRouter } from './services/InferenceRouter';
 import { RecoveryService } from './services/RecoveryService';
+import { LogRetention } from './services/LogRetention';
 import { OpenRouterService } from './services/OpenRouterService';
 
 
@@ -65,8 +71,10 @@ const fastify = Fastify({
 });
 
 async function build() {
+  registerLenientJsonParser(fastify);
+
   fastify.setErrorHandler((error: any, request, reply) => {
-    Logger.error('FastifyError', `Error in ${request.method} ${request.url}: ${error.message}\nStack: ${error.stack}`);
+    Logger.error('FastifyError', `Error in ${request.method} ${redactUrl(request.url)}: ${error.message}\nStack: ${error.stack}`);
     reply.status(error.statusCode || 500).send({ error: error.message });
   });
 
@@ -109,23 +117,7 @@ async function build() {
     }
   });
 
-  fastify.addHook('preValidation', async (request, reply) => {
-    if (request.method === 'OPTIONS') return; // Skip preflight
-    if (request.url.startsWith('/ws/')) return;
-    if (request.url.startsWith('/api/freellmapi-proxy/')) return; // Bypass auth for LLM proxy
-    if (request.url.startsWith('/api/evolution/gitea/webhook')) return; // Allow Gitea webhooks
-    const apiKey = request.headers['x-api-key'] as string;
-    
-    // Global API Key Check
-    if (apiKey === config.server.apiKey) return;
-    
-    // Check against individual node keys
-    if (config.auth?.keys && Object.values(config.auth.keys).includes(apiKey)) return;
-    
-    Logger.warn('Fastify', `Unauthorized request blocked from ${request.ip} to ${request.url}`);
-    reply.code(401).send({ error: 'Unauthorized' });
-    return reply;
-  });
+  fastify.addHook('preValidation', authHook);
 
   fastify.register(nodeRoutes, { prefix: '/api/nodes' });
   fastify.register(chatRoutes, { prefix: '/api/chat' });
@@ -139,6 +131,8 @@ async function build() {
   fastify.register(aiTasksRoutes, { prefix: '/api/ai-tasks' });
   fastify.register(wikiRoutes, { prefix: '/api/wiki' });
   fastify.register(evolutionRoutes, { prefix: '/api/evolution' });
+  fastify.register(giteaWebhookRoutes, { prefix: '/api/evolution' });
+  fastify.register(giteaCiWebhookRoutes, { prefix: '/api/organization' });
   fastify.register(webRoutes, { prefix: '/api/web' });
   fastify.register(syncRoutes, { prefix: '/api/sync' });
   fastify.register(kasmRoutes, { prefix: '/api/kasm' });
@@ -198,6 +192,13 @@ async function build() {
   fastify.post('/api/freellmapi-proxy/v1/chat/completions', async (request, reply) => {
     const body = request.body as any;
     const authHeader = request.headers['authorization'];
+
+    // Callers (OpenClaw, Hermes) must present their own FreeLLMAPI key: the server key is never injected
+    if (!authHeader) {
+      Logger.warn('FreeLLMAPI-Proxy', `Rejected unauthenticated proxy request from ${request.ip}`);
+      reply.code(401).send({ error: 'Missing Authorization header' });
+      return reply;
+    }
     
     // Clone and strip 'model' from the request body to force FreeLLMAPI's internal routing/fallback
     const proxyBody = { ...body };
@@ -217,7 +218,7 @@ async function build() {
       }
     }
 
-    Logger.info('FreeLLMAPI-Proxy', `Proxying chat completions from ${request.ip} (stripped model: ${body.model}). Payload: ${JSON.stringify(body)}`);
+    Logger.info('FreeLLMAPI-Proxy', `Proxying chat completions from ${request.ip} (stripped model: ${body.model}, messages: ${Array.isArray(body.messages) ? body.messages.length : 0}, stream: ${!!body.stream})`);
 
     const freellmapiUrl = `${config.freellmapi?.baseUrl || 'http://10.2.0.54:3001'}/v1/chat/completions`;
 
@@ -229,7 +230,7 @@ async function build() {
           data: proxyBody,
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': authHeader || `Bearer ${config.freellmapi?.apiKey}`
+            'Authorization': authHeader
           },
           responseType: 'stream'
         });
@@ -248,7 +249,7 @@ async function build() {
           data: proxyBody,
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': authHeader || `Bearer ${config.freellmapi?.apiKey}`
+            'Authorization': authHeader
           }
         });
         
@@ -449,6 +450,7 @@ async function start() {
     
     // Start background enrichment recovery
     RecoveryService.start();
+    LogRetention.start();
     
     // OpenRouter Credit Monitoring
     await OpenRouterService.init();

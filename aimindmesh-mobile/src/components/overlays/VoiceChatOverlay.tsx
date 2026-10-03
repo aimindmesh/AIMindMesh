@@ -3,12 +3,16 @@ import { Personality, SpeechConfig } from '../../types';
 import { useGeminiLive } from '../../hooks/useGeminiLive';
 import { PhoneIcon, SpeakerIcon } from '../../constants';
 import { triggerHaptic } from '../../services/native';
-import { getOfflineSttService, getOnlineSttService } from '../../services/tts/speech';
+import { getOfflineSttService, getOnlineSttService, stopSpeaking } from '../../services/tts/speech';
 import { getVoskSttService } from '../../services/stt/voskSTT';
 import { getVoxtralSttService } from '../../services/stt/voxtralSTT';
 import { getWhisperSTTService } from '../../services/stt/whisperSTT';
 import { logger } from '../../services/logger';
 import { AudioOutput } from 'audio-output-capacitor';
+import { Capacitor } from '@capacitor/core';
+import { normalizeSttProvider, normalizeTtsProvider, shouldUseStandardVoiceChat } from '../../services/tts/providerIds';
+import { enterActivity, leaveActivity } from '../../services/model/modelOrchestrator';
+import { voiceCallMemoryConflict } from '../../services/model/llmPreloader';
 
 interface VoiceChatOverlayProps {
     personality: Personality;
@@ -20,6 +24,11 @@ interface VoiceChatOverlayProps {
     currentThinking?: string;
     speechConfig?: SpeechConfig;
     autoStartConversation?: boolean;
+    /**
+     * Gemini Live answers by voice itself: its turns are stored through this instead of
+     * sendMessage(), which would make the main provider generate a second answer.
+     */
+    onSaveTranscript?: (role: 'user' | 'model', text: string) => void;
 }
 
 const statusMap: Record<number, { text: string; color: string }> = {
@@ -42,6 +51,12 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
 
     const lastTranscriptRef = useRef('');
     const hasStartedRef = useRef(false);
+    // Only accept transcript updates while listening: services can deliver a late result
+    // after stop() (or a start that raced a stop), which would send a phantom message.
+    const listeningRef = useRef(false);
+    // Lowercased/legacy-normalized ids ('Vosk' from the one-click setup used to match nothing)
+    const sttProvider = normalizeSttProvider(speechConfig?.sttProvider);
+    const ttsProvider = normalizeTtsProvider(speechConfig?.ttsProvider);
 
     // Initial Greeting for Autonomous Calls
     useEffect(() => {
@@ -63,17 +78,18 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
         }
     }, [autoStartConversation, isSttReady, isLoading, isSpeaking, sendMessage]);
 
-    const sttService = speechConfig?.sttProvider === 'voxtral'
+    const sttService = sttProvider === 'voxtral'
         ? getVoxtralSttService()
-        : speechConfig?.sttProvider === 'whisper'
+        : sttProvider === 'whisper'
             ? getWhisperSTTService()
-            : speechConfig?.sttProvider === 'vosk'
+            : sttProvider === 'vosk'
                 ? getVoskSttService()
-                : speechConfig?.sttProvider === 'offline'
+                : sttProvider === 'offline'
                     ? getOfflineSttService()
                     : getOnlineSttService();
 
     const handleTranscriptUpdate = useCallback((text: string) => {
+        if (!listeningRef.current) return;
         setTranscript(text);
         lastTranscriptRef.current = text;
 
@@ -91,10 +107,16 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
         }
     }, [sendMessage]);
 
+    // RAM during a call: speech models + LLM, no Stable Diffusion; hanging up frees the speech models
+    useEffect(() => {
+        void enterActivity('voice', ['gguf', 'litert', 'genie', 'whisper', 'voxtral']).catch(() => { });
+        return () => { void leaveActivity('voice'); };
+    }, []);
+
     // Load STT model if needed (Vosk, Voxtral, or Whisper)
     useEffect(() => {
         const checkAndLoadModel = async () => {
-            if (speechConfig?.sttProvider === 'vosk' && speechConfig?.voskModelId) {
+            if (sttProvider === 'vosk' && speechConfig?.voskModelId) {
                 const voskService = getVoskSttService();
                 if (!voskService.isModelLoaded() || voskService.getCurrentModelId() !== speechConfig.voskModelId) {
                     setStatus('Loading Vosk model...');
@@ -111,9 +133,9 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
                 } else {
                     setIsSttReady(true);
                 }
-            } else if (speechConfig?.sttProvider === 'whisper') {
+            } else if (sttProvider === 'whisper') {
                 const whisperService = getWhisperSTTService();
-                let modelToLoad = speechConfig.whisperModelId;
+                let modelToLoad = speechConfig?.whisperModelId;
 
                 if (!modelToLoad) {
                     try {
@@ -133,6 +155,8 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
                     setIsSttReady(false);
                     return;
                 }
+                const conflict = voiceCallMemoryConflict('whisper', modelToLoad);
+                if (conflict) { setStatus(`Error: ${conflict}`); setIsSttReady(false); return; }
 
                 if (!whisperService.isModelLoaded() || whisperService.getCurrentModelId() !== modelToLoad) {
                     setStatus('Loading Whisper...');
@@ -149,9 +173,11 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
                 } else {
                     setIsSttReady(true);
                 }
-            } else if (speechConfig?.sttProvider === 'voxtral') {
+            } else if (sttProvider === 'voxtral') {
+                const conflict = voiceCallMemoryConflict('voxtral');
+                if (conflict) { setStatus(`Error: ${conflict}`); setIsSttReady(false); return; }
                 const voxtralService = getVoxtralSttService();
-                let modelToLoad = speechConfig.voxtralModel;
+                let modelToLoad = speechConfig?.voxtralModel;
 
                 // Fallback discovery if needed
                 if (!modelToLoad) {
@@ -180,9 +206,9 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
                     try {
                         await voxtralService.loadModel({
                             modelPath: modelToLoad,
-                            transcriptionDelayMs: speechConfig.voxtralLatency,
-                            nThreads: speechConfig.voxtralThreads,
-                            maxModelLen: speechConfig.voxtralMaxLen
+                            transcriptionDelayMs: speechConfig?.voxtralLatency,
+                            nThreads: speechConfig?.voxtralThreads,
+                            maxModelLen: speechConfig?.voxtralMaxLen
                         });
                         setIsSttReady(true);
                         setStatus('Ready');
@@ -201,7 +227,7 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
         };
 
         checkAndLoadModel();
-    }, [speechConfig?.sttProvider, speechConfig?.voskModelId, speechConfig?.whisperModelId, speechConfig?.voxtralModel, speechConfig?.voxtralLatency, speechConfig?.voxtralThreads]);
+    }, [sttProvider, speechConfig?.voskModelId, speechConfig?.whisperModelId, speechConfig?.voxtralModel, speechConfig?.voxtralLatency, speechConfig?.voxtralThreads]);
 
     // Throttle audio level updates to reduce render pressure (10fps)
     const throttledSetAudioLevel = useCallback((level: number) => {
@@ -223,6 +249,7 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
     useEffect(() => {
         if (isLoading) {
             setStatus('Thinking...');
+            listeningRef.current = false;
             sttService.stop();
             if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
             // CRITICAL: Clear transcript when AI starts thinking to prevent contamination
@@ -231,6 +258,7 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
             // Note: Piper idle timer (in piperTTS.ts) handles memory cleanup after speech ends
         } else if (isSpeaking) {
             setStatus('Speaking...');
+            listeningRef.current = false;
             sttService.stop();
             // CRITICAL: Clear transcript when AI starts speaking
             setTranscript('');
@@ -238,10 +266,16 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
         } else {
             // Only start listening if STT is ready
             if (!isSttReady) {
-                if (speechConfig?.sttProvider === 'vosk' || speechConfig?.sttProvider === 'voxtral' || speechConfig?.sttProvider === 'whisper') {
+                if (sttProvider === 'vosk' || sttProvider === 'voxtral' || sttProvider === 'whisper') {
                     setStatus('Loading model...');
                     return;
                 }
+            }
+
+            const supportCheck = (sttService as { isSupported?: () => boolean }).isSupported;
+            if (supportCheck && !supportCheck.call(sttService)) {
+                setStatus('Error: speech recognition not supported on this device');
+                return;
             }
 
             // Initial state before listening
@@ -249,22 +283,33 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
 
             // Delay to prevent picking up TTS echo
             const timer = setTimeout(() => {
+                listeningRef.current = true;
                 setStatus('Listening');
-                sttService.start(handleTranscriptUpdate, apiKey, throttledSetAudioLevel);
+                // Start failures (no microphone permission, model missing...) must not leave
+                // the call on "Listening" with nothing recording
+                Promise.resolve(sttService.start(handleTranscriptUpdate, apiKey, throttledSetAudioLevel))
+                    .catch((err: unknown) => {
+                        logger.log('error', 'Failed to start speech recognition', err);
+                        listeningRef.current = false;
+                        const message = err instanceof Error ? err.message : 'microphone unavailable';
+                        setStatus(`Error: ${message}`);
+                    });
             }, 1000);
 
             return () => {
                 clearTimeout(timer);
+                listeningRef.current = false;
                 sttService.stop();
                 if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
             };
         }
 
         return () => {
+            listeningRef.current = false;
             sttService.stop();
             if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
         };
-    }, [isLoading, isSpeaking, isSttReady, speechConfig?.sttProvider, sttService, handleTranscriptUpdate, apiKey, throttledSetAudioLevel]);
+    }, [isLoading, isSpeaking, isSttReady, sttProvider, sttService, handleTranscriptUpdate, apiKey, throttledSetAudioLevel]);
 
     const handleEndCall = () => {
         triggerHaptic('HEAVY');
@@ -287,11 +332,7 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
             }
         });
 
-        if (speechConfig?.ttsProvider === 'piper') {
-            import('../../services/tts/piperTTS').then(({ getPiperTtsService }) => {
-                getPiperTtsService().setAudioOutput(initialOutput);
-            });
-        }
+        applyTtsOutput(ttsProvider, initialOutput);
     }, []);
 
     const toggleAudioOutput = () => {
@@ -307,20 +348,11 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
                 AudioOutput.setSpeakerphoneOn({ enabled: isSpeaker })
                     .then(() => logger.log('info', `Native speakerphone set to ${isSpeaker ? 'ON' : 'OFF'}`))
                     .catch((err: any) => logger.log('error', 'Failed to set native speakerphone', err));
-            } else {
-                // Fallback for web
-                if (speechConfig?.ttsProvider === 'piper') {
-                    // Piper might have its own web handling if needed, but usually handled by audio element
-                }
             }
         });
 
-        // Keep Piper specific call if it needs internal state update, but native plugin should handle routing
-        if (speechConfig?.ttsProvider === 'piper') {
-            import('../../services/tts/piperTTS').then(({ getPiperTtsService }) => {
-                getPiperTtsService().setAudioOutput(next);
-            });
-        }
+        // Keep TTS-specific calls for their internal state, but native plugin should handle routing
+        applyTtsOutput(ttsProvider, next);
     };
 
     return (
@@ -393,7 +425,7 @@ const StandardVoiceChat: React.FC<VoiceChatOverlayProps> = ({
     );
 };
 
-const GeminiLiveVoiceChat: React.FC<VoiceChatOverlayProps> = ({ personality, apiKey, onClose, sendMessage, speechConfig }) => {
+const GeminiLiveVoiceChat: React.FC<VoiceChatOverlayProps> = ({ personality, apiKey, onClose, onSaveTranscript, speechConfig }) => {
     const {
         startSession,
         stopSession,
@@ -408,24 +440,28 @@ const GeminiLiveVoiceChat: React.FC<VoiceChatOverlayProps> = ({ personality, api
     } = useGeminiLive(personality, apiKey, speechConfig);
     const [showTranscripts, setShowTranscripts] = useState(true);
 
-    // Save transcripts to chat history when turn completes
-    const lastInputRef = useRef('');
+    // Save transcripts to chat history when turn completes. Gemini Live has already answered
+    // by voice: store both sides directly; sendMessage() made the main provider answer again.
+    const lastSavedRef = useRef({ input: '', output: '' });
 
     useEffect(() => {
-        if (turnComplete && sendMessage) {
-            // Save user input if available and different from last saved
-            if (inputTranscript.trim() && inputTranscript !== lastInputRef.current) {
-                sendMessage(inputTranscript);
-                lastInputRef.current = inputTranscript;
+        if (!turnComplete) return;
+        const input = inputTranscript.trim();
+        const output = outputTranscript.trim();
+        if (onSaveTranscript) {
+            if (input && input !== lastSavedRef.current.input) {
+                onSaveTranscript('user', input);
+                lastSavedRef.current.input = input;
             }
-
-            // Note: We don't save outputTranscript as sendMessage triggers AI generation
-            // The AI response is already being generated and saved by the main chat flow
-
-            // Reset the turn complete flag
-            resetTurnComplete();
+            if (output && output !== lastSavedRef.current.output) {
+                onSaveTranscript('model', output);
+                lastSavedRef.current.output = output;
+            }
         }
-    }, [turnComplete, inputTranscript, outputTranscript, sendMessage, resetTurnComplete]);
+
+        // Reset the turn complete flag
+        resetTurnComplete();
+    }, [turnComplete, inputTranscript, outputTranscript, onSaveTranscript, resetTurnComplete]);
 
     useEffect(() => {
         startSession();
@@ -512,25 +548,39 @@ const GeminiLiveVoiceChat: React.FC<VoiceChatOverlayProps> = ({ personality, api
     );
 };
 
+/** Pushes the call's output choice into the TTS engine that plays the replies. */
+function applyTtsOutput(ttsProvider: string, output: 'speaker' | 'earpiece') {
+    if (ttsProvider === 'piper') {
+        import('../../services/tts/piperTTS').then(({ getPiperTtsService }) => {
+            getPiperTtsService().setAudioOutput(output).catch(() => { /* logged by the service */ });
+        });
+    } else if (ttsProvider === 'kokoro') {
+        import('../../services/tts/kokoroTTS').then(({ getKokoroTtsService }) => {
+            getKokoroTtsService().setAudioOutput(output).catch(() => { /* logged by the service */ });
+        });
+    }
+}
+
 const VoiceChatOverlay: React.FC<VoiceChatOverlayProps> = (props) => {
-    // If STT is offline or TTS is Piper, use StandardVoiceChat
-    // Otherwise, default to Gemini Live (if configured)
-    // Actually, we should check if the user specifically wants Gemini Live or Standard
-    // For now, if offline providers are selected, force Standard
+    // Every configured provider (including Whisper and Kokoro) uses the standard pipeline;
+    // Gemini Live is only the fallback for unrecognized ids.
+    const useStandard = shouldUseStandardVoiceChat(props.speechConfig?.sttProvider, props.speechConfig?.ttsProvider);
 
-    const sttProv = props.speechConfig?.sttProvider;
-    const ttsProv = props.speechConfig?.ttsProvider;
-
-    // Normalize legacy IDs ('gemini'→'online', 'system'→'offline') for backwards compat with old localStorage
-    const useStandard = sttProv === 'offline' ||
-        sttProv === 'vosk' ||
-        sttProv === 'voxtral' ||
-        sttProv === 'online' ||
-        (sttProv as unknown as string) === 'gemini' ||
-        ttsProv === 'piper' ||
-        ttsProv === 'offline' ||
-        ttsProv === 'online' ||
-        (ttsProv as unknown as string) === 'gemini';
+    // The earpiece sets MODE_IN_COMMUNICATION process-wide: restore normal routing when the
+    // call ends, or later TTS and other apps stay on call routing/volume.
+    useEffect(() => {
+        return () => {
+            // Hanging up silences the assistant (its onEnd resets isSpeaking)
+            stopSpeaking();
+            if (Capacitor.isNativePlatform()) {
+                AudioOutput.resetAudioMode()
+                    .catch((err: unknown) => logger.log('error', 'Failed to reset audio mode', err));
+            }
+            import('../../services/tts/kokoroTTS').then(({ getKokoroTtsService }) => {
+                getKokoroTtsService().setAudioOutput('speaker').catch(() => { /* logged by the service */ });
+            });
+        };
+    }, []);
 
     if (useStandard) {
         return <StandardVoiceChat {...props} />;

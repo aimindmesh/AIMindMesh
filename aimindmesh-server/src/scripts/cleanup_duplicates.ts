@@ -37,10 +37,14 @@ async function cleanup() {
 
     Logger.info('Cleanup', `Group "${dup.title}": keeping ${toKeep}, deleting ${toDelete.length} others.`);
 
-    const deleteStmt = db.prepare(`DELETE FROM evolution_candidates WHERE id = ?`);
-    for (const id of toDelete) {
-      deleteStmt.run(id);
-    }
+    // Proposals and attempts of the duplicates move to the kept candidate (FK)
+    db.transaction(() => {
+      for (const id of toDelete) {
+        db.prepare(`UPDATE evolution_proposals SET candidate_id = ? WHERE candidate_id = ?`).run(toKeep, id);
+        db.prepare(`UPDATE evolution_attempts SET candidate_id = ? WHERE candidate_id = ?`).run(toKeep, id);
+        db.prepare(`DELETE FROM evolution_candidates WHERE id = ?`).run(id);
+      }
+    })();
   }
 
   Logger.info('Cleanup', 'Duplicate cleanup finished.');

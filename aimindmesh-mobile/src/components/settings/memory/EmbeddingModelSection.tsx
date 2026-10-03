@@ -36,43 +36,28 @@ export const EmbeddingModelSection: React.FC<EmbeddingModelSectionProps> = ({
         }
     };
 
-    const checkEmbeddingModelStatus = async () => {
+    /**
+     * Status of the selected model. With `load`, the model is loaded now (a model change takes
+     * effect at once and a load error, e.g. an unsupported tokenizer, is shown here).
+     */
+    const checkEmbeddingModelStatus = async (load: boolean = false, modelId: string | undefined = llmConfig.embeddingModelId) => {
         try {
-            const { TextEmbedding } = await import('text-embedding-capacitor');
-            // Try to perform a dummy embedding to check if model is loaded
-            const result = await TextEmbedding.generateEmbedding({
-                text: 'test'
-            }).catch((e: any) => ({ error: e }));
-
-            if ((result as any).embedding) {
-                setEmbeddingModelStatus({
-                    loaded: true,
-                    dimension: (result as any).embedding.length,
-                    modelId: llmConfig.embeddingModelId
-                });
-            } else {
-                // Model not loaded yet - this is normal before first message
-                // Check if it's a "not initialized" vs actual error
-                const errorMsg = (result as any).error?.message || '';
-                const isNotInitialized = errorMsg.toLowerCase().includes('not initialized') ||
-                    errorMsg.toLowerCase().includes('not loaded') ||
-                    errorMsg.toLowerCase().includes('no model');
-                setEmbeddingModelStatus({
-                    loaded: false,
-                    dimension: 0,
-                    error: isNotInitialized ? undefined : errorMsg, // Don't show error for lazy loading
-                    modelId: llmConfig.embeddingModelId
-                });
-            }
+            const runtime = await import('../../../services/model/embedding/embeddingRuntime');
+            if (load && modelId) await runtime.ensureEmbeddingModel(modelId, { force: true });
+            const active = runtime.getActiveEmbeddingModel();
+            const error = modelId ? runtime.getEmbeddingLoadError(modelId) : null;
+            setEmbeddingModelStatus({
+                loaded: !!active && active.modelId === modelId,
+                dimension: active && active.modelId === modelId ? active.dimension : 0,
+                error: error || undefined,
+                modelId
+            });
         } catch (e) {
-            // Check if it's a lazy loading situation
-            const errorMsg = (e as any).message || '';
-            const isNotInitialized = errorMsg.toLowerCase().includes('not initialized') ||
-                errorMsg.toLowerCase().includes('not loaded');
             setEmbeddingModelStatus({
                 loaded: false,
                 dimension: 0,
-                error: isNotInitialized ? undefined : errorMsg
+                error: (e as any)?.message || String(e),
+                modelId
             });
         }
     };
@@ -98,15 +83,18 @@ export const EmbeddingModelSection: React.FC<EmbeddingModelSectionProps> = ({
                             </span>
                         )}
                         <button
-                            onClick={() => checkEmbeddingModelStatus()}
+                            onClick={() => checkEmbeddingModelStatus(true)}
                             className="text-[10px] text-purple-400 hover:underline ml-2"
                         >
-                            Check
+                            Load
                         </button>
                     </div>
                     {embeddingModelStatus.error && (
                         <p className="text-[9px] text-red-400 mt-1">{embeddingModelStatus.error}</p>
                     )}
+                    <p className="text-[9px] text-text-secondary/60 mt-1">
+                        Memories and documents indexed with another model are re-indexed in the background after a change.
+                    </p>
                 </div>
             )}
 
@@ -117,9 +105,10 @@ export const EmbeddingModelSection: React.FC<EmbeddingModelSectionProps> = ({
                     <select
                         value={llmConfig.embeddingModelId || ''}
                         onChange={(e) => {
-                            onLlmConfigSave({ ...llmConfig, embeddingModelId: e.target.value });
-                            // Trigger check after a short delay
-                            setTimeout(checkEmbeddingModelStatus, 500);
+                            const modelId = e.target.value;
+                            onLlmConfigSave({ ...llmConfig, embeddingModelId: modelId });
+                            // Switch now, so the new model is used from the next message
+                            if (modelId) checkEmbeddingModelStatus(true, modelId);
                         }}
                         className="w-full bg-input border-surface rounded-md px-3 py-2 text-text-primary text-sm focus:outline-none focus:ring-1 focus:ring-purple-500"
                     >
@@ -184,7 +173,7 @@ export const EmbeddingModelSection: React.FC<EmbeddingModelSectionProps> = ({
                         }
 
                         // Check status
-                        checkEmbeddingModelStatus();
+                        checkEmbeddingModelStatus(false, llmConfig.embeddingModelId || modelId);
                     } catch (e) {
                         console.error('Failed to import embedding model', e);
                         alert('Import error: ' + (e as any).message);

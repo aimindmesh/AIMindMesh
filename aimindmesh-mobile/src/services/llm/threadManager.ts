@@ -1,9 +1,25 @@
 import { Message } from '../../types';
 import { ConversationThread, ThreadMetadata, Category } from '../../types/conversationThread';
+import { clearContextSummary } from './contextSummaryStore';
 
 const STORAGE_KEY = 'conversation-threads';
 const CATEGORY_STORAGE_KEY = 'conversation-categories';
 const ACTIVE_THREAD_KEY = 'active-thread-id';
+/** Copy of stored threads that could not be parsed, kept for recovery */
+const UNREADABLE_KEY = 'conversation-threads-unreadable';
+
+// True when stored threads are unreadable AND could not be copied aside: saving would destroy them
+let writesBlocked = false;
+
+function preserveUnreadable(raw: string) {
+    try {
+        if (localStorage.getItem(UNREADABLE_KEY) !== raw) localStorage.setItem(UNREADABLE_KEY, raw);
+        console.warn(`Stored threads are unreadable: a copy is kept in "${UNREADABLE_KEY}"`);
+    } catch {
+        writesBlocked = true;
+        console.error('Stored threads are unreadable and could not be copied: saving is disabled to keep them');
+    }
+}
 
 /**
  * Generate a title from the first user message
@@ -40,10 +56,9 @@ function generatePreview(messages: Message[]): string {
  * Load all threads from localStorage
  */
 export function loadThreads(): ConversationThread[] {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (!stored) return [];
     try {
-        const stored = localStorage.getItem(STORAGE_KEY);
-        if (!stored) return [];
-
         const threads = JSON.parse(stored);
 
         // Convert date strings back to Date objects
@@ -51,25 +66,31 @@ export function loadThreads(): ConversationThread[] {
             ...thread,
             createdAt: new Date(thread.createdAt),
             updatedAt: new Date(thread.updatedAt),
-            messages: thread.messages.map((msg: any) => ({
+            messages: (thread.messages || []).map((msg: any) => ({
                 ...msg,
                 timestamp: new Date(msg.timestamp)
             }))
         }));
     } catch (error) {
         console.error('Failed to load threads:', error);
+        preserveUnreadable(stored);
         return [];
     }
 }
 
 /**
- * Save all threads to localStorage
+ * Save all threads to localStorage. Returns false when nothing was written
+ * (storage full, or unreadable data that must not be overwritten).
  */
-function saveThreads(threads: ConversationThread[]): void {
+function saveThreads(threads: ConversationThread[]): boolean {
+    if (writesBlocked) return false;
     try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(threads));
+        return true;
     } catch (error) {
+        // QuotaExceededError: the previous content is still there, untouched
         console.error('Failed to save threads:', error);
+        return false;
     }
 }
 
@@ -90,9 +111,9 @@ export function createThread(messages: Message[]): ConversationThread {
 }
 
 /**
- * Save or update a thread
+ * Save or update a thread. Returns false if it could not be stored (e.g. storage full).
  */
-export function saveThread(thread: ConversationThread): void {
+export function saveThread(thread: ConversationThread): boolean {
     const threads = loadThreads();
     const existingIndex = threads.findIndex(t => t.id === thread.id);
 
@@ -108,7 +129,21 @@ export function saveThread(thread: ConversationThread): void {
         threads.push(updatedThread);
     }
 
-    saveThreads(threads);
+    return saveThreads(threads);
+}
+
+/**
+ * Store the messages of a conversation, creating its thread on the first message
+ * (a new conversation has no stored thread until it has content).
+ * Returns false if nothing could be written.
+ */
+export function saveThreadMessages(threadId: string, messages: Message[]): boolean {
+    const stored = loadThread(threadId);
+    if (!stored && messages.length === 0) return true; // nothing to keep yet
+    const thread = stored ?? { ...createThread(messages), id: threadId };
+    thread.messages = messages;
+    if (thread.title === generateThreadTitle([])) thread.title = generateThreadTitle(messages);
+    return saveThread(thread);
 }
 
 /**
@@ -126,6 +161,7 @@ export function deleteThread(id: string): void {
     const threads = loadThreads();
     const filtered = threads.filter(t => t.id !== id);
     saveThreads(filtered);
+    clearContextSummary(id);
 
     // If deleted thread was active, clear active thread
     if (getActiveThreadId() === id) {

@@ -35,41 +35,9 @@ export interface DebateThread {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DB Migration — call once at startup (e.g. in db/sqlite.ts or index.ts)
+// Debate tables are part of the schema baseline (db/migrations.ts)
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function migrateDebateTables(): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS debate_threads (
-      id              TEXT PRIMARY KEY,
-      insight_id      TEXT NOT NULL,
-      insight_content TEXT NOT NULL,
-      status          TEXT NOT NULL DEFAULT 'ACTIVE',
-      current_round   INTEGER NOT NULL DEFAULT 0,
-      created_at      INTEGER NOT NULL,
-      updated_at      INTEGER NOT NULL,
-      merged_into     TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS debate_messages (
-      id         TEXT PRIMARY KEY,
-      debate_id  TEXT NOT NULL,
-      author     TEXT NOT NULL,
-      content    TEXT NOT NULL,
-      round      INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
-      FOREIGN KEY (debate_id) REFERENCES debate_threads(id)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_debate_insight  ON debate_threads(insight_id);
-    CREATE INDEX IF NOT EXISTS idx_debate_messages ON debate_messages(debate_id, round);
-  `);
-
-  // Safe migration for existing DBs that don't have merged_into yet
-  try { db.exec(`ALTER TABLE debate_threads ADD COLUMN merged_into TEXT`); } catch (_) { }
-
-  Logger.info('DebateEngine', 'Debate tables migrated.');
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Agent Personas
@@ -108,7 +76,6 @@ export class DebateEngine {
 
   public static start(): void {
     this.stop();
-    migrateDebateTables();
 
     if (!config.debate?.enabled) {
       Logger.debug('DebateEngine', 'Debate Engine is disabled in config');
@@ -606,41 +573,39 @@ export class DebateEngine {
         let consolidatedNodeIds: string[] = [];
         try { consolidatedNodeIds = JSON.parse(primaryInsight.source_node_ids || '[]'); } catch (e) { }
 
-        for (const obsInsightId of obsoleteInsightIds) {
-          const obsInsight = db.prepare(`SELECT source_node_ids FROM feed_items WHERE id = ?`).get(obsInsightId) as any;
-          if (obsInsight) {
-            try {
-              const obsNodeIds = JSON.parse(obsInsight.source_node_ids || '[]');
-              obsNodeIds.forEach((id: string) => {
-                if (!consolidatedNodeIds.includes(id)) consolidatedNodeIds.push(id);
-              });
-            } catch (e) { }
-          }
+        // One transaction per group: a failure never leaves insights half merged
+        db.transaction(() => {
+          for (const obsInsightId of obsoleteInsightIds) {
+            const obsInsight = db.prepare(`SELECT source_node_ids FROM feed_items WHERE id = ?`).get(obsInsightId) as any;
+            if (obsInsight) {
+              try {
+                const obsNodeIds = JSON.parse(obsInsight.source_node_ids || '[]');
+                obsNodeIds.forEach((id: string) => {
+                  if (!consolidatedNodeIds.includes(id)) consolidatedNodeIds.push(id);
+                });
+              } catch (e) { }
+            }
 
-          const obsThread = db.prepare(`SELECT id FROM debate_threads WHERE insight_id = ?`).get(obsInsightId) as any;
-          if (obsThread) {
-            if (primaryThreadId) {
-              // Migrate agent messages to primary thread
+            const obsThread = db.prepare(`SELECT id FROM debate_threads WHERE insight_id = ?`).get(obsInsightId) as any;
+            if (obsThread && primaryThreadId) {
+              // Migrate agent messages to primary thread and mark the obsolete one as merged
               db.prepare(`UPDATE debate_messages SET debate_id = ? WHERE debate_id = ?`).run(primaryThreadId, obsThread.id);
-              // Mark obsolete thread as merged
               db.prepare(`UPDATE debate_threads SET status = 'CLOSED', merged_into = ? WHERE id = ?`).run(primaryThreadId, obsThread.id);
-            } else {
+            } else if (obsThread) {
               // No primary thread exists — just close the orphan thread
               db.prepare(`UPDATE debate_threads SET status = 'CLOSED' WHERE id = ?`).run(obsThread.id);
             }
+            // Migrate human replies; queued deliveries of the obsolete insight are dropped (FK)
+            db.prepare(`UPDATE feed_replies SET feed_item_id = ? WHERE feed_item_id = ?`).run(primaryInsightId, obsInsightId);
+            db.prepare(`DELETE FROM pending_delivery WHERE insight_id = ?`).run(obsInsightId);
+            db.prepare(`DELETE FROM feed_items WHERE id = ?`).run(obsInsightId);
+
+            Logger.info('DebateEngine', 'Consolidated insight ' + obsInsightId + ' into ' + primaryInsightId);
           }
 
-          // Migrate human replies
-          db.prepare(`UPDATE feed_replies SET feed_item_id = ? WHERE feed_item_id = ?`).run(primaryInsightId, obsInsightId);
-
-          // Delete obsolete insight
-          db.prepare(`DELETE FROM feed_items WHERE id = ?`).run(obsInsightId);
-
-          Logger.info('DebateEngine', 'Consolidated insight ' + obsInsightId + ' into ' + primaryInsightId);
-        }
-
-        // Update primary with consolidated node ids
-        db.prepare(`UPDATE feed_items SET source_node_ids = ? WHERE id = ?`).run(JSON.stringify(consolidatedNodeIds), primaryInsightId);
+          // Update primary with consolidated node ids
+          db.prepare(`UPDATE feed_items SET source_node_ids = ? WHERE id = ?`).run(JSON.stringify(consolidatedNodeIds), primaryInsightId);
+        })();
       }
 
       Logger.info('DebateEngine', '✅ Merge cycle complete.');

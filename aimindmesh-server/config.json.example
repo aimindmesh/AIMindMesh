@@ -103,7 +103,8 @@
     "repoLocalPath": "/app",
     "autoMerge": false,
     "shadowMode": false,
-    "preferredNode": "OPENROUTER"
+    "preferredNode": "OPENROUTER",
+    "giteaWebhookSecret": "same-secret-as-the-gitea-webhook"
   },
   "openrouter": {
     "apiKey": "your-openrouter-api-key",

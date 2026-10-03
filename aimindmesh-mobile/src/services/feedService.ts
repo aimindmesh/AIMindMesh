@@ -5,6 +5,8 @@
  */
 
 import { AIMindMeshServerSettings } from '../types';
+import type { FeedItem } from '@aimindmesh/api-types';
+import { createLineDecoder } from './streamLines';
 // logger removed if unused to fix TS6133
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -17,7 +19,7 @@ export interface InsightItem {
     reply_thread_id?: string;
     source_node_ids?: string; // Comma-separated or JSON list from server
     usedNode?: string;        // Optional used inference node
-    type?: 'INSIGHT' | 'SYSTEM';
+    type?: FeedItem['type'];
 }
 
 export interface ThreadMessage {
@@ -38,6 +40,8 @@ export type FeedStreamChunk = {
     token?: string;
     done?: boolean;
     usedNode?: string;
+    /** Author of the message (debate agent or 'assistant') */
+    role?: ThreadMessage['role'];
     error?: string;
 };
 
@@ -48,6 +52,11 @@ function headers(settings: AIMindMeshServerSettings) {
         'Content-Type': 'application/json',
         'x-api-key': settings.apiKey
     };
+}
+
+/** For body-less requests (DELETE): a JSON Content-Type with an empty body used to be rejected */
+function authHeaders(settings: AIMindMeshServerSettings) {
+    return { 'x-api-key': settings.apiKey };
 }
 
 function base(settings: AIMindMeshServerSettings) {
@@ -91,11 +100,12 @@ export async function deleteInsight(
     settings: AIMindMeshServerSettings,
     insightId: string
 ): Promise<void> {
-    await fetch(`${base(settings)}/api/feed/${insightId}`, {
+    const resp = await fetch(`${base(settings)}/api/feed/${insightId}`, {
         method: 'DELETE',
-        headers: headers(settings),
+        headers: authHeaders(settings),
         signal: AbortSignal.timeout(5000)
     });
+    if (!resp.ok) throw new Error(`Delete failed: ${resp.status}`);
 }
 
 // ─── Archives (Library) ───────────────────────────────────────────────────────
@@ -110,11 +120,13 @@ export async function fetchArchives(settings: AIMindMeshServerSettings, limit: n
 }
 
 export async function deleteArchive(settings: AIMindMeshServerSettings, execId: string): Promise<void> {
-    await fetch(`${base(settings)}/api/ai-tasks/executions/${execId}`, {
+    const resp = await fetch(`${base(settings)}/api/ai-tasks/executions/${execId}`, {
         method: 'DELETE',
-        headers: headers(settings),
+        headers: authHeaders(settings),
         signal: AbortSignal.timeout(5000)
     });
+    // The server answers 204; anything else means the archive is still there
+    if (!resp.ok) throw new Error(`Archive delete failed: ${resp.status}`);
 }
 
 export async function fetchArchiveArtifact(settings: AIMindMeshServerSettings, taskId: string, execId: string): Promise<string> {
@@ -171,6 +183,25 @@ export async function fetchThread(
     };
 }
 
+/**
+ * Applies one reply payload: an NDJSON line of a debate stream, or the single JSON answer
+ * the server gives to insights without a debate. Throws on a server error line.
+ */
+export function handleReplyPayload(payload: any, onChunk: (chunk: FeedStreamChunk) => void): void {
+    if (payload?.type === 'agent_reply' && payload.message) {
+        onChunk({
+            token: payload.message.content,
+            done: false, // We don't know if it's the last one yet
+            usedNode: payload.message.author,
+            role: payload.message.author
+        });
+    } else if (payload?.type === 'error') {
+        throw new Error(payload.message || 'Reply failed');
+    } else if (payload?.assistantReply?.content) {
+        onChunk({ token: payload.assistantReply.content, done: false, role: 'assistant' });
+    }
+}
+
 export async function sendReply(
     settings: AIMindMeshServerSettings,
     insightId: string,
@@ -186,49 +217,36 @@ export async function sendReply(
     });
     if (!resp.ok) throw new Error(`Reply failed: ${resp.status}`);
 
-    // Handle streaming response (NDJSON)
-    const reader = resp.body?.getReader();
+    // Insights without a debate get one JSON answer ({ reply, assistantReply }), not a stream
+    // (checked before getReader(), which locks the body)
+    const isJson = (resp.headers.get('content-type') || '').includes('application/json');
+    const reader = isJson ? undefined : resp.body?.getReader();
     if (!reader) {
-        // Fallback for environments where body.getReader() is missing (unlikely in modern WebView)
-        const data = await resp.json();
-        if (data.assistantReply?.content) {
-            onChunk({ token: data.assistantReply.content, done: true, usedNode: data.assistantReply.used_node });
-        }
+        handleReplyPayload(await resp.json(), onChunk);
+        onChunk({ done: true });
         return;
     }
 
-    const decoder = new TextDecoder();
-    let buffer = '';
+    // Debate replies stream as NDJSON, one agent message per line
+    const lines = createLineDecoder();
+    const handleLine = (line: string) => {
+        if (!line.trim()) return;
+        let payload: any;
+        try {
+            payload = JSON.parse(line);
+        } catch {
+            return; // not a JSON line
+        }
+        handleReplyPayload(payload, onChunk);
+    };
 
     while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        
-        // Keep the last partial line in buffer
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-            if (!line.trim()) continue;
-            try {
-                const payload = JSON.parse(line);
-                if (payload.type === 'agent_reply' && payload.message) {
-                    onChunk({ 
-                        token: payload.message.content, 
-                        done: false, // We don't know if it's the last one yet 
-                        usedNode: payload.message.author 
-                    });
-                } else if (payload.type === 'error') {
-                   throw new Error(payload.message);
-                }
-            } catch (e) {
-                // Ignore parse errors for partial chunks
-            }
-        }
+        lines.push(value).forEach(handleLine);
     }
-    
+    lines.end().forEach(handleLine);
+
     // Final signal
     onChunk({ done: true });
 }

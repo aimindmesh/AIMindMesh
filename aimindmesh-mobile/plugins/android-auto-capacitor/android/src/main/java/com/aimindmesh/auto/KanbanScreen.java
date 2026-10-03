@@ -16,6 +16,7 @@ import java.util.Map;
 public class KanbanScreen extends Screen {
     public KanbanScreen(CarContext carContext) {
         super(carContext);
+        AutoDataStore.register(this);
     }
 
     @NonNull
@@ -25,7 +26,7 @@ public class KanbanScreen extends Screen {
         listTemplateBuilder.setTitle("Kanban Board");
         listTemplateBuilder.setHeaderAction(Action.BACK);
 
-        String json = AndroidAutoPlugin.getKanbanData();
+        String json = AutoDataStore.getKanbanData(getCarContext());
         List<Map<String, Object>> columns = AutoUtils.parseKanbanColumns(json);
 
         if (columns.isEmpty()) {

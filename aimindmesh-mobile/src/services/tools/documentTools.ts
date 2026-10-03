@@ -2,6 +2,7 @@ import { ToolDefinition } from './types';
 import { DocumentIngestionService } from '../documents/DocumentIngestionService';
 import { DocumentRetriever } from '../documents/DocumentRetriever';
 import { getKnowledgeDatabase } from '../database/knowledgeDatabase';
+import { workspaceService } from '../workspaces/WorkspaceService';
 import { Type } from '@google/genai';
 
 const ingestionService = new DocumentIngestionService();
@@ -28,8 +29,10 @@ export const documentTools: ToolDefinition[] = [
         requiresConfirmation: false,
         category: 'files',
         handler: async (params) => {
-            // Auto-retrieve uses active workspace if set
-            const results = await retriever.autoRetrieve(params.query);
+            // An explicit search: the active workspace (or all documents), even when its auto-inject is off
+            await workspaceService.ensureInitialized();
+            const topK = Math.min(Math.max(Number(params.top_k) || 5, 1), 20);
+            const results = await retriever.hybridSearchInWorkspace(params.query, workspaceService.getActiveWorkspace()?.id ?? null, topK);
 
             if (results.length === 0) {
                 return 'No relevant documents found.';
@@ -62,6 +65,7 @@ export const documentTools: ToolDefinition[] = [
                 if (result.status === 'failed') {
                     return `Failed to ingest document: ${result.error}`;
                 }
+                if (result.remote) return `Document sent to the AIMindMesh server for ingestion (job ${result.jobId ?? 'unknown'}).`;
                 return `Successfully ingested document. ID: ${result.id}, Chunks: ${result.chunks}.`;
             } catch (e: any) {
                 return `Error: ${e.message}`;
@@ -81,7 +85,8 @@ export const documentTools: ToolDefinition[] = [
         category: 'files',
         handler: async () => {
             const db = await getKnowledgeDatabase();
-            const res = await db.query('SELECT id, title, filename, file_type, total_chunks, created_at FROM documents ORDER BY created_at DESC LIMIT 20');
+            // total_chunks = -1 marks a document still being ingested
+            const res = await db.query('SELECT id, title, filename, file_type, total_chunks, created_at FROM documents WHERE total_chunks >= 0 ORDER BY created_at DESC LIMIT 20');
 
             if (!res.values || res.values.length === 0) return 'No documents found.';
 

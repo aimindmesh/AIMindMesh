@@ -17,7 +17,6 @@
         android:extractNativeLibs="true"
         android:largeHeap="true">
 
-        <service android:name=".proactive.ProactiveBackgroundService" android:enabled="true" android:exported="false" />
 
         <meta-data
             android:name="com.google.android.gms.car.application"
@@ -83,6 +82,15 @@
             android:name=".AssistantSessionService"
             android:permission="android.permission.BIND_VOICE_INTERACTION"
             android:exported="true" />
+
+        <!-- Required by assistant_interaction_service.xml (recognitionService); answers with an error -->
+        <service
+            android:name=".AssistantRecognitionService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.speech.RecognitionService" />
+            </intent-filter>
+        </service>
 
         <provider
             android:name="androidx.core.content.FileProvider"

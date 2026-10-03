@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Settings, Personality, LLMConfig, SpeechConfig, ProactiveFrequency, ResponseStyle, ThemeConfig, DEFAULT_THEME_CONFIG, DEFAULT_PROACTIVE_SETTINGS, ProactiveSettings as ProactiveSettingsType, AIMindMeshServerSettings, DEFAULT_AIMINDMESH_SERVER_SETTINGS } from '../types';
 import { AgendaSettings as AgendaSettingsType } from '../services/calendar/calendarService';
 import { PRESET_PERSONALITIES } from '../constants';
@@ -6,7 +6,8 @@ import { triggerHaptic } from '../services/native';
 import { logger, LogEntry } from '../services/logger';
 import { fetchOpenRouterModels, OpenRouterModel } from '../services/llm/providers/openrouterProvider';
 import { fetchGeminiModels } from '../services/llm/providers/geminiProvider';
-import { GlobalSyncService } from '../services/GlobalSyncService';
+import { GlobalSyncService, SyncResult } from '../services/GlobalSyncService';
+import { createOpenGate, initialOpenRouterKey } from './settingsOpenGate';
 
 export const useSettingsState = (
     isOpen: boolean,
@@ -104,7 +105,7 @@ export const useSettingsState = (
     const [apiKeyState, setApiKeyState] = useState(settings.apiKey);
     const [perplexityApiKeyState, setPerplexityApiKeyState] = useState(settings.perplexityApiKey);
     const [claudeApiKeyState, setClaudeApiKeyState] = useState(settings.claudeApiKey);
-    const [openrouterApiKeyState, setOpenrouterApiKeyState] = useState(settings.openrouterApiKey ?? '');
+    const [openrouterApiKeyState, setOpenrouterApiKeyState] = useState(() => initialOpenRouterKey(settings.llmConfig.openrouterApiKey, settings.openrouterApiKey));
     const [openRouterModelsState, setOpenRouterModelsState] = useState<OpenRouterModel[]>(settings.openRouterModels || []);
     const [isFetchingOpenRouterModels, setIsFetchingOpenRouterModels] = useState(false);
     const [hfTokenState, setHfTokenState] = useState(settings.hfToken);
@@ -130,17 +131,20 @@ export const useSettingsState = (
     const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
     const [isLoggingEnabled, setIsLoggingEnabled] = useState(logger.getIsEnabled());
     const [isSyncingState, setIsSyncingState] = useState(false);
+    const [syncResultState, setSyncResultState] = useState<SyncResult | null>(null);
 
-    // Update local state when modal opens or settings change
+    // Copy the saved settings when the modal opens, never while it is open:
+    // App re-renders would otherwise discard the user's unsaved edits
+    const openGate = useRef(createOpenGate()).current;
     useEffect(() => {
-        if (isOpen) {
+        if (openGate(isOpen)) {
             setPersonalityState(settings.personality);
             setLlmState(settings.llmConfig);
             setSpeechConfigState(settings.speechConfig);
             setApiKeyState(settings.apiKey);
             setPerplexityApiKeyState(settings.perplexityApiKey);
             setClaudeApiKeyState(settings.claudeApiKey);
-            setOpenrouterApiKeyState(settings.openrouterApiKey ?? '');
+            setOpenrouterApiKeyState(initialOpenRouterKey(settings.llmConfig.openrouterApiKey, settings.openrouterApiKey));
             setOpenRouterModelsState(settings.openRouterModels || []);
             setHfTokenState(settings.hfToken);
             setAutoPlayAudioState(settings.autoPlayAudio);
@@ -215,6 +219,15 @@ export const useSettingsState = (
         }
     }, [isOpen, settings, agendaSettings]);
 
+    // Settings applied from outside while the modal is open (one-click setup) replace the
+    // local copies, so saving the modal does not write the old values back
+    const lastSeen = useRef({ llmConfig: settings.llmConfig, speechConfig: settings.speechConfig });
+    useEffect(() => {
+        if (isOpen && settings.llmConfig !== lastSeen.current.llmConfig) setLlmState(settings.llmConfig);
+        if (isOpen && settings.speechConfig !== lastSeen.current.speechConfig) setSpeechConfigState(settings.speechConfig);
+        lastSeen.current = { llmConfig: settings.llmConfig, speechConfig: settings.speechConfig };
+    }, [isOpen, settings.llmConfig, settings.speechConfig]);
+
     const fetchORModels = async () => {
         setIsFetchingOpenRouterModels(true);
         try {
@@ -248,7 +261,8 @@ export const useSettingsState = (
         const newSettings: Settings = {
             ...settings,
             personality: personalityState,
-            llmConfig: llmState,
+            // The OpenRouter key lives in llmConfig, where the provider reads it
+            llmConfig: { ...llmState, openrouterApiKey: openrouterApiKeyState },
             speechConfig: speechConfigState,
             apiKey: apiKeyState,
             perplexityApiKey: perplexityApiKeyState,
@@ -318,8 +332,9 @@ export const useSettingsState = (
 
     const handleSync = async () => {
         setIsSyncingState(true);
+        setSyncResultState(null);
         try {
-            await GlobalSyncService.performSync(aimindmeshServerState);
+            setSyncResultState(await GlobalSyncService.performSync(aimindmeshServerState));
         } finally {
             setIsSyncingState(false);
         }
@@ -379,6 +394,7 @@ export const useSettingsState = (
         handleLoggingToggle,
         handleClearLogs,
         isSyncingState,
+        syncResultState,
         handleSync
     };
 };

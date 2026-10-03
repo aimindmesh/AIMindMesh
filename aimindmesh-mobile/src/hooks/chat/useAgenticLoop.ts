@@ -1,16 +1,23 @@
 import { useState, useRef, useCallback } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { KeepAwake } from '@capacitor-community/keep-awake';
-import { Message, Personality, LLMConfig, SpeechConfig, ResponseStyle, AIMindMeshServerSettings } from '../../types';
-import { ChatContext, ApiKeys, AgentContext, ToolCall } from './types';
+import { Message, Personality, LLMConfig, SpeechConfig, ResponseStyle, AIMindMeshServerSettings, ImageAttachment } from '../../types';
+import { ChatContext, ApiKeys, AgentContext, ToolCall, ToolRunResult } from './types';
 import { logger } from '../../services/logger';
 import { triggerHaptic } from '../../services/native';
 import { speak } from '../../services/tts/speech';
 import { generateTextResponseStreamWithTools, generateMemorySummary } from '../../services/llm/llmService';
 import { getMaxTokensForStyle, processCompletedResponse } from '../../services/llm/responseUtils';
-import { executeTool, needsConfirmation } from '../../services/tools';
+import { executeTool, needsConfirmation, isToolDenied } from '../../services/tools';
 import { useContextCompression } from './useContextCompression';
 import { estimateTokens } from '../../services/llm/context/unifiedContextManager';
+import { applyContextSummary } from '../../services/llm/contextSummaryStore';
+import { getActiveThreadId } from '../../services/llm/threadManager';
+import { imageFromToolData, resolveToolSourceImage } from '../../services/image/imagePrompt';
+import {
+    effectiveProvider, apiKeyForProvider, compressionBudget, streamDisplayText, buildToolTurnText,
+    buildObservationMessage, mergeTextThinking, extractInlineMemories, cleanFinalAnswer, shouldNudgeModel
+} from './agentLoopHelpers';
 
 interface UseAgenticLoopProps {
     llmConfig: LLMConfig;
@@ -28,8 +35,9 @@ interface UseAgenticLoopProps {
     serverSettings?: AIMindMeshServerSettings;
 }
 
+const toolLabel = (name: string) => name.split(' ')[0].split('(')[0].trim();
+
 export const useAgenticLoop = ({
-// ... (rest of hook setup)
     llmConfig,
     personality,
     speechConfig,
@@ -37,7 +45,7 @@ export const useAgenticLoop = ({
     responseStyle,
     autoPlayAudio,
     context,
-    activeThreadId: _activeThreadId,
+    activeThreadId,
     onUpdateToolRules,
     setMessages,
     setIsLoading,
@@ -45,40 +53,67 @@ export const useAgenticLoop = ({
     serverSettings
 }: UseAgenticLoopProps) => {
     const [pendingToolCall, setPendingToolCall] = useState<ToolCall | null>(null);
+    // Controller of the run that is generating (null when idle or paused on a confirmation)
     const abortControllerRef = useRef<AbortController | null>(null);
     const pausedAgentContextRef = useRef<AgentContext | null>(null);
-    const toolCallSourceRef = useRef<string | null>(null);
 
     const { compressHistoryIfNeeded } = useContextCompression();
 
-    const stopGeneration = useCallback(() => {
-        if (abortControllerRef.current) {
-            abortControllerRef.current.abort();
-            abortControllerRef.current = null;
-            setIsLoading(false);
-            triggerHaptic('MEDIUM');
+    const allowSleep = useCallback(() => {
+        if (llmConfig.keepScreenOn && Capacitor.isNativePlatform()) {
+            KeepAwake.allowSleep().catch(() => { });
         }
-    }, [setIsLoading]);
+    }, [llmConfig.keepScreenOn]);
+
+    /** A run is generating or waiting for a tool confirmation: new requests are refused meanwhile */
+    const isBusy = useCallback(() => abortControllerRef.current !== null || pausedAgentContextRef.current !== null, []);
+
+    const stopGeneration = useCallback(() => {
+        const paused = pausedAgentContextRef.current;
+        if (!abortControllerRef.current && !paused) return;
+        abortControllerRef.current?.abort();
+        abortControllerRef.current = null;
+        // A run waiting for a confirmation is cancelled too: drop the dialog and its status line
+        if (paused) {
+            pausedAgentContextRef.current = null;
+            setPendingToolCall(null);
+            setMessages(prev => prev.map(msg => msg.id === paused.modelMessageId
+                ? { ...msg, text: streamDisplayText(paused.accumulatedResponse) } : msg));
+        }
+        setIsLoading(false);
+        allowSleep();
+        triggerHaptic('MEDIUM');
+    }, [setIsLoading, setMessages, allowSleep]);
 
     /**
-     * Core Agentic Loop
+     * Core Agentic Loop: generate, run the requested tools (pausing on those that need a
+     * confirmation), feed their results back, until the model answers or the step limit.
      */
     const runAgenticLoop = useCallback(async (
         initialHistory: Message[],
         resumeContext?: AgentContext,
-        decision?: { allowed: boolean; toolName: string }
+        decision?: { allowed: boolean }
     ) => {
-        logger.log('info', `[LLM_CHAIN] =======================================`);
-        logger.log('info', `[LLM_CHAIN] USER CLICKED SEND / runAgenticLoop initiated`);
-        logger.log('info', `[LLM_CHAIN] =======================================`);
+        // One run at a time: a second one would share the bubble, the abort and the loading state
+        if (abortControllerRef.current || (!resumeContext && pausedAgentContextRef.current)) {
+            logger.log('warn', '[AgenticLoop] A generation is already in progress, request ignored');
+            return;
+        }
+        logger.log('info', `[LLM_CHAIN] runAgenticLoop initiated${resumeContext ? ' (resumed after confirmation)' : ''}`);
+
+        const controller = new AbortController();
+        const signal = controller.signal;
+        abortControllerRef.current = controller;
+        const isActiveRun = () => abortControllerRef.current === controller;
+        let paused = false;
         setIsLoading(true);
-        abortControllerRef.current = new AbortController();
 
         if (llmConfig.keepScreenOn && Capacitor.isNativePlatform()) {
             try { KeepAwake.keepAwake(); } catch (e) { }
         }
 
-        let conversationHistory = resumeContext ? [...resumeContext.conversationHistory] : [...initialHistory];
+        // The model gets the thread's context summary in place of the messages it covers (the chat keeps them)
+        let conversationHistory = resumeContext ? [...resumeContext.conversationHistory] : applyContextSummary([...initialHistory], activeThreadId ?? getActiveThreadId());
         const modelMessageId = resumeContext ? resumeContext.modelMessageId : (Date.now() + 1).toString();
         const maxIterations = llmConfig.maxAgentIterations || 5;
         let currentIteration = resumeContext ? resumeContext.currentIteration : 0;
@@ -86,10 +121,14 @@ export const useAgenticLoop = ({
         let accumulatedResponse = resumeContext ? resumeContext.accumulatedResponse : '';
         let accumulatedThinking = resumeContext ? resumeContext.accumulatedThinking : '';
         let accumulatedSources = resumeContext ? [...resumeContext.accumulatedSources] : [];
-        let accumulatedToolResults = resumeContext ? [...resumeContext.accumulatedToolResults] : [];
+        const accumulatedToolResults: ToolRunResult[] = resumeContext ? [...resumeContext.accumulatedToolResults] : [];
+        const generatedImages: ImageAttachment[] = resumeContext ? [...(resumeContext.generatedImages || [])] : [];
 
-        let hasMoreToolCalls = true;
-        let toolCallsToExecute: ToolCall[] = [];
+        // Tool batch in progress: calls still to run, their results so far, the turn that asked for them
+        let pendingBatch: ToolCall[] = resumeContext ? [...resumeContext.pendingToolCalls] : [];
+        let batchResults: ToolRunResult[] = resumeContext ? [...(resumeContext.batchResults || [])] : [];
+        let batchModelText = resumeContext?.batchModelText ?? '';
+        let pendingDecision = pendingBatch.length > 0 ? decision : undefined; // Applies to the call that paused
 
         if (!resumeContext) {
             const modelMessage: Message = { id: modelMessageId, role: 'model', text: '', timestamp: new Date() };
@@ -97,35 +136,29 @@ export const useAgenticLoop = ({
         }
 
         let lastUpdateTimestamp = 0;
-        const throttledUpdate = (text: string, thinking?: string, sources?: any[], toolResults?: any[], status?: string) => {
+        const throttledUpdate = (status?: string) => {
+            if (signal.aborted) return; // A stopped run no longer writes into the bubble
             const now = Date.now();
             if (!status && now - lastUpdateTimestamp < 100) return;
             lastUpdateTimestamp = now;
 
-            let cleanText = text ? text.replace(/^\s+/, '') : '';
-            const answerMatch = cleanText.match(/(?:^|\n)(?:Final )?Answer:\s*/i);
-            if (answerMatch && answerMatch.index !== undefined) {
-                // We found an Answer: block, only show what comes after it
-                cleanText = cleanText.substring(answerMatch.index + answerMatch[0].length);
-            } else if (cleanText.includes('<tool>') || cleanText.includes('</tool>')) {
-                // If it's a tool block without Answer:, don't show the tool call JSON to the user
-                cleanText = '';
-            }
-            const cleanThinking = thinking ? thinking.replace(/^\s+/, '') : undefined;
-            
-            // Clean inline memory tags so they don't show on screen
-            cleanText = cleanText.replace(/<save_memory>[\s\S]*?(?:<\/save_memory>|$)/gi, '');
-            
-            const displayText = status ? (cleanText ? `${cleanText}\n\n_${status}_` : `_${status}_`) : cleanText;
-
+            const displayText = streamDisplayText(accumulatedResponse, status);
+            const thinking = accumulatedThinking.replace(/^\s+/, '') || undefined;
+            const sources = accumulatedSources.length > 0 ? accumulatedSources : undefined;
+            const toolResults = accumulatedToolResults.length > 0 ? [...accumulatedToolResults] : undefined;
+            const images = generatedImages.length > 0 ? [...generatedImages] : undefined;
             logger.log('debug', `[LLM_CHAIN] UI UPDATE (throttled): Text length=${displayText.length}, updating React state.`);
             setMessages(prev => prev.map(msg =>
-                msg.id === modelMessageId ? { ...msg, text: displayText, thinking: cleanThinking, sources, toolResults } : msg
+                msg.id === modelMessageId ? { ...msg, text: displayText, thinking, sources, toolResults, images } : msg
             ));
         };
 
+        const record = (result: ToolRunResult) => {
+            accumulatedToolResults.push(result);
+            batchResults.push(result);
+        };
+
         try {
-            // Helper for tool execution used in both Resume and Loop phases
             const toolContext = {
                 todos: context.todos,
                 memories: context.memories,
@@ -133,23 +166,32 @@ export const useAgenticLoop = ({
                 completeTodo: context.completeTodo,
                 addMemory: context.addMemory,
                 confirmationMode: llmConfig.toolConfirmationMode || 'dangerous',
-                llmConfig: llmConfig // Add missing property
+                llmConfig: llmConfig
             };
 
-            let effectiveApiKey = apiKeys.gemini;
-            if (llmConfig.provider === 'perplexity') effectiveApiKey = apiKeys.perplexity;
-            if (llmConfig.provider === 'claude') effectiveApiKey = apiKeys.claude;
+            const provider = effectiveProvider(llmConfig, serverSettings);
+            const effectiveApiKey = apiKeyForProvider(provider, apiKeys, llmConfig);
+            const maxResponseTokens = getMaxTokensForStyle(responseStyle);
+            const historyBudget = compressionBudget(provider, llmConfig, maxResponseTokens);
 
-            const executeSingleTool = async (call: ToolCall) => {
+            const runTool = async (call: ToolCall): Promise<ToolRunResult> => {
                 logger.log('debug', '[AgenticLoop] Executing tool:', call.name);
-                throttledUpdate(accumulatedResponse, accumulatedThinking || undefined, accumulatedSources.length > 0 ? accumulatedSources : undefined, accumulatedToolResults.length > 0 ? accumulatedToolResults : undefined, `🔧 Executing: ${call.name.split(' ')[0].split('(')[0].trim()}...`);
+                throttledUpdate(`🔧 Executing: ${toolLabel(call.name)}...`);
                 try {
+                    if (call.name === 'generate_image' && call.args?.source_image) {
+                        // The model names the image to edit ("last"); the pixels come from the chat
+                        const { source, error } = resolveToolSourceImage(call.args.source_image, conversationHistory, generatedImages);
+                        if (error) return { name: call.name, success: false, result: error };
+                        call = { ...call, args: { ...call.args, source_image: source } };
+                    }
                     const result = await executeTool(call, toolContext);
+                    const image = imageFromToolData(result.data);
+                    if (image) generatedImages.push(image); // shown in the bubble, never sent back to the model
                     let cleanResult = result.message.split('\n\n').filter((b: string) => !b.trim().startsWith('[SYSTEM')).join('\n\n').trim();
-                    
+
                     // Tool Output Pruning: Summarize long tool outputs
-                    if (estimateTokens(cleanResult) > 800) { 
-                        throttledUpdate(accumulatedResponse, accumulatedThinking || undefined, accumulatedSources.length > 0 ? accumulatedSources : undefined, accumulatedToolResults.length > 0 ? accumulatedToolResults : undefined, `✂️ Summarizing large result from ${call.name.split(' ')[0].split('(')[0].trim()}...`);
+                    if (estimateTokens(cleanResult) > 800 && !signal.aborted) {
+                        throttledUpdate(`✂️ Summarizing large result from ${toolLabel(call.name)}...`);
                         try {
                             const summary = await generateMemorySummary(`Summarize this tool output keeping only facts relevant to answer a user request. Output: ${cleanResult.substring(0, 15000)}`, llmConfig, effectiveApiKey);
                             if (summary) {
@@ -162,83 +204,25 @@ export const useAgenticLoop = ({
 
                     // Always ensure we don't exceed a hard limit to prevent crash
                     cleanResult = cleanResult.substring(0, 4000);
-
-                    accumulatedToolResults.push({ name: call.name, success: result.success, result: cleanResult });
                     context.showToast(result.message.substring(0, 80) + (result.message.length > 80 ? '...' : ''), result.success ? 'success' : 'error');
-                    return cleanResult; // Return raw result for cleaner formatting
+                    return { name: call.name, success: result.success, result: cleanResult };
                 } catch (error) {
-                    accumulatedToolResults.push({ name: call.name, success: false, result: (error as Error).message });
-                    return `Error: ${(error as Error).message}`;
+                    return { name: call.name, success: false, result: (error as Error).message };
                 }
             };
 
-            if (resumeContext) {
+            while (currentIteration < maxIterations) {
+                if (signal.aborted) return;
 
-                const allPending = [...resumeContext.pendingToolCalls];
-
-                // Process the adjudged tool first
-                if (decision) {
-                    const toolIndex = allPending.findIndex(t => t.name === decision.toolName);
-                    if (toolIndex !== -1) {
-                        const toolToProcess = allPending[toolIndex];
-                        // Remove from pending list
-                        allPending.splice(toolIndex, 1);
-
-                        if (decision.allowed) {
-                            await executeSingleTool(toolToProcess);
-                        } else {
-                            accumulatedToolResults.push({ name: toolToProcess.name, success: false, result: 'User denied execution.' });
-                            context.showToast(`Tool ${toolToProcess.name} denied`, 'info');
-                        }
-                    }
-                }
-
-                // CRITICAL: Add the tool result to conversation history BEFORE continuing
-                // This was missing - causing the loop to call the model without the tool result
-                if (accumulatedToolResults.length > 0) {
-                    const toolResultsStr = accumulatedToolResults.map(r =>
-                        `[${r.name}]: ${r.success ? r.result : `Failed - ${r.result}`}`
-                    );
-                    const toolResultMessage: Message = {
-                        id: `tool_${Date.now()}`,
-                        role: 'user',
-                        text: `Observation:\n${toolResultsStr.join('\n\n')}`,
-                        timestamp: new Date()
-                    };
-
-                    const modelTurnForHistory: Message = {
-                        id: `model_${Date.now()}`,
-                        role: 'model',
-                        text: resumeContext.accumulatedResponse ||
-                            resumeContext.pendingToolCalls.map(c =>
-                                `<tool>${c.name}(${JSON.stringify(c.args)})</tool>`).join('\n'),
-                        timestamp: new Date()
-                    };
-
-                    conversationHistory = [
-                        ...conversationHistory,
-                        modelTurnForHistory,
-                        toolResultMessage
-                    ];
-                }
-
-                // Set remaining tools to be executed in the loop
-                toolCallsToExecute = allPending;
-                hasMoreToolCalls = true;
-            }
-
-            while (hasMoreToolCalls && currentIteration < maxIterations) {
-                if (!abortControllerRef.current) break;
-
-                if (toolCallsToExecute.length === 0) {
-                    hasMoreToolCalls = false;
-
+                if (pendingBatch.length === 0) {
                     if (currentIteration > 0) {
-                        throttledUpdate(accumulatedResponse, accumulatedThinking || undefined, accumulatedSources.length > 0 ? accumulatedSources : undefined, accumulatedToolResults.length > 0 ? accumulatedToolResults : undefined, `🔄 Reasoning step ${currentIteration} of ${maxIterations}...`);
+                        throttledUpdate(`🔄 Reasoning step ${currentIteration} of ${maxIterations}...`);
                     }
 
-                    // Compress history aggressively for mobile GPU (Gemma 3n ~4k context)
-                    conversationHistory = compressHistoryIfNeeded(conversationHistory, 1500);
+                    // On-device models have a small window (Gemma 3n ~4k); remote ones prune by themselves
+                    if (Number.isFinite(historyBudget)) {
+                        conversationHistory = compressHistoryIfNeeded(conversationHistory, historyBudget);
+                    }
 
                     const stream = await generateTextResponseStreamWithTools(
                         conversationHistory,
@@ -246,53 +230,96 @@ export const useAgenticLoop = ({
                         llmConfig,
                         context.memories,
                         effectiveApiKey,
-                        abortControllerRef.current.signal,
-                        getMaxTokensForStyle(responseStyle),
+                        signal,
+                        maxResponseTokens,
                         serverSettings
                     );
 
+                    accumulatedResponse = ''; // Each step has its own answer text
                     let iterationResponse = '';
-                    let iterationThinking = '';
+                    const requestedCalls: ToolCall[] = [];
 
                     for await (const chunk of stream) {
-                        const content = chunk.type === 'text' || chunk.type === 'thinking' ? chunk.content : '';
-                        logger.log('debug', `[LLM_CHAIN] AgenticLoop received chunk: type=${chunk.type}, content=[${content?.replace(/\n/g, '\\n')}]`);
+                        if (signal.aborted) break;
                         if (chunk.type === 'text') {
                             iterationResponse += chunk.content;
-                            if (!iterationResponse.trim()) iterationResponse = iterationResponse.trimStart();
-                            else if (accumulatedResponse.length === 0) iterationResponse = iterationResponse.trimStart();
+                            if (!iterationResponse.trim() || accumulatedResponse.length === 0) iterationResponse = iterationResponse.trimStart();
                             accumulatedResponse = iterationResponse;
-                            throttledUpdate(accumulatedResponse, accumulatedThinking + iterationThinking || undefined, accumulatedSources.length > 0 ? accumulatedSources : undefined, accumulatedToolResults.length > 0 ? accumulatedToolResults : undefined);
+                            throttledUpdate();
                         } else if (chunk.type === 'thinking') {
-                            iterationThinking += chunk.content;
                             accumulatedThinking += chunk.content;
-                            throttledUpdate(accumulatedResponse, accumulatedThinking, accumulatedSources.length > 0 ? accumulatedSources : undefined, accumulatedToolResults.length > 0 ? accumulatedToolResults : undefined);
+                            throttledUpdate();
                         } else if (chunk.type === 'sources') {
                             accumulatedSources = chunk.sources;
-                            throttledUpdate(accumulatedResponse, accumulatedThinking || undefined, accumulatedSources, accumulatedToolResults.length > 0 ? accumulatedToolResults : undefined);
+                            throttledUpdate();
                         } else if (chunk.type === 'function_call') {
                             // Ensure the tool call matches the expected ToolCall interface
                             const rawCall = chunk.call as any;
-                            const toolCall: ToolCall = {
+                            requestedCalls.push({
                                 name: rawCall.name,
                                 args: rawCall.args || rawCall.arguments || {}, // Handle both for safety
                                 id: rawCall.id
-                            };
-                            toolCallsToExecute.push(toolCall);
+                            });
                         }
+                    }
+                    // Providers that swallow the abort end normally: nothing of a stopped run is finalized
+                    if (signal.aborted) return;
+
+                    if (requestedCalls.length > 0 && llmConfig.enableToolCalling) {
+                        logger.log('debug', '[AgenticLoop] Processing tool calls:', requestedCalls);
+                        pendingBatch = requestedCalls;
+                        batchResults = [];
+                        batchModelText = buildToolTurnText(accumulatedResponse, accumulatedThinking, requestedCalls);
+                        // Thinking streamed as text must stay visible while the tools run
+                        accumulatedThinking = mergeTextThinking(accumulatedThinking, accumulatedResponse);
+                    } else if (shouldNudgeModel(accumulatedResponse, accumulatedThinking, currentIteration, maxIterations)) {
+                        // Only a short thought, no answer and no tool: ask the model to continue
+                        conversationHistory = [
+                            ...conversationHistory,
+                            { id: `model_${Date.now()}`, role: 'model', text: accumulatedThinking, timestamp: new Date() },
+                            {
+                                id: `nudge_${Date.now()}`,
+                                role: 'user',
+                                text: 'Please continue. If you have finished the task, provide the final answer. If you need more information, use a tool.',
+                                timestamp: new Date()
+                            }
+                        ];
+                        accumulatedResponse = '';
+                        accumulatedThinking = '';
+                        currentIteration++; // A nudge is a step: the limit bounds repeated nudges too
+                        continue;
+                    } else {
+                        break; // Final answer
                     }
                 }
 
-                if (toolCallsToExecute.length > 0 && llmConfig.enableToolCalling) {
-                    logger.log('debug', '[AgenticLoop] Processing tool calls:', toolCallsToExecute);
-                    hasMoreToolCalls = true;
+                // Run the batch in order. A call that needs confirmation pauses the run; the
+                // decision resumes it on that same call.
+                while (pendingBatch.length > 0) {
+                    if (signal.aborted) return;
+                    const call = pendingBatch[0];
 
-                    const needsConfirmTools = toolCallsToExecute.filter(call =>
-                        needsConfirmation(call.name, llmConfig.toolConfirmationMode || 'dangerous', {}, llmConfig.toolRules)
-                    );
+                    if (pendingDecision) {
+                        const { allowed } = pendingDecision;
+                        pendingDecision = undefined;
+                        pendingBatch.shift();
+                        if (allowed) {
+                            record(await runTool(call));
+                        } else {
+                            record({ name: call.name, success: false, result: 'User denied execution.' });
+                            context.showToast(`Tool ${call.name} denied`, 'info');
+                        }
+                        continue;
+                    }
 
-                    if (needsConfirmTools.length > 0) {
-                        logger.log('debug', '[AgenticLoop] Pausing for tool confirmation', needsConfirmTools[0].name);
+                    if (isToolDenied(call.name, llmConfig.toolRules)) {
+                        pendingBatch.shift();
+                        record({ name: call.name, success: false, result: 'This tool is disabled in the user\'s settings.' });
+                        continue;
+                    }
+
+                    if (needsConfirmation(call.name, llmConfig.toolConfirmationMode || 'dangerous', {}, llmConfig.toolRules)) {
+                        logger.log('debug', '[AgenticLoop] Pausing for tool confirmation', call.name);
                         pausedAgentContextRef.current = {
                             conversationHistory,
                             modelMessageId,
@@ -303,264 +330,116 @@ export const useAgenticLoop = ({
                             accumulatedSources,
                             accumulatedToolResults,
                             iterationResponse: accumulatedResponse,
-                            pendingToolCalls: toolCallsToExecute
+                            pendingToolCalls: [...pendingBatch],
+                            batchResults,
+                            batchModelText,
+                            generatedImages
                         };
-
-                        setPendingToolCall(needsConfirmTools[0]);
-                        toolCallSourceRef.current = modelMessageId;
-                        throttledUpdate(accumulatedResponse, accumulatedThinking || undefined, accumulatedSources.length > 0 ? accumulatedSources : undefined, accumulatedToolResults.length > 0 ? accumulatedToolResults : undefined, `⏸️ Waiting: ${needsConfirmTools[0].name} requires confirmation...`);
+                        paused = true;
+                        setPendingToolCall(call);
+                        throttledUpdate(`⏸️ Waiting: ${call.name} requires confirmation...`);
                         return;
                     }
 
-                    const toolResultsStr: string[] = [];
-                    for (const call of toolCallsToExecute) {
-                        if (!abortControllerRef.current) break;
-                        const resStr = await executeSingleTool(call);
-                        toolResultsStr.push(`[${call.name}]: ${resStr}`);
-                    }
-
-                    const toolResultMessage: Message = {
-                        id: `tool_${Date.now()}`,
-                        role: 'user',
-                        text: `Observation:\n${toolResultsStr.join('\n\n')}`,
-                        timestamp: new Date()
-                    };
-
-                    // Reconstruct the full model response including thinking and tool calls for history
-                    // [FIX] Clean duplication: Strip raw tags from the text part since we'll restructure it canonically
-                    let cleanBody = accumulatedResponse
-                        .replace(/<thinking>[\s\S]*?(?:<\/thinking>|$)/g, '')
-                        .replace(/<tool>[\s\S]*?(?:<\/tool>|$)/g, '')
-                        .replace(/\[tool\][\s\S]*?(?:\[\/tool\]|$)/g, '')
-                        .trim();
-                    const historyAnswerMatch = cleanBody.match(/(?:^|\n)(?:Final )?Answer:\s*/i);
-                    if (historyAnswerMatch && historyAnswerMatch.index !== undefined) {
-                        // We found an Answer: block, only save what comes after it
-                        cleanBody = cleanBody.substring(historyAnswerMatch.index + historyAnswerMatch[0].length);
-                    } else if (accumulatedResponse.includes('<tool>') || accumulatedResponse.includes('</tool>')) {
-                        // CRITICAL ANTI-LEAK: If the model called a tool but FORGOT the "Answer:" prefix,
-                        // any text it produced before the tool is just conversational fluff ("I will now search...").
-                        // We MUST discard it, otherwise it gets pushed to history as a final reply and the model repeats it.
-                        cleanBody = '';
-                    }
-
-                    let fullModelResponse = '';
-
-                    if (accumulatedThinking) {
-                        fullModelResponse += `<thinking>${accumulatedThinking}</thinking>\n`;
-                    }
-
-                    if (cleanBody) {
-                        fullModelResponse += `${cleanBody}\n`;
-                    }
-
-                    // Add tool usage to history if it wasn't already part of the text
-                    if (toolCallsToExecute.length > 0) {
-                        const toolCallsStr = toolCallsToExecute
-                            .map(call =>
-                                `<tool>${call.name}(${JSON.stringify(call.args)})</tool>`
-                            ).join('\n');
-
-                        fullModelResponse += `${toolCallsStr}`;
-                    }
-
-                    conversationHistory = [
-                        ...conversationHistory,
-                        { id: `model_${Date.now()}`, role: 'model', text: fullModelResponse.trim(), timestamp: new Date() },
-                        toolResultMessage
-                    ];
-
-                    // [CRITICAL FIX] Robust Thinking Preservation
-                    // Before clearing accumulatedResponse, we must check if it contains any thinking blocks 
-                    // that were streamed as 'text' instead of 'thinking' chunks.
-                    // This prevents the thinking block from disappearing when tool execution starts.
-                    const textThinkingMatch = accumulatedResponse.match(/<thinking>([\s\S]*?)(?:<\/thinking>|$)/);
-                    if (textThinkingMatch) {
-                        // Strip any nested tags that might have broken the regex or leaked
-                        let extractedThinking = textThinkingMatch[1]
-                            .replace(/<thinking>/g, '')
-                            .replace(/<\/thinking>/g, '')
-                            .replace(/<tool>[\s\S]*?(?:<\/tool>|$)/g, '')
-                            .replace(/\[tool\][\s\S]*?(?:\[\/tool\]|$)/g, '')
-                            .trim();
-
-                        if (extractedThinking && !accumulatedThinking.includes(extractedThinking)) {
-                            // Append only if not already in accumulatedThinking (avoid duplication)
-                            accumulatedThinking = (accumulatedThinking + '\n' + extractedThinking).trim();
-                        }
-                    }
-
-                    accumulatedResponse = '';
-                    // accumulatedThinking = ''; // PRESERVE THINKING across iterations
-                    toolCallsToExecute = [];
-                    currentIteration++;  // Increment AFTER tool execution
-
-                } else {
-                    // Self-correction: Only nudge if model produced ONLY thinking with no substantive answer
-                    // A substantive answer is:
-                    // 1. accumulatedResponse has meaningful content (>50 chars outside thinking tags)
-                    // 2. accumulatedThinking contains a complete answer (describes something, answers a question)
-                    // 3. Model is responding to an image/audio analysis request (no tools needed)
-
-                    const cleanResponse = accumulatedResponse.replace(/<thinking>[\s\S]*?<\/thinking>/g, '').trim();
-                    const hasSubstantiveResponse = cleanResponse.length > 0 && cleanResponse !== '<'; // Reject lone '<'
-
-                    // Check if thinking contains a direct answer (not just reasoning steps)
-                    const thinkingHasAnswer = accumulatedThinking && (
-                        accumulatedThinking.toLowerCase().includes('the image') ||
-                        accumulatedThinking.toLowerCase().includes('the picture') ||
-                        accumulatedThinking.toLowerCase().includes('the audio') ||
-                        accumulatedThinking.toLowerCase().includes('i see') ||
-                        accumulatedThinking.toLowerCase().includes('this shows') ||
-                        accumulatedThinking.length > 200  // Long thinking usually contains answer
-                    );
-
-                    // Only nudge if: short thinking, no response, AND not an obvious direct answer
-                    const shouldNudge = !hasSubstantiveResponse &&
-                        !thinkingHasAnswer &&
-                        accumulatedThinking &&
-                        accumulatedThinking.length > 5 &&
-                        accumulatedThinking.length < 80 &&  // Only nudge for extremely short/empty thoughts
-                        currentIteration < maxIterations - 1;
-
-                    if (shouldNudge) {
-                        // Model didn't call a tool or provide answer - nudge it
-                        const nudgeMessage: Message = {
-                            id: `nudge_${Date.now()}`,
-                            role: 'user',
-                            text: 'Please continue. If you have finished the task, provide the final answer. If you need more information, use a tool.',
-                            timestamp: new Date()
-                        };
-                        conversationHistory = [
-                            ...conversationHistory,
-                            { id: `model_${Date.now()}`, role: 'model', text: accumulatedThinking, timestamp: new Date() },
-                            nudgeMessage
-                        ];
-                        hasMoreToolCalls = true;
-                        accumulatedResponse = '';
-                        accumulatedThinking = '';
-                        toolCallsToExecute = [];
-                    } else {
-                        hasMoreToolCalls = false;
-                    }
+                    pendingBatch.shift();
+                    record(await runTool(call));
                 }
+                if (signal.aborted) return;
+
+                // Batch complete: the model turn that asked for the tools, then only their results
+                conversationHistory = [
+                    ...conversationHistory,
+                    { id: `model_${Date.now()}`, role: 'model', text: batchModelText, timestamp: new Date() },
+                    buildObservationMessage(batchResults, `tool_${Date.now()}`)
+                ];
+                batchResults = [];
+                batchModelText = '';
+                accumulatedResponse = '';
+                currentIteration++;  // Increment AFTER tool execution (resumed batches count too)
             }
 
             // Fallback: If no response text but we have thinking, use thinking as the response
             let finalResponse = accumulatedResponse;
             if (!finalResponse.trim() && accumulatedThinking) {
-                // Only fallback to thinking if we actually generated some in this iteration or we have nothing else
-                // If the model was totally silent, returning old thoughts makes it look like it repeated itself.
                 finalResponse = accumulatedThinking;
             }
             // Also fallback to tool results if nothing else
             if (!finalResponse.trim() && accumulatedToolResults.length > 0) {
                 finalResponse = accumulatedToolResults.map(r => `${r.name}: ${r.result}`).join('\n\n');
             }
-
             // If we STILL have absolutely nothing, provide a safe fallback so the app doesn't hang
-            // or repeat the previous message endlessly.
             if (!finalResponse.trim()) {
                 finalResponse = "I apologize, but I wasn't able to generate a response. The context might be too large or complex.";
                 accumulatedThinking = ""; // Clear confusing thoughts
             }
 
             // Extract inline memories before cleaning
-            // We use a regex that handles both closed and unclosed (at end of string) tags
-            const memoryMatches = finalResponse.match(/<save_memory>([\s\S]*?)(?:<\/save_memory>|$)/ig);
-            if (memoryMatches) {
-                for (const match of memoryMatches) {
-                    const memoryContent = match.replace(/<\/?save_memory>/ig, '').trim();
-                    if (memoryContent) {
-                        logger.log('info', `[MemoryExtraction] Inline memory found: "${memoryContent}"`);
-                        
-                        // 1. Save to explicit profile memory (Settings > Memory)
-                        context.addMemory(memoryContent, 'general');
-                        
-                        // 2. Save to semantic vector database (so it has the 'extracted' tag like before)
-                        if (llmConfig.enableSemanticMemory && _activeThreadId) {
-                            import('../../services/memory/semanticMemoryRetriever').then(async ({ getOrInitializeSemanticMemoryRetriever }) => {
-                                try {
-                                    const retriever = await getOrInitializeSemanticMemoryRetriever(llmConfig);
-                                    if (retriever) {
-                                        await retriever.saveMessage(_activeThreadId, 'extracted', memoryContent);
-                                        logger.log('info', `[MemoryExtraction] Saved inline memory to semantic DB with role 'extracted'`);
-                                    }
-                                } catch (e) {
-                                    logger.log('warn', '[MemoryExtraction] Failed to save to semantic DB', e);
-                                }
-                            }).catch(err => logger.log('warn', '[MemoryExtraction] Failed to import semantic retriever', err));
+            for (const memoryContent of extractInlineMemories(finalResponse)) {
+                logger.log('info', `[MemoryExtraction] Inline memory found: "${memoryContent}"`);
+                // 1. Save to explicit profile memory (Settings > Memory)
+                context.addMemory(memoryContent, 'general');
+
+                // 2. Save to semantic vector database (so it has the 'extracted' tag like before)
+                if (llmConfig.enableSemanticMemory && activeThreadId) {
+                    import('../../services/memory/semanticMemoryRetriever').then(async ({ getOrInitializeSemanticMemoryRetriever }) => {
+                        try {
+                            const retriever = await getOrInitializeSemanticMemoryRetriever(llmConfig);
+                            if (retriever) {
+                                await retriever.saveMessage(activeThreadId, 'extracted', memoryContent);
+                                logger.log('info', `[MemoryExtraction] Saved inline memory to semantic DB with role 'extracted'`);
+                            }
+                        } catch (e) {
+                            logger.log('warn', '[MemoryExtraction] Failed to save to semantic DB', e);
                         }
-                    }
+                    }).catch(err => logger.log('warn', '[MemoryExtraction] Failed to import semantic retriever', err));
                 }
             }
 
-            // Clean up any status messages (like "🔄 Reasoning step...") from the final response
-            let cleanFinalResponse = finalResponse
-                .replace(/_🔄 Reasoning step \d+ of \d+\.\.._/g, '')
-                .replace(/<thinking>[\s\S]*?(?:<\/thinking>|$)/g, '')
-                .replace(/<tool>[\s\S]*?(?:<\/tool>|$)/g, '')
-                .replace(/\[tool\][\s\S]*?(?:\[\/tool\]|$)/g, '')
-                .replace(/<save_memory>[\s\S]*?(?:<\/save_memory>|$)/ig, '')
-                .trim();
-
-            const finalAnswerMatch = cleanFinalResponse.match(/(?:^|\n)(?:Final )?Answer:\s*/i);
-            if (finalAnswerMatch && finalAnswerMatch.index !== undefined) {
-                // We found an Answer: block, only save what comes after it
-                cleanFinalResponse = cleanFinalResponse.substring(finalAnswerMatch.index + finalAnswerMatch[0].length);
-            } else if (finalResponse.includes('<tool>') || finalResponse.includes('</tool>')) {
-                // If the model called a tool but FORGOT the "Answer:" prefix,
-                // the text is merely conversational reasoning ("I will search...").
-                // Hide it from the final UI response so it doesn't leak.
-                cleanFinalResponse = '';
-            }
-
-            const processedResponse = processCompletedResponse(cleanFinalResponse, responseStyle);
-            setMessages(prev => prev.map(msg => msg.id === modelMessageId ? { ...msg, text: processedResponse, thinking: accumulatedThinking || undefined, sources: accumulatedSources.length > 0 ? accumulatedSources : undefined } : msg));
+            const processedResponse = processCompletedResponse(cleanFinalAnswer(finalResponse), responseStyle);
+            setMessages(prev => prev.map(msg => msg.id === modelMessageId ? {
+                ...msg,
+                text: processedResponse,
+                thinking: accumulatedThinking || undefined,
+                sources: accumulatedSources.length > 0 ? accumulatedSources : undefined,
+                toolResults: accumulatedToolResults.length > 0 ? [...accumulatedToolResults] : undefined,
+                images: generatedImages.length > 0 ? [...generatedImages] : undefined
+            } : msg));
 
             if (autoPlayAudio && processedResponse) {
                 setIsSpeaking(true);
                 speak(processedResponse, speechConfig.ttsProvider, llmConfig, speechConfig, apiKeys.gemini, () => setIsSpeaking(false));
             }
-
-            // NOTE: We don't save model responses to semantic memory anymore
-            // - They waste space with verbose assistant text
-            // - The MemoryExtractionService extracts and saves important facts instead
-            // - Only user messages are useful for semantic retrieval
-            // if (processedResponse) {
-            //     saveToSemanticMemory('model', processedResponse);
-            // }
-
-            // Clear paused context - loop is complete
-            pausedAgentContextRef.current = null;
+            // NOTE: model responses are not saved to semantic memory: MemoryExtractionService
+            // stores the important facts instead (only user messages help retrieval)
 
         } catch (error: any) {
-            if (error.name === 'AbortError') return;
+            // Errors of a stopped run (AbortError, "Generation aborted by user") are not shown
+            if (signal.aborted || error?.name === 'AbortError') return;
             const errorMessageText = `Sorry, I encountered an error: ${error.message || 'Please try again.'} `;
             setMessages(prev => prev.map(msg => msg.id === modelMessageId ? { ...msg, text: errorMessageText } : msg));
         } finally {
-            if (!pausedAgentContextRef.current) {
-                setIsLoading(false);
+            // Only the run that still owns the shared state resets it (Stop already did otherwise).
+            // While paused on a confirmation the bubble keeps its "processing" state.
+            if (isActiveRun()) {
                 abortControllerRef.current = null;
-                if (llmConfig.keepScreenOn && Capacitor.isNativePlatform()) {
-                    try { await KeepAwake.allowSleep(); } catch (e) { }
+                if (!paused) {
+                    setIsLoading(false);
+                    allowSleep();
                 }
             }
-            // If paused (waiting for tool confirmation), we KEEP isLoading=true
-            // so the UI remains in "processing" state and doesn't trigger auto-focus.
-            setPendingToolCall(prev => prev); // Trigger re-render if needed? No, state already set.
         }
     }, [
-        llmConfig, personality, context, apiKeys, responseStyle, speechConfig, autoPlayAudio,
-        getMaxTokensForStyle, generateTextResponseStreamWithTools, processCompletedResponse,
-        setMessages, setIsLoading, setIsSpeaking, compressHistoryIfNeeded
+        llmConfig, personality, context, apiKeys, responseStyle, speechConfig, autoPlayAudio, activeThreadId,
+        serverSettings, setMessages, setIsLoading, setIsSpeaking, compressHistoryIfNeeded, allowSleep
     ]);
 
     const handleConfirmTool = useCallback(async (allowed: boolean, remember: boolean) => {
-        const context = pausedAgentContextRef.current;
+        const paused = pausedAgentContextRef.current;
         const call = pendingToolCall;
 
-        if (!context || !call) return;
+        if (!paused || !call) return;
+        // The resumed run owns this state now: an error in it must not leave the app "busy"
+        pausedAgentContextRef.current = null;
         setPendingToolCall(null);
 
         if (remember && allowed && onUpdateToolRules) {
@@ -568,8 +447,8 @@ export const useAgenticLoop = ({
             onUpdateToolRules(call.name, 'allow');
         }
 
-        // Resume loop with decision
-        runAgenticLoop([], context, { allowed, toolName: call.name });
+        // Resume loop with the decision for the call that paused it
+        runAgenticLoop([], paused, { allowed });
 
     }, [pendingToolCall, runAgenticLoop, onUpdateToolRules]);
 
@@ -578,6 +457,7 @@ export const useAgenticLoop = ({
         setPendingToolCall,
         stopGeneration,
         runAgenticLoop,
-        handleConfirmTool
+        handleConfirmTool,
+        isBusy
     };
 };

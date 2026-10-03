@@ -2,8 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { CloseIcon, PlayIcon, PauseIcon, SaveIcon } from '../../constants';
 import { logger } from '../../services/logger';
 
-import { Capacitor } from '@capacitor/core';
-import { deleteMeeting as deleteMeetingFromStorage, loadMeetingsAsync, getMeetingAudioFile } from '../../services/meeting/meetingStorage';
+import { deleteMeeting as deleteMeetingFromStorage, loadMeetingsAsync, resolveMeetingAudio } from '../../services/meeting/meetingStorage';
 import { SavedMeeting } from '../../types/meeting';
 import ExportBottomSheet from './ExportBottomSheet';
 
@@ -33,18 +32,12 @@ const MeetingHistory: React.FC<MeetingHistoryProps> = ({ isOpen, onClose, onRepr
     useEffect(() => {
         const loadAudio = async () => {
             if (selectedMeeting?.hasAudio) {
-                // Check if we already have the data (rare, mostly for backward compatibility)
-                if (selectedMeeting.audioData) {
-                    createAudioUrl(selectedMeeting.audioData, selectedMeeting.audioMimeType || 'audio/webm');
-                    return;
-                }
-
                 setIsLoadingAudio(true);
                 try {
-                    const audioFile = await getMeetingAudioFile(selectedMeeting.id);
-                    if (audioFile) {
-                        const localUrl = Capacitor.convertFileSrc(audioFile.path);
-                        setAudioUrl(localUrl);
+                    // Also decodes legacy recordings stored as base64 inside JSON
+                    const audio = await resolveMeetingAudio(selectedMeeting);
+                    if (audio) {
+                        setAudioUrl(audio.url);
                     } else {
                         logger.log('warn', `Audio file not found for meeting ${selectedMeeting.id}`);
                         setAudioUrl(null);
@@ -72,21 +65,6 @@ const MeetingHistory: React.FC<MeetingHistoryProps> = ({ isOpen, onClose, onRepr
             setAudioUrl(null);
         };
     }, [selectedMeeting?.id]); // Only reload if ID changes
-
-    const createAudioUrl = (base64Data: string, mimeType: string) => {
-        try {
-            const binaryString = atob(base64Data);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-                bytes[i] = binaryString.charCodeAt(i);
-            }
-            const blob = new Blob([bytes], { type: mimeType });
-            const url = URL.createObjectURL(blob);
-            setAudioUrl(url);
-        } catch (e) {
-            logger.log('error', 'Failed to create audio URL', e);
-        }
-    };
 
     const loadMeetingsData = async () => {
         try {
@@ -366,12 +344,15 @@ const MeetingHistory: React.FC<MeetingHistoryProps> = ({ isOpen, onClose, onRepr
                 </div>
             </div>
 
-            {selectedMeeting && (
+            {/* Mounted on open, so it starts on the audio format */}
+            {selectedMeeting && isExportSheetOpen && (
                 <ExportBottomSheet
                     isOpen={isExportSheetOpen}
                     onClose={() => setIsExportSheetOpen(false)}
                     transcript={selectedMeeting.transcript || []}
                     speakerNames={selectedMeeting.speakerNames || {}}
+                    meeting={selectedMeeting}
+                    initialFormat="audio"
                 />
             )}
         </div>

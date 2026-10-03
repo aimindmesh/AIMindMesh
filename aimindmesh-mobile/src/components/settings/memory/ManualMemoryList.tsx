@@ -1,6 +1,7 @@
 import React from 'react';
 import { Memory } from '../../../types';
 import { TrashIcon } from '../../../constants';
+import { uncategorizedMemories, withCategory } from '../../../services/memory/manualMemories';
 
 interface ManualMemoryListProps {
     memories: Memory[];
@@ -19,20 +20,27 @@ export const ManualMemoryList: React.FC<ManualMemoryListProps> = ({
 }) => {
     if (memories.length === 0) return null;
 
+    // Memories whose category is not listed (deleted category, saved by the model under a new
+    // one, older data) get their own group instead of disappearing
+    const uncategorized = uncategorizedMemories(memories, memoryCategories);
+    const groups = memoryCategories
+        .filter(cat => viewCategory === 'all' || viewCategory === cat)
+        .map(category => ({ key: category, label: category, items: memories.filter(m => (m.category || 'other') === category) }));
+    if (viewCategory === 'all' && uncategorized.length > 0) {
+        groups.push({ key: '__uncategorized__', label: 'Uncategorized', items: uncategorized });
+    }
+
     return (
         <div className="space-y-4">
             <h4 className="text-xs font-bold text-blue-400 uppercase tracking-wider bg-blue-500/10 p-1 rounded flex items-center gap-1">
                 📝 Memorie Manuali ({memories.length})
             </h4>
-            {memoryCategories
-                .filter(cat => viewCategory === 'all' || viewCategory === cat)
-                .map(category => {
-                    const categoryMemories = memories.filter(m => (m.category || 'other') === category);
+            {groups.map(({ key, label, items: categoryMemories }) => {
                     if (categoryMemories.length === 0 && viewCategory === 'all') return null;
 
                     return (
-                        <div key={category} className="mb-4">
-                            <h5 className="text-[10px] font-bold text-text-secondary uppercase tracking-wider mb-2 pl-1">{category}</h5>
+                        <div key={key} className="mb-4">
+                            <h5 className="text-[10px] font-bold text-text-secondary uppercase tracking-wider mb-2 pl-1">{label}</h5>
                             <div className="space-y-2">
                                 {categoryMemories.slice().reverse().map(memory => (
                                     <div key={memory.id} className="flex items-start justify-between p-2 rounded bg-surface/40 hover:bg-surface/80 transition-colors group">
@@ -50,7 +58,7 @@ export const ManualMemoryList: React.FC<ManualMemoryListProps> = ({
                                                     onChange={(e) => onUpdateMemoryCategory(memory.id, e.target.value)}
                                                     className="bg-transparent text-[10px] text-primary border-none p-0 focus:ring-0 cursor-pointer opacity-0 group-hover:opacity-100 transition-opacity"
                                                 >
-                                                    {memoryCategories.map(cat => <option key={cat} value={cat}>{cat}</option>)}
+                                                    {withCategory(memoryCategories, memory.category || 'other').map(cat => <option key={cat} value={cat}>{cat}</option>)}
                                                 </select>
                                             </div>
                                         </div>

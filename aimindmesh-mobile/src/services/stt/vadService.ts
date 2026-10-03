@@ -4,15 +4,26 @@
  * Uses Silero VAD for detecting speech segments in audio.
  */
 
+import { Capacitor } from '@capacitor/core';
+import { VAD } from 'vad-capacitor';
 import { logger } from '../logger';
 
-// Plugin import will be available after native build
-let VAD: any;
-try {
-    VAD = require('vad-capacitor').VAD;
-} catch {
-    // Plugin not available (web or not built yet)
-    VAD = null;
+/**
+ * Int16 PCM -> base64 of little-endian Float32 samples, the format processSamples expects
+ * (sending Int16 bytes made the native side read garbage floats).
+ */
+export function int16ToFloat32Base64(pcm: Int16Array): string {
+    const floats = new Float32Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) {
+        floats[i] = pcm[i] / 32768;
+    }
+    const bytes = new Uint8Array(floats.buffer);
+    let binary = '';
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(binary);
 }
 
 /**
@@ -60,10 +71,36 @@ export class VADService {
     }
 
     /**
-     * Check if VAD is available (native plugin installed)
+     * Check if VAD is available (native plugin installed).
+     * (It used to be loaded with require(), which does not exist in the Vite bundle, so VAD
+     * was always reported unavailable.)
      */
     public isAvailable(): boolean {
-        return VAD !== null;
+        return Capacitor.isNativePlatform() && Capacitor.isPluginAvailable('VAD');
+    }
+
+    /**
+     * Load a VAD model if none is loaded: the preferred id when downloaded, else the first
+     * downloaded one. Returns whether a model is ready (nothing else loads VAD models).
+     */
+    public async ensureModelLoaded(preferredModelId?: string): Promise<boolean> {
+        if (!this.isAvailable()) return false;
+        if (await this.checkModelLoaded()) return true;
+
+        try {
+            const { listLocalVADModels } = await import('./vadModelDownloader');
+            const local = await listLocalVADModels();
+            const modelId = preferredModelId && local.includes(preferredModelId) ? preferredModelId : local[0];
+            if (!modelId) {
+                logger.log('info', 'No VAD model downloaded');
+                return false;
+            }
+            await this.loadModel(modelId);
+            return true;
+        } catch (error) {
+            logger.log('warn', 'Could not load a VAD model', error);
+            return false;
+        }
     }
 
     /**
@@ -173,6 +210,11 @@ export class VADService {
             logger.log('error', 'VAD processing failed', error);
             throw error;
         }
+    }
+
+    /** Convenience for Int16 PCM (16 kHz mono) recordings. */
+    public async processInt16Samples(pcm: Int16Array): Promise<VADResult> {
+        return this.processSamples(int16ToFloat32Base64(pcm));
     }
 
     /**

@@ -2,42 +2,11 @@ import { Cpu, Activity, HardDrive, RefreshCw, Layers, Zap, Clock, Globe, Shield,
 import { Dropdown } from '../ui/Dropdown';
 import { TaskPriorityManager } from './TaskPriorityManager';
 import { TaskStatsDashboard } from './TaskStatsDashboard';
+import type { AdminServerStatus } from '../../types/adminStatus';
 
-interface Node {
-  id: string;
-  type: string;
-  url: string;
-  status: string;
-  version?: string;
-  address?: string;
-  last_heartbeat?: number;
-  capabilities?: string[];
-  name?: string;
-}
 
 interface AdminOverviewProps {
-  status: {
-    cpu: number;
-    ram: { total: string; used: string; percent: number };
-    nodes: Node[];
-    geminiUsage: number;
-    openrouterUsage: number;
-    dailyQuotaCap?: number;
-    openrouterDailyQuotaCap?: number;
-    coreCount?: number;
-    openrouterCredits?: {
-      balance: number;
-      total_usage: number;
-      total_credits: number;
-      lastChecked: number;
-    } | null;
-    infrastructureBrake: boolean;
-    openClawHealth?: {
-      isHealthy: boolean;
-      statusMessage: string;
-      lastCheck: number;
-    };
-  } | null;
+  status: AdminServerStatus | null;
   config: any;
   onUpdateConfig: (partial: any) => void;
   onToggleBrake: (active: boolean) => void;

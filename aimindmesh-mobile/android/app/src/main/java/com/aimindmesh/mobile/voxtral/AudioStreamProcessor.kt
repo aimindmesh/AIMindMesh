@@ -4,7 +4,6 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.util.Log
-import kotlinx.coroutines.*
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -17,84 +16,123 @@ class AudioStreamProcessor(
 ) {
 
     private var audioRecord: AudioRecord? = null
-    private var recordingJob: Job? = null
+    private var readerThread: Thread? = null
+    @Volatile
     private var isRecording = false
 
     companion object {
         private const val TAG = "AudioStreamProcessor"
         private const val BUFFER_SIZE_FACTOR = 2
+        // A chunk being transcribed can take seconds; stop waits for it before the model is touched
+        private const val STOP_JOIN_TIMEOUT_MS = 30_000L
     }
 
     /**
-     * Start capturing audio
-     * @param onChunk: Callback with audio data (normalized float array)
+     * Start capturing audio on a dedicated thread.
+     * @param onChunk: Callback with audio data (normalized float array), called on the capture thread
+     * @return false when the microphone cannot be opened (permission denied, busy, unsupported)
      */
-    fun startCapture(onChunk: (FloatArray) -> Unit) {
+    fun startCapture(onChunk: (FloatArray) -> Unit): Boolean {
         val channelConfig = if (channels == 1) {
             AudioFormat.CHANNEL_IN_MONO
         } else {
             AudioFormat.CHANNEL_IN_STEREO
         }
 
-        val bufferSize = AudioRecord.getMinBufferSize(
+        val minBuffer = AudioRecord.getMinBufferSize(
             sampleRate,
             channelConfig,
             AudioFormat.ENCODING_PCM_16BIT
-        ) * BUFFER_SIZE_FACTOR
+        )
+        if (minBuffer <= 0) {
+            Log.e(TAG, "Unsupported audio configuration ($minBuffer)")
+            return false
+        }
+        val bufferSize = minBuffer * BUFFER_SIZE_FACTOR
 
-        try {
-            audioRecord = AudioRecord(
+        val record = try {
+            AudioRecord(
                 MediaRecorder.AudioSource.VOICE_RECOGNITION,
                 sampleRate,
                 channelConfig,
                 AudioFormat.ENCODING_PCM_16BIT,
                 bufferSize
             )
-
-            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                Log.e(TAG, "AudioRecord not initialized")
-                return
-            }
-
-            audioRecord?.startRecording()
-            isRecording = true
-
-            // Start reading audio in background
-            recordingJob = CoroutineScope(Dispatchers.IO).launch {
-                val buffer = ByteArray(bufferSize)
-
-                while (isRecording) {
-                    val bytesRead = audioRecord?.read(buffer, 0, buffer.size) ?: -1
-
-                    if (bytesRead > 0) {
-                        // Convert PCM16 to float32 normalized [-1.0, 1.0]
-                        val floatData = pcm16ToFloat32(buffer, bytesRead)
-
-                        // Send to callback
-                        onChunk(floatData)
-                    }
-                }
-            }
-
-            Log.i(TAG, "Audio capture started")
-
         } catch (e: SecurityException) {
             Log.e(TAG, "Microphone permission denied", e)
+            return false
         } catch (e: Exception) {
             Log.e(TAG, "Audio capture failed", e)
+            return false
         }
+
+        if (record.state != AudioRecord.STATE_INITIALIZED) {
+            Log.e(TAG, "AudioRecord not initialized")
+            record.release()
+            return false
+        }
+
+        try {
+            record.startRecording()
+        } catch (e: Exception) {
+            Log.e(TAG, "startRecording failed", e)
+            record.release()
+            return false
+        }
+        if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+            // Another app holds the microphone
+            Log.e(TAG, "AudioRecord did not start recording")
+            record.release()
+            return false
+        }
+
+        audioRecord = record
+        isRecording = true
+        readerThread = Thread({
+            val buffer = ByteArray(bufferSize)
+            while (isRecording) {
+                val bytesRead = record.read(buffer, 0, buffer.size)
+                if (bytesRead > 0 && isRecording) {
+                    // Convert PCM16 to float32 normalized [-1.0, 1.0]
+                    onChunk(pcm16ToFloat32(buffer, bytesRead))
+                } else if (bytesRead < 0) {
+                    Log.e(TAG, "AudioRecord read error $bytesRead")
+                    break
+                }
+            }
+        }, "Voxtral-Capture").also { it.start() }
+
+        Log.i(TAG, "Audio capture started")
+        return true
     }
 
     /**
-     * Stop capturing audio
+     * Stop capturing audio. Blocks until the capture thread (and any chunk it is
+     * processing) has finished, so callers can safely release or reset the model.
      */
     fun stopCapture() {
         isRecording = false
-        recordingJob?.cancel()
-        recordingJob = null
+        val record = audioRecord
+        try {
+            record?.stop() // unblocks a pending read()
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "AudioRecord stop failed", e)
+        }
 
-        audioRecord?.stop()
-        audioRecord?.release()
+        val thread = readerThread
+        if (thread != null && thread !== Thread.currentThread()) {
+            try {
+                thread.join(STOP_JOIN_TIMEOUT_MS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+            if (thread.isAlive) {
+                Log.w(TAG, "Capture thread still busy after ${STOP_JOIN_TIMEOUT_MS}ms")
+            }
+        }
+        readerThread = null
+
+        record?.release()
         audioRecord = null
 
         Log.i(TAG, "Audio capture stopped")

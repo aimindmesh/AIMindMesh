@@ -1,18 +1,16 @@
 import { CalendarTask, AiTaskExecution } from '../../types/calendar';
 import { logger } from '../logger';
+import { readSetting } from '../security/secretStore';
 
 /**
  * Retrieves the server base URL from saved settings, or uses the default
  */
 export function getBaseUrl(): string {
     try {
-        const raw = localStorage.getItem('aimindmesh-server-settings');
-        if (raw) {
-            const settings = JSON.parse(raw);
-            if (settings.serverUrl) {
-                // Remove trailing slash if present
-                return settings.serverUrl.replace(/\/$/, '');
-            }
+        const settings = readSetting<any>('aimindmesh-server-settings', {});
+        if (settings.serverUrl) {
+            // Remove trailing slash if present
+            return settings.serverUrl.replace(/\/$/, '');
         }
     } catch (e) {
         logger.log('warn', '[AiTaskService] Unable to parse server settings', e);
@@ -26,15 +24,54 @@ export function getBaseUrl(): string {
  */
 export function getApiKey(): string {
     try {
-        const raw = localStorage.getItem('aimindmesh-server-settings');
-        if (raw) {
-            const settings = JSON.parse(raw);
-            if (settings.apiKey) return settings.apiKey;
-        }
+        // The API key may live in the secret store, not in localStorage
+        const settings = readSetting<any>('aimindmesh-server-settings', {});
+        if (settings.apiKey) return settings.apiKey;
     } catch (e) {
         // Fallback
     }
     return '';
+}
+
+/** Server tasks whose deletion failed (offline, VPN down): retried on the next server call */
+const PENDING_DELETES_KEY = 'ai-task-pending-deletes';
+
+function readPendingDeletes(): string[] {
+    try {
+        const ids = JSON.parse(localStorage.getItem(PENDING_DELETES_KEY) || '[]');
+        return Array.isArray(ids) ? ids : [];
+    } catch {
+        return [];
+    }
+}
+
+function writePendingDeletes(ids: string[]) {
+    if (ids.length === 0) localStorage.removeItem(PENDING_DELETES_KEY);
+    else localStorage.setItem(PENDING_DELETES_KEY, JSON.stringify(ids));
+}
+
+/** True when the server no longer has the task (404 counts: already gone). */
+async function deleteOnServer(taskId: string): Promise<boolean> {
+    try {
+        const response = await fetch(`${getBaseUrl()}/api/ai-tasks/${encodeURIComponent(taskId)}`, {
+            method: 'DELETE',
+            headers: { 'x-api-key': getApiKey() },
+            signal: AbortSignal.timeout(5000)
+        });
+        return response.ok || response.status === 404;
+    } catch {
+        return false;
+    }
+}
+
+/** Retries the queued deletions; `keep` is a task being synced again (assigned back to the AI). */
+async function flushPendingDeletes(keep?: string): Promise<string[]> {
+    const failed: string[] = [];
+    for (const id of readPendingDeletes()) {
+        if (id !== keep && !(await deleteOnServer(id))) failed.push(id);
+    }
+    writePendingDeletes(failed);
+    return failed;
 }
 
 /**
@@ -69,12 +106,15 @@ export const AiTaskService = {
      */
     async syncTask(task: CalendarTask): Promise<void> {
         if (!task.aiConfig) return;
+        await flushPendingDeletes(task.id);
 
         const payload = {
             id: task.id,
             title: task.title,
             promptTemplate: task.aiConfig.promptTemplate,
             model: task.aiConfig.model,
+            // The "model" picker selects a provider: send it as provider so the server routes it
+            provider: task.aiConfig.model,
             outputFormat: task.aiConfig.outputFormat,
             storagePolicy: task.aiConfig.storagePolicy,
             requiresReview: task.aiConfig.requiresReview,
@@ -105,6 +145,21 @@ export const AiTaskService = {
         } catch (error) {
             logger.log('error', `[AiTaskService] Error synchronizing task ${task.id}`, error);
             throw error;
+        }
+    },
+
+    /**
+     * Removes a task from the server scheduler (deleted locally or handed back to the user),
+     * so its cron job stops. Failures are queued and retried by later calls.
+     */
+    async deleteTask(taskId: string): Promise<void> {
+        writePendingDeletes([...new Set([...readPendingDeletes(), taskId])]);
+        if (!readSetting<any>('aimindmesh-server-settings', {}).enabled) return;
+        const failed = await flushPendingDeletes();
+        if (failed.includes(taskId)) {
+            logger.log('warn', `[AiTaskService] Server deletion of ${taskId} failed, will retry`);
+        } else {
+            logger.log('info', `[AiTaskService] Task ${taskId} removed from the server`);
         }
     },
 

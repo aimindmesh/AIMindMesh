@@ -34,20 +34,11 @@ export const useNativeModelLoader = (
         }
 
         try {
-            // Resolve absolute path for the native layer if it's a local file
-            let absolutePath = filename;
-            if (!filename.startsWith('/') && !filename.includes(':')) {
-                const { FileSystemAdapter: Filesystem, Directory } = await import('../utils/fileSystemAdapter');
-                const uriResult = await Filesystem.getUri({
-                    path: filename,
-                    directory: Directory.Data
-                });
-                absolutePath = uriResult.uri.replace('file://', '');
-                logger.log('info', `Resolved absolute path for ${filename}: ${absolutePath}`);
-            }
-
+            // Loaded with the same path that is saved: generation compares the loaded path with
+            // the configured one, and a resolved absolute path made the first message reload the
+            // model. The native layer resolves bare file names itself.
             await initNativeModel({
-                modelPath: absolutePath,
+                modelPath: filename,
                 tokenizerPath: llmConfig.nativeTokenizerPath,
                 nThreads: llmConfig.nThreads || 6,
                 nThreadsBatch: llmConfig.nThreadsBatch || 4,

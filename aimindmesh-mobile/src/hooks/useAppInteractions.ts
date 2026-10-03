@@ -1,10 +1,20 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { Personality } from '../types';
 import { logger } from '../services/logger';
 import { isDesktop } from '../utils/platform';
 import { App as CapacitorApp } from '@capacitor/app';
+import { runBackHandler } from '../services/native/backButtonRegistry';
+import { ASSISTANT_LAUNCH_EVENT, consumeAssistantLaunch } from '../services/native/assistantLaunch';
 
-export const useAppInteractions = (chat: any) => {
+/** Back steps for screens App owns; each returns true when it handled the press */
+export interface AppBackHandlers {
+    /** Overlays above everything (tool confirmation, image studio) */
+    closeOverlay: () => boolean;
+    /** In-app navigation (feed thread, a tab other than chat) */
+    navigateBack: () => boolean;
+}
+
+export const useAppInteractions = (backHandlersRef: React.MutableRefObject<AppBackHandlers | null>) => {
     const [isSettingsOpen, setIsSettingsOpen] = useState(false);
     const [isVoiceMode, setIsVoiceMode] = useState(false);
     const [isProactiveThinking, setIsProactiveThinking] = useState(false);
@@ -57,15 +67,30 @@ export const useAppInteractions = (chat: any) => {
             }
         };
 
+        // Assistant gesture / wake word session: MainActivity keeps the request until it is read,
+        // so a cold start (event fired before this listener existed) is caught by the check below
+        const openVoiceIfRequested = () => {
+            consumeAssistantLaunch().then(requested => {
+                if (requested) {
+                    logger.log('info', '[App] Opened as assistant: starting voice mode');
+                    setIsVoiceMode(true);
+                }
+            });
+        };
+
         window.addEventListener('widgetAction', handleWidgetAction);
         window.addEventListener('shortcutAction', handleShortcutAction);
+        window.addEventListener(ASSISTANT_LAUNCH_EVENT, openVoiceIfRequested);
+        openVoiceIfRequested();
         return () => {
             window.removeEventListener('widgetAction', handleWidgetAction);
             window.removeEventListener('shortcutAction', handleShortcutAction);
+            window.removeEventListener(ASSISTANT_LAUNCH_EVENT, openVoiceIfRequested);
         };
     }, []);
 
     // --- Back Button Handling ---
+    // Read by the listener registered once below (state of the last render)
     const backHandlerStateRef = useRef({
         isVoiceMode,
         incomingCall,
@@ -73,34 +98,30 @@ export const useAppInteractions = (chat: any) => {
         isThreadListOpen,
         isMeetingMode,
         isAgendaOpen,
-        isTodoListOpen,
-        pendingToolCall: chat.pendingToolCall
+        isTodoListOpen
     });
-
-    useEffect(() => {
-        backHandlerStateRef.current = {
-            isVoiceMode,
-            incomingCall,
-            isSettingsOpen,
-            isThreadListOpen,
-            isMeetingMode,
-            isAgendaOpen,
-            isTodoListOpen,
-            pendingToolCall: chat.pendingToolCall
-        };
-    }, [isVoiceMode, incomingCall, isSettingsOpen, isThreadListOpen, isMeetingMode, isAgendaOpen, isTodoListOpen, chat.pendingToolCall]);
+    backHandlerStateRef.current = {
+        isVoiceMode,
+        incomingCall,
+        isSettingsOpen,
+        isThreadListOpen,
+        isMeetingMode,
+        isAgendaOpen,
+        isTodoListOpen
+    };
 
     useEffect(() => {
         const handleBackButton = async () => {
             const state = backHandlerStateRef.current;
+            const app = backHandlersRef.current;
             logger.log('debug', '[App] Back/Escape action, state:', state);
 
             if (state.incomingCall) {
                 setIncomingCall(null);
             } else if (state.isVoiceMode) {
                 setIsVoiceMode(false);
-            } else if (state.pendingToolCall) {
-                chat.handleConfirmTool(false, false);
+            } else if (app?.closeOverlay()) {
+                // Tool confirmation (denied) or image studio closed
             } else if (state.isSettingsOpen) {
                 setIsSettingsOpen(false);
             } else if (state.isThreadListOpen) {
@@ -110,7 +131,10 @@ export const useAppInteractions = (chat: any) => {
             } else if (state.isTodoListOpen) {
                 setIsTodoListOpen(false);
             } else if (state.isMeetingMode) {
-                setIsMeetingMode(false);
+                // Meeting mode closes itself when it registered a guarded close (active recording)
+                if (runBackHandler('meeting') === undefined) setIsMeetingMode(false);
+            } else if (app?.navigateBack()) {
+                // Feed thread closed, or back to the chat tab
             } else if (!isDesktop()) {
                 CapacitorApp.exitApp();
             }
@@ -130,7 +154,7 @@ export const useAppInteractions = (chat: any) => {
                 listener.then(handle => handle.remove());
             };
         }
-    }, [chat]);
+    }, [backHandlersRef]);
 
     return {
         isSettingsOpen, setIsSettingsOpen,

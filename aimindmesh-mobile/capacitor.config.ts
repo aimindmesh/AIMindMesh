@@ -13,9 +13,7 @@ const config: CapacitorConfig = {
   android: {
     // Allow WebView to access microphone and camera
     allowMixedContent: true,
-    // Grant WebView permissions for getUserMedia
-    // Grant WebView permissions for getUserMedia
-    webContentsDebuggingEnabled: true,
+    // webContentsDebuggingEnabled is left unset: Capacitor enables chrome://inspect on debug builds only
     loggingBehavior: 'none'
   },
   plugins: {

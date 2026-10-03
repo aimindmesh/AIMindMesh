@@ -23,8 +23,8 @@ import java.util.List;
 public class VADPlugin extends Plugin {
     private static final String TAG = "VADPlugin";
 
-    private SileroVAD vadModel;
-    private boolean isModelLoaded = false;
+    private volatile SileroVAD vadModel;
+    private volatile boolean isModelLoaded = false;
 
     @Override
     public void load() {
@@ -40,54 +40,66 @@ public class VADPlugin extends Plugin {
             return;
         }
 
-        try {
-            // Resolve path relative to app's files directory
-            File filesDir = getContext().getFilesDir();
-            File modelFile = new File(filesDir, modelPath);
+        // Off the shared plugin thread: session creation (and waiting for a running
+        // processFile to release the old model) can take a while
+        new Thread(() -> {
+            try {
+                // Resolve path relative to app's files directory
+                File filesDir = getContext().getFilesDir();
+                File modelFile = new File(filesDir, modelPath);
 
-            if (!modelFile.exists()) {
-                call.reject("Model file not found: " + modelFile.getAbsolutePath());
-                return;
+                if (!modelFile.exists()) {
+                    call.reject("Model file not found: " + modelFile.getAbsolutePath());
+                    return;
+                }
+
+                Log.i(TAG, "Loading VAD model: " + modelFile.getAbsolutePath());
+
+                // Initialize VAD model
+                SileroVAD previous = vadModel;
+                vadModel = null;
+                isModelLoaded = false;
+                if (previous != null) {
+                    previous.release();
+                }
+
+                SileroVAD model = new SileroVAD(getContext());
+                boolean success = model.loadModel(modelFile.getAbsolutePath());
+
+                if (success) {
+                    vadModel = model;
+                    isModelLoaded = true;
+                    Log.i(TAG, "VAD model loaded successfully");
+                    call.resolve();
+                } else {
+                    call.reject("Failed to load VAD model");
+                }
+
+            } catch (Exception e) {
+                Log.e(TAG, "Error loading model", e);
+                call.reject("Failed to load model: " + e.getMessage());
             }
-
-            Log.i(TAG, "Loading VAD model: " + modelFile.getAbsolutePath());
-
-            // Initialize VAD model
-            if (vadModel != null) {
-                vadModel.release();
-            }
-
-            vadModel = new SileroVAD(getContext());
-            boolean success = vadModel.loadModel(modelFile.getAbsolutePath());
-
-            if (success) {
-                isModelLoaded = true;
-                Log.i(TAG, "VAD model loaded successfully");
-                call.resolve();
-            } else {
-                call.reject("Failed to load VAD model");
-            }
-
-        } catch (Exception e) {
-            Log.e(TAG, "Error loading model", e);
-            call.reject("Failed to load model: " + e.getMessage());
-        }
+        }).start();
     }
 
     @PluginMethod
     public void unloadModel(PluginCall call) {
-        try {
-            if (vadModel != null) {
-                vadModel.release();
-                vadModel = null;
+        SileroVAD previous = vadModel;
+        vadModel = null;
+        isModelLoaded = false;
+        // release() waits for a running processFile, so keep it off the plugin thread
+        new Thread(() -> {
+            try {
+                if (previous != null) {
+                    previous.release();
+                }
+                Log.i(TAG, "VAD model unloaded");
+                call.resolve();
+            } catch (Exception e) {
+                Log.e(TAG, "Error unloading model", e);
+                call.reject("Failed to unload model: " + e.getMessage());
             }
-            isModelLoaded = false;
-            Log.i(TAG, "VAD model unloaded");
-            call.resolve();
-        } catch (Exception e) {
-            Log.e(TAG, "Error unloading model", e);
-            call.reject("Failed to unload model: " + e.getMessage());
-        }
+        }).start();
     }
 
     @PluginMethod
@@ -99,6 +111,7 @@ public class VADPlugin extends Plugin {
 
     @PluginMethod
     public void setThresholds(PluginCall call) {
+        final SileroVAD vadModel = this.vadModel;
         if (vadModel == null) {
             call.reject("Model not loaded. Call loadModel first.");
             return;
@@ -123,6 +136,7 @@ public class VADPlugin extends Plugin {
 
     @PluginMethod
     public void processSamples(PluginCall call) {
+        final SileroVAD vadModel = this.vadModel;
         if (!isModelLoaded || vadModel == null) {
             call.reject("Model not loaded. Call loadModel first.");
             return;
@@ -168,6 +182,7 @@ public class VADPlugin extends Plugin {
 
     @PluginMethod
     public void processFile(PluginCall call) {
+        final SileroVAD vadModel = this.vadModel;
         if (!isModelLoaded || vadModel == null) {
             call.reject("Model not loaded. Call loadModel first.");
             return;
@@ -221,6 +236,7 @@ public class VADPlugin extends Plugin {
 
     @PluginMethod
     public void reset(PluginCall call) {
+        final SileroVAD vadModel = this.vadModel;
         if (vadModel != null) {
             vadModel.reset();
         }
@@ -279,11 +295,12 @@ public class VADPlugin extends Plugin {
 
     @Override
     protected void handleOnDestroy() {
-        if (vadModel != null) {
-            vadModel.release();
-            vadModel = null;
-        }
+        final SileroVAD previous = vadModel;
+        vadModel = null;
         isModelLoaded = false;
+        if (previous != null) {
+            new Thread(previous::release).start();
+        }
         super.handleOnDestroy();
     }
 }

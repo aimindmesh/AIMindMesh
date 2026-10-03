@@ -1,6 +1,7 @@
 import { logger } from '../logger';
 import { IncrementalStrategy } from './clustering/IncrementalStrategy';
 import { StoredEmbedding } from './clustering/types';
+import { alignClusterLabels } from './labelAlignment';
 
 /**
  * Speaker embedding identification using cosine similarity.
@@ -395,30 +396,37 @@ export class SpeakerEmbedding {
                 logCallback: this.logCallback
             });
 
-            // Update internal centroids with clustering results
-            if (result.centroids.length > 0) {
-                const newSpeakers: number[][] = [];
-                if (this.hasUserEnrolled && this.userProfile) {
-                    newSpeakers.push([...this.userProfile]);
-                }
-                for (const centroid of result.centroids) {
-                    if (centroid.length > 0) {
-                        newSpeakers.push([...centroid]);
-                    }
-                }
-                if (newSpeakers.length > 0 && newSpeakers.length <= this.sessionEmbeddings.length) {
-                    this.speakers = newSpeakers;
-                    this.logCallback(`Centroids updated: ${newSpeakers.length} speakers (was ${result.speakerCount})`);
-                }
+            // Cluster numbers are arbitrary: map them onto the ids already in use, so the user
+            // stays Speaker 0 and renamed speakers keep their names after the correction.
+            const pairs = stored
+                .filter(e => result.speakerAssignments.has(e.id))
+                .map(e => ({ previous: e.originalSpeakerId, cluster: result.speakerAssignments.get(e.id)! }));
+            const labels = alignClusterLabels(pairs, this.speakers.length);
+            const userProtected = this.hasUserEnrolled && !!this.userProfile;
+
+            // Speakers absent from this session keep their centroid
+            const newSpeakers = this.speakers.map(s => [...s]);
+            result.centroids.forEach((centroid, clusterId) => {
+                const speakerId = labels.get(clusterId);
+                if (speakerId === undefined || centroid.length === 0) return;
+                if (speakerId === 0 && userProtected) return; // enrolled profile never drifts
+                newSpeakers[speakerId] = [...centroid];
+            });
+            // Array.from turns holes into undefined (every() would skip them)
+            if (Array.from(newSpeakers, s => Array.isArray(s)).every(Boolean)) {
+                this.speakers = newSpeakers;
+                this.logCallback(`Centroids updated: ${newSpeakers.length} speakers (${result.speakerCount} clusters)`);
             }
 
-            // Build corrections map: segmentId → clusterId.
-            // The clusterId is offset by 1 if user profile occupies index 0,
-            // keeping speaker IDs consistent with the rest of the system.
             const corrections = new Map<string, number>();
-            const userProfileOffset = (this.hasUserEnrolled && this.userProfile) ? 1 : 0;
             for (const [embId, clusterId] of result.speakerAssignments) {
-                corrections.set(embId, clusterId + userProfileOffset);
+                const speakerId = labels.get(clusterId);
+                if (speakerId !== undefined) corrections.set(embId, speakerId);
+            }
+            // Later re-clusters align against the corrected labels
+            for (const e of this.sessionEmbeddings) {
+                const corrected = corrections.get(e.id);
+                if (corrected !== undefined) e.speakerId = corrected;
             }
 
             return corrections;

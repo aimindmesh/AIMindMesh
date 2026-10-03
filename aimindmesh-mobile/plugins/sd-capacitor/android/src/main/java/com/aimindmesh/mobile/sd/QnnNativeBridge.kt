@@ -5,9 +5,48 @@ import android.util.Log
 import org.json.JSONObject
 import java.io.File
 
+/** Shapes and optional parts of the loaded package, as the native engine read them from the binaries. */
+data class SDModelInfo(
+    val seqLen: Int = 77,
+    val embedDim: Int = 1024,
+    val latentChannels: Int = 4,
+    val latentHeight: Int = 64,
+    val latentWidth: Int = 64,
+    val imageWidth: Int = 512,
+    val imageHeight: Int = 512,
+    val timestepMax: Int = 999,
+    val hasVaeEncoder: Boolean = false,
+    val hasSuperResolution: Boolean = false,
+    val superResolutionWidth: Int = 0,
+    val superResolutionHeight: Int = 0,
+    val unetQuantized: Boolean = false
+) {
+    val latentSize get() = latentChannels * latentHeight * latentWidth
+
+    companion object {
+        fun parse(json: String): SDModelInfo = JSONObject(json).run {
+            SDModelInfo(
+                seqLen = optInt("seqLen", 77),
+                embedDim = optInt("embedDim", 1024),
+                latentChannels = optInt("latentChannels", 4),
+                latentHeight = optInt("latentHeight", 64),
+                latentWidth = optInt("latentWidth", 64),
+                imageWidth = optInt("imageWidth", 512),
+                imageHeight = optInt("imageHeight", 512),
+                timestepMax = optDouble("timestepMax", 999.0).toInt(),
+                hasVaeEncoder = optBoolean("hasVaeEncoder", false),
+                hasSuperResolution = optBoolean("hasSuperResolution", false),
+                superResolutionWidth = optInt("superResolutionWidth", 0),
+                superResolutionHeight = optInt("superResolutionHeight", 0),
+                unetQuantized = optBoolean("unetQuantized", false)
+            )
+        }
+    }
+}
+
 /**
- * Qualcomm QNN / Hexagon HTP native runtime bridge and quantization interface.
- * Connects directly to libqnn_sd_jni.so for on-device NPU graph execution.
+ * Qualcomm QNN / Hexagon HTP runtime bridge (libqnn_sd_jni.so). Latents are NHWC floats,
+ * images RGB bytes; the native side converts to whatever each graph declares.
  */
 class QnnNativeBridge(private val context: Context) {
     companion object {
@@ -27,23 +66,18 @@ class QnnNativeBridge(private val context: Context) {
 
     private external fun nativeInit(modelDirPath: String, nativeLibDir: String): Boolean
     private external fun nativeIsReady(): Boolean
+    private external fun nativeModelInfo(): String
     private external fun nativeRunTextEncoder(tokens: IntArray): FloatArray?
     private external fun nativeRunUnet(latent: FloatArray, timestep: Float, textEmb: FloatArray): FloatArray?
     private external fun nativeRunVae(latent: FloatArray): ByteArray?
     private external fun nativeRunVaeEncoder(rgbBytes: ByteArray): FloatArray?
     private external fun nativeHasVaeEncoder(): Boolean
-    private external fun nativeRunSuperResolution(inRgb512: ByteArray): ByteArray?
+    private external fun nativeRunSuperResolution(rgb: ByteArray): ByteArray?
     private external fun nativeHasSuperResolution(): Boolean
     private external fun nativeRelease()
 
-    private var modelDir: File? = null
-    private var isNativeReady = false
-
-    /**
-     * Load model configuration and initialize native QNN context binaries.
-     */
+    /** Loads the context binaries of a package directory onto the NPU. */
     fun initializeFromDirectory(dir: File): Boolean {
-        modelDir = dir
         try {
             com.geniex.sdk.GenieXSdk.getInstance().init(
                 context,
@@ -56,16 +90,12 @@ class QnnNativeBridge(private val context: Context) {
                     }
                 }
             )
-
-            val nativeLibDirFile = File(context.applicationInfo.nativeLibraryDir)
-            if (nativeLibDirFile.exists() && nativeLibDirFile.isDirectory) {
-                nativeLibDirFile.listFiles()?.forEach { libFile ->
-                    if (libFile.name.startsWith("libgeniex_plugin_") && libFile.name.endsWith(".so")) {
-                        try {
-                            com.geniex.sdk.GenieXSdk.getInstance().registerPlugin(libFile.absolutePath)
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Plugin registration exception for ${libFile.name}", e)
-                        }
+            File(context.applicationInfo.nativeLibraryDir).listFiles()?.forEach { libFile ->
+                if (libFile.name.startsWith("libgeniex_plugin_") && libFile.name.endsWith(".so")) {
+                    try {
+                        com.geniex.sdk.GenieXSdk.getInstance().registerPlugin(libFile.absolutePath)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Plugin registration exception for ${libFile.name}", e)
                     }
                 }
             }
@@ -73,123 +103,57 @@ class QnnNativeBridge(private val context: Context) {
             Log.w(TAG, "GenieXSdk initialization check in SD bridge", e)
         }
 
-        if (isJniLoaded) {
-            try {
-                val nativeLibDir = context.applicationInfo.nativeLibraryDir ?: ""
-                isNativeReady = nativeInit(dir.absolutePath, nativeLibDir)
-                Log.i(TAG, "nativeInit for QNN context binary returned: $isNativeReady (nativeLibDir: $nativeLibDir)")
-                if (isNativeReady) {
-                    return true
-                }
-            } catch (e: Throwable) {
-                Log.e(TAG, "Exception in nativeInit", e)
-            }
+        if (!isJniLoaded) return false
+        return try {
+            val ready = nativeInit(dir.absolutePath, context.applicationInfo.nativeLibraryDir ?: "")
+            Log.i(TAG, "nativeInit returned $ready")
+            ready
+        } catch (e: Throwable) {
+            Log.e(TAG, "Exception in nativeInit", e)
+            false
         }
-        return isNativeReady
     }
 
-    fun isReady(): Boolean = isNativeReady
+    // The QNN engine is a process-wide native singleton: ask it, so a bridge created after an
+    // Activity recreation sees the pipeline loaded by the previous one
+    fun isReady(): Boolean = isJniLoaded && nativeIsReady()
 
-    /**
-     * Run CLIP Text Encoder graph (text_encoder.bin): tokens [1, 77] -> text_embedding [1, 77, 1024]
-     */
-    fun runTextEncoder(tokens: IntArray): FloatArray {
-        if (isJniLoaded && isNativeReady) {
-            val result = nativeRunTextEncoder(tokens)
-            if (result != null && result.isNotEmpty()) {
-                return result
-            }
-        }
-        Log.w(TAG, "Native TextEncoder returned null, using initialized zero embedding")
-        return FloatArray(77 * 1024)
+    fun modelInfo(): SDModelInfo = SDModelInfo.parse(if (isReady()) nativeModelInfo() else "{}")
+
+    fun runTextEncoder(tokens: IntArray): FloatArray =
+        (if (isReady()) nativeRunTextEncoder(tokens) else null)
+            ?: throw IllegalStateException("Stable Diffusion text encoder failed on the NPU")
+
+    fun runUnet(latent: FloatArray, timestep: Float, textEmbedding: FloatArray): FloatArray =
+        (if (isReady()) nativeRunUnet(latent, timestep, textEmbedding) else null)
+            ?: throw IllegalStateException("Stable Diffusion UNet failed on the NPU")
+
+    /** RGB bytes of the decoded image */
+    fun runVaeDecoder(latent: FloatArray): ByteArray =
+        (if (isReady()) nativeRunVae(latent) else null)
+            ?: throw IllegalStateException("Stable Diffusion VAE decoder failed on the NPU")
+
+    /** Latent of an RGB image (image editing) */
+    fun runVaeEncoder(rgbBytes: ByteArray): FloatArray =
+        (if (hasVaeEncoder()) nativeRunVaeEncoder(rgbBytes) else null)
+            ?: throw IllegalStateException("Stable Diffusion VAE encoder failed on the NPU")
+
+    fun hasVaeEncoder(): Boolean = isReady() && nativeHasVaeEncoder()
+
+    /** Real-ESRGAN on the NPU; null when the model is missing or fails (callers fall back to filtering). */
+    fun runSuperResolution(rgb: ByteArray): ByteArray? {
+        if (!hasSuperResolution()) return null
+        return nativeRunSuperResolution(rgb).also { if (it == null) Log.e(TAG, "Real-ESRGAN failed on the NPU") }
     }
 
-    /**
-     * Run UNet graph (unet.bin): [1, 64, 64, 4] -> output_latent [1, 64, 64, 4]
-     */
-    fun runUnet(
-        latent: FloatArray,
-        timestep: Float,
-        textEmbedding: FloatArray
-    ): FloatArray {
-        if (isJniLoaded && isNativeReady) {
-            val result = nativeRunUnet(latent, timestep, textEmbedding)
-            if (result != null && result.isNotEmpty()) {
-                return result
-            }
-        }
-        Log.w(TAG, "Native UNet returned null")
-        return FloatArray(latent.size)
-    }
-
-    /**
-     * Run VAE Decoder graph (vae.bin): latent [1, 64, 64, 4] -> RGB image [512, 512, 3] bytes
-     */
-    fun runVaeDecoder(latent: FloatArray): ByteArray {
-        if (isJniLoaded && isNativeReady) {
-            val result = nativeRunVae(latent)
-            if (result != null && result.isNotEmpty()) {
-                return result
-            }
-        }
-        Log.w(TAG, "Native VAE returned null")
-        return ByteArray(512 * 512 * 3)
-    }
-
-    /**
-     * Run VAE Encoder graph (vae_encoder.bin): RGB image [512, 512, 3] bytes -> latent [1, 64, 64, 4]
-     * Returns null if the encoder model was not loaded.
-     */
-    fun runVaeEncoder(rgbBytes: ByteArray): FloatArray? {
-        if (!isJniLoaded || !isNativeReady) {
-            Log.w(TAG, "runVaeEncoder: engine not ready")
-            return null
-        }
-        if (!nativeHasVaeEncoder()) {
-            Log.w(TAG, "runVaeEncoder: VAE encoder model not loaded")
-            return null
-        }
-        val result = nativeRunVaeEncoder(rgbBytes)
-        if (result == null) {
-            Log.e(TAG, "nativeRunVaeEncoder returned null")
-        }
-        return result
-    }
-
-    /** Returns true if the VAE encoder binary was successfully loaded. */
-    fun hasVaeEncoder(): Boolean = isJniLoaded && isNativeReady && nativeHasVaeEncoder()
-
-    /**
-     * Run Real-ESRGAN x4plus Super-Resolution on Qualcomm Hexagon NPU:
-     * inRgb512 [512, 512, 3] -> outRgb2048 [2048, 2048, 3] bytes.
-     */
-    fun runSuperResolution(rgb512: ByteArray): ByteArray? {
-        if (!isJniLoaded || !isNativeReady) {
-            Log.w(TAG, "runSuperResolution: engine not ready")
-            return null
-        }
-        if (!nativeHasSuperResolution()) {
-            Log.w(TAG, "runSuperResolution: Real-ESRGAN model not loaded")
-            return null
-        }
-        val result = nativeRunSuperResolution(rgb512)
-        if (result == null) {
-            Log.e(TAG, "nativeRunSuperResolution returned null")
-        }
-        return result
-    }
-
-    /** Returns true if the Real-ESRGAN super resolution binary was successfully loaded. */
-    fun hasSuperResolution(): Boolean = isJniLoaded && isNativeReady && nativeHasSuperResolution()
+    fun hasSuperResolution(): Boolean = isReady() && nativeHasSuperResolution()
 
     fun release() {
-        if (isJniLoaded) {
-            try {
-                nativeRelease()
-                isNativeReady = false
-            } catch (e: Throwable) {
-                Log.e(TAG, "Exception in nativeRelease", e)
-            }
+        if (!isJniLoaded) return
+        try {
+            nativeRelease()
+        } catch (e: Throwable) {
+            Log.e(TAG, "Exception in nativeRelease", e)
         }
     }
 }

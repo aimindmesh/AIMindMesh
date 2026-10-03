@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Vosk } from 'vosk-capacitor';
 import { SpeakerEmbedding as SpeakerEmbeddingPlugin } from 'speaker-embedding-capacitor';
 import { logger } from '../../services/logger';
@@ -8,19 +8,17 @@ import { MeetingSettingsState } from './useMeetingSettings';
 interface UseMeetingInitializationProps {
     settings: MeetingSettingsState;
     showToast: (message: string, type: 'success' | 'error' | 'info') => void;
-    transcript: any[]; // Depencency for effect
-    currentText: string; // Dependency for effect
 }
 
 export function useMeetingInitialization({
     settings,
-    showToast,
-    transcript,
-    currentText
+    showToast
 }: UseMeetingInitializationProps) {
     const [isModelLoading, setIsModelLoading] = useState(false);
+    const onnxLoadingRef = useRef(false);
 
-    // Init and Model Loading
+    // Init and model loading: once per mode change. It used to re-run on every transcript change
+    // and partial result, starting concurrent ONNX loads that raced in the native session.
     useEffect(() => {
         const init = async () => {
             // Permission check for Vosk/Recorder
@@ -34,7 +32,8 @@ export function useMeetingInitialization({
             }
 
             // ONNX Speaker Model Loading
-            if (settings.recognitionMode === 'precise') {
+            if (settings.recognitionMode === 'precise' && !onnxLoadingRef.current) {
+                onnxLoadingRef.current = true;
                 try {
                     const status = await SpeakerEmbeddingPlugin.isModelLoaded();
                     if (!status.loaded) {
@@ -44,12 +43,14 @@ export function useMeetingInitialization({
                     }
                 } catch (e) {
                     logger.log('error', 'Failed to load ONNX model on init', e);
+                } finally {
+                    onnxLoadingRef.current = false;
                 }
             }
         };
 
         init();
-    }, [transcript, currentText, settings.recognitionMode]);
+    }, [settings.recognitionMode]);
 
     // Pre-load Whisper Model when mode changes
     useEffect(() => {

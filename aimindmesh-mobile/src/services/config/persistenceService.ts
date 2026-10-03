@@ -3,6 +3,50 @@ import { isDesktop } from '../../utils/platform';
 import { logger } from '../logger';
 
 const SETTINGS_FILE = 'app-settings.json';
+/** Changes made within this delay are written together (a settings save changes ~25 keys) */
+const WRITE_DELAY_MS = 250;
+
+/**
+ * In-memory copy of the file: every change goes into it and one writer saves it.
+ * Separate read-modify-write cycles per key used to overwrite each other's changes.
+ */
+let cache: Record<string, any> | null = null;
+let loading: Promise<Record<string, any>> | null = null;
+let writeTimer: ReturnType<typeof setTimeout> | null = null;
+let writing: Promise<void> = Promise.resolve();
+
+async function readSettingsFile(): Promise<Record<string, any>> {
+    if (!(await isSettingsFileExists())) return {};
+    const result = await Filesystem.readFile({
+        path: SETTINGS_FILE,
+        directory: Directory.Data,
+        encoding: Encoding.UTF8
+    });
+    return JSON.parse(result.data as string);
+}
+
+/** The cached settings, read from disk the first time */
+function loadCache(): Promise<Record<string, any>> {
+    if (cache) return Promise.resolve(cache);
+    if (!loading) {
+        loading = readSettingsFile()
+            .catch(() => ({})) // unreadable: start fresh
+            .then(settings => {
+                // Changes made while the file was being read win over its content
+                cache = { ...settings, ...(cache ?? {}) };
+                return cache;
+            });
+    }
+    return loading;
+}
+
+function scheduleWrite() {
+    if (writeTimer) clearTimeout(writeTimer);
+    writeTimer = setTimeout(() => {
+        writeTimer = null;
+        void PersistenceService.flush();
+    }, WRITE_DELAY_MS);
+}
 
 /**
  * Service to handle persistent settings on Desktop.
@@ -23,17 +67,12 @@ export const PersistenceService = {
                 return;
             }
 
-            const result = await Filesystem.readFile({
-                path: SETTINGS_FILE,
-                directory: Directory.Data,
-                encoding: Encoding.UTF8
-            });
-
-            const settings = JSON.parse(result.data as string);
+            const settings = await readSettingsFile();
+            cache = { ...settings, ...(cache ?? {}) };
 
             // Populate localStorage
             Object.keys(settings).forEach(key => {
-                // specific check to avoid overwriting session data if needed, 
+                // specific check to avoid overwriting session data if needed,
                 // but generally we want to restore everything saved.
                 localStorage.setItem(key, JSON.stringify(settings[key]));
             });
@@ -44,76 +83,59 @@ export const PersistenceService = {
         }
     },
 
-    /**
-     * Save a specific key-value pair to disk.
-     * This reads the current file, updates the key, and writes back.
-     * Note: This is not atomic and could be slow for frequent updates.
-     * Ideally, we should debounce this or keep an in-memory copy.
-     */
+    /** Save a specific key-value pair to disk (written shortly after, with other changes) */
     saveItem: async (key: string, value: any) => {
         if (!isDesktop()) return;
-
-        try {
-            // Optimization: Keep a cached version in memory? 
-            // For now, read-modify-write for safety.
-            let settings: Record<string, any> = {};
-
-            try {
-                const exists = await isSettingsFileExists();
-                if (exists) {
-                    const result = await Filesystem.readFile({
-                        path: SETTINGS_FILE,
-                        directory: Directory.Data,
-                        encoding: Encoding.UTF8
-                    });
-                    settings = JSON.parse(result.data as string);
-                }
-            } catch (readError) {
-                // ignore, start fresh
-            }
-
-            settings[key] = value;
-
-            await Filesystem.writeFile({
-                path: SETTINGS_FILE,
-                data: JSON.stringify(settings, null, 2),
-                directory: Directory.Data,
-                encoding: Encoding.UTF8
-            });
-        } catch (error) {
-            console.error('Persistence: Failed to save item', key, error);
-        }
+        const settings = cache ?? await loadCache();
+        settings[key] = value;
+        scheduleWrite();
     },
 
-    /**
-     * Remove item from disk.
-     */
+    /** Remove item from disk. */
     removeItem: async (key: string) => {
         if (!isDesktop()) return;
-        try {
-            const exists = await isSettingsFileExists();
-            if (!exists) return;
+        const settings = cache ?? await loadCache();
+        if (!(key in settings)) return;
+        delete settings[key];
+        scheduleWrite();
+    },
 
-            const result = await Filesystem.readFile({
-                path: SETTINGS_FILE,
-                directory: Directory.Data,
-                encoding: Encoding.UTF8
-            });
-            const settings = JSON.parse(result.data as string);
-
-            delete settings[key];
-
-            await Filesystem.writeFile({
-                path: SETTINGS_FILE,
-                data: JSON.stringify(settings, null, 2),
-                directory: Directory.Data,
-                encoding: Encoding.UTF8
-            });
-        } catch (error) {
-            console.error('Persistence: Failed to remove item', key, error);
+    /** Writes pending changes now; writes never overlap */
+    flush: (): Promise<void> => {
+        if (writeTimer) {
+            clearTimeout(writeTimer);
+            writeTimer = null;
         }
+        writing = writing.then(async () => {
+            if (!cache) return;
+            try {
+                await Filesystem.writeFile({
+                    path: SETTINGS_FILE,
+                    data: JSON.stringify(cache, null, 2),
+                    directory: Directory.Data,
+                    encoding: Encoding.UTF8
+                });
+            } catch (error) {
+                console.error('Persistence: Failed to save settings', error);
+            }
+        });
+        return writing;
+    },
+
+    /** For tests: forget the in-memory copy */
+    resetForTests: () => {
+        if (writeTimer) clearTimeout(writeTimer);
+        writeTimer = null;
+        cache = null;
+        loading = null;
+        writing = Promise.resolve();
     }
 };
+
+// Pending changes are written before the window goes away
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('pagehide', () => { if (writeTimer) void PersistenceService.flush(); });
+}
 
 async function isSettingsFileExists() {
     try {

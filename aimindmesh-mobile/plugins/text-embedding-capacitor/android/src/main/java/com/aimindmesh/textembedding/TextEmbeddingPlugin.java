@@ -64,7 +64,9 @@ public class TextEmbeddingPlugin extends Plugin {
         JSObject ret = new JSObject();
         ret.put("loaded", embedder.isModelLoaded());
         ret.put("dimension", embedder.getEmbeddingDimension());
-        ret.put("modelId", currentModelId);
+        // Directory actually loaded (JS reloads when it differs from the selected model)
+        String loadedDir = embedder.getLoadedModelDir();
+        ret.put("modelId", loadedDir != null ? loadedDir : "");
         call.resolve(ret);
     }
 
@@ -292,8 +294,13 @@ public class TextEmbeddingPlugin extends Plugin {
         try {
             java.util.zip.ZipEntry ze;
             byte[] buffer = new byte[8192];
+            String targetPath = targetDirectory.getCanonicalPath() + java.io.File.separator;
             while ((ze = zis.getNextEntry()) != null) {
                 java.io.File file = new java.io.File(targetDirectory, ze.getName());
+                // Reject entries like "../x" that would be written outside the model directory
+                if (!file.getCanonicalPath().startsWith(targetPath)) {
+                    throw new java.io.IOException("ZIP entry outside the model directory: " + ze.getName());
+                }
                 java.io.File dir = ze.isDirectory() ? file : file.getParentFile();
                 if (!dir.isDirectory() && !dir.mkdirs()) {
                     throw new java.io.FileNotFoundException("Failed to ensure directory: " + dir.getAbsolutePath());

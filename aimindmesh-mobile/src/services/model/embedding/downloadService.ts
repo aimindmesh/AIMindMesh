@@ -144,11 +144,12 @@ export async function downloadEmbeddingModel(
             encoding: Encoding.UTF8
         });
 
-        // 3. Save config for dimension if needed (optional)
+        // 3. Save config: dimension and input limit (without the limit the native side used
+        //    to truncate every text to 128 tokens; all catalog models have 512 positions)
         const configPath = `${modelDir}/config.json`;
         await Filesystem.writeFile({
             path: configPath,
-            data: JSON.stringify({ hidden_size: modelDef.dimension }),
+            data: JSON.stringify({ hidden_size: modelDef.dimension, max_position_embeddings: 512 }),
             directory: Directory.Data,
             encoding: Encoding.UTF8
         });

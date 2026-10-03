@@ -1,13 +1,10 @@
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
-import { exec } from 'child_process';
-import { promisify } from 'util';
 import { Logger } from '../utils/Logger';
 import { config } from '../config';
 import { CodeGenerationOutput } from './CodeGenerationTask';
-
-const execAsync = promisify(exec);
+import { isSelfRepo, normalizeRepoPath } from './evolution/EvolutionPathPolicy';
+import { typecheckPatch, PatchFile, TypecheckResult } from './evolution/PatchTypeChecker';
 
 export interface ValidationResult {
   passed: boolean;
@@ -33,8 +30,10 @@ export class ValidationLayer {
     originalContent?: string,
     options?: {
       feedbacks?: import('./FeedbackService').FeedbackRecord[];
+      repository?: string;
     }
   ): Promise<ValidationResult> {
+    const repository = options?.repository ?? 'AIMindMesh';
     const ext = path.extname(targetComponent).toLowerCase();
     const isJSorTS = ['.ts', '.tsx', '.js', '.jsx'].includes(ext);
     const warnings: string[] = [];
@@ -101,56 +100,52 @@ export class ValidationLayer {
     }
 
     const steps: ValidationStep[] = [];
-    const tempDir = await this.writeTempFiles(targetComponent, output);
 
-    try {
-      if (isJSorTS) {
-        // Step 1: TypeScript type check
-        steps.push(await this.runStep(
-          'TypeScript type check',
-          `npx tsc --noEmit --strict`,
-          { cwd: this.repoPath }
-        ));
-
-        // Step 2: ESLint
-        steps.push(await this.runStep(
-          'ESLint',
-          `npx eslint ${tempDir}/${path.basename(targetComponent)} --max-warnings 10`,
-          { cwd: this.repoPath }
-        ));
-      } else {
-        Logger.info('ValidationLayer', `Skipping TS/ESLint validation for non-JS/TS file: ${ext}`);
+    if (ext === '.json') {
+      try {
+        JSON.parse(output.modifiedFileContent);
+      } catch (err: any) {
+        errors.push(`Generated JSON is not valid: ${err.message}`);
       }
-    } catch (err: any) {
-      Logger.error('ValidationLayer', `Validation process crashed: ${err.message}`);
-    } finally {
-      // Clean up temp files
-      await fs.promises.rm(tempDir, { recursive: true, force: true });
     }
 
-    // Process steps to separate blocking errors from warnings
-    for (const step of steps) {
-      if (!step.passed) {
-        const outputText = step.output;
-        
-        // Ignore ESLint config errors
-        if (outputText.includes('ESLint couldn\'t find an eslint.config')) continue;
-
-        // Check if TSC failure is just because of missing modules (new dependencies)
-        if (step.name === 'TypeScript type check' && newDeps.length > 0) {
-          const missingModuleErrors = newDeps.some(dep => 
-            outputText.includes(`Cannot find module '${dep}'`) || 
-            outputText.includes(`Could not find a declaration file for module '${dep}'`)
-          );
-          
-          if (missingModuleErrors) {
-            warnings.push(`TSC failed because of new dependencies: ${step.output.slice(0, 300)}...`);
-            continue;
-          }
-        }
-
-        errors.push(`${step.name}: ${step.output.slice(0, 500)}`);
+    if (isJSorTS) {
+      // Type-check the patched sources (not the unmodified repo)
+      const start = Date.now();
+      let result: TypecheckResult;
+      try {
+        result = await typecheckPatch(this.repoPath, this.collectPatchFiles(repository, targetComponent, output), this.TIMEOUT_MS);
+      } catch (err: any) {
+        result = { status: 'failed', errors: [`Type check could not complete: ${err.message}`], checkedFiles: [] };
       }
+
+      if (result.status === 'skipped') {
+        warnings.push(`${targetComponent} was not type-checked: only aimindmesh-server/src TypeScript files of the AIMindMesh repository can be.`);
+      } else if (result.status === 'unavailable') {
+        // Fail closed: a server TS change must never be proposed unchecked
+        errors.push(`TypeScript type check unavailable: ${result.errors.join('; ')}`);
+      } else {
+        // Missing-module errors for newly introduced dependencies are expected until "npm install"
+        const isNewDepError = (line: string) => newDeps.some(dep =>
+          line.includes(`Cannot find module '${dep}'`) ||
+          line.includes(`Could not find a declaration file for module '${dep}'`)
+        );
+        const blocking = result.errors.filter(line => !isNewDepError(line));
+        if (blocking.length < result.errors.length) {
+          warnings.push(`TSC reported missing modules for new dependencies: ${newDeps.join(', ')}`);
+        }
+        if (blocking.length > 0) {
+          errors.push(`TypeScript type check: ${blocking.slice(0, 10).join('\n').slice(0, 1500)}`);
+        }
+        steps.push({
+          name: 'TypeScript type check',
+          passed: blocking.length === 0,
+          output: result.errors.join('\n'),
+          durationMs: Date.now() - start
+        });
+      }
+    } else {
+      Logger.info('ValidationLayer', `Skipping TypeScript validation for non-JS/TS file: ${ext}`);
     }
 
     return {
@@ -199,33 +194,6 @@ export class ValidationLayer {
   }
 
 
-  private async runStep(
-    name: string,
-    command: string,
-    options: any
-  ): Promise<ValidationStep> {
-    const start = Date.now();
-    try {
-      const { stdout, stderr } = await execAsync(command, {
-        ...options,
-        timeout: this.TIMEOUT_MS
-      });
-      return {
-        name,
-        passed: true,
-        output: String(stdout) + String(stderr),
-        durationMs: Date.now() - start
-      };
-    } catch (err: any) {
-      return {
-        name,
-        passed: false,
-        output: (err.stdout || '') + (err.stderr || '') + (err.message || ''),
-        durationMs: Date.now() - start
-      };
-    }
-  }
-
   private extractExportedSignatures(content: string): string[] {
     const sigRegex = /export\s+(?:async\s+)?(?:function|class|const|interface|type|enum)\s+(\w+)/g;
     const sigs: string[] = [];
@@ -236,23 +204,22 @@ export class ValidationLayer {
     return sigs;
   }
 
-  private async writeTempFiles(
-
-    targetComponent: string,
-    output: CodeGenerationOutput
-  ): Promise<string> {
-    const tempDir = path.join(os.tmpdir(), `autoevo-${Date.now()}`);
-    await fs.promises.mkdir(tempDir, { recursive: true });
-    await fs.promises.writeFile(
-      path.join(tempDir, path.basename(targetComponent)),
-      output.modifiedFileContent
-    );
+  /** Repo-root paths and contents of every file the proposal would commit (self repo only). */
+  private collectPatchFiles(repository: string, targetComponent: string, output: CodeGenerationOutput): PatchFile[] {
+    if (!isSelfRepo(repository)) return [];
+    const candidates: { path: unknown; content: unknown }[] = [
+      { path: targetComponent, content: output.modifiedFileContent },
+      ...(output.additionalFiles ?? []).map(f => ({ path: f?.path, content: f?.content })),
+    ];
+    // Unit tests are compiled too: tsconfig includes src/**, so a broken test would break the build
     if (output.unitTestContent && output.unitTestPath) {
-      await fs.promises.writeFile(
-        path.join(tempDir, path.basename(output.unitTestPath)),
-        output.unitTestContent
-      );
+      candidates.push({ path: output.unitTestPath, content: output.unitTestContent });
     }
-    return tempDir;
+    const files: PatchFile[] = [];
+    for (const c of candidates) {
+      const normalized = normalizeRepoPath(repository, c.path);
+      if (normalized && typeof c.content === 'string') files.push({ path: normalized, content: c.content });
+    }
+    return files;
   }
 }

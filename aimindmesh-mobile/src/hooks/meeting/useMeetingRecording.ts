@@ -1,589 +1,462 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
+import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 import { Vosk } from 'vosk-capacitor';
 import { isVoskSpeakerModelInstalled } from '../../services/speaker/speakerModelDownloader';
 import { logger } from '../../services/logger';
 import { RecognitionMode, TranscriptionMode, TranscriptSegment } from '../../types/meeting';
-import { HighQualityAudioRecorder, RecordingResult, pcmToBase64 } from '../../services/audio/highQualityAudioRecorder';
+import { HighQualityAudioRecorder, pcmToBase64 } from '../../services/audio/highQualityAudioRecorder';
 import { floatToInt16, arrayBufferToBase64 } from '../../services/audio/audioUtils';
 import AudioConverter from '../../services/audio/audioConverter';
-import { SpeakerEmbedding as SpeakerEmbeddingPlugin } from 'speaker-embedding-capacitor';
+import { meetingAudioConverter } from '../../services/meeting/recordingRecovery';
+import { appendBounded, countSamples, createWavBlobFromFloat32, readRange, readSince } from '../../services/meeting/pcmBuffer';
+import { MeetingTimeline } from '../../services/meeting/meetingTimeline';
+import { startMeetingForegroundService, stopMeetingForegroundService } from '../../services/meeting/meetingForegroundService';
+import { startVoxtralMeeting, stopVoxtralMeeting } from './voxtralMeetingSession';
+import { pin } from '../../services/model/modelOrchestrator';
 
-const MAX_BUFFER_DURATION = 10; // Extended from 5s to 10s: ONNX embeddings need 2.5s window + Vosk finalResult latency
-const MAX_WHISPER_BUFFER_DURATION = 60 * 5; // Keep last 5 minutes for Whisper lookback context during active meeting
+const SAMPLE_RATE = 16000;
+const MAX_BUFFER_DURATION = 10; // ONNX embeddings need a 2.5 s window + Vosk finalResult latency
+const MAX_WHISPER_BUFFER_DURATION = 60 * 5; // Last 5 minutes kept for Whisper during the meeting
+/** Audio reaches JS once per worklet chunk: 1 s keeps speaker-embedding windows on the speech */
+const CHUNK_INTERVAL_SAMPLES = SAMPLE_RATE;
+/** Upper bound for the transcription tails (Whisper, Vosk) before the stop-save */
+const STOP_DRAIN_TIMEOUT_MS = 20000;
+
+export interface RecordingStopResult {
+    /** Native recording file (absent when finalizing it failed) */
+    filePath?: string;
+    /** In-memory WAV of the last minutes, only when there is no file */
+    pcmBlob: Blob | null;
+    durationMs: number;
+}
 
 export interface MeetingRecordingState {
     isRecording: boolean;
     isPaused: boolean;
+    /** Starting or finalizing: a new recording must not start meanwhile */
+    isBusy: boolean;
     audioLevel: number;
-    // Legacy refs exposed for external use (some still needed for ONNX analysis)
-    mediaRecorderRef: React.MutableRefObject<null>; // Deprecated, kept for interface compatibility
-    audioChunksRef: React.MutableRefObject<Blob[]>; // Deprecated
-    audioContextRef: React.MutableRefObject<AudioContext | null>;
-    audioBufferRef: React.MutableRefObject<Float32Array[]>; // For ONNX speaker analysis
-    fullPcmBufferRef: React.MutableRefObject<Float32Array[]>; // For Whisper
-    totalBufferedDurationRef: React.MutableRefObject<number>;
-    recordingStartTimeRef: React.MutableRefObject<number>;
-    animationFrameRef: React.MutableRefObject<number | null>; // Deprecated
-    audioProcessorRef: React.MutableRefObject<AudioWorkletNode | null>;
-    // Actions
-    startRecording: () => Promise<void>;
+    isRecordingRef: MutableRefObject<boolean>;
+    isPausedRef: MutableRefObject<boolean>;
+    isBusyRef: MutableRefObject<boolean>;
+    audioBufferRef: MutableRefObject<Float32Array[]>; // Last seconds, for ONNX speaker analysis
+    totalBufferedDurationRef: MutableRefObject<number>;
+    fullPcmBufferRef: MutableRefObject<Float32Array[]>; // Last minutes, for Whisper
+    recordingStartTimeRef: MutableRefObject<number>;
+    timelineRef: MutableRefObject<MeetingTimeline>;
+    startRecording: () => Promise<boolean>;
     stopRecording: () => Promise<void>;
     togglePause: () => void;
     setAudioLevel: (level: number) => void;
-    getAudioSince: (sampleOffset: number, maxSamples?: number) => { base64: string, newOffset: number };
+    /** Audio from an absolute sample offset (counted from the recording start) */
+    getAudioSince: (sampleOffset: number, maxSamples?: number) => { base64: string; startOffset: number; newOffset: number };
+    /** Absolute [start, end) samples still held in memory */
+    getAudioRange: (startSample: number, endSample: number) => Float32Array;
+    /** Absolute number of samples received so far */
+    getReceivedSamples: () => number;
+    /** Work that must finish before the stop-save (transcription tails); returns the unregister */
+    registerStopDrain: (drain: () => Promise<void>) => () => void;
 }
 
 interface UseMeetingRecordingOptions {
-    recognitionModeRef: React.MutableRefObject<RecognitionMode>;
-    transcriptionModeRef: React.MutableRefObject<TranscriptionMode>;
+    recognitionModeRef: MutableRefObject<RecognitionMode>;
+    transcriptionModeRef: MutableRefObject<TranscriptionMode>;
     showToast: (message: string, type: 'success' | 'error' | 'info') => void;
-    onRecordingStopped?: (audioChunks: Blob[], mimeType: string, pcmBlob?: Blob | null, durationMs?: number, filePath?: string) => Promise<void>;
-    /** Transcript setters for Voxtral real-time transcription */
-    setCurrentText?: (text: string) => void;
-    setTranscript?: React.Dispatch<React.SetStateAction<TranscriptSegment[]>>;
-    diarizationRef?: React.MutableRefObject<any>;
+    onRecordingStopped?: (result: RecordingStopResult) => Promise<void>;
+    /** Transcript setter for Voxtral real-time transcription */
+    setTranscript?: Dispatch<SetStateAction<TranscriptSegment[]>>;
+    diarizationRef?: MutableRefObject<any>;
+    /** Meeting the recording belongs to: written into the native file name for crash recovery */
+    getMeetingId?: () => string | null;
 }
 
 /**
- * Hook for managing meeting audio recording with Vosk integration
- * Uses Web Audio API + AudioWorklet for high-quality 16kHz PCM capture
- * 
- * Audio Flow: Microfono → Web Audio API @ 16kHz → AudioWorklet PCM16 → Whisper.cpp → Testo
+ * Meeting audio recording: AudioWorklet @ 16 kHz streamed to a native file, with Vosk or Voxtral
+ * transcribing alongside. Stopping (or leaving the screen) always finishes the file and hands it
+ * to the saver.
  */
 export function useMeetingRecording({
     recognitionModeRef,
     transcriptionModeRef,
     showToast,
     onRecordingStopped,
-    setCurrentText,
     setTranscript,
-    diarizationRef
+    diarizationRef,
+    getMeetingId
 }: UseMeetingRecordingOptions): MeetingRecordingState {
     const [isRecording, setIsRecording] = useState(false);
     const [isPaused, setIsPaused] = useState(false);
+    const [isBusy, setIsBusy] = useState(false);
     const [audioLevel, setAudioLevel] = useState(0);
 
-    // High-quality audio recorder instance
+    const isRecordingRef = useRef(false);
+    const isPausedRef = useRef(false);
+    const isBusyRef = useRef(false);
+    const unmountedRef = useRef(false);
+    const voskStartedRef = useRef(false);
+    const voxtralStartedRef = useRef(false);
+
     const recorderRef = useRef<HighQualityAudioRecorder | null>(null);
+    const audioBufferRef = useRef<Float32Array[]>([]);
+    const fullPcmBufferRef = useRef<Float32Array[]>([]);
+    const droppedSamplesRef = useRef(0);
+    const totalBufferedDurationRef = useRef(0);
+    const recordingStartTimeRef = useRef(0);
+    const timelineRef = useRef(new MeetingTimeline());
+    const drainsRef = useRef(new Set<() => Promise<void>>());
 
-    // Refs for audio processing and analysis
-    const audioContextRef = useRef<AudioContext | null>(null);
-    const audioBufferRef = useRef<Float32Array[]>([]); // Ring buffer for ONNX speaker analysis
-    const fullPcmBufferRef = useRef<Float32Array[]>([]); // Full recording for Whisper
-    const totalBufferedDurationRef = useRef<number>(0);
-    const recordingStartTimeRef = useRef<number>(0);
-    const audioProcessorRef = useRef<AudioWorkletNode | null>(null);
+    // Callbacks read through refs: the unmount path runs after the last render
+    const onStoppedRef = useRef(onRecordingStopped);
+    onStoppedRef.current = onRecordingStopped;
+    const showToastRef = useRef(showToast);
+    showToastRef.current = showToast;
+    const getMeetingIdRef = useRef(getMeetingId);
+    getMeetingIdRef.current = getMeetingId;
 
-    // Legacy refs (kept for interface compatibility but deprecated)
-    const mediaRecorderRef = useRef<null>(null);
-    const audioChunksRef = useRef<Blob[]>([]);
-    const animationFrameRef = useRef<number | null>(null);
+    const setBusy = useCallback((busy: boolean) => {
+        isBusyRef.current = busy;
+        setIsBusy(busy);
+    }, []);
 
+    const stopEngines = useCallback(async () => {
+        if (voxtralStartedRef.current) {
+            voxtralStartedRef.current = false;
+            await stopVoxtralMeeting();
+        }
+        if (voskStartedRef.current) {
+            voskStartedRef.current = false;
+            // Vosk emits the utterance still in progress before this resolves
+            await Vosk.stopRecognition().catch((e: any) => logger.log('warn', 'Error stopping Vosk', e));
+        }
+    }, []);
 
-
-    // Cleanup on unmount
-    useEffect(() => {
-        return () => {
-            if (recorderRef.current) {
-                recorderRef.current.cleanup();
+    const handleChunk = useCallback((int16Data: Int16Array) => {
+        // Paused audio must reach neither the file nor the transcription buffers
+        const ranges = timelineRef.current.keptSampleRanges(Date.now(), int16Data.length, SAMPLE_RATE);
+        if (ranges.length === 0) return;
+        let kept = int16Data;
+        if (ranges.length !== 1 || ranges[0][0] !== 0 || ranges[0][1] !== int16Data.length) {
+            kept = new Int16Array(ranges.reduce((acc, [a, b]) => acc + b - a, 0));
+            let offset = 0;
+            for (const [a, b] of ranges) {
+                kept.set(int16Data.subarray(a, b), offset);
+                offset += b - a;
             }
-            // Ensure Vosk stops when component unmounts
-            Vosk.stopRecognition().catch(console.warn);
+        }
+
+        // Stream to file (no await: the bridge keeps the call order)
+        AudioConverter.writeChunk({ data: pcmToBase64(kept) }).catch(e => {
+            logger.log('error', 'Failed to write audio chunk', e);
+        });
+
+        const float32Data = new Float32Array(kept.length);
+        for (let i = 0; i < kept.length; i++) float32Data[i] = kept[i] / 32768.0;
+
+        droppedSamplesRef.current += appendBounded(fullPcmBufferRef.current, float32Data, MAX_WHISPER_BUFFER_DURATION * SAMPLE_RATE);
+
+        // Ring buffer for ONNX speaker recognition
+        if (recognitionModeRef.current !== 'off') {
+            audioBufferRef.current.push(float32Data);
+            totalBufferedDurationRef.current += float32Data.length / SAMPLE_RATE;
+            while (totalBufferedDurationRef.current > MAX_BUFFER_DURATION && audioBufferRef.current.length > 1) {
+                const removed = audioBufferRef.current.shift()!;
+                totalBufferedDurationRef.current -= removed.length / SAMPLE_RATE;
+            }
+        }
+    }, [recognitionModeRef]);
+
+    const startVosk = useCallback(async (recognitionMode: RecognitionMode): Promise<boolean> => {
+        try {
+            const status = await (Vosk as any).checkPermissions();
+            if (status.microphone !== 'granted') {
+                const request = await (Vosk as any).requestPermissions();
+                if (request.microphone !== 'granted') {
+                    showToastRef.current('Permesso microfono negato', 'error');
+                    return false;
+                }
+            }
+        } catch (e) {
+            logger.log('warn', 'Vosk permission check failed, proceeding anyway', e);
+        }
+
+        try {
+            if (recognitionMode === 'fast') {
+                if (await isVoskSpeakerModelInstalled()) {
+                    logger.log('info', 'Loading Vosk speaker model for fast diarization');
+                    await (Vosk as any).loadSpeakerModel({ modelPath: 'vosk-models/vosk-model-spk-0.4' });
+                } else {
+                    logger.log('warn', 'Vosk speaker model not installed, falling back to RMS diarization');
+                }
+            } else {
+                // Speaker vectors only belong to 'fast' mode
+                const speakerStatus = await (Vosk as any).isSpeakerModelLoaded().catch(() => ({ loaded: false }));
+                if (speakerStatus.loaded) await (Vosk as any).unloadSpeakerModel();
+            }
+        } catch (e) {
+            logger.log('warn', 'Failed to configure speaker model', e);
+        }
+
+        logger.log('info', 'Starting Vosk...');
+        await Vosk.startRecognition();
+        voskStartedRef.current = true;
+        // Vosk word times count from here
+        timelineRef.current.setVoskStart(Date.now());
+        return true;
+    }, []);
+
+    const startAudioCapture = useCallback(async (): Promise<boolean> => {
+        const recorder = new HighQualityAudioRecorder({
+            sampleRate: SAMPLE_RATE,
+            channels: 1,
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+            disableInternalStorage: true,
+            chunkIntervalSamples: CHUNK_INTERVAL_SAMPLES
+        });
+        try {
+            // Microphone first: if it fails no native file is left open
+            await recorder.init();
+            await meetingAudioConverter.startWriting({
+                sampleRate: SAMPLE_RATE,
+                channels: 1,
+                meetingId: getMeetingIdRef.current?.() ?? undefined,
+                startedAt: Date.now()
+            });
+        } catch (audioError) {
+            logger.log('error', 'AudioWorklet recording failed', audioError);
+            await recorder.cleanup().catch(() => { });
+            showToastRef.current('Error starting audio recording', 'error');
+            return false;
+        }
+
+        recorderRef.current = recorder;
+        audioBufferRef.current = [];
+        fullPcmBufferRef.current = [];
+        droppedSamplesRef.current = 0;
+        totalBufferedDurationRef.current = 0;
+
+        recorder.start(
+            (level) => {
+                if (isPausedRef.current) return;
+                setAudioLevel(level);
+                // Without Vosk this is the only level source for the RMS speaker fallback
+                if (!voskStartedRef.current) diarizationRef?.current?.recordRmsValue(level);
+            },
+            undefined,
+            handleChunk
+        );
+        recordingStartTimeRef.current = Date.now();
+        timelineRef.current.setFileStart(recordingStartTimeRef.current);
+        return true;
+    }, [diarizationRef, handleChunk]);
+
+    const sttPinRef = useRef<(() => void) | null>(null);
+
+    const startRecording = useCallback(async (): Promise<boolean> => {
+        // A second tap while models load used to start a second recorder and leak the mic
+        if (isRecordingRef.current || isBusyRef.current) return false;
+        setBusy(true);
+        const recognitionMode = recognitionModeRef.current;
+        const transcriptionMode = transcriptionModeRef.current;
+        const needsVosk = transcriptionMode === 'vosk' || transcriptionMode === 'hybrid' || recognitionMode === 'fast';
+        timelineRef.current = new MeetingTimeline();
+
+        try {
+            if (transcriptionMode === 'voxtral') {
+                try {
+                    logger.log('info', 'Initializing Voxtral STT for real-time transcription');
+                    await startVoxtralMeeting({
+                        setTranscript,
+                        diarizationRef,
+                        recognitionModeRef,
+                        audioBufferRef,
+                        isPausedRef,
+                        timelineRef
+                    });
+                    voxtralStartedRef.current = true;
+                } catch (voxtralError) {
+                    logger.log('error', 'Failed to initialize Voxtral, recording audio only', voxtralError);
+                    showToastRef.current('Voxtral initialization failed', 'error');
+                }
+            } else if (needsVosk) {
+                if (!(await startVosk(recognitionMode))) return false;
+            }
+
+            const captured = !unmountedRef.current && await startAudioCapture();
+            if (!captured || unmountedRef.current) {
+                if (captured) {
+                    await recorderRef.current?.cleanup();
+                    recorderRef.current = null;
+                    await AudioConverter.finishWriting().catch(() => { });
+                }
+                await stopEngines();
+                return false;
+            }
+
+            isRecordingRef.current = true;
+            isPausedRef.current = false;
+            setIsRecording(true);
+            setIsPaused(false);
+            void startMeetingForegroundService();
+            // The speech model stays in RAM until the recording is saved (an LLM request waits)
+            sttPinRef.current?.();
+            sttPinRef.current = transcriptionMode === 'voxtral' ? pin('voxtral')
+                : (transcriptionMode === 'whisper' || transcriptionMode === 'hybrid') ? pin('whisper') : null;
+            logger.log('info', recognitionMode === 'off'
+                ? 'Meeting recording started (AudioWorklet @ 16kHz - battery saving mode)'
+                : 'Meeting recording started (AudioWorklet @ 16kHz)');
+            return true;
+        } catch (error) {
+            logger.log('error', 'Failed to start recording', error);
+            showToastRef.current('Error starting recording', 'error');
+            await stopEngines();
+            return false;
+        } finally {
+            setBusy(false);
+        }
+    }, [recognitionModeRef, transcriptionModeRef, setTranscript, diarizationRef, setBusy, startVosk, startAudioCapture, stopEngines]);
+
+    const runDrains = useCallback(async () => {
+        const drains = [...drainsRef.current].map(drain => drain().catch(e => logger.log('warn', 'Stop drain failed', e)));
+        if (drains.length === 0) return;
+        await Promise.race([
+            Promise.all(drains),
+            new Promise(resolve => setTimeout(resolve, STOP_DRAIN_TIMEOUT_MS))
+        ]);
+    }, []);
+
+    /** Stops everything, finalizes the file, waits for the transcription tails, then saves. */
+    const finishRecording = useCallback(async () => {
+        isRecordingRef.current = false;
+        if (isPausedRef.current) timelineRef.current.resume(Date.now());
+        isPausedRef.current = false;
+        setIsRecording(false);
+        setIsPaused(false);
+        setAudioLevel(0);
+
+        await stopEngines();
+
+        const recorder = recorderRef.current;
+        recorderRef.current = null;
+        let durationMs = timelineRef.current.wallToFileMs(Date.now());
+        let filePath: string | undefined;
+        let pcmBlob: Blob | null = null;
+
+        if (recorder) {
+            try {
+                // Delivers the last chunk to handleChunk before resolving
+                await recorder.stop();
+            } catch (stopError) {
+                logger.log('error', 'Error stopping recording', stopError);
+            }
+            try {
+                const fileResult = await AudioConverter.finishWriting();
+                filePath = fileResult.filePath;
+                if (fileResult.durationMs > 0) durationMs = fileResult.durationMs;
+                logger.log('info', `Audio saved to file: ${filePath}, duration: ${durationMs}ms`);
+            } catch (e) {
+                logger.log('error', 'Failed to finish writing audio file', e);
+                // Last resort: only the last minutes are still in memory
+                if (countSamples(fullPcmBufferRef.current) > 0) {
+                    pcmBlob = createWavBlobFromFloat32(fullPcmBufferRef.current, SAMPLE_RATE);
+                }
+            }
+            await recorder.cleanup().catch(() => { });
+        }
+
+        void stopMeetingForegroundService();
+        await runDrains();
+
+        try {
+            await onStoppedRef.current?.({ filePath, pcmBlob, durationMs });
+            if (filePath || pcmBlob) showToastRef.current('Recording completed', 'success');
+        } catch (error) {
+            logger.log('error', 'Failed to handle the stopped recording', error);
+        }
+        sttPinRef.current?.();
+        sttPinRef.current = null;
+        logger.log('info', 'Meeting recording stopped');
+    }, [stopEngines, runDrains]);
+
+    const finishRecordingRef = useRef(finishRecording);
+    finishRecordingRef.current = finishRecording;
+
+    const stopRecording = useCallback(async () => {
+        if (!isRecordingRef.current) return;
+        setBusy(true);
+        try {
+            await finishRecording();
+        } finally {
+            setBusy(false);
+        }
+    }, [finishRecording, setBusy]);
+
+    // Unmount: leaving the screen must not discard the meeting being recorded
+    useEffect(() => {
+        unmountedRef.current = false;
+        return () => {
+            unmountedRef.current = true;
+            if (isRecordingRef.current) {
+                isBusyRef.current = true;
+                void finishRecordingRef.current().finally(() => { isBusyRef.current = false; });
+                return;
+            }
+            if (recorderRef.current) recorderRef.current.cleanup().catch(() => { });
+            if (voskStartedRef.current) Vosk.stopRecognition().catch(() => { });
         };
     }, []);
 
-    const startRecording = useCallback(async () => {
-        const recognitionMode = recognitionModeRef.current;
-        const transcriptionMode = transcriptionModeRef.current;
-
-        // Determine if we need Vosk or Voxtral
-        // We need Vosk if:
-        // 1. Transcription is set to 'vosk'
-        // 2. Speaker recognition is 'fast' (uses Vosk model)
-        const isVoskNeeded = transcriptionMode === 'vosk' || recognitionMode === 'fast';
-        const isVoxtralNeeded = transcriptionMode === 'voxtral';
-
-        try {
-            if (isVoxtralNeeded) {
-                // Initialize Voxtral STT
-                try {
-                    logger.log('info', 'Initializing Voxtral STT for real-time transcription');
-                    const { getVoxtralSttService } = await import('../../services/stt/voxtralSTT');
-                    const voxtralService = getVoxtralSttService();
-
-                    // Start Voxtral streaming with transcript callback
-                    let voxtralSegCount = 0;
-                    let lastVoxtralEmbedTime = 0;
-                    await voxtralService.start(async (transcript: string, tokens: any[]) => {
-                        setCurrentText?.(transcript);
-
-                        if (tokens && tokens.length > 0 && setTranscript) {
-                            // Extract ONNX embedding for speaker ID when precise mode is active
-                            let speakerId = diarizationRef?.current?.identifySpeaker() ?? 0;
-                            const isPrecise = recognitionModeRef?.current === 'precise';
-
-                            if (isPrecise && diarizationRef?.current && audioBufferRef.current.length > 0) {
-                                const now = Date.now();
-                                // Extract embedding at most every 3 seconds to avoid overloading
-                                if (now - lastVoxtralEmbedTime > 3000) {
-                                    try {
-                                        const flattened = new Float32Array(audioBufferRef.current.reduce((acc, c) => acc + c.length, 0));
-                                        let offset = 0;
-                                        audioBufferRef.current.forEach(c => { flattened.set(c, offset); offset += c.length; });
-                                        const samplesToTake = Math.min(flattened.length, Math.ceil(4.0 * 16000));
-                                        const rawSegment = flattened.slice(Math.max(0, flattened.length - samplesToTake));
-                                        const downsampled = rawSegment;
-                                        const int16 = floatToInt16(downsampled);
-                                        const base64Audio = arrayBufferToBase64(int16.buffer as ArrayBuffer);
-                                        const embedResult = await SpeakerEmbeddingPlugin.extractEmbedding({ audioData: base64Audio });
-                                        if (embedResult?.embedding?.length > 0) {
-                                            speakerId = diarizationRef.current.identifySpeaker(embedResult.embedding);
-                                            diarizationRef.current.getEmbeddingService().storeEmbedding(
-                                                `voxtral_embed_${Date.now()}`, embedResult.embedding, Date.now(), speakerId
-                                            );
-                                            voxtralSegCount++;
-                                            lastVoxtralEmbedTime = now;
-                                        }
-                                    } catch (e) {
-                                        // ONNX extraction failed, use fallback speakerId
-                                    }
-                                }
-                            }
-
-                            const lastToken = tokens[tokens.length - 1];
-                            setTranscript(prev => {
-                                const lastSeg = prev[prev.length - 1];
-                                const startMs = lastToken.startMs ?? lastToken.timestampMs ?? Date.now();
-                                const endMs = lastToken.endMs ?? (lastToken.timestampMs ?? Date.now());
-                                if (lastSeg && lastSeg.stt_provider === 'voxtral' && lastSeg.speakerId === speakerId) {
-                                    const updated = [...prev];
-                                    updated[updated.length - 1] = {
-                                        ...lastSeg,
-                                        text: transcript,
-                                        end_ms: endMs
-                                    };
-                                    return updated;
-                                }
-                                return [...prev, {
-                                    id: `voxtral_${Date.now()}_${tokens.length}`,
-                                    speakerId,
-                                    text: transcript,
-                                    timestamp: Date.now(),
-                                    start_ms: startMs,
-                                    end_ms: endMs,
-                                    stt_provider: 'voxtral'
-                                } as TranscriptSegment];
-                            });
-
-                            // Periodic re-clustering every ~30s or 10 Voxtral segments
-                            if (isPrecise && voxtralSegCount >= 10) {
-                                try {
-                                    diarizationRef?.current?.getEmbeddingService().periodicRecluster();
-                                    voxtralSegCount = 0;
-                                } catch (e) {
-                                    logger.log('warn', 'Voxtral periodic recluster failed', e);
-                                }
-                            }
-                        }
-                    });
-                    logger.log('info', 'Voxtral STT started successfully');
-                } catch (voxtralError) {
-                    logger.log('error', 'Failed to initialize Voxtral, fallback may not work', voxtralError);
-                    showToast('Voxtral initialization failed', 'error');
-                }
-            } else if (isVoskNeeded) {
-                // Re-check microphone permission
-                try {
-                    const status = await (Vosk as any).checkPermissions();
-                    if (status.microphone !== 'granted') {
-                        const request = await (Vosk as any).requestPermissions();
-                        if (request.microphone !== 'granted') {
-                            showToast('Permesso microfono negato', 'error');
-                            return;
-                        }
-                    }
-                } catch (e) {
-                    console.warn('Vosk permission check failed, proceeding anyway:', e);
-                }
-
-                try {
-                    if (recognitionMode === 'fast') {
-                        const isInstalled = await isVoskSpeakerModelInstalled();
-                        if (isInstalled) {
-                            logger.log('info', 'Loading Vosk speaker model for fast diarization');
-                            await (Vosk as any).loadSpeakerModel({ modelPath: 'vosk-models/vosk-model-spk-0.4' });
-                        } else {
-                            logger.log('warn', 'Vosk speaker model not installed, falling back to RMS diarization');
-                        }
-                    } else {
-                        // If precise, we might still be here if transcriptionMode is vosk
-                        // Ensure speaker model is unloaded if we don't want 'fast' mode
-                        try {
-                            const speakerStatus = await (Vosk as any).isSpeakerModelLoaded();
-                            if (speakerStatus.loaded) {
-                                logger.log('info', 'Unloading Vosk speaker model');
-                                await (Vosk as any).unloadSpeakerModel();
-                            }
-                        } catch (e) {
-                            // Method might not exist or fail, ignore
-                        }
-                    }
-                } catch (e) {
-                    logger.log('warn', 'Failed to configure speaker model', e);
-                }
-
-                // Start Vosk transcription
-                logger.log('info', 'Starting Vosk...');
-                await Vosk.startRecognition();
-            } else {
-                logger.log('info', 'Vosk not needed (Whisper/Off mode + Precise/Off speakers), skipping Vosk start');
-                // Note: We won't get 'audioLevel' events from Vosk, but HighQualityAudioRecorder provides them via callback
-            }
-
-            setIsRecording(true);
-            setIsPaused(false);
-
-            // Initialize high-quality audio recording with AudioWorklet
-            try {
-                // Start streaming to file
-                await AudioConverter.startWriting({ sampleRate: 16000, channels: 1 });
-
-                // Create recorder with Whisper-optimal settings
-                const recorder = new HighQualityAudioRecorder({
-                    sampleRate: 16000,  // Whisper optimal sample rate
-                    channels: 1,        // Mono
-                    echoCancellation: false,  // Raw audio for better quality
-                    noiseSuppression: false,
-                    autoGainControl: false,
-                    disableInternalStorage: true
-                });
-                recorderRef.current = recorder;
-
-                // Initialize the recorder (sets up AudioWorklet)
-                await recorder.init();
-
-                // Store audio context reference for external access
-                audioContextRef.current = (recorder as any).audioContext;
-                audioProcessorRef.current = (recorder as any).workletNode;
-
-                // Initialize buffers
-                audioBufferRef.current = [];
-                fullPcmBufferRef.current = [];
-                totalBufferedDurationRef.current = 0;
-
-                // Start recording with audio level callback and data callback
-                recorder.start(
-                    (level) => setAudioLevel(level),
-                    (progress) => {
-                        logger.log('debug', `Recording progress: ${progress.durationSeconds.toFixed(1)}s`);
-                    },
-                    (int16Data: Int16Array) => {
-                        // Received real-time audio chunk from recorder
-
-                        // Stream to file (async, no await to avoid blocking audio thread too much)
-                        const base64Data = pcmToBase64(int16Data);
-                        AudioConverter.writeChunk({ data: base64Data }).catch(e => {
-                            console.error('Failed to write audio chunk', e);
-                        });
-
-                        // Convert Int16 to Float32 for ONNX analysis and internal processing
-                        const float32Data = new Float32Array(int16Data.length);
-                        for (let i = 0; i < int16Data.length; i++) {
-                            float32Data[i] = int16Data[i] / 32768.0;
-                        }
-
-                        // Store for Whisper, but bounded to prevent OOM
-                        fullPcmBufferRef.current.push(float32Data);
-                        let totalWhisperSamples = fullPcmBufferRef.current.reduce((acc, chunk) => acc + chunk.length, 0);
-                        const maxWhisperSamples = MAX_WHISPER_BUFFER_DURATION * 16000;
-
-                        while (totalWhisperSamples > maxWhisperSamples && fullPcmBufferRef.current.length > 0) {
-                            const removed = fullPcmBufferRef.current.shift();
-                            if (removed) {
-                                totalWhisperSamples -= removed.length;
-                            }
-                        }
-
-                        // Update ring buffer for ONNX speaker recognition
-                        // Only needed if we are doing speaker recognition
-                        if (recognitionModeRef.current !== 'off') {
-                            audioBufferRef.current.push(float32Data);
-                            totalBufferedDurationRef.current += float32Data.length / 16000;
-
-                            // Trim ring buffer to max duration
-                            while (totalBufferedDurationRef.current > MAX_BUFFER_DURATION && audioBufferRef.current.length > 0) {
-                                const removed = audioBufferRef.current.shift();
-                                if (removed) {
-                                    totalBufferedDurationRef.current -= removed.length / 16000;
-                                }
-                            }
-                        }
-                    }
-                );
-
-                console.log('debug', 'HighQualityAudioRecorder started with data callback');
-                recordingStartTimeRef.current = Date.now();
-
-                logger.log('info', recognitionMode === 'off'
-                    ? 'Meeting recording started (AudioWorklet @ 16kHz - battery saving mode)'
-                    : 'Meeting recording started (Vosk + AudioWorklet @ 16kHz)');
-
-            } catch (audioError) {
-                logger.log('error', 'AudioWorklet recording failed', audioError);
-                showToast('Error starting audio recording', 'error');
-
-                // Cleanup on failure
-                if (recorderRef.current) {
-                    await recorderRef.current.cleanup();
-                    recorderRef.current = null;
-                }
-            }
-
-
-        } catch (error) {
-            logger.log('error', 'Failed to start recording', error);
-            showToast('Error starting recording', 'error');
-        }
-    }, [recognitionModeRef, transcriptionModeRef, showToast]);
-
-    const stopRecording = useCallback(async () => {
-        if (!isRecording) return;
-
-        try {
-            // Determine if Vosk was needed/started based on refs (state might have changed, but usually mode stays same during rec)
-            // We should check if we actually started it. 
-            // Ideally we'd track 'isVoskRunning' ref, but checking logic is safe enough:
-            // If we were in vosk mode or fast mode, we probably started it.
-            // Asking Vosk to stop if not started usually just warns or does nothing.
-            // Let's just try stopping it if mode implies it.
-            const currentRecMode = recognitionModeRef.current;
-            const currentTransMode = transcriptionModeRef.current;
-
-            // Stop Voxtral if it was running
-            if (currentTransMode === 'voxtral') {
-                try {
-                    const { getVoxtralSttService } = await import('../../services/stt/voxtralSTT');
-                    const voxtralService = getVoxtralSttService();
-                    await voxtralService.stop();
-                    logger.log('info', 'Voxtral STT stopped');
-                } catch (e) {
-                    console.warn('Error stopping Voxtral:', e);
-                }
-            }
-
-            // Stop Vosk if it was running
-            if (currentTransMode === 'vosk' || currentRecMode === 'fast') {
-                await Vosk.stopRecognition().catch((e: any) => console.warn('Error stopping Vosk (might not be running):', e));
-            }
-
-            setIsRecording(false);
-            setIsPaused(false);
-
-            // Stop AudioWorklet recording and get result
-            if (recorderRef.current && recorderRef.current.isCurrentlyRecording()) {
-                try {
-                    const result: RecordingResult = await recorderRef.current.stop();
-
-                    // Finish writing file
-                    let savedFilePath: string | undefined;
-                    try {
-                        const fileResult = await AudioConverter.finishWriting();
-                        savedFilePath = fileResult.filePath;
-                        logger.log('info', `Audio saved to file: ${savedFilePath}, duration: ${fileResult.durationMs}ms`);
-                    } catch (e) {
-                        logger.log('error', 'Failed to finish writing audio file', e);
-                    }
-
-                    logger.log('info', `Audio recording stopped: ${result.blob.size} bytes, ${result.durationMs}ms, ${result.sampleCount} samples`);
-
-                    if (onRecordingStopped) {
-                        // Call the callback with WAV blob and file path
-                        await onRecordingStopped(
-                            [], // audioChunks (deprecated, now empty)
-                            'audio/wav', // mimeType
-                            result.blob, // pcmBlob (WAV format at 16kHz)
-                            result.durationMs,
-                            savedFilePath // Pass file path
-                        );
-                    }
-
-                    showToast('Recording completed', 'success');
-                } catch (stopError) {
-                    logger.log('error', 'Error stopping recording', stopError);
-
-                    // Try to provide fallback data from fullPcmBufferRef
-                    if (onRecordingStopped && fullPcmBufferRef.current.length > 0) {
-                        const pcmBlob = createWavBlobFromFloat32(fullPcmBufferRef.current, 16000);
-                        const durationMs = Date.now() - recordingStartTimeRef.current;
-                        await onRecordingStopped([], 'audio/wav', pcmBlob, durationMs);
-                    }
-                }
-
-                // Cleanup recorder
-                await recorderRef.current.cleanup();
-                recorderRef.current = null;
-            }
-
-
-
-            // Reset audio level
-            setAudioLevel(0);
-            audioContextRef.current = null;
-            audioProcessorRef.current = null;
-
-            logger.log('info', 'Meeting recording stopped');
-        } catch (error) {
-            logger.log('error', 'Failed to stop recording', error);
-        }
-    }, [isRecording, recognitionModeRef, transcriptionModeRef, showToast, onRecordingStopped]);
-
     const togglePause = useCallback(() => {
-        if (isPaused) {
-            setIsPaused(false);
-        } else {
-            setIsPaused(true);
-        }
-    }, [isPaused]);
+        if (!isRecordingRef.current) return;
+        const now = Date.now();
+        const pausing = !isPausedRef.current;
+        if (pausing) timelineRef.current.pause(now);
+        else timelineRef.current.resume(now);
+        isPausedRef.current = pausing;
+        setIsPaused(pausing);
+        if (pausing) setAudioLevel(0);
+    }, []);
 
     const getAudioSince = useCallback((sampleOffset: number, maxSamples?: number) => {
-        const chunks = fullPcmBufferRef.current;
-        let totalSamples = 0;
-        chunks.forEach(c => totalSamples += c.length);
+        const read = readSince(fullPcmBufferRef.current, droppedSamplesRef.current, sampleOffset, maxSamples);
+        const base64 = read.samples.length > 0
+            ? arrayBufferToBase64(floatToInt16(read.samples).buffer as ArrayBuffer)
+            : '';
+        return { base64, startOffset: read.startOffset, newOffset: read.newOffset };
+    }, []);
 
-        if (sampleOffset >= totalSamples) {
-            return { base64: '', newOffset: totalSamples };
-        }
+    const getAudioRange = useCallback((startSample: number, endSample: number) =>
+        readRange(fullPcmBufferRef.current, droppedSamplesRef.current, startSample, endSample), []);
 
-        // Limit data if maxSamples provided
-        let samplesToTake = totalSamples - sampleOffset;
-        if (maxSamples && samplesToTake > maxSamples) {
-            samplesToTake = maxSamples;
-        }
+    const getReceivedSamples = useCallback(
+        () => droppedSamplesRef.current + countSamples(fullPcmBufferRef.current), []);
 
-        // Flatten full buffer (optimization: could just slice relevant chunks but this is safer for boundary issues)
-        // For performance in long meetings, we might want to optimize this to only process needed chunks
-        // But since we need a single Float32Array to convert to Int16, we probably need to copy anyway.
-        // Let's try to be smart finding start chunk.
-
-        let currentCount = 0;
-        let startIndex = 0;
-        let startInChunkOffset = 0;
-
-        for (let i = 0; i < chunks.length; i++) {
-            if (currentCount + chunks[i].length > sampleOffset) {
-                startIndex = i;
-                startInChunkOffset = sampleOffset - currentCount;
-                break;
-            }
-            currentCount += chunks[i].length;
-        }
-
-        // Collect needed data
-        const result = new Float32Array(samplesToTake);
-        let resultOffset = 0;
-        let remainingToCopy = samplesToTake;
-        let idx = startIndex;
-
-        // First chunk (partial)
-        if (idx < chunks.length) {
-            const firstChunk = chunks[idx];
-            const available = firstChunk.length - startInChunkOffset;
-            const toCopy = Math.min(available, remainingToCopy);
-
-            result.set(firstChunk.subarray(startInChunkOffset, startInChunkOffset + toCopy), resultOffset);
-            resultOffset += toCopy;
-            remainingToCopy -= toCopy;
-            idx++;
-        }
-
-        // Rest of chunks
-        while (remainingToCopy > 0 && idx < chunks.length) {
-            const chunk = chunks[idx];
-            const toCopy = Math.min(chunk.length, remainingToCopy);
-
-            result.set(chunk.subarray(0, toCopy), resultOffset);
-            resultOffset += toCopy;
-            remainingToCopy -= toCopy;
-            idx++;
-        }
-
-        // Convert to Int16 Base64
-        const int16 = floatToInt16(result);
-        const base64 = arrayBufferToBase64(int16.buffer as ArrayBuffer);
-
-        return { base64, newOffset: sampleOffset + samplesToTake };
-
+    const registerStopDrain = useCallback((drain: () => Promise<void>) => {
+        drainsRef.current.add(drain);
+        return () => { drainsRef.current.delete(drain); };
     }, []);
 
     return {
         isRecording,
         isPaused,
+        isBusy,
         audioLevel,
-        mediaRecorderRef,
-        audioChunksRef,
-        audioContextRef,
+        isRecordingRef,
+        isPausedRef,
+        isBusyRef,
         audioBufferRef,
         totalBufferedDurationRef,
+        fullPcmBufferRef,
         recordingStartTimeRef,
-        animationFrameRef,
-        audioProcessorRef,
+        timelineRef,
         startRecording,
         stopRecording,
         togglePause,
         setAudioLevel,
-        fullPcmBufferRef,
-        getAudioSince
+        getAudioSince,
+        getAudioRange,
+        getReceivedSamples,
+        registerStopDrain
     };
-}
-
-/**
- * Helper to create WAV blob from Float32 audio chunks
- */
-function createWavBlobFromFloat32(chunks: Float32Array[], sampleRate: number): Blob {
-    // Merge all chunks
-    const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
-    const merged = new Float32Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-        merged.set(chunk, offset);
-        offset += chunk.length;
-    }
-
-    // Convert to Int16
-    const int16 = new Int16Array(totalLength);
-    for (let i = 0; i < totalLength; i++) {
-        const s = Math.max(-1, Math.min(1, merged[i]));
-        int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    }
-
-    // Create WAV header
-    const wavHeader = new ArrayBuffer(44);
-    const view = new DataView(wavHeader);
-    const channels = 1;
-    const bitsPerSample = 16;
-    const byteRate = sampleRate * channels * bitsPerSample / 8;
-    const blockAlign = channels * bitsPerSample / 8;
-    const dataSize = totalLength * 2;
-
-    const writeString = (offset: number, string: string) => {
-        for (let i = 0; i < string.length; i++) {
-            view.setUint8(offset + i, string.charCodeAt(i));
-        }
-    };
-
-    writeString(0, 'RIFF');
-    view.setUint32(4, 36 + dataSize, true);
-    writeString(8, 'WAVE');
-    writeString(12, 'fmt ');
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, channels, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, byteRate, true);
-    view.setUint16(32, blockAlign, true);
-    view.setUint16(34, bitsPerSample, true);
-    writeString(36, 'data');
-    view.setUint32(40, dataSize, true);
-
-    return new Blob([wavHeader, int16], { type: 'audio/wav' });
 }

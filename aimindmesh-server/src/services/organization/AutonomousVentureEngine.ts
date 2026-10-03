@@ -321,16 +321,36 @@ export class AutonomousVentureEngine {
     db.prepare("UPDATE organization_ideas SET status = ?, analysis_synthesis = ?, updated_at = ? WHERE id = ?")
       .run(newStatus, result.synthesis, new Date().toISOString(), ideaId);
 
-    if (result.consensus) {
+    // Characterization leads to Gitea repo creation and a development agent run:
+    // without explicit opt-in (organization.allowAutoRepoCreation) a human must confirm via /ideas/:id/approve
+    const autoRepoAllowed = (config as any).organization?.allowAutoRepoCreation === true;
+    const auditService = new OrganizationAuditService();
+
+    if (result.consensus && autoRepoAllowed) {
       try {
         const { DesignOrchestrator } = await import('./DesignOrchestrator');
         await DesignOrchestrator.characterizeIdea(ideaId);
       } catch (orr: any) {
         Logger.error('AutonomousVentureEngine', `Auto-characterization failed on auto-council approval: ${orr.message}`);
       }
+    } else if (result.consensus) {
+      await auditService.log({
+        eventType: 'idea:auto-council-awaiting-human',
+        actorType: 'system',
+        actorId: 'autonomous-venture-engine',
+        targetType: 'idea',
+        targetId: ideaId,
+        payload: { title: ideaTitle }
+      });
+      NotificationService.broadcast('idea_awaiting_approval', { ideaId, title: ideaTitle });
+      await FCMDispatcher.sendToDevice(config.fcm?.testToken || '', {
+        title: '🗳️ Idea approved by the AI council',
+        body: `"${ideaTitle}" is waiting for your confirmation before a repository is created`,
+        data: { type: 'VENTURE_IDEAS', screen: 'OrganizationView', tab: 'ideas' }
+      }).catch(e => Logger.warn('AutonomousVentureEngine', `FCM notify failed: ${e.message}`));
+      Logger.info('AutonomousVentureEngine', `Idea "${ideaTitle}" approved by council, awaiting human confirmation`);
     }
 
-    const auditService = new OrganizationAuditService();
     await auditService.log({
       eventType: 'idea:auto-council',
       actorType: 'system',

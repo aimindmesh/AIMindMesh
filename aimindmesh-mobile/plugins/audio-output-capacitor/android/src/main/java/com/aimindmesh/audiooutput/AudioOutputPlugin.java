@@ -54,6 +54,31 @@ public class AudioOutputPlugin extends Plugin {
         }
     }
 
+    /**
+     * Leaves call routing: MODE_IN_COMMUNICATION set for the earpiece is process-wide and
+     * otherwise persisted after a voice call (TTS and other apps kept call routing/volume).
+     */
+    @PluginMethod
+    public void resetAudioMode(PluginCall call) {
+        if (audioManager == null) {
+            call.reject("AudioManager not available");
+            return;
+        }
+
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                audioManager.clearCommunicationDevice();
+            }
+            audioManager.setSpeakerphoneOn(false);
+            audioManager.setMode(AudioManager.MODE_NORMAL);
+            Log.d(TAG, "Audio mode reset to normal");
+            call.resolve();
+        } catch (Exception e) {
+            Log.e(TAG, "Error resetting audio mode", e);
+            call.reject("Failed to reset audio mode: " + e.getMessage());
+        }
+    }
+
     @PluginMethod
     public void getSpeakerphoneStatus(PluginCall call) {
         if (audioManager == null) {

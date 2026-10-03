@@ -47,7 +47,7 @@ export const StableDiffusionSection: React.FC<StableDiffusionSectionProps> = ({
                     const modelPath = (await getSDModelPath(modelId)) || importedPath;
 
                     const { imageGenService } = await import('../../../services/image/imageGenService');
-                    const loadOk = await imageGenService.loadModel(modelPath);
+                    const loadOk = await imageGenService.verifyModel(modelPath); // loads, checks, frees the RAM again
 
                     onLlmConfigSave({
                         ...llmConfig,
@@ -56,7 +56,7 @@ export const StableDiffusionSection: React.FC<StableDiffusionSectionProps> = ({
                     });
 
                     if (loadOk) {
-                        alert(`Successfully imported and loaded Stable Diffusion model: ${modelId}`);
+                        alert(`Successfully imported Stable Diffusion model: ${modelId} (verified on the NPU)`);
                     } else {
                         alert(`Imported "${modelId}", but model could not be loaded into NPU memory immediately. Please ensure the bundle contains valid QNN bin files.`);
                     }
@@ -105,7 +105,7 @@ export const StableDiffusionSection: React.FC<StableDiffusionSectionProps> = ({
             const modelPath = await getSDModelPath(modelId);
             if (modelPath) {
                 const { imageGenService } = await import('../../../services/image/imageGenService');
-                const loadOk = await imageGenService.loadModel(modelPath);
+                const loadOk = await imageGenService.verifyModel(modelPath); // loads, checks, frees the RAM again
                 if (loadOk) {
                     onLlmConfigSave({
                         ...llmConfig,

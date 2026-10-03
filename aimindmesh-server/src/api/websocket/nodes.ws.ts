@@ -1,11 +1,13 @@
 import { FastifyInstance } from 'fastify';
 import { InferenceRouter } from '../../services/InferenceRouter';
 import { Logger } from '../../utils/Logger';
+import { NodeRegistry } from '../../services/NodeRegistry';
 
 export default async function (fastify: FastifyInstance) {
   fastify.get('/ws/nodes', { websocket: true }, (connection, req) => {
     const query = req.query as { id?: string; name?: string };
-    Logger.info('NodesWS', `Incoming WebSocket connection attempt from ${req.ip} with query: ${JSON.stringify(query)}`);
+    // Never log the raw query: it carries the auth token
+    Logger.info('NodesWS', `Incoming WebSocket connection attempt from ${req.ip} (id: ${query.id}, name: ${query.name})`);
 
     if (!query.id) {
       Logger.warn('NodesWS', 'Connection rejected: Missing node ID');
@@ -29,7 +31,6 @@ export default async function (fastify: FastifyInstance) {
     (connection as any).nodeId = nodeId; 
 
     // Force node to be ONLINE in the registry when WS connects
-    const { NodeRegistry } = require('../../services/NodeRegistry');
     NodeRegistry.registerNode({ 
       id: nodeId, 
       type: 'mobile', 
@@ -66,6 +67,15 @@ export default async function (fastify: FastifyInstance) {
         Logger.debug('NodesWS', `Message from [${nodeId}]: ${raw.substring(0, 100)}${raw.length > 100 ? '...' : ''}`);
         
         const data = JSON.parse(raw);
+
+        // Only the node a task was dispatched to may stream or resolve it
+        if (data.id && ['token', 'thinking', 'result'].includes(data.type)) {
+          const assigned = InferenceRouter.pendingMobileTasks.get(data.id)?.node;
+          if (assigned !== undefined && assigned.toUpperCase() !== nodeId) {
+            Logger.warn('NodesWS', `Ignoring ${data.type} for task ${data.id} from [${nodeId}]: task is assigned to [${assigned}]`);
+            return;
+          }
+        }
         
         if (data.type === 'token' && data.id) {
            InferenceRouter.onTaskUpdate(data.id, { type: 'token', content: data.token });

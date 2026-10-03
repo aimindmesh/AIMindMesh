@@ -1,288 +1,262 @@
 import { Device } from '@capacitor/device';
-import { getMeetingDatabase } from './database/meetingDatabase';
-import { getKnowledgeDatabase } from './database/knowledgeDatabase';
-import { getMemoryDatabase } from './memory/memoryDatabase';
-import { listCalendarEvents } from './calendar';
+import type { SQLiteDBConnection } from '@capacitor-community/sqlite';
+import type { SyncPullResponse, SyncPushResponse } from '@aimindmesh/api-types';
+import { getMeetingDatabase, getPendingSyncDeletions, clearSyncDeletions, applyRemoteDeletions } from './database/meetingDatabase';
+import { getMemoryDatabase, blobToFloat32Array } from './memory/memoryDatabase';
+import { listCalendarEvents, calendarEventSyncId } from './calendar';
 import { AIMindMeshServerSettings } from '../types';
+import { readSetting } from './security/secretStore';
+
+const THREADS_KEY = 'conversation-threads';
+/** Phone clock: threads changed after it are pushed (compared with the phone's own updatedAt) */
+const PUSH_CURSOR_KEY = 'sync_push_cursor';
+/** Server clock: the `timestamp` of the last pull, sent back as `since` */
+const PULL_CURSOR_KEY = 'sync_pull_cursor';
+/** Shown in the settings panel */
+const LAST_SYNC_KEY = 'last_sync_timestamp';
+
+export interface SyncResult {
+    ok: boolean;
+    error?: string;
+}
+
+const readNumber = (key: string) => {
+    const value = parseInt(localStorage.getItem(key) || '0', 10);
+    return Number.isFinite(value) ? value : 0;
+};
+const toMs = (value: unknown) => {
+    const ms = typeof value === 'number' ? value : new Date(value as string).getTime();
+    return Number.isFinite(ms) ? ms : 0;
+};
+
+/** `UPDATE table SET is_synced = 1 WHERE id IN (?, ?, ...)` with bound ids */
+async function markSynced(db: SQLiteDBConnection, table: string, ids: string[]) {
+    if (ids.length === 0) return;
+    await db.run(`UPDATE ${table} SET is_synced = 1 WHERE id IN (${ids.map(() => '?').join(',')})`, ids);
+}
 
 export class GlobalSyncService {
     private static isSyncing = false;
 
     /**
      * Perform a full bidirectional sync with the server.
+     * Never throws: the outcome is returned (and logged) so the UI can show it.
      */
-    public static async performSync(serverSettings?: AIMindMeshServerSettings): Promise<void> {
+    public static async performSync(serverSettings?: AIMindMeshServerSettings): Promise<SyncResult> {
         if (this.isSyncing) {
-            console.log('[AI Mind Mesh] [Sync] ALREADY SYNCING (early exit)');
-            return;
+            return { ok: false, error: 'A sync is already running' };
         }
         this.isSyncing = true;
-        console.log('[AI Mind Mesh] [Sync] performSync ENTRY POINT');
-        
+
         try {
-            // Self-load settings if not provided (e.g. when called from FCM listener)
+            // Self-load settings if not provided (e.g. when called from FCM listener), with the API key
             if (!serverSettings) {
-                console.log('[AI Mind Mesh] [Sync] No settings provided, attempting to load from localStorage...');
-                const raw = localStorage.getItem('aimindmesh-server-settings');
-                if (raw) {
-                    try {
-                        serverSettings = JSON.parse(raw);
-                        console.log('[AI Mind Mesh] [Sync] Settings loaded from localStorage');
-                    } catch (e) {
-                        console.error('[AI Mind Mesh] [Sync] Failed to parse settings from localStorage', e);
-                    }
-                }
+                serverSettings = readSetting<AIMindMeshServerSettings | undefined>('aimindmesh-server-settings', undefined);
             }
-
-            console.log('[AI Mind Mesh] [Sync] performSync validation started');
             if (!serverSettings?.serverUrl || !serverSettings?.enabled) {
-                console.warn('[AI Mind Mesh] [Sync] Server sync disabled or URL missing, skipping');
-                return;
+                return { ok: false, error: 'Server sync is disabled or the server URL is missing' };
             }
 
-            console.log('[AI Mind Mesh] [Sync] Checking server reachability at:', serverSettings.serverUrl);
-            try {
-                const healthResp = await fetch(`${serverSettings.serverUrl.replace(/\/$/, '')}/api/health`, {
-                    headers: { 'x-api-key': serverSettings.apiKey }
-                });
-                console.log('[AI Mind Mesh] [Sync] Health check status:', healthResp.status);
-            } catch (healthErr) {
-                console.error('[AI Mind Mesh] [Sync] Server unreachable:', healthErr);
-                throw new Error('Server unreachable');
-            }
+            const baseUrl = serverSettings.serverUrl.replace(/\/$/, '');
+            const headers = { 'x-api-key': serverSettings.apiKey };
+            const deviceId = (await Device.getId()).identifier;
 
-            console.log('[AI Mind Mesh] [Sync] Starting global synchronization loop...');
-            
-            let deviceId;
-            try {
-                deviceId = await Device.getId();
-                console.log('[AI Mind Mesh] [Sync] Device ID retrieved:', deviceId.identifier);
-            } catch (deviceErr) {
-                console.error('[AI Mind Mesh] [Sync] Failed to get Device ID:', deviceErr);
-                throw deviceErr;
-            }
+            // 1. Push. The cursor is read BEFORE collecting: a thread changed meanwhile goes next time
+            const pushStartedAt = Date.now();
+            const payload = await this.collectLocalChanges(deviceId, readNumber(PUSH_CURSOR_KEY));
+            const hasChanges = ['meetings', 'meetingSegments', 'memories', 'calendarEvents', 'chats', 'deletions']
+                .some(key => payload[key]?.length > 0);
 
-            // 1. Collect local changes
-            console.log('[AI Mind Mesh] [Sync] Collecting local changes...');
-            const payload = await this.collectLocalChanges(deviceId.identifier);
-            console.log(`[AI Mind Mesh] [Sync] Collected ${payload.meetings?.length || 0} meetings, ${payload.chats?.length || 0} threads`);
-
-            // 2. Push to server
-            if (payload.meetings?.length > 0 || payload.meetingSegments?.length > 0 || 
-                payload.documents?.length > 0 || payload.memories?.length > 0 ||
-                payload.calendarEvents?.length > 0 || payload.chats?.length > 0) {
-                
-                console.log('[AI Mind Mesh] [Sync] Pushing changes to server...');
-                const pushResp = await fetch(`${serverSettings.serverUrl.replace(/\/$/, '')}/api/sync/push`, {
+            if (hasChanges) {
+                const pushResp = await fetch(`${baseUrl}/api/sync/push`, {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-api-key': serverSettings.apiKey
-                    },
+                    headers: { ...headers, 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
                 });
-
                 if (!pushResp.ok) {
-                    const errorText = await pushResp.text();
-                    throw new Error(`Push failed: ${pushResp.status} ${errorText}`);
+                    throw new Error(`Push failed: ${pushResp.status} ${await pushResp.text()}`);
                 }
-                console.log('[AI Mind Mesh] [Sync] Push successful, marking as synced locally...');
-                await this.markItemsAsSynced(payload);
-            } else {
-                console.log('[AI Mind Mesh] [Sync] No local changes to push.');
+                const pushed: Partial<SyncPushResponse> = await pushResp.json().catch(() => ({}));
+                await this.markItemsAsSynced(payload, pushed.failedMemoryIds ?? []);
+                // Pushed deletions are tombstones on the server now
+                await clearSyncDeletions(payload.deletions);
             }
+            localStorage.setItem(PUSH_CURSOR_KEY, String(pushStartedAt));
 
-            // 3. Pull from server
-            console.log('[AI Mind Mesh] [Sync] Pulling updates from server...');
-            const lastSync = parseInt(localStorage.getItem('last_sync_timestamp') || '0', 10);
-            const pullUrl = `${serverSettings.serverUrl.replace(/\/$/, '')}/api/sync/pull?deviceId=${deviceId.identifier}&since=${lastSync}`;
-            
-            const pullResp = await fetch(pullUrl, {
-                headers: { 'x-api-key': serverSettings.apiKey }
-            });
-
+            // 2. Pull since the server timestamp of the previous pull
+            const pullUrl = `${baseUrl}/api/sync/pull?deviceId=${encodeURIComponent(deviceId)}&since=${readNumber(PULL_CURSOR_KEY)}`;
+            const pullResp = await fetch(pullUrl, { headers });
             if (!pullResp.ok) {
                 throw new Error(`Pull failed: ${pullResp.status}`);
             }
-
-            const incoming = await pullResp.json();
-            console.log(`[AI Mind Mesh] [Sync] Pulled ${incoming.meetings?.length || 0} meetings from server.`);
-
-            // 4. Merge incoming data
-            if (incoming.meetings?.length > 0 || incoming.meetingSegments?.length > 0 || 
-                incoming.documents?.length > 0 || incoming.memories?.length > 0 || 
-                incoming.chats?.length > 0) {
-                console.log('[AI Mind Mesh] [Sync] Merging incoming data...');
-                await this.mergeIncomingData(incoming);
+            const incoming: SyncPullResponse = await pullResp.json();
+            await this.mergeIncomingData(incoming);
+            if (typeof incoming.timestamp === 'number') {
+                localStorage.setItem(PULL_CURSOR_KEY, String(incoming.timestamp));
             }
 
-            localStorage.setItem('last_sync_timestamp', Date.now().toString());
-            console.log('[AI Mind Mesh] [Sync] Synchronization complete.');
-
+            localStorage.setItem(LAST_SYNC_KEY, Date.now().toString());
+            console.log(`[AI Mind Mesh] [Sync] Complete: pushed ${hasChanges ? 'changes' : 'nothing'}, pulled ${incoming.meetings?.length || 0} meetings and ${incoming.chats?.length || 0} messages`);
+            return { ok: true };
         } catch (error: any) {
-            console.error('[AI Mind Mesh] [Sync] CRITICAL ERROR IN SYNC LOOP', error);
+            console.error('[AI Mind Mesh] [Sync] Sync failed', error);
+            return { ok: false, error: error?.message || String(error) };
         } finally {
             this.isSyncing = false;
         }
     }
 
-    private static async collectLocalChanges(deviceId: string): Promise<any> {
+    private static async collectLocalChanges(deviceId: string, pushCursor: number): Promise<any> {
         const payload: any = { deviceId, timestamp: Date.now() };
 
+        const meetingDb = await getMeetingDatabase();
+        payload.meetings = (await meetingDb.query('SELECT * FROM meetings WHERE is_synced = 0')).values || [];
+        payload.meetingSegments = (await meetingDb.query('SELECT * FROM meeting_segments WHERE is_synced = 0')).values || [];
+
+        // Documents are not synced: the server has no handler for them
+
+        // Memories: the embedding BLOB is sent as numbers, not as raw bytes
+        const memoryDb = await getMemoryDatabase();
+        const memories = (await memoryDb.query('SELECT id, content, embedding, category FROM memories WHERE is_synced = 0')).values || [];
+        payload.memories = memories.map((m: any) => ({
+            id: m.id,
+            content: m.content,
+            category: m.category,
+            embedding: Array.from(blobToFloat32Array(m.embedding)),
+        }));
+
         try {
-            // Meetings
-            console.log('[AI Mind Mesh] [Sync] Querying meetings...');
-            const meetingDb = await getMeetingDatabase();
-            const unsyncedMeetings = await meetingDb.query("SELECT * FROM meetings WHERE is_synced = 0");
-            payload.meetings = unsyncedMeetings.values || [];
-            console.log(`[AI Mind Mesh] [Sync] Found ${payload.meetings.length} unsynced meetings`);
-
-            console.log('[AI Mind Mesh] [Sync] Querying meeting segments...');
-            const unsyncedSegments = await meetingDb.query("SELECT * FROM meeting_segments WHERE is_synced = 0");
-            payload.meetingSegments = unsyncedSegments.values || [];
-            console.log(`[AI Mind Mesh] [Sync] Found ${payload.meetingSegments.length} unsynced segments`);
-
-            // Knowledge (Documents)
-            console.log('[AI Mind Mesh] [Sync] Querying knowledge documents...');
-            const knowledgeDb = await getKnowledgeDatabase();
-            const unsyncedDocs = await knowledgeDb.query("SELECT * FROM documents WHERE is_synced = 0");
-            payload.documents = unsyncedDocs.values || [];
-            console.log(`[AI Mind Mesh] [Sync] Found ${payload.documents.length} unsynced documents`);
-
-            // Memories
-            console.log('[AI Mind Mesh] [Sync] Querying memories...');
-            const memoryDb = await getMemoryDatabase();
-            const unsyncedMemories = await memoryDb.query("SELECT * FROM memories WHERE is_synced = 0");
-            payload.memories = unsyncedMemories.values || [];
-            console.log(`[AI Mind Mesh] [Sync] Found ${payload.memories.length} unsynced memories`);
-
-            // Calendar
-            console.log('[AI Mind Mesh] [Sync] Querying calendar...');
-            try {
-                const start = new Date();
-                start.setDate(start.getDate() - 7);
-                const end = new Date();
-                end.setDate(end.getDate() + 30);
-                const calendarEvents = await listCalendarEvents(start, end);
-                payload.calendarEvents = calendarEvents.map(e => ({
-                    id: `${deviceId}_${e.startDate.getTime()}`,
-                    title: e.title,
-                    description: e.notes,
-                    location: e.location,
-                    start_time: e.startDate.getTime(),
-                    end_time: e.endDate.getTime(),
-                    is_all_day: e.isAllDay ? 1 : 0
-                }));
-                console.log(`[AI Mind Mesh] [Sync] Found ${payload.calendarEvents.length} calendar events`);
-            } catch (calErr) {
-                console.error('[AI Mind Mesh] [Sync] Calendar query failed:', calErr);
-                payload.calendarEvents = [];
-            }
-
-            // Chats
-            console.log('[AI Mind Mesh] [Sync] Collecting chats...');
-            const lastSyncTs = parseInt(localStorage.getItem('last_sync_timestamp') || '0', 10);
-            const threads = JSON.parse(localStorage.getItem('conversation-threads') || '[]');
-            
-            // Only sync threads updated since last sync
-            const unsyncedThreads = threads.filter((t: any) => (t.updatedAt || 0) > lastSyncTs);
-            
-            payload.chats = unsyncedThreads.map((t: any) => ({
-                id: t.id,
-                conversation_id: t.id,
-                title: t.title,
-                messages: t.messages,
-                created_at: t.createdAt,
-                updated_at: t.updatedAt
+            const start = new Date();
+            start.setDate(start.getDate() - 7);
+            const end = new Date();
+            end.setDate(end.getDate() + 30);
+            const calendarEvents = await listCalendarEvents(start, end);
+            payload.calendarEvents = calendarEvents.map(e => ({
+                id: calendarEventSyncId(deviceId, e),
+                title: e.title,
+                description: e.notes,
+                location: e.location,
+                start_time: e.startDate.getTime(),
+                end_time: e.endDate.getTime(),
+                is_all_day: e.isAllDay ? 1 : 0
             }));
-            console.log(`[AI Mind Mesh] [Sync] Collected ${payload.chats.length} unsynced chat threads`);
-
-        } catch (collectErr) {
-            console.error('[AI Mind Mesh] [Sync] Collection failed:', collectErr);
-            throw collectErr;
+        } catch (calErr) {
+            console.error('[AI Mind Mesh] [Sync] Calendar query failed:', calErr);
+            payload.calendarEvents = [];
         }
+
+        // Chats: threads keep dates as ISO strings in localStorage, so they are converted to compare
+        const threads = JSON.parse(localStorage.getItem(THREADS_KEY) || '[]');
+        payload.chats = threads
+            .filter((t: any) => toMs(t.updatedAt) > pushCursor)
+            .map((t: any) => ({
+                id: t.id,
+                title: t.title,
+                created_at: toMs(t.createdAt),
+                updated_at: toMs(t.updatedAt),
+                // Text only: hidden trigger messages and attachments stay on the device
+                messages: (t.messages || [])
+                    .filter((m: any) => !m.hidden && typeof m.text === 'string' && m.text.length > 0)
+                    .map((m: any) => ({ id: m.id, role: m.role, content: m.text, timestamp: toMs(m.timestamp) })),
+            }));
+
+        // Meetings and segments deleted here: the server forwards them to the other devices
+        payload.deletions = await getPendingSyncDeletions();
 
         return payload;
     }
 
-    private static async markItemsAsSynced(payload: any): Promise<void> {
-        try {
-            console.log('[AI Mind Mesh] [Sync] Marking meetings as synced...');
-            const meetingDb = await getMeetingDatabase();
-            if (payload.meetings?.length > 0) {
-                const ids = payload.meetings.map((m: any) => `'${m.id}'`).join(',');
-                await meetingDb.execute(`UPDATE meetings SET is_synced = 1 WHERE id IN (${ids})`);
-            }
-            if (payload.meetingSegments?.length > 0) {
-                const ids = payload.meetingSegments.map((s: any) => `'${s.id}'`).join(',');
-                await meetingDb.execute(`UPDATE meeting_segments SET is_synced = 1 WHERE id IN (${ids})`);
-            }
+    private static async markItemsAsSynced(payload: any, failedMemoryIds: string[]): Promise<void> {
+        const meetingDb = await getMeetingDatabase();
+        await markSynced(meetingDb, 'meetings', (payload.meetings || []).map((m: any) => m.id));
+        await markSynced(meetingDb, 'meeting_segments', (payload.meetingSegments || []).map((s: any) => s.id));
 
-            console.log('[AI Mind Mesh] [Sync] Marking documents as synced...');
-            const knowledgeDb = await getKnowledgeDatabase();
-            if (payload.documents?.length > 0) {
-                const ids = payload.documents.map((d: any) => d.id).join(',');
-                await knowledgeDb.execute(`UPDATE documents SET is_synced = 1 WHERE id IN (${ids})`);
-            }
-
-            console.log('[AI Mind Mesh] [Sync] Marking memories as synced...');
-            const memoryDb = await getMemoryDatabase();
-            if (payload.memories?.length > 0) {
-                const ids = payload.memories.map((m: any) => `'${m.id}'`).join(',');
-                await memoryDb.execute(`UPDATE memories SET is_synced = 1 WHERE id IN (${ids})`);
-            }
-        } catch (markErr) {
-            console.error('[AI Mind Mesh] [Sync] Marking failed:', markErr);
-        }
+        // Memories the server could not store stay unsynced and are pushed again
+        const memoryDb = await getMemoryDatabase();
+        const failed = new Set(failedMemoryIds);
+        await markSynced(memoryDb, 'memories', (payload.memories || []).map((m: any) => m.id).filter((id: string) => !failed.has(id)));
     }
 
-    private static async mergeIncomingData(incoming: any): Promise<void> {
-        try {
-            console.log('[AI Mind Mesh] [Sync] Merging meetings...');
-            const meetingDb = await getMeetingDatabase();
-            for (const m of (incoming.meetings || [])) {
-                await meetingDb.run(
-                    `INSERT OR REPLACE INTO meetings (id, timestamp, duration, has_audio, speaker_names_json, is_synced, server_id)
-                     VALUES (?, ?, ?, ?, ?, 1, ?)`,
-                    [m.id, m.timestamp, m.duration, m.has_audio, m.speaker_names_json, m.id]
-                );
-            }
+    private static async mergeIncomingData(incoming: SyncPullResponse): Promise<void> {
+        // Deletions made on other devices first (never pushed back: no local tombstone is written)
+        if (incoming.deletions?.length) await applyRemoteDeletions(incoming.deletions);
+        // A local deletion not pushed yet must not be undone by the pull
+        const pending = await getPendingSyncDeletions();
+        const deletedHere = new Set(pending.map(d => `${d.type}:${d.id}`));
 
-            for (const s of (incoming.meetingSegments || [])) {
-                await meetingDb.run(
-                    `INSERT OR REPLACE INTO meeting_segments (id, meeting_id, sequence, start_ms, end_ms, text, speaker_id, is_synced, server_id)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`,
-                    [s.id, s.meeting_id, s.sequence, s.start_ms, s.end_ms, s.text, s.speaker_id, s.id]
-                );
-            }
-            console.log('[AI Mind Mesh] [Sync] Merging chats...');
-            const existingThreads = JSON.parse(localStorage.getItem('conversation-threads') || '[]');
-            let changed = false;
-
-            for (const incomingThread of (incoming.chats || [])) {
-                const idx = existingThreads.findIndex((t: any) => t.id === incomingThread.conversation_id);
-                if (idx === -1) {
-                    existingThreads.push({
-                        id: incomingThread.conversation_id,
-                        title: incomingThread.title || 'Remote Chat',
-                        messages: [], // We pull full messages later or handle as needed
-                        createdAt: Date.now(),
-                        updatedAt: incomingThread.timestamp
-                    });
-                    changed = true;
-                } else if (incomingThread.timestamp > (existingThreads[idx].updatedAt || 0)) {
-                    // Update existing if newer
-                    existingThreads[idx].updatedAt = incomingThread.timestamp;
-                    changed = true;
-                }
-            }
-
-            if (changed) {
-                localStorage.setItem('conversation-threads', JSON.stringify(existingThreads));
-            }
-
-        } catch (mergeErr) {
-            console.error('[AI Mind Mesh] [Sync] Merge failed:', mergeErr);
+        const meetingDb = await getMeetingDatabase();
+        // Upserts: INSERT OR REPLACE would delete (ON DELETE CASCADE) the local segments.
+        // Rows with local changes not pushed yet (is_synced = 0) are left as they are.
+        for (const m of incoming.meetings || []) {
+            if (deletedHere.has(`meeting:${m.id}`)) continue;
+            await meetingDb.run(
+                `INSERT INTO meetings (id, timestamp, duration, has_audio, speaker_names_json, is_synced, server_id)
+                 VALUES (?, ?, ?, ?, ?, 1, ?)
+                 ON CONFLICT(id) DO UPDATE SET timestamp = excluded.timestamp, duration = excluded.duration,
+                   has_audio = excluded.has_audio, speaker_names_json = excluded.speaker_names_json, server_id = excluded.server_id
+                 WHERE meetings.is_synced = 1`,
+                [m.id, m.timestamp, m.duration, m.has_audio, m.speaker_names_json, m.id]
+            );
         }
+        for (const s of incoming.meetingSegments || []) {
+            if (deletedHere.has(`segment:${s.id}`) || deletedHere.has(`meeting:${s.meeting_id}`)) continue;
+            await meetingDb.run(
+                `INSERT INTO meeting_segments (id, meeting_id, sequence, start_ms, end_ms, text, speaker_id, original_text, is_edited, edited_at, is_synced, server_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                 ON CONFLICT(id) DO UPDATE SET sequence = excluded.sequence, start_ms = excluded.start_ms, end_ms = excluded.end_ms,
+                   text = excluded.text, speaker_id = excluded.speaker_id, original_text = excluded.original_text,
+                   is_edited = excluded.is_edited, edited_at = excluded.edited_at, server_id = excluded.server_id
+                 WHERE meeting_segments.is_synced = 1`,
+                [s.id, s.meeting_id, s.sequence, s.start_ms, s.end_ms, s.text, s.speaker_id, s.original_text ?? null, s.is_edited ?? 0, s.edited_at ?? null, s.id]
+            );
+        }
+
+        this.mergeChats(incoming);
+    }
+
+    /** Pulled messages go into the thread of their conversation, once (ids are compared namespaced). */
+    private static mergeChats(incoming: SyncPullResponse) {
+        if (!incoming.chats?.length) return;
+        const threads: any[] = JSON.parse(localStorage.getItem(THREADS_KEY) || '[]');
+        const titles = new Map((incoming.conversations || []).map(c => [c.id, c]));
+        let changed = false;
+
+        for (const msg of incoming.chats) {
+            const conversationId = msg.conversation_id;
+            if (!conversationId) continue;
+            let thread = threads.find(t => t.id === conversationId);
+            if (!thread) {
+                const meta = titles.get(conversationId);
+                thread = {
+                    id: conversationId,
+                    title: meta?.title || 'Remote Chat',
+                    createdAt: new Date(meta?.created_at || msg.timestamp).toISOString(),
+                    updatedAt: new Date(msg.timestamp).toISOString(),
+                    messages: [],
+                    preview: '',
+                };
+                threads.push(thread);
+            }
+            // The server stores `${conversationId}:${localId}`: local ids are compared the same way
+            const key = (id: string) => (id.startsWith(`${conversationId}:`) ? id : `${conversationId}:${id}`);
+            const existing = thread.messages.find((m: any) => key(String(m.id)) === msg.id);
+            if (existing) {
+                if (existing.text === msg.content) continue;
+                existing.text = msg.content;
+            } else {
+                thread.messages.push({
+                    id: msg.id,
+                    role: msg.role === 'assistant' ? 'model' : msg.role,
+                    text: msg.content,
+                    timestamp: new Date(msg.timestamp).toISOString(),
+                });
+                thread.messages.sort((a: any, b: any) => toMs(a.timestamp) - toMs(b.timestamp));
+            }
+            if (!thread.preview && msg.role === 'user') thread.preview = msg.content.slice(0, 100);
+            if (msg.timestamp > toMs(thread.updatedAt)) thread.updatedAt = new Date(msg.timestamp).toISOString();
+            changed = true;
+        }
+
+        if (changed) localStorage.setItem(THREADS_KEY, JSON.stringify(threads));
     }
 }

@@ -123,6 +123,21 @@ export async function addEventToSystemCalendar(event: Omit<CalendarDB.CalendarEv
     }
 }
 
+/**
+ * Whether background features (car screen, meeting briefings) may include system calendar
+ * events: only when the Agenda shows them (App's 'agenda-settings') and the permission is
+ * already granted. Never prompts: getSystemCalendarEvents would.
+ */
+export async function systemCalendarVisible(): Promise<boolean> {
+    try {
+        const settings = JSON.parse(localStorage.getItem('agenda-settings') || '{}');
+        if (settings?.showSystemCalendar !== true) return false;
+    } catch {
+        return false;
+    }
+    return checkSystemCalendarPermissions();
+}
+
 // --- Unified API (merges internal + system) ---
 
 /**

@@ -83,7 +83,7 @@ export const documentApi = {
   deleteAll: () => api.delete('/api/documents', { data: {} }),
   // Upload a file as multipart form data
   uploadFile: (formData: FormData) =>
-    api.post('/api/documents/upload', formData, {
+    api.post('/api/documents/ingest/file', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
       timeout: 120000,
     }),
@@ -93,27 +93,9 @@ export const documentApi = {
 };
 
 // ─── Interfaces ────────────────────────────────────────────────────────────────
-export interface IngestionJob {
-  id: string;
-  status: 'PENDING' | 'EXTRACTING' | 'CHUNKING' | 'VECTORIZING' | 'INDEXING' | 'DONE' | 'ERROR' | 'SKIPPED' | 'CANCELLED';
-  docId?: string;
-  source: string;
-  totalChunks: number;
-  doneChunks: number;
-  progress: number;
-  error?: string;
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface KGDocument {
-  id: string;
-  title: string;
-  source: string;
-  mimeType: string;
-  chunkCount: number;
-  date: number;
-}
+// Wire formats from the server contract (aimindmesh-server/src/types/api.ts)
+export type { IngestionJob, KGDocument } from '@aimindmesh/api-types';
+import type { IngestionJob, KGDocument } from '@aimindmesh/api-types';
 
 export interface LogEntry {
   id?: string;

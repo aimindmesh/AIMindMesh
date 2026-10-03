@@ -4,6 +4,7 @@
 
 import { executeTermuxCommand } from '../termuxPlugin';
 import { ToolResult } from './types';
+import { shellQuote } from './shellArgs';
 
 export async function executeSendWhatsApp(args: Record<string, unknown>): Promise<ToolResult> {
     const phoneNumber = args.phone_number as string;
@@ -19,7 +20,7 @@ export async function executeSendWhatsApp(args: Record<string, unknown>): Promis
 
     // WhatsApp uses wa.me URL scheme
     const url = `https://wa.me/${cleanPhone}?text=${encodedMessage}`;
-    const cmd = `am start -a android.intent.action.VIEW -d "${url}"`;
+    const cmd = `am start -a android.intent.action.VIEW -d ${shellQuote(url)}`;
 
     const result = await executeTermuxCommand(cmd);
 
@@ -50,13 +51,14 @@ export async function executeSendTelegram(args: Record<string, unknown>): Promis
 
     if (username) {
         // Send to specific user
-        url = `tg://msg?to=${username}&text=${encodedMessage}`;
+        url = `tg://msg?to=${encodeURIComponent(username)}&text=${encodedMessage}`;
     } else {
         // Just open Telegram with the message (user selects recipient)
         url = `tg://msg?text=${encodedMessage}`;
     }
 
-    const cmd = `am start -a android.intent.action.VIEW -d "${url}"`;
+    // Quoted: "$(...)" inside double quotes would still be expanded by sh
+    const cmd = `am start -a android.intent.action.VIEW -d ${shellQuote(url)}`;
     const result = await executeTermuxCommand(cmd);
 
     if (result.success || result.exitCode === 0) {
@@ -83,7 +85,7 @@ export async function executeGetContacts(args: Record<string, unknown>): Promise
     }
 
     // Use termux-contact-list and grep
-    const cmd = `termux-contact-list | grep -i '${name.replace(/'/g, "'\\''")}'`;
+    const cmd = `termux-contact-list | grep -i -- ${shellQuote(name)}`;
     const result = await executeTermuxCommand(cmd);
 
     if (result.success && result.stdout) {

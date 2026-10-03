@@ -22,8 +22,9 @@ WORKDIR /app
 # Copy package manifests
 COPY package*.json ./
 
-# Install dependencies (rebuilding for current arch)
-RUN npm install && npm audit fix --force
+# Install exactly the locked dependencies (reproducible builds).
+# devDependencies stay: typescript is used at runtime by the auto-evolution type-check.
+RUN npm ci
 RUN npm rebuild better-sqlite3
 
 # Copy source and config

@@ -1,11 +1,18 @@
 import { downloadModel } from './model/modelDownloader';
+import { readSetting, storeSetting } from './security/secretStore';
 import { downloadVoskModel, VOSK_MODELS } from './stt/voskModelDownloader';
 import { downloadWhisperModel, WHISPER_MODELS } from './stt/whisperModelDownloader';
 import { logger } from './logger';
 import { FileSystemAdapter as Filesystem, Directory } from '../utils/fileSystemAdapter';
 import { registerPlugin } from '@capacitor/core';
+import { LLMConfig, SpeechConfig } from '../types';
 
 const Vosk = registerPlugin('Vosk') as any;
+
+// Directories and ids the app's services load these models from
+const PIPER_DIR = 'piper-voices';
+const VAD_DIR = 'vad-models';
+const VAD_MODEL_ID = 'silero-vad-v4';
 
 export interface SetupStep {
     id: string;
@@ -43,6 +50,15 @@ class SetupService {
         this.onProgressChange = callback;
     }
 
+    /** Current state: a setup keeps running while the settings screen is closed */
+    getProgress(): SetupProgress {
+        return this.progress;
+    }
+
+    isRunning(): boolean {
+        return this.progress.status === 'fetching' || this.progress.status === 'downloading' || this.progress.status === 'installing';
+    }
+
     private updateProgress(patch: Partial<SetupProgress>) {
         this.progress = { ...this.progress, ...patch };
         if (this.onProgressChange) {
@@ -58,6 +74,7 @@ class SetupService {
     }
 
     async runOneClickSetup(serverUrl: string, apiKey: string): Promise<void> {
+        if (this.isRunning()) return; // a second run would download every model twice
         try {
             this.updateProgress({ 
                 status: 'fetching', 
@@ -85,6 +102,7 @@ class SetupService {
             });
             this.log(`Found ${steps.length} models to configure.`);
 
+            const installed: SetupStep[] = [];
             for (let i = 0; i < steps.length; i++) {
                 const step = steps[i];
                 this.updateProgress({ 
@@ -96,24 +114,32 @@ class SetupService {
                 this.log(`Step ${i + 1}/${steps.length}: Downloading ${step.name}...`);
                 
                 const downloadUrl = `${serverUrl.replace(/\/$/, '')}/dl/${step.path}`;
+                // Progress inside the step moves the overall bar between this step and the next
+                const onStepProgress = (fraction: number) => this.updateProgress({
+                    percentage: ((i + Math.min(Math.max(fraction, 0), 1)) / steps.length) * 100
+                });
                 
                 try {
-                    await this.processStep(step, downloadUrl, apiKey);
+                    await this.processStep(step, downloadUrl, apiKey, onStepProgress);
+                    installed.push(step);
                     this.log(`✓ ${step.name} installed successfully.`);
                 } catch (err: any) {
                     this.log(`✗ Error installing ${step.name}: ${err.message}`);
                 }
             }
 
+            const failed = steps.length - installed.length;
             this.updateProgress({ 
                 status: 'completed', 
                 percentage: 100, 
-                currentStepName: 'Setup Complete' 
+                currentStepName: failed > 0 ? `Setup Complete (${failed} failed)` : 'Setup Complete'
             });
-            this.log('🎉 One-Click Configuration complete!');
+            this.log(failed > 0
+                ? `Configuration finished: ${installed.length} installed, ${failed} failed (see above).`
+                : '🎉 One-Click Configuration complete!');
             
-            // Auto-update settings
-            this.applyDefaultSettings(steps);
+            // Only models that are really on the device are selected
+            this.applyDefaultSettings(installed);
 
         } catch (error: any) {
             this.updateProgress({ status: 'failed', error: error.message });
@@ -121,14 +147,22 @@ class SetupService {
         }
     }
 
-    private async processStep(step: SetupStep, url: string, apiKey: string) {
+    /** Downloads one file through the native downloader and waits until it is complete and verified */
+    private async downloadFile(url: string, target: string, apiKey: string, onProgress?: (fraction: number) => void) {
+        await downloadModel(url, target, p => onProgress?.(p.percentage / 100), apiKey);
+    }
+
+    /** Same, into a sub-directory of the app data directory (created if missing) */
+    private async downloadToSubdir(url: string, subdir: string, filename: string, apiKey: string, onProgress?: (fraction: number) => void) {
+        await Filesystem.mkdir({ path: subdir, directory: Directory.Data, recursive: true }).catch(() => { /* already there */ });
+        await this.downloadFile(url, `${subdir}/${filename}`, apiKey, onProgress);
+    }
+
+    private async processStep(step: SetupStep, url: string, apiKey: string, onProgress: (fraction: number) => void) {
         switch (step.category) {
             case 'GGUF':
-                await downloadModel(url, step.target, undefined, apiKey);
-                break;
-            
             case 'LiteRT':
-                await downloadModel(url, step.target, undefined, apiKey);
+                await this.downloadFile(url, step.target, apiKey, onProgress);
                 break;
 
             case 'Embedding':
@@ -147,7 +181,7 @@ class SetupService {
                         url: url,
                         size: step.size
                     };
-                    await downloadVoskModel(voskModel as any);
+                    await downloadVoskModel(voskModel as any, p => onProgress(p.percentage / 100));
                 }
                 break;
 
@@ -159,7 +193,7 @@ class SetupService {
                         sizeBytes: step.size,
                         name: step.name
                     };
-                    await downloadWhisperModel(whisperModel as any);
+                    await downloadWhisperModel(whisperModel as any, p => onProgress(p.percentage / 100));
                 }
                 break;
 
@@ -171,15 +205,23 @@ class SetupService {
                 break;
 
             case 'Piper':
-                await this.downloadToSubdir(url, 'piper-models', step.target, apiKey);
+                // Where piperTTS loads voices from: the model plus its .onnx.json config
+                await this.downloadToSubdir(url, PIPER_DIR, step.target, apiKey, onProgress);
+                try {
+                    await this.downloadToSubdir(`${url}.json`, PIPER_DIR, `${step.target}.json`, apiKey);
+                } catch (e: any) {
+                    throw new Error(`voice config (${step.target}.json) unavailable on the server: ${e.message}`);
+                }
                 break;
 
             case 'SpeakerID':
-                await this.downloadToSubdir(url, 'speaker-id', step.target, apiKey);
+                // The speaker embedding plugin reads models/<file> from the app data directory
+                await this.downloadToSubdir(url, 'models', step.target, apiKey, onProgress);
                 break;
 
             case 'VAD':
-                await downloadModel(url, step.target, undefined, apiKey);
+                // vadService loads vad-models/<model id>.onnx
+                await this.downloadToSubdir(url, VAD_DIR, `${VAD_MODEL_ID}.onnx`, apiKey, onProgress);
                 break;
 
             default:
@@ -187,72 +229,39 @@ class SetupService {
         }
     }
 
-    private async downloadToSubdir(url: string, subdir: string, filename: string, apiKey: string) {
-        await Filesystem.mkdir({ path: subdir, directory: Directory.Data, recursive: true });
-        const targetPath = `${subdir}/${filename}`;
-        const tempName = `temp_${filename}`;
-        await downloadModel(url, tempName, undefined, apiKey);
-        
-        await Filesystem.copy({
-            from: tempName,
-            to: targetPath,
-            directory: Directory.Data
-        });
-        await Filesystem.deleteFile({ path: tempName, directory: Directory.Data });
+    /** Settings writes go through the secret store and reach App's state via a storage event */
+    private applySetting<T extends object>(key: string, patch: Partial<T>) {
+        const next = { ...readSetting<T>(key, {} as T), ...patch };
+        storeSetting(key, next);
+        window.dispatchEvent(new StorageEvent('storage', { key, newValue: JSON.stringify(next) }));
     }
 
-    private applyDefaultSettings(steps: SetupStep[]) {
+    private applyDefaultSettings(installed: SetupStep[]) {
         this.log('Applying optimized settings for downloaded models...');
+        const step = (id: string) => installed.find(s => s.id === id);
 
         try {
-            // Since we use useLocalStorage in App.tsx, writing directly to localStorage
-            // and dispatching a storage event will trigger updates in components.
-            
-            // 1. LLM Defaults
-            if (steps.find(s => s.id === 'qwen3.5-2b')) {
-                const currentLLM = JSON.parse(localStorage.getItem('llm-config') || '{}');
-                const newLLM = {
-                    ...currentLLM,
-                    provider: 'GGUF',
-                    modelPath: 'Qwen3.5-2B-Q4_K_M.gguf'
-                };
-                localStorage.setItem('llm-config', JSON.stringify(newLLM));
-                window.dispatchEvent(new StorageEvent('storage', { key: 'llm-config', newValue: JSON.stringify(newLLM) }));
+            // 1. LLM Defaults (ids the app knows: provider 'native-gguf' + nativeModelPath)
+            const chatModel = step('qwen3.5-2b');
+            if (chatModel) {
+                this.applySetting<LLMConfig>('llm-config', { provider: 'native-gguf', engine: 'gguf', nativeModelPath: chatModel.target });
             }
 
             // 2. LiteRT Defaults
-            if (steps.find(s => s.id === 'gemma-4-e2b')) {
-                const currentLLM = JSON.parse(localStorage.getItem('llm-config') || '{}');
-                const newLLM = {
-                    ...currentLLM,
-                    liteRTModelPath: 'gemma-4-E2B-it.litertlm'
-                };
-                localStorage.setItem('llm-config', JSON.stringify(newLLM));
-                window.dispatchEvent(new StorageEvent('storage', { key: 'llm-config', newValue: JSON.stringify(newLLM) }));
+            const liteRTModel = step('gemma-4-e2b');
+            if (liteRTModel) {
+                this.applySetting<LLMConfig>('llm-config', { liteRTModelPath: liteRTModel.target });
             }
 
             // 3. STT Defaults
-            if (steps.find(s => s.id === 'vosk-it')) {
-                const currentSpeech = JSON.parse(localStorage.getItem('speech-config') || '{}');
-                const newSpeech = {
-                    ...currentSpeech,
-                    sttProvider: 'Vosk',
-                    voskModelId: 'vosk-model-it-0.22'
-                };
-                localStorage.setItem('speech-config', JSON.stringify(newSpeech));
-                window.dispatchEvent(new StorageEvent('storage', { key: 'speech-config', newValue: JSON.stringify(newSpeech) }));
+            if (step('vosk-it')) {
+                this.applySetting<SpeechConfig>('speech-config', { sttProvider: 'vosk', voskModelId: 'vosk-model-it-0.22' });
             }
 
             // 4. TTS Defaults
-            if (steps.find(s => s.id === 'piper-paola')) {
-                const currentSpeech = JSON.parse(localStorage.getItem('speech-config') || '{}');
-                const newSpeech = {
-                    ...currentSpeech,
-                    ttsProvider: 'Piper',
-                    piperVoiceId: 'it_IT-paola-medium'
-                };
-                localStorage.setItem('speech-config', JSON.stringify(newSpeech));
-                window.dispatchEvent(new StorageEvent('storage', { key: 'speech-config', newValue: JSON.stringify(newSpeech) }));
+            const voice = step('piper-paola');
+            if (voice) {
+                this.applySetting<SpeechConfig>('speech-config', { ttsProvider: 'piper', piperVoiceId: voice.target.replace(/\.onnx$/, '') });
             }
 
             this.log('✓ Settings updated and applied via storage events.');

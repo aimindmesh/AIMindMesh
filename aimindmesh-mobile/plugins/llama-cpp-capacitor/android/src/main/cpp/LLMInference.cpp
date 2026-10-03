@@ -7,6 +7,7 @@
 
 #include "LLMInference.h"
 #include <android/log.h>
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -43,25 +44,8 @@ void LLMInference::loadModel(const char* model_path, const char* multimodalProj,
                               int nThreads, bool useMmap, bool useMlock, bool useVulkan, bool useOpenCL, bool useHexagon,
                               int nBatch, int nUBatch, bool flashAttn,
                               const char* cacheTypeK, const char* cacheTypeV, int nGpuLayers) {
-    LOGi("Loading model with:"
-         "\n\tmodel_path = %s"
-         "\n\tmultimodalProj = %s"
-         "\n\tminP = %f"
-         "\n\ttemperature = %f"
-         "\n\tstoreChats = %d"
-         "\n\tcontextSize = %ld"
-         "\n\tchatTemplate = %s"
-         "\n\tnThreads = %d"
-         "\n\tuseMmap = %d"
-         "\n\tuseMlock = %d"
-         "\n\tuseVulkan = %d"
-         "\n\tuseOpenCL = %d"
-         "\n\tnBatch = %d"
-         "\n\tnUBatch = %d"
-         "\n\tflashAttn = %d"
-         "\n\tcacheTypeK = %s"
-         "\n\tcacheTypeV = %s"
-         "\n\tnGpuLayers = %d",
+    LOGi("Loading model: path=%s mmproj=%s minP=%f temp=%f storeChats=%d n_ctx=%ld template=%s threads=%d "
+         "mmap=%d mlock=%d vulkan=%d opencl=%d n_batch=%d n_ubatch=%d flash_attn=%d cache_k=%s cache_v=%s gpu_layers=%d",
          model_path, multimodalProj ? multimodalProj : "(none)", minP, temperature, storeChats, contextSize, 
          chatTemplate ? chatTemplate : "(auto)", nThreads, useMmap, useMlock, useVulkan, useOpenCL,
          nBatch, nUBatch, flashAttn,
@@ -158,6 +142,10 @@ void LLMInference::loadModel(const char* model_path, const char* multimodalProj,
     
     _sampler = common_sampler_init(_model, sparams);
     LOGi("common_sampler initialized with temp=%.2f, minP=%.2f", temperature, minP);
+    // Defaults restored by setSamplingOverrides() when a request does not override them
+    _minP = minP; _defaultTemp = temperature; _defaultTopP = sparams.top_p;
+    _activeTemp = temperature; _activeTopP = sparams.top_p;
+    llama_set_abort_callback(_ctx, &LLMInference::abortCallback, this);
 
     _formattedMessages = std::vector<char>(llama_n_ctx(_ctx));
     _messages.clear();
@@ -477,9 +465,9 @@ bool LLMInference::loadState(const char* filepath, int seqId) {
 
 
 std::string LLMInference::completionLoop() {
-    // Check for interrupt
-    if (_interrupted.load()) {
-        LOGi("Generation interrupted by user");
+    // Interrupt, or the request's token limit (nPredict) reached
+    if (_interrupted.load() || (_nPredict > 0 && _responseNumTokens >= _nPredict)) {
+        LOGi("Generation stopped (interrupted=%d, tokens=%ld)", _interrupted.load() ? 1 : 0, _responseNumTokens);
         return "[EOG]";
     }
     
@@ -514,6 +502,10 @@ std::string LLMInference::completionLoop() {
             LOGe("[LLM_CHAIN] llama_decode() failed during prompt decode");
             throw std::runtime_error("llama_decode() failed");
         }
+        if (_interrupted.load()) { // decode aborted: only the first _nPast prompt tokens are in the KV cache
+            _prevTokens.resize(std::min(_prevTokens.size(), (size_t) _nPast));
+            return "[EOG]";
+        }
 
         _nPast += n_eval;
         _evalIndex += n_eval;
@@ -544,6 +536,7 @@ std::string LLMInference::completionLoop() {
             LOGe("[LLM_CHAIN] llama_decode() failed during generation");
             throw std::runtime_error("llama_decode() failed");
         }
+        if (_interrupted.load()) return "[EOG]"; // decode aborted: logits are stale
         _batch->n_tokens = 0; // Clear batch after decode
     }
 
@@ -606,11 +599,7 @@ std::string LLMInference::completionLoop() {
     }
 
     _incompleteTokensCount++;
-    LOGw("Invalid UTF-8 Sequence detected. _cacheResponseTokens hex: ");
-    for (char c : _cacheResponseTokens) {
-        LOGw("  %02X", (unsigned char)c);
-    }
-    LOGw("Incomplete sequence count: %d", _incompleteTokensCount);
+    LOGw("Incomplete UTF-8 sequence buffered (%zu bytes, count %d)", _cacheResponseTokens.size(), _incompleteTokensCount);
 
     if (_incompleteTokensCount >= 100) {
         LOGe("FATAL: Stuck in incomplete UTF-8 sequence for 100 iterations. Aborting generation loop natively to prevent UI hang.");
@@ -642,6 +631,7 @@ void LLMInference::stopCompletion() {
     }
     _response.clear();
     _cacheResponseTokens.clear();
+    _nPredict = 0; // per-request limit
     LOGi("Completion stopped, generated %ld tokens at %.2f tok/s", 
          _responseNumTokens, getResponseGenerationTime());
     if (_ctx) {

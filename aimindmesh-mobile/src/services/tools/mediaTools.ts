@@ -1,30 +1,31 @@
 import { Type } from '@google/genai';
 import { executeTermuxCommand } from '../termuxPlugin';
 import { ToolDefinition, ToolResult } from './types';
+import { shellQuote, clampInt } from './shellArgs';
 import { imageGenService } from '../image/imageGenService';
 
 export const mediaTools: ToolDefinition[] = [
     {
         name: 'generate_image',
-        description: 'Generates or edits an image locally on device using the Qualcomm Hexagon NPU (Stable Diffusion). Use this whenever the user asks to draw, generate, visualize, or modify an image.',
+        description: 'Generates an image, or edits one, locally on the device NPU with Stable Diffusion; the picture is shown to the user. Use it whenever the user asks to draw, generate, visualize or modify an image.',
         parameters: {
             type: Type.OBJECT,
             properties: {
                 prompt: {
                     type: Type.STRING,
-                    description: 'Detailed description of the image to generate or modification instructions'
+                    description: 'In ENGLISH, comma-separated: what the final picture shows (subject, setting, style, lighting). Stable Diffusion cannot follow instructions: for an edit, describe how the edited picture must look ("a red sports car on a beach at sunset"), never the change ("make it red").'
                 },
                 negative_prompt: {
                     type: Type.STRING,
-                    description: 'Negative prompt specifying elements to avoid (optional)'
+                    description: 'Optional, in English: things the picture must not contain'
                 },
                 source_image: {
                     type: Type.STRING,
-                    description: 'Optional base64 or file path of the source image to modify (for image-to-image editing)'
+                    description: 'Only to edit: "last" = the newest image in the conversation (the photo the user attached or a previous result). Omit to create a new image.'
                 },
                 strength: {
                     type: Type.NUMBER,
-                    description: 'Denoising / edit intensity between 0.1 (subtle) and 0.9 (drastic), default 0.65'
+                    description: 'Only with source_image: how much to change it, 0.3-0.5 keeps the composition (recolor, light restyle), 0.6-0.8 for a strong transformation. Default 0.65'
                 }
             },
             required: ['prompt']
@@ -81,7 +82,7 @@ export async function executeGenerateImage(args: Record<string, unknown>): Promi
     }
 
     try {
-        const result = await imageGenService.generateImage({
+        const result = await imageGenService.generateFromChat({ // the LLM leaves the RAM for SD, then comes back
             prompt: prompt.trim(),
             negativePrompt: (args.negative_prompt as string) || undefined,
             sourceImage: (args.source_image as string) || undefined,
@@ -90,7 +91,7 @@ export async function executeGenerateImage(args: Record<string, unknown>): Promi
 
         return {
             success: true,
-            message: `Image generated on Qualcomm Hexagon NPU (${result.generationTimeMs}ms) for prompt: "${prompt}"`,
+            message: `Image ${args.source_image ? 'edited' : 'generated'} on the NPU in ${(result.generationTimeMs / 1000).toFixed(1)}s and shown to the user (prompt: "${prompt}").`,
             data: {
                 base64Image: result.base64Image,
                 generationTimeMs: result.generationTimeMs,
@@ -107,15 +108,18 @@ export async function executeGenerateImage(args: Record<string, unknown>): Promi
 }
 
 export async function executeRecordAudio(args: Record<string, unknown>): Promise<ToolResult> {
-    const durationSeconds = Math.min((args.duration_seconds as number) || 10, 60);
-    const customFilename = args.filename as string;
+    const durationSeconds = clampInt(args.duration_seconds, 1, 60, 10);
+    // A file name only: no directories, no shell syntax (the path is passed to sh -c)
+    const customFilename = typeof args.filename === 'string'
+        ? args.filename.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+/, '')
+        : '';
 
     const filename = customFilename || `recording_${new Date().getTime()}.wav`;
     const targetDir = '/storage/emulated/0/Documents/AI_Companion_Audio';
     const targetFile = `${targetDir}/${filename}`;
 
     // Create directory and record
-    const cmd = `mkdir -p ${targetDir} && termux-microphone-record -f '${targetFile}' -l ${durationSeconds}`;
+    const cmd = `mkdir -p ${targetDir} && termux-microphone-record -f ${shellQuote(targetFile)} -l ${durationSeconds}`;
 
     const result = await executeTermuxCommand(cmd);
 

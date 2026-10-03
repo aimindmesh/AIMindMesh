@@ -1,7 +1,10 @@
 
 import { LLMConfig } from '../../types';
 import { generateTextResponseStream } from '../llm/llmService';
-import { saveMemoryToDb, deleteMemoryFromDb, getAllSemanticMemories } from './memoryDatabase';
+import { getAllSemanticMemoriesWithEmbeddings, getOldestMemoriesForSummary, replaceMemoriesAtomically } from './memoryDatabase';
+import { cosineSimilarity } from './embeddingCodec';
+import { memoryTaskConfig } from './memoryLlmConfig';
+import { embedText, ensureEmbeddingModel, ensureEmbeddingModelFromSettings, getActiveEmbeddingModel, getEmbeddingLoadError } from '../model/embedding/embeddingRuntime';
 import { logger } from '../logger';
 
 const SUMMARIZATION_PROMPT = `
@@ -17,6 +20,9 @@ Here are the memories to summarize:
 Summary:
 `;
 
+/** Consolidation compares every pair: only the most recent rows are clustered */
+const MAX_CONSOLIDATION_ROWS = 500;
+
 export class MemorySummarizer {
     private llmConfig: LLMConfig;
     private apiKey?: string;
@@ -26,75 +32,66 @@ export class MemorySummarizer {
         this.apiKey = apiKey;
     }
 
+    /** Text of an internal LLM task: no injected memories, tools or thinking in the output */
+    private async generate(prompt: string): Promise<string> {
+        let text = '';
+        for await (const chunk of generateTextResponseStream(
+            [{ role: 'user', id: 'system', text: prompt, timestamp: new Date() }],
+            { name: 'System', description: 'System', systemPrompt: '', traits: [] }, // Dummy personality
+            memoryTaskConfig(this.llmConfig),
+            [] as any[], // No memories needed for summarization
+            this.apiKey
+        )) {
+            if (typeof chunk === 'string') text += chunk;
+            else if (chunk.type === 'text') text += chunk.content;
+        }
+        return text.trim();
+    }
+
+    /** Embedding model the new rows are stored with (the one selected in the settings). */
+    private async ensureModel(): Promise<string> {
+        const loaded = this.llmConfig.embeddingModelId
+            ? await ensureEmbeddingModel(this.llmConfig.embeddingModelId)
+            : await ensureEmbeddingModelFromSettings();
+        const model = getActiveEmbeddingModel();
+        if (!loaded || !model) {
+            throw new Error(`Embedding model not available${getEmbeddingLoadError() ? `: ${getEmbeddingLoadError()}` : ''}`);
+        }
+        return model.key;
+    }
+
     async summarizeMemories(countToSummarize: number = 20): Promise<{ success: boolean; message: string }> {
         try {
             logger.log('info', '[MemorySummarizer] Starting summarization...');
 
-            // 1. Get all semantic memories
-            // We'll summarize the OLDEST memories first to keep the "long term" memory compact
-            const allMemories = await getAllSemanticMemories();
-
-            // Filter out memories that are already summaries (if we had a flag, but for now we basically rely on content length or metadata.
-            // For now, let's just take the oldest N memories.
-            // Sort by timestamp asc
-            allMemories.sort((a, b) => a.timestamp - b.timestamp);
-
-            const memoriesToSummarize = allMemories.slice(0, countToSummarize);
+            // The OLDEST memories (summaries excluded) are compressed first, to keep the
+            // "long term" memory compact without re-summarizing summaries every run
+            const memoriesToSummarize = await getOldestMemoriesForSummary(countToSummarize);
 
             if (memoriesToSummarize.length < 5) {
                 return { success: false, message: 'Not enough memories to summarize (min 5).' };
             }
+            const modelKey = await this.ensureModel();
 
             // 2. Prepare content for LLM
             const memoryContent = memoriesToSummarize.map(m => `- [${new Date(m.timestamp).toLocaleDateString()}] ${m.content}`).join('\n');
-            const prompt = SUMMARIZATION_PROMPT.replace('{{MEMORIES}}', memoryContent);
+            const summary = await this.generate(SUMMARIZATION_PROMPT.replace('{{MEMORIES}}', memoryContent));
 
-            // 3. Generate Summary
-            // We use a "cheap" or "fast" model if possible, but here we just use the configured one
-            const stream = await generateTextResponseStream(
-                [{ role: 'user', id: 'system', text: prompt, timestamp: new Date() }],
-                { name: 'System', description: 'System', systemPrompt: '', traits: [] }, // Dummy personality
-                this.llmConfig,
-                [] as any[], // No memories needed for summarization
-                this.apiKey,
-                undefined // No abort signal necessary for now
-            );
-
-            let summary = '';
-            for await (const chunk of stream) {
-                if (typeof chunk === 'string') {
-                    summary += chunk;
-                } else if (chunk.type === 'text') {
-                    summary += chunk.content;
-                }
-            }
-
-            if (!summary || summary.trim().length === 0) {
+            if (!summary) {
                 throw new Error('Failed to generate summary from LLM');
             }
 
             logger.log('info', '[MemorySummarizer] Generated summary:', summary);
 
-            // 4. Save new summary memory
-            const newId = `summary_${Date.now()}`;
-            // We need an embedding for the new summary
-            const { TextEmbedding } = await import('text-embedding-capacitor');
-            const result = await TextEmbedding.generateEmbedding({ text: summary });
-            const embedding = new Float32Array(result.embedding);
-
-            await saveMemoryToDb(
-                newId,
-                'system_summary', // session_id
-                'system',        // role
-                `[MEMORY SUMMARY] ${summary}`, // Content
-                embedding
+            // 4. Save the summary and delete the old memories in one transaction
+            const content = `[MEMORY SUMMARY] ${summary}`;
+            const { vector, key } = await embedText(content, 'passage');
+            if (key !== modelKey) throw new Error('Embedding model changed during summarization');
+            await replaceMemoriesAtomically(
+                { id: `summary_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, sessionId: 'system_summary', role: 'system', content, embedding: vector, modelKey: key },
+                memoriesToSummarize.map(m => m.id)
             );
-
-            // 5. Delete old memories
-            logger.log('info', `[MemorySummarizer] Deleting ${memoriesToSummarize.length} old memories...`);
-            for (const mem of memoriesToSummarize) {
-                await deleteMemoryFromDb(mem.id);
-            }
+            logger.log('info', `[MemorySummarizer] Replaced ${memoriesToSummarize.length} old memories with a summary`);
 
             return {
                 success: true,
@@ -115,9 +112,9 @@ export class MemorySummarizer {
         try {
             logger.log('info', `[MemorySummarizer] Starting consolidation (threshold: ${similarityThreshold})...`);
 
-            // 1. Get all memories with embeddings
-            const { getAllSemanticMemoriesWithEmbeddings } = await import('./memoryDatabase');
-            const memories = await getAllSemanticMemoriesWithEmbeddings();
+            // 1. Recent memories with embeddings of the active model (others are not comparable)
+            const modelKey = await this.ensureModel();
+            const memories = await getAllSemanticMemoriesWithEmbeddings(modelKey, MAX_CONSOLIDATION_ROWS);
 
             if (memories.length < 2) {
                 return { success: true, message: 'Not enough memories to consolidate.', consolidatedCount: 0 };
@@ -139,7 +136,7 @@ export class MemorySummarizer {
                 for (let j = i + 1; j < memories.length; j++) {
                     if (processed.has(memories[j].id)) continue;
 
-                    const similarity = this.computeCosineSimilarity(memories[i].embedding, memories[j].embedding);
+                    const similarity = cosineSimilarity(memories[i].embedding, memories[j].embedding);
                     if (similarity >= similarityThreshold) {
                         currentCluster.push(memories[j]);
                         processed.add(memories[j].id);
@@ -160,12 +157,13 @@ export class MemorySummarizer {
 
             // 3. Process clusters
             let totalConsolidated = 0;
+            let merged = 0;
 
             for (const cluster of clusters) {
                 // Generate prompt
                 const memoryContent = cluster.map(m => `- ${m.content}`).join('\n');
                 const prompt = `
-You are a memory efficient assistant. 
+You are a memory efficient assistant.
 Combine the following related memories into a single, concise memory statement.
 If they are exact duplicates, just pick one.
 If they conflict, prefer the most recent one (but here they are just a list).
@@ -177,51 +175,33 @@ ${memoryContent}
 Consolidated Memory:
 `;
 
-                // Generate
-                const stream = await generateTextResponseStream(
-                    [{ role: 'user', id: 'system', text: prompt, timestamp: new Date() }],
-                    { name: 'System', description: 'System', systemPrompt: '', traits: [] },
-                    this.llmConfig,
-                    [] as any[],
-                    this.apiKey
-                );
-
-                let consolidatedText = '';
-                for await (const chunk of stream) {
-                    if (typeof chunk === 'string') consolidatedText += chunk;
-                    else if (chunk.type === 'text') consolidatedText += chunk.content;
-                }
-
-                consolidatedText = consolidatedText.replace(/^Consolidated Memory:\s*/i, '').trim();
+                const consolidatedText = (await this.generate(prompt)).replace(/^Consolidated Memory:\s*/i, '').trim();
 
                 if (consolidatedText) {
-                    // Save new
-                    const newId = `consolidated_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-                    const { TextEmbedding } = await import('text-embedding-capacitor');
-                    const result = await TextEmbedding.generateEmbedding({ text: consolidatedText });
-                    const embedding = new Float32Array(result.embedding);
+                    const { vector, key } = await embedText(consolidatedText, 'passage');
+                    if (key !== modelKey) throw new Error('Embedding model changed during consolidation');
+                    // Facts and summaries stay long-lived once merged; chat turns keep their role
+                    const longLived = cluster.some(m => m.role === 'extracted' || m.role === 'system');
 
-                    await saveMemoryToDb(
-                        newId,
-                        cluster[0].sessionId,
-                        cluster[0].role,
-                        consolidatedText,
-                        embedding
-                    );
-
-                    // Delete old
-                    for (const mem of cluster) {
-                        await deleteMemoryFromDb(mem.id);
-                    }
+                    // Save the merged memory and delete the cluster in one transaction
+                    await replaceMemoriesAtomically({
+                        id: `consolidated_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                        sessionId: cluster[0].sessionId,
+                        role: longLived ? 'extracted' : cluster[0].role,
+                        content: consolidatedText,
+                        embedding: vector,
+                        modelKey: key,
+                    }, cluster.map(m => m.id));
 
                     totalConsolidated += cluster.length;
+                    merged++;
                     logger.log('info', `[MemorySummarizer] Consolidated ${cluster.length} memories into: "${consolidatedText}"`);
                 }
             }
 
             return {
                 success: true,
-                message: `Consolidated ${totalConsolidated} memories into ${clusters.length} new entries.`,
+                message: `Consolidated ${totalConsolidated} memories into ${merged} new entries.`,
                 consolidatedCount: totalConsolidated
             };
 
@@ -229,16 +209,5 @@ Consolidated Memory:
             logger.log('error', '[MemorySummarizer] Consolidation failed', error);
             return { success: false, message: error.message, consolidatedCount: 0 };
         }
-    }
-
-    private computeCosineSimilarity(a: Float32Array, b: Float32Array): number {
-        if (a.length !== b.length) return 0;
-        let dot = 0, normA = 0, normB = 0;
-        for (let i = 0; i < a.length; i++) {
-            dot += a[i] * b[i];
-            normA += a[i] * a[i];
-            normB += b[i] * b[i];
-        }
-        return (normA === 0 || normB === 0) ? 0 : dot / (Math.sqrt(normA) * Math.sqrt(normB));
     }
 }

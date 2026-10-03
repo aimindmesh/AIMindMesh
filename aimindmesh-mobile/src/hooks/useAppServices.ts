@@ -13,7 +13,8 @@ export const useAppServices = (
     personality: any,
     addMemory: any,
     activeThreadIdState: string | null,
-    showToast: any
+    showToast: any,
+    keepAlive: boolean
 ) => {
     // --- Proactive Service Init ---
     useEffect(() => {
@@ -32,7 +33,7 @@ export const useAppServices = (
             const lastMsg = chat.messages[chat.messages.length - 1];
             if (lastMsg.role === 'model' && lastMsg.text && !lastMsg.text.startsWith('Sorry, I encountered')) {
                 const runExtraction = async () => {
-                    if (!isAppActive && !llmConfig.keepAlive) {
+                    if (!isAppActive && !keepAlive) {
                         logger.log('debug', '[App] Memory extraction skipped: App not active and keepAlive false');
                         return;
                     }
@@ -74,7 +75,7 @@ export const useAppServices = (
                 setTimeout(runExtraction, 2000);
             }
         }
-    }, [chat.isLoading, chat.messages, isAppActive, llmConfig, apiKey, perplexityApiKey, claudeApiKey, personality, addMemory, activeThreadIdState]);
+    }, [chat.isLoading, chat.messages, isAppActive, keepAlive, llmConfig, apiKey, perplexityApiKey, claudeApiKey, personality, addMemory, activeThreadIdState]);
 
     // --- Memory Summarization ---
     useEffect(() => {

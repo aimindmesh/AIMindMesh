@@ -1,18 +1,30 @@
 import { logger } from '../logger';
 import { Device } from '@capacitor/device';
+import { PluginListenerHandle } from '@capacitor/core';
 import { AIMindMeshServerSettings, LLMConfig, Personality } from '../../types';
 import { generateTextResponseStream } from '../llm/llmService';
 import { App } from '@capacitor/app';
 import { saveNativeKvCache } from '../llm/nativeLLM';
 import { saveLiteRTKvCache } from '../llm/providers/liteRT/plugin';
 
+/** Reconnect delay after a closed link: doubles up to the maximum, reset once connected */
+export const RECONNECT_MIN_MS = 2_000;
+export const RECONNECT_MAX_MS = 60_000;
+
+/** What identifies the server link: a change means reconnecting */
+const connectionKey = (s: AIMindMeshServerSettings) => `${s.serverUrl}|${s.apiKey}|${s.deviceName ?? ''}`;
 
 class MobileNodeWorker {
     private ws: WebSocket | null = null;
     private serverSettings: AIMindMeshServerSettings | null = null;
+    private connectedKey = '';
     private llmConfig: LLMConfig | null = null;
     private personality: Personality | null = null;
-    private reconnectTimer: any = null;
+    private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    private reconnectDelayMs = RECONNECT_MIN_MS;
+    private connecting = false;
+    private survivalTimer: ReturnType<typeof setInterval> | null = null;
+    private appStateListener: Promise<PluginListenerHandle> | null = null;
     private statusListeners: ((isWorking: boolean) => void)[] = [];
     private activeTaskAbort: AbortController | null = null;
     public isWorking: boolean = false;
@@ -30,24 +42,46 @@ class MobileNodeWorker {
         this.statusListeners.forEach(cb => cb(isWorking));
     }
 
+    /**
+     * Starts (or keeps) the worker link. Safe to call repeatedly: timers and listeners are
+     * created once, and the socket is reopened only when the server address or key changed.
+     */
     public init(settings: AIMindMeshServerSettings, llmConfig?: LLMConfig, personality?: Personality) {
+        this.updateConfig(llmConfig, personality);
+
+        const key = connectionKey(settings);
+        if (this.connectedKey && key !== this.connectedKey) {
+            logger.log('info', '[NodeWorker] Server settings changed: reconnecting');
+            this.closeSocket();
+            this.reconnectDelayMs = RECONNECT_MIN_MS;
+        }
         this.serverSettings = settings;
-        if (llmConfig) this.llmConfig = llmConfig;
-        if (personality) this.personality = personality;
-        this.connect();
-        
+        this.connectedKey = key;
+
         // Survival logging: verify if worker is alive and logging is working
-        setInterval(() => {
-            logger.log('debug', `[NodeWorker] SURVIVAL CHECK - Status: ${this.isWorking ? 'BUSY' : 'IDLE'}, WS: ${this.ws?.readyState}`);
-        }, 5000);
+        if (!this.survivalTimer) {
+            this.survivalTimer = setInterval(() => {
+                logger.log('debug', `[NodeWorker] SURVIVAL CHECK - Status: ${this.isWorking ? 'BUSY' : 'IDLE'}, WS: ${this.ws?.readyState}`);
+            }, 5000);
+        }
 
         // [KV CACHE] Persistence trigger: flush to disk when app goes to background
-        App.addListener('appStateChange', async ({ isActive }) => {
-            if (!isActive) {
-                logger.log('info', '[NodeWorker] App backgrounding. Flushing KV cache to disk...');
-                await this.flushCache();
-            }
-        });
+        if (!this.appStateListener) {
+            this.appStateListener = App.addListener('appStateChange', async ({ isActive }) => {
+                if (!isActive) {
+                    logger.log('info', '[NodeWorker] App backgrounding. Flushing KV cache to disk...');
+                    await this.flushCache();
+                }
+            });
+        }
+
+        void this.connect();
+    }
+
+    /** The model and personality remote tasks run with; no reconnect needed */
+    public updateConfig(llmConfig?: LLMConfig | null, personality?: Personality | null) {
+        if (llmConfig) this.llmConfig = llmConfig;
+        if (personality) this.personality = personality;
     }
 
     private async flushCache() {
@@ -67,28 +101,65 @@ class MobileNodeWorker {
 
     public stop() {
         if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+        this.reconnectDelayMs = RECONNECT_MIN_MS;
         this.serverSettings = null;
-        if (this.ws) {
-            this.ws.close();
-            this.ws = null;
+        this.connectedKey = '';
+        if (this.survivalTimer) clearInterval(this.survivalTimer);
+        this.survivalTimer = null;
+        this.appStateListener?.then(handle => handle.remove()).catch(() => { });
+        this.appStateListener = null;
+        this.closeSocket();
+    }
+
+    /** Closes the current socket without triggering its reconnect */
+    private closeSocket() {
+        const socket = this.ws;
+        this.ws = null;
+        if (socket) {
+            socket.onclose = null;
+            socket.close();
         }
     }
 
+    private scheduleReconnect() {
+        if (!this.serverSettings || this.reconnectTimer) return;
+        const delay = this.reconnectDelayMs;
+        this.reconnectDelayMs = Math.min(delay * 2, RECONNECT_MAX_MS);
+        logger.log('warn', `[NodeWorker] Neural link closed, reconnecting in ${Math.round(delay / 1000)}s...`);
+        this.reconnectTimer = setTimeout(() => {
+            this.reconnectTimer = null;
+            void this.connect();
+        }, delay);
+    }
+
+    /** Opens the link now (also used when a push wakes the app); no-op if already open */
     public async connect() {
         if (!this.serverSettings || !this.serverSettings.enabled || !this.serverSettings.serverUrl) return;
+        if (this.connecting) return; // a second socket would be opened while awaiting the device id
         if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
 
-        const deviceId = await Device.getId();
-        const wsUrl = this.serverSettings.serverUrl.replace(/^http/, 'ws') + '/ws/nodes?id=' + encodeURIComponent(deviceId.identifier) + '&name=' + encodeURIComponent(this.serverSettings.deviceName || 'Mobile Node');
-        
+        this.connecting = true;
         try {
-            this.ws = new WebSocket(wsUrl);
+            const deviceId = await Device.getId();
+            const settings = this.serverSettings;
+            if (!settings) return; // stopped meanwhile
+            // Browser WebSockets cannot set headers: the server accepts the API key as the `token` query param
+            const wsUrl = settings.serverUrl.replace(/^http/, 'ws') + '/ws/nodes?id=' + encodeURIComponent(deviceId.identifier) + '&name=' + encodeURIComponent(settings.deviceName || 'Mobile Node') + '&token=' + encodeURIComponent(settings.apiKey || '');
 
-            this.ws.onopen = () => {
+            const socket = new WebSocket(wsUrl);
+            this.ws = socket;
+
+            socket.onopen = () => {
+                this.reconnectDelayMs = RECONNECT_MIN_MS;
                 logger.log('info', '[NodeWorker] Neural link established with server cluster');
             };
 
-            this.ws.onmessage = async (event) => {
+            socket.onmessage = async (event) => {
                 try {
                     let rawData = '';
                     if (typeof event.data === 'string') {
@@ -223,18 +294,20 @@ class MobileNodeWorker {
                 }
             };
 
-            this.ws.onclose = () => {
-                logger.log('warn', '[NodeWorker] Neural link closed, reconnecting in 2s...');
-                if (this.serverSettings) {
-                    this.reconnectTimer = setTimeout(() => this.connect(), 2000);
-                }
+            socket.onclose = () => {
+                if (this.ws !== socket) return; // replaced or stopped
+                this.ws = null;
+                this.scheduleReconnect();
             };
 
-            this.ws.onerror = (e) => {
+            socket.onerror = (e) => {
                 logger.log('error', '[NodeWorker] WebSocket error', e);
             };
         } catch (e) {
             logger.log('error', '[NodeWorker] Connection failed', e);
+            this.scheduleReconnect();
+        } finally {
+            this.connecting = false;
         }
     }
 }

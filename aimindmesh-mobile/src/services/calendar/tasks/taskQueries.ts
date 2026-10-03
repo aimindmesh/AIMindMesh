@@ -3,6 +3,10 @@ import { getCalendarDatabase } from '../calendarDatabase';
 import { CalendarTask, TaskStatus, TaskStats, KanbanBoard } from '../../../types/calendar';
 import { parseTaskRow } from './taskHelpers';
 
+/** Priority is stored as text: sort by rank, not alphabetically (urgent > high > medium > low) */
+export const PRIORITY_RANK_SQL =
+    "CASE priority WHEN 'urgent' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END";
+
 /**
  * Get tasks by status (for a single Kanban column)
  */
@@ -13,7 +17,7 @@ export async function getTasksByStatus(status: TaskStatus): Promise<CalendarTask
         const result = await db.query(
             `SELECT * FROM calendar_tasks 
              WHERE status = ? AND parent_task_id IS NULL 
-             ORDER BY task_order ASC, priority DESC, due_date ASC`,
+             ORDER BY task_order ASC, ${PRIORITY_RANK_SQL} DESC, due_date ASC`,
             [status]
         );
 
@@ -45,6 +49,23 @@ export async function getKanbanBoard(): Promise<KanbanBoard> {
 }
 
 /**
+ * Ids of the tasks that have at least one subtask (the board itself lists top-level tasks only)
+ */
+export async function getTaskIdsWithSubtasks(): Promise<Set<string>> {
+    const db = await getCalendarDatabase();
+
+    try {
+        const result = await db.query(
+            'SELECT DISTINCT parent_task_id AS id FROM calendar_tasks WHERE parent_task_id IS NOT NULL'
+        );
+        return new Set((result.values || []).map((row: any) => row.id));
+    } catch (error) {
+        logger.log('error', '[TaskDB] Failed to get tasks with subtasks', error);
+        return new Set();
+    }
+}
+
+/**
  * Get tasks for a specific date
  */
 export async function getTasksForDate(date: Date): Promise<CalendarTask[]> {
@@ -56,7 +77,7 @@ export async function getTasksForDate(date: Date): Promise<CalendarTask[]> {
         const result = await db.query(
             `SELECT * FROM calendar_tasks 
              WHERE due_date >= ? AND due_date <= ?
-             ORDER BY priority DESC, due_date ASC`,
+             ORDER BY ${PRIORITY_RANK_SQL} DESC, due_date ASC`,
             [startOfDay, endOfDay]
         );
 

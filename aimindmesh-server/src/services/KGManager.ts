@@ -15,25 +15,48 @@ export class KGManager {
 
     const session = getSession();
     try {
+      // An empty embedding never wipes a real one, and a plain description ("Extracted from ...")
+      // never overwrites an enriched one
       const result = await session.run(`
         MERGE (c:Concept {name: $name})
         ON CREATE SET c.id = randomUUID(), c.createdAt = timestamp()
-        SET c.description = $description, c.embedding = $embedding, c.updatedAt = timestamp(), c.enriched = $enriched
+        SET c.embedding = CASE WHEN size($embedding) > 0 THEN $embedding ELSE c.embedding END,
+            c.description = CASE WHEN $enriched OR NOT coalesce(c.enriched, false) THEN $description ELSE c.description END,
+            c.enriched = $enriched OR coalesce(c.enriched, false),
+            c.updatedAt = timestamp()
         RETURN c.id AS id
-      `, { name, description, embedding, enriched });
+      `, { name, description, embedding: embedding ?? [], enriched });
       return result.records[0]?.get('id');
     } finally {
       await session.close();
     }
   }
 
+  /** Links an Insight to a Concept (ids, e.g. the one returned by upsertConcept). */
+  public static async linkInsightToConcept(insightId: string, conceptId: string, relType: string, weight: number = 1.0) {
+    const safeRelType = String(relType ?? '').replace(/[^A-Za-z0-9_]/g, '_') || 'RELATED_TO';
+    const session = getSession();
+    try {
+      await session.run(`
+        MATCH (i:Insight {id: $insightId})
+        MATCH (c:Concept {id: $conceptId})
+        MERGE (i)-[r:\`${safeRelType}\`]->(c)
+        SET r.weight = $weight, r.updatedAt = timestamp()
+      `, { insightId, conceptId, weight });
+    } finally {
+      await session.close();
+    }
+  }
+
   public static async linkConcepts(idA: string, idB: string, relType: string, weight: number = 1.0) {
+    // Relationship types cannot be query parameters: relType comes from LLM output, so whitelist its characters
+    const safeRelType = String(relType ?? '').replace(/[^A-Za-z0-9_]/g, '_') || 'RELATED_TO';
     const session = getSession();
     try {
       await session.run(`
         MATCH (a:Concept {id: $idA})
         MATCH (b:Concept {id: $idB})
-        MERGE (a)-[r:\`${relType}\`]->(b)
+        MERGE (a)-[r:\`${safeRelType}\`]->(b)
         SET r.weight = $weight, r.updatedAt = timestamp()
       `, { idA, idB, weight });
     } finally {
@@ -122,20 +145,22 @@ export class KGManager {
     }
   }
 
-  public static async upsertMemory(content: string, embedding: number[], category: string, source: string) {
+  /** Stores a memory. With `syncId` (device push) an existing node is updated instead of duplicated. */
+  public static async upsertMemory(content: string, embedding: number[], category: string, source: string, syncId?: string) {
     const session = getSession();
     try {
-      const result = await session.run(`
+      const result = await session.run(syncId ? `
+        MERGE (m:Memory {syncId: $syncId})
+        ON CREATE SET m.id = randomUUID(), m.createdAt = timestamp()
+        SET m.content = $content, m.embedding = $embedding, m.category = $category, m.source = $source
+        RETURN m.id AS id
+      ` : `
         CREATE (m:Memory {
-          id: randomUUID(),
-          content: $content,
-          embedding: $embedding,
-          category: $category,
-          source: $source,
-          createdAt: timestamp()
+          id: randomUUID(), content: $content, embedding: $embedding,
+          category: $category, source: $source, createdAt: timestamp()
         })
         RETURN m.id AS id
-      `, { content, embedding, category, source });
+      `, { content, embedding, category, source, syncId: syncId ?? null });
 
       if (result.records.length === 0) {
         throw new Error('Neo4j returned no result for upsertMemory');
@@ -189,6 +214,8 @@ export class KGManager {
   }
 
   public static async getNeighbors(id: string, depth: number = 1) {
+    // depth is interpolated into the query: keep it a small integer (also bounds the traversal cost)
+    depth = Number.isFinite(depth) ? Math.min(Math.max(Math.trunc(depth), 0), 5) : 1;
     if (depth === 0) {
       const node = await this.getNodeById(id);
       return {

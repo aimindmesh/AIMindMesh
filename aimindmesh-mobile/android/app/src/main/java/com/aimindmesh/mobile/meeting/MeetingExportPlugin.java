@@ -32,6 +32,9 @@ public class MeetingExportPlugin extends Plugin {
 
     private static final String TAG = "MeetingExportPlugin";
 
+    // Held until printing starts: an unreferenced WebView can be collected before onPageFinished
+    private WebView printWebView;
+
     @PluginMethod
     public void exportToPDF(PluginCall call) {
         String html = call.getString("html");
@@ -45,12 +48,18 @@ public class MeetingExportPlugin extends Plugin {
         getActivity().runOnUiThread(() -> {
             try {
                 WebView webView = new WebView(getContext());
+                printWebView = webView;
                 webView.setWebViewClient(new WebViewClient() {
+                    private boolean printed = false;
+
                     @Override
                     public void onPageFinished(WebView view, String url) {
+                        // Can fire more than once: print (and resolve) only the first time
+                        if (printed) return;
+                        printed = true;
                         PrintManager printManager = (PrintManager) getContext().getSystemService(Context.PRINT_SERVICE);
 
-                        PrintDocumentAdapter adapter = webView.createPrintDocumentAdapter(title);
+                        PrintDocumentAdapter adapter = view.createPrintDocumentAdapter(title);
 
                         PrintAttributes attrs = new PrintAttributes.Builder()
                                 .setMediaSize(PrintAttributes.MediaSize.ISO_A4)

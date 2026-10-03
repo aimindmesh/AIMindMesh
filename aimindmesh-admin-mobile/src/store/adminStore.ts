@@ -1,42 +1,19 @@
 import { create } from 'zustand';
 import { adminApi } from '../services/api';
+import type { ServerStatus as ApiServerStatus, ServerNode } from '@aimindmesh/api-types';
 
-interface ServerNode {
-  id: string; type: string; status: string; url: string;
-  models?: string[]; address?: string; version?: string;
-}
-interface ServerStatus {
-  nodes: ServerNode[];
-  cpu: number;
-  ram: { total: string; used: string; percent: number };
-  geminiUsage: number;
-  openrouterUsage?: number;
-  fcmStatus?: { configured: boolean; path: string };
-  dailyQuotaCap?: number;
-  openrouterDailyQuotaCap?: number;
-  inferenceQueue?: any[];
-  runningTasksCount?: number;
-  queueHistory?: any[];
-  activity?: any[];
+// GET /api/admin/status (server contract) plus the lists this store merges in
+type ServerStatus = Omit<ApiServerStatus, 'openrouterCredits'> & {
   openrouterCredits?: {
     balance: number;
     total_credits: number;
     total_usage: number;
     lastChecked: number;
   } | null;
-  infrastructureBrake: boolean;
-  openClawHealth?: {
-    isHealthy: boolean;
-    statusMessage: string;
-    lastCheck: number;
-  };
-  hermesHealth?: {
-    isHealthy: boolean;
-    statusMessage: string;
-    lastCheck: number;
-  };
+  queueHistory?: any[];
+  activity?: any[];
   failedHistory?: any[];
-}
+};
 interface ServerConfig {
   server?: { port: number; apiKey: string };
   proactive?: { 

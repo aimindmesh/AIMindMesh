@@ -1,0 +1,28 @@
+# Gitea Actions runner for the AIMindMesh CI (.gitea/workflows/ci.yml).
+# Copy to docker-compose.yml, set the registration token, then: docker compose up -d
+#
+# SECURITY: the runner needs the Docker socket to start job containers, but the jobs
+# themselves must NOT get it (see config.yaml: container.docker_host "-"), otherwise any
+# job could take over the VPS. Jobs also stay off wirehole_private_network.
+services:
+  act_runner:
+    image: docker.io/gitea/act_runner:latest
+    container_name: gitea-act-runner
+    restart: unless-stopped
+    environment:
+      CONFIG_FILE: /config.yaml
+      GITEA_INSTANCE_URL: http://gitea:3000
+      # Gitea → Site Administration → Actions → Runners → Create new runner
+      GITEA_RUNNER_REGISTRATION_TOKEN: change-me
+      GITEA_RUNNER_NAME: aimindmesh-ci
+    volumes:
+      - ./config.yaml:/config.yaml:ro
+      - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - gitea_net
+
+networks:
+  # The network Gitea is attached to (check `docker network ls`); NOT wirehole_private_network
+  gitea_net:
+    external: true

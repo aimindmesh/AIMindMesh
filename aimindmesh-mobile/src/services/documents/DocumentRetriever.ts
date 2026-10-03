@@ -1,7 +1,8 @@
 import { getKnowledgeDatabase } from '../database/knowledgeDatabase';
-import { TextEmbedding } from 'text-embedding-capacitor';
 import { logger } from '../logger';
 import { workspaceService } from '../workspaces/WorkspaceService';
+import { embedText, ensureEmbeddingModelFromSettings, getActiveEmbeddingModel } from '../model/embedding/embeddingRuntime';
+import { blobToFloat32Array, cosineSimilarity } from '../memory/embeddingCodec';
 
 export interface RetrievalResult {
     id: number;
@@ -29,12 +30,14 @@ export class DocumentRetriever {
         // 1. FTS5 Search (Keyword)
         const ftsResults = await this.keywordSearch(query, workspaceId, topK * 2);
 
-        // 2. Vector Search (Semantic)
+        // 2. Vector Search (Semantic): only chunks embedded by the same model are comparable
         let vecResults: RetrievalResult[] = [];
         try {
-            const embeddingResult = await TextEmbedding.generateEmbedding({ text: query });
-            const queryVec = new Float32Array(embeddingResult.embedding);
-            vecResults = await this.vectorSearch(queryVec, workspaceId, topK * 2);
+            if (!getActiveEmbeddingModel() && !(await ensureEmbeddingModelFromSettings())) {
+                throw new Error('No embedding model loaded');
+            }
+            const { vector: queryVec, key } = await embedText(query, 'query');
+            vecResults = await this.vectorSearch(queryVec, key, workspaceId, topK * 2);
         } catch (e) {
             logger.log('error', '[Retriever] Vector search failed, falling back to keyword only', e);
             // Fallback: return FTS results if vector fails
@@ -55,6 +58,8 @@ export class DocumentRetriever {
 
     // Helper for auto-retrieve based on active workspace settings
     async autoRetrieve(query: string): Promise<RetrievalResult[]> {
+        // The saved mode and active workspace are loaded lazily (the default would be GLOBAL)
+        await workspaceService.ensureInitialized();
         const mode = workspaceService.getContextMode();
 
         // 1. If Context Disabled (None), return nothing
@@ -77,14 +82,14 @@ export class DocumentRetriever {
         }
 
         if (activeWorkspace.settings.search_strategy === 'keyword') {
-            const fts = await this.keywordSearch(query, activeWorkspace.id, activeWorkspace.settings.max_chunks);
+            const fts = await this.keywordSearch(query, activeWorkspace.id, activeWorkspace.settings.max_chunks || 5);
             return fts.map(r => ({ ...r, score: 1 }));
         }
 
         return this.hybridSearchInWorkspace(
             query,
             activeWorkspace.id,
-            activeWorkspace.settings.max_chunks
+            activeWorkspace.settings.max_chunks || 5
         );
     }
 
@@ -102,7 +107,7 @@ export class DocumentRetriever {
       FROM document_chunks_fts fts
       JOIN document_chunks dc ON fts.rowid = dc.id
       JOIN documents d ON d.id = dc.document_id
-      WHERE document_chunks_fts MATCH ? 
+      WHERE document_chunks_fts MATCH ? AND d.total_chunks > 0
     `;
 
         const sanitizedQuery = this.sanitizeFtsQuery(query);
@@ -133,56 +138,52 @@ export class DocumentRetriever {
         }
     }
 
-    private async vectorSearch(queryVec: Float32Array, workspaceId: number | null, limit: number): Promise<RetrievalResult[]> {
+    private async vectorSearch(queryVec: Float32Array, modelKey: string, workspaceId: number | null, limit: number): Promise<RetrievalResult[]> {
         const db = await getKnowledgeDatabase();
+        const PAGE = 500;
 
-        // Fetch all chunks embeddings for this workspace
-        // Optimization: In real production, use sqlite-vec or ANNOY/HNSW index.
-        // Here we use brute-force in JS (acceptable for <10k chunks)
-        let sql = `
-      SELECT 
-        dc.id, 
-        dc.content, 
-        dc.document_id,
-        dc.embedding,
-        d.title as document_title,
-        dc.page_number
-      FROM document_chunks dc
-      JOIN documents d ON d.id = dc.document_id
-    `;
-
-        const params: any[] = [];
+        // Brute force in JS (fine for <10k chunks), but only ids and embeddings (as compact hex)
+        // travel over the bridge, in pages: the text is loaded for the best `limit` chunks only.
+        // Chunks of another model wait for re-embedding (embeddingReindexer).
+        let sql = `SELECT dc.id, hex(dc.embedding) AS embedding FROM document_chunks dc WHERE dc.embedding_model = ?`;
+        const params: any[] = [modelKey];
         if (workspaceId) {
-            sql += ` WHERE dc.document_id IN (SELECT document_id FROM workspace_documents WHERE workspace_id = ?)`;
+            sql += ` AND dc.document_id IN (SELECT document_id FROM workspace_documents WHERE workspace_id = ?)`;
             params.push(workspaceId);
         }
+        sql += ` ORDER BY dc.id LIMIT ? OFFSET ?`;
 
-        const result = await db.query(sql, params);
-        if (!result.values) return [];
+        let best: { id: number; score: number }[] = [];
+        for (let offset = 0; ; offset += PAGE) {
+            const page = (await db.query(sql, [...params, PAGE, offset])).values || [];
+            for (const row of page) {
+                best.push({ id: row.id, score: cosineSimilarity(queryVec, blobToFloat32Array(row.embedding)) });
+            }
+            best = best.sort((x, y) => y.score - x.score).slice(0, limit);
+            if (page.length < PAGE) break;
+        }
+        if (best.length === 0) return [];
 
-        const candidates = result.values.map(row => ({
-            ...row,
-            embedding: this.blobToFloat32Array(row.embedding)
-        }));
+        const details = await db.query(`
+      SELECT dc.id, dc.content, dc.document_id, d.title as document_title, dc.page_number
+      FROM document_chunks dc
+      JOIN documents d ON d.id = dc.document_id
+      WHERE dc.id IN (${best.map(() => '?').join(',')}) AND d.total_chunks > 0
+    `, best.map(b => b.id));
+        const rows = new Map((details.values || []).map(row => [row.id, row]));
 
-        // Compute Cosine Similarity
-        const scored = candidates.map(c => {
-            const sim = this.cosineSimilarity(queryVec, c.embedding);
-            return {
-                id: c.id,
-                document_id: c.document_id,
-                document_title: c.document_title,
-                content: c.content,
-                page_number: c.page_number,
-                score: sim,
-                distance: 1 - sim
-            };
+        return best.flatMap(({ id, score }) => {
+            const row = rows.get(id);
+            return row ? [{
+                id,
+                document_id: row.document_id,
+                document_title: row.document_title,
+                content: row.content,
+                page_number: row.page_number,
+                score,
+                distance: 1 - score
+            }] : [];
         });
-
-        // Sort and limit
-        return scored
-            .sort((a, b) => b.score - a.score)
-            .slice(0, limit);
     }
 
     private fuseResults(fts: RetrievalResult[], vec: RetrievalResult[]): RetrievalResult[] {
@@ -211,32 +212,6 @@ export class DocumentRetriever {
         });
     }
 
-    private blobToFloat32Array(blob: any): Float32Array {
-        if (!blob) return new Float32Array(384);
-        if (blob instanceof Uint8Array) return new Float32Array(blob.buffer);
-        if (typeof blob === 'string') {
-            // Hex string
-            const bytes = new Uint8Array(blob.length / 2);
-            for (let i = 0; i < blob.length; i += 2) {
-                bytes[i / 2] = parseInt(blob.substr(i, 2), 16);
-            }
-            return new Float32Array(bytes.buffer);
-        }
-        if (Array.isArray(blob)) return new Float32Array(new Uint8Array(blob).buffer);
-        return new Float32Array(384);
-    }
-
-    private cosineSimilarity(a: Float32Array, b: Float32Array): number {
-        if (a.length !== b.length) return 0;
-        let dot = 0, normA = 0, normB = 0;
-        for (let i = 0; i < a.length; i++) {
-            dot += a[i] * b[i];
-            normA += a[i] * a[i];
-            normB += b[i] * b[i];
-        }
-        return (normA === 0 || normB === 0) ? 0 : dot / (Math.sqrt(normA) * Math.sqrt(normB));
-    }
-
     /**
      * Sanitizes a query for SQLite FTS5 MATCH clause.
      * Prevents syntax errors from special characters like !, *, -, ".
@@ -258,8 +233,9 @@ export class DocumentRetriever {
         // but split into words to allow multiple terms
         const words = clean.split(/\s+/).filter(w => w.length > 0);
 
-        // Return words wrapped in quotes and joined by AND (implicitly or explicitly)
-        // This is the safest way to avoid fts5 syntax errors while still being effective.
-        return words.map(w => `"${w}"`).join(' ');
+        // Quoted words joined by OR: an implicit AND required every word of a natural-language
+        // question to appear in the same chunk, so almost nothing matched. bm25 `rank` still puts
+        // the chunks matching more (and rarer) words first.
+        return words.slice(0, 16).map(w => `"${w}"`).join(' OR ');
     }
 }

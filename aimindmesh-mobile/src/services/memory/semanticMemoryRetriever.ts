@@ -3,10 +3,14 @@
  * 
  * Core class for semantic memory retrieval using vector embeddings.
  * Uses SQLite for storage and all-MiniLM-L6-v2 (or compatible) for embeddings.
+ * Model loading, prefixes and the model tag of each vector are handled by embeddingRuntime.
  */
 
 import { TextEmbedding } from 'text-embedding-capacitor';
-import { saveMemoryToDb, getRecentMemories, getMemoryDatabase } from '../memory/memoryDatabase';
+import { saveMemoryToDb, getRecentMemories, getMemoryDatabase, getMemoryEmbeddings, getMemoriesByIds, pruneOldMemories } from '../memory/memoryDatabase';
+import { cosineSimilarity } from './embeddingCodec';
+import { isSelfMatch, withoutSelfMatches } from './selfMatch';
+import { embedText, ensureEmbeddingModel, getActiveEmbeddingModel, getEmbeddingLoadError, unloadEmbeddingModel } from '../model/embedding/embeddingRuntime';
 import { logger } from '../logger';
 
 export interface RelevantMemory {
@@ -14,15 +18,20 @@ export interface RelevantMemory {
     similarity: number;
     role: string;
     timestamp: number;
+    id?: string;
 }
+
+/** Spare candidates scored beyond maxResults, to replace self matches dropped afterwards */
+const SELF_MATCH_SPARE = 3;
+let pruneScheduled = false;
 
 export interface SemanticMemoryConfig {
     maxResults?: number;       // Max memories to return
     minSimilarity?: number;    // Min cosine similarity threshold
     maxTokens?: number;        // Max tokens in context injection
-    maxAgeDays?: number;       // Max age of memories to consider
+    maxAgeDays?: number;       // Max age of chat turns to consider (facts and summaries never age out)
     sessionBoost?: number;     // Boost multiplier for current session
-    queryPrefix?: string;      // Prefix for query embedding (e.g., 'query: ' for E5 models)
+    queryPrefix?: string;      // Unused: the runtime applies each model's own prefixes
 }
 
 const DEFAULT_CONFIG: SemanticMemoryConfig = {
@@ -31,12 +40,11 @@ const DEFAULT_CONFIG: SemanticMemoryConfig = {
     maxTokens: 400,
     maxAgeDays: 30,
     sessionBoost: 1.2, // 20% boost for current session
-    queryPrefix: '',   // Empty for MiniLM, 'query: ' for E5 models
+    queryPrefix: '',   // Unused: embeddingRuntime adds 'query: ' for E5 models
 };
 
 class SemanticMemoryRetriever {
     private isModelLoaded = false;
-    private dimension = 384;
     private config: SemanticMemoryConfig;
 
     constructor(config: Partial<SemanticMemoryConfig> = {}) {
@@ -44,42 +52,27 @@ class SemanticMemoryRetriever {
     }
 
     /**
-     * Initialize the embedding model
+     * Make `modelId` the loaded embedding model (reloads when another model is loaded, cheap
+     * when it already is). Called before every use, so a model change in the settings takes
+     * effect on the next message.
      * @param modelId ID of the model directory to load
      */
     async initialize(modelId: string): Promise<boolean> {
-        logger.log('info', `[SemanticMemory] Starting initialization for model ID: "${modelId}"`);
-
         try {
-            // Step 1: Validate model exists
-            const { validateEmbeddingModel } = await import('../model/embeddingModelDownloader');
-            const validation = await validateEmbeddingModel(modelId);
-
-            if (!validation.exists) {
-                logger.log('error', `[SemanticMemory] Model validation failed: ${validation.error}`);
-                logger.log('error', `[SemanticMemory] Model path: ${validation.path}`);
-                logger.log('error', `[SemanticMemory] Has model.onnx: ${validation.hasModel}, Has tokenizer.json: ${validation.hasTokenizer}`);
-                this.isModelLoaded = false;
+            const loaded = await ensureEmbeddingModel(modelId);
+            const model = getActiveEmbeddingModel();
+            this.isModelLoaded = loaded && model?.modelId === modelId;
+            if (!this.isModelLoaded || !model) {
+                logger.log('error', `[SemanticMemory] Model "${modelId}" not available: ${getEmbeddingLoadError(modelId) || 'unknown error'}`);
                 return false;
             }
-
-            logger.log('info', `[SemanticMemory] Model validation passed, loading from: ${validation.path}`);
-
-            // Step 2: Load model into TextEmbedding plugin
-            const startTime = performance.now();
-            const result = await TextEmbedding.loadModel({ modelDir: validation.path });
-            const loadTime = performance.now() - startTime;
-
-            this.dimension = result.dimension;
-            this.isModelLoaded = true;
-
-            logger.log('info', `[SemanticMemory] ✓ Model loaded successfully in ${loadTime.toFixed(0)}ms`);
-            logger.log('info', `[SemanticMemory] ✓ Embedding dimension: ${this.dimension}`);
-
-            // Step 3: Ensure database is initialized
+            // Ensure database is initialized
             await getMemoryDatabase();
-            logger.log('info', `[SemanticMemory] ✓ Database initialized`);
-
+            if (!pruneScheduled) {
+                pruneScheduled = true;
+                // Chat turns past the retention period are outside the retrieval window anyway
+                pruneOldMemories().catch(e => logger.log('warn', '[SemanticMemory] Prune failed', e));
+            }
             return true;
         } catch (error) {
             logger.log('error', `[SemanticMemory] ✗ Failed to initialize: ${(error as any).message}`, error);
@@ -95,9 +88,6 @@ class SemanticMemoryRetriever {
         try {
             const status = await TextEmbedding.isModelLoaded();
             this.isModelLoaded = status.loaded;
-            if (status.loaded) {
-                this.dimension = status.dimension;
-            }
             return { loaded: status.loaded, dimension: status.dimension };
         } catch {
             return { loaded: false, dimension: 0 };
@@ -113,23 +103,23 @@ class SemanticMemoryRetriever {
      * - Content is filler (OK, Capito, etc.)
      * - Semantically similar memory already exists (similarity > 0.90)
      */
-    async saveMessage(sessionId: string, role: string, content: string): Promise<void> {
-        if (!this.isModelLoaded) {
+    async saveMessage(sessionId: string, role: string, content: string): Promise<string | null> {
+        if (!this.isModelLoaded || !getActiveEmbeddingModel()) {
             logger.log('warn', '[SemanticMemory] Cannot save message - embedding model not loaded');
-            return;
+            return null;
         }
 
         // Skip very short messages
         if (content.trim().length < 20) {
             logger.log('debug', '[SemanticMemory] Skipping short message (<20 chars)');
-            return;
+            return null;
         }
 
         // Skip filler messages
         const fillerPatterns = /^(ok|okay|understood|got it|all right|sure|yes|no|thanks|thank you|you're welcome|good|perfect|great|capito|va bene|certo|sì|si|grazie|prego|ottimo)[\.\!\?]?$/i;
         if (fillerPatterns.test(content.trim())) {
             logger.log('debug', '[SemanticMemory] Skipping filler message');
-            return;
+            return null;
         }
 
         const contentPreview = content.length > 50 ? content.substring(0, 50) + '...' : content;
@@ -138,60 +128,49 @@ class SemanticMemoryRetriever {
         const startTime = performance.now();
 
         try {
-            // Generate embedding with a 10s timeout wrapper to prevent full app freezes
-            const embeddingStart = performance.now();
-            
-            const embeddingPromise = TextEmbedding.generateEmbedding({ text: content });
-            const timeoutPromise = new Promise<any>((_, reject) => 
-                setTimeout(() => reject(new Error('TextEmbedding.generateEmbedding TIMEOUT')), 10000)
-            );
-            
-            const result = await Promise.race([embeddingPromise, timeoutPromise]);
-            
-            const embedding = new Float32Array(result.embedding);
-            const embeddingTime = performance.now() - embeddingStart;
+            // Embedding with the model's passage prefix, tagged with the model key
+            const { vector: embedding, key } = await embedText(content, 'passage');
 
-            logger.log('debug', `[SemanticMemory] Generated ${embedding.length}-dim embedding in ${embeddingTime.toFixed(1)}ms`);
-
-            // Deduplication check: compare with recent memories
-            const recentMemories = await getRecentMemories(30); // Check last 30 entries
+            // Deduplication check: compare with recent memories of the same model
+            const recentMemories = await getRecentMemories(30, undefined, 30, key); // Check last 30 entries
             const DUPLICATE_THRESHOLD = 0.90;
 
             for (const mem of recentMemories) {
-                const similarity = this.cosineSimilarity(embedding, mem.embedding);
+                const similarity = cosineSimilarity(embedding, mem.embedding);
                 if (similarity >= DUPLICATE_THRESHOLD) {
                     logger.log('info', `[SemanticMemory] ⏭️ Skipping duplicate (similarity: ${similarity.toFixed(3)}): "${mem.content.substring(0, 40)}..."`);
-                    return; // Skip save
+                    return null; // Skip save
                 }
             }
 
             // Generate unique ID
             const id = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
-            // Save to database
-            const dbStart = performance.now();
-            await saveMemoryToDb(id, sessionId, role, content, embedding);
-            const dbTime = performance.now() - dbStart;
+            await saveMemoryToDb(id, sessionId, role, content, embedding, key);
 
             const elapsed = performance.now() - startTime;
-            logger.log('info', `[SemanticMemory] ✓ Saved to DB in ${dbTime.toFixed(1)}ms (total: ${elapsed.toFixed(1)}ms)`);
+            logger.log('info', `[SemanticMemory] ✓ Saved to DB (total: ${elapsed.toFixed(1)}ms)`);
+
+            // Link it in the memory graph (follows / similar_to / mentioned_with), off the reply path
+            import('./memoryGraph')
+                .then(({ getMemoryGraphService }) => getMemoryGraphService().detectRelations(id, content, embedding, sessionId, key))
+                .catch(e => logger.log('debug', '[SemanticMemory] Graph linking skipped', e));
+            return id;
         } catch (error) {
             logger.log('error', '[SemanticMemory] ✗ Failed to save message', error);
             throw error;
         }
     }
 
-
-
     /**
      * Retrieve semantically relevant memories for a query
      * Target: <200ms on Z Fold 7
      * 
      * Strategy:
-     * 1. Get top 50 recent memories
-     * 2. Compute cosine similarity with query embedding
-     * 3. Filter by minSimilarity, boost current session
-     * 4. Return top N results
+     * 1. Score EVERY memory in the age window (ids + embeddings only, read in pages)
+     * 2. Compute cosine similarity with query embedding, boost current session
+     * 3. Filter by minSimilarity, keep the top N
+     * 4. Load the text of those N only
      */
     async retrieveRelevantMemories(
         query: string,
@@ -211,86 +190,71 @@ class SemanticMemoryRetriever {
         }
 
         // Check if model is loaded
-        if (!this.isModelLoaded) {
+        if (!this.isModelLoaded || !getActiveEmbeddingModel()) {
             logger.log('warn', '[SemanticMemory] Model not loaded, using recency fallback');
-            return this.getRecentMemoriesFallback(maxResults);
+            return this.getRecentMemoriesFallback(maxResults, query);
         }
 
         try {
-            // Generate query embedding with optional prefix (for E5/BGE models)
-            const queryText = this.config.queryPrefix ? this.config.queryPrefix + query : query;
-            logger.log('info', `[SemanticMemory] Generating embedding for query: "${queryPreview}"`);
-            
-            const embeddingPromise = TextEmbedding.generateEmbedding({ text: queryText });
-            const timeoutPromise = new Promise<any>((_, reject) => 
-                setTimeout(() => reject(new Error('TextEmbedding.generateEmbedding TIMEOUT')), 10000)
-            );
-            const queryResult = await Promise.race([embeddingPromise, timeoutPromise]);
-            
-            logger.log('info', `[SemanticMemory] Embedding generation complete.`);
-            const queryEmbedding = new Float32Array(queryResult.embedding);
+            // Query embedding with the model's query prefix (E5)
+            const { vector: queryEmbedding, key } = await embedText(query, 'query');
 
-            // Get recent memories from database
-            const memories = await getRecentMemories(50, undefined, this.config.maxAgeDays);
-            logger.log('debug', `[SemanticMemory] Retrieved ${memories.length} recent memories from DB`);
+            // Score every usable memory of the same model (other models' vectors are not comparable)
+            const vectors = await getMemoryEmbeddings(this.config.maxAgeDays!, key);
+            logger.log('debug', `[SemanticMemory] Scoring ${vectors.length} memories`);
 
-            if (memories.length === 0) {
+            if (vectors.length === 0) {
                 logger.log('warn', '[SemanticMemory] No memories in database');
                 return [];
             }
 
-            // Compute similarities
-            const scored = memories.map(memory => {
-                let similarity = this.cosineSimilarity(queryEmbedding, memory.embedding);
-
-                // Boost current session matches
-                if (sessionId && memory.sessionId === sessionId) {
-                    similarity *= this.config.sessionBoost!;
-                }
-
-                return {
-                    content: memory.content,
-                    similarity,
-                    role: memory.role,
-                    timestamp: memory.timestamp,
-                };
-            });
-
-            // Filter by minimum similarity
-            const filtered = scored.filter(m => m.similarity >= minSimilarity);
+            const candidates = vectors
+                .map(v => {
+                    let similarity = cosineSimilarity(queryEmbedding, v.embedding);
+                    // Boost current session matches
+                    if (sessionId && v.sessionId === sessionId) similarity *= this.config.sessionBoost!;
+                    return { id: v.id, similarity };
+                })
+                .filter(m => m.similarity >= minSimilarity)
+                .sort((a, b) => b.similarity - a.similarity)
+                .slice(0, maxResults + SELF_MATCH_SPARE);
 
             // If no semantic matches, return empty. Do NOT fallback to recency because the LLM already 
             // has the recent history natively. Returning recent history here pollutes the factual context block.
-            if (filtered.length === 0) {
+            if (candidates.length === 0) {
                 logger.log('debug', `[SemanticMemory] No matches above similarity threshold ${minSimilarity}`);
                 return [];
             }
 
-            // Sort by similarity and take top N
-            let results = filtered
-                .sort((a, b) => b.similarity - a.similarity)
-                .slice(0, maxResults);
+            const rows = new Map((await getMemoriesByIds(candidates.map(m => m.id))).map(r => [r.id, r]));
+            // The message being answered was saved just before this call: it is not a memory
+            let results: RelevantMemory[] = withoutSelfMatches(candidates.flatMap(m => {
+                const row = rows.get(m.id);
+                return row ? [{ id: m.id, content: row.content, similarity: m.similarity, role: row.role, timestamp: row.timestamp }] : [];
+            }), query, maxResults);
 
             // Enrich with graph-related memories (if graph is available)
             try {
                 const { getMemoryGraphService } = await import('../memory/memoryGraph');
                 const graphService = getMemoryGraphService();
 
-                if (results.length > 0) {
-                    // Find memories related via graph to the top result
-                    const topMemoryId = results[0].content.substring(0, 50); // Use content hash as ID proxy
-                    const graphRelated = await graphService.findRelatedMemories(topMemoryId, 2);
+                if (results.length > 0 && results[0].id) {
+                    // Find memories related via graph to the top result (by its real id)
+                    const graphRelated = await graphService.findRelatedMemories(results[0].id, 2);
 
                     // Add graph-related memories that aren't already in results
                     const existingContent = new Set(results.map(r => r.content));
                     for (const related of graphRelated) {
-                        if (!existingContent.has(related.memory.content) && results.length < maxResults + 2) {
+                        if (existingContent.has(related.memory.content) || isSelfMatch(related.memory.content, query)) continue;
+                        if (results.length < maxResults + 2) {
                             results.push({
+                                id: related.memory.id,
                                 content: related.memory.content,
                                 similarity: related.score * 0.9, // Slightly lower score for graph-based
                                 role: 'memory', // Graph nodes don't have role, default to 'memory'
                                 timestamp: related.memory.timestamp,
                             });
+                            existingContent.add(related.memory.content);
                             logger.log('debug', `[SemanticMemory] Added graph-related memory: "${related.memory.content.substring(0, 30)}..."`);
                         }
                     }
@@ -313,35 +277,8 @@ class SemanticMemoryRetriever {
             return results;
         } catch (error) {
             logger.log('error', '[SemanticMemory] ✗ Failed to retrieve memories', error);
-            return this.getRecentMemoriesFallback(maxResults);
+            return this.getRecentMemoriesFallback(maxResults, query);
         }
-    }
-
-    /**
-     * Cosine similarity between two 384-dim vectors
-     * Pure numerical implementation, no libraries
-     */
-    private cosineSimilarity(vec1: Float32Array, vec2: Float32Array): number {
-        if (vec1.length !== vec2.length) {
-            logger.log('warn', `Dimension mismatch: ${vec1.length} vs ${vec2.length}`);
-            return 0;
-        }
-
-        let dot = 0;
-        let normA = 0;
-        let normB = 0;
-
-        for (let i = 0; i < vec1.length; i++) {
-            dot += vec1[i] * vec2[i];
-            normA += vec1[i] * vec1[i];
-            normB += vec2[i] * vec2[i];
-        }
-
-        if (normA === 0 || normB === 0) {
-            return 0;
-        }
-
-        return dot / (Math.sqrt(normA) * Math.sqrt(normB));
     }
 
     /**
@@ -380,15 +317,16 @@ class SemanticMemoryRetriever {
     /**
      * Fallback: get most recent memories without semantic matching
      */
-    private async getRecentMemoriesFallback(limit: number): Promise<RelevantMemory[]> {
+    private async getRecentMemoriesFallback(limit: number, query: string = ''): Promise<RelevantMemory[]> {
         try {
-            const memories = await getRecentMemories(limit);
-            return memories.map(m => ({
+            const memories = await getRecentMemories(limit + 1);
+            return withoutSelfMatches(memories.map(m => ({
+                id: m.id,
                 content: m.content,
                 similarity: 0,
                 role: m.role,
                 timestamp: m.timestamp,
-            }));
+            })), query, limit);
         } catch (error) {
             logger.log('error', 'Failed to get recent memories fallback', error);
             return [];
@@ -415,7 +353,7 @@ class SemanticMemoryRetriever {
      */
     async unload(): Promise<void> {
         try {
-            await TextEmbedding.unloadModel();
+            await unloadEmbeddingModel();
             this.isModelLoaded = false;
             logger.log('info', 'Embedding model unloaded');
         } catch (error) {
@@ -476,16 +414,11 @@ export async function getOrInitializeSemanticMemoryRetriever(
         minSimilarity: config.semanticMemorySimilarityThreshold || 0.75,
     });
 
-    // Check current status
-    const status = await retriever.checkModelStatus();
-    if (!status.loaded) {
-        // Attempt to initialize
-        logger.log('info', `Auto-initializing semantic memory with model: ${config.embeddingModelId}`);
-        const initialized = await retriever.initialize(config.embeddingModelId);
-        if (!initialized) {
-            logger.log('warn', 'Failed to auto-initialize semantic memory retriever');
-            return null;
-        }
+    // Loads the selected model, or switches to it when another one is loaded
+    const initialized = await retriever.initialize(config.embeddingModelId);
+    if (!initialized) {
+        logger.log('warn', 'Failed to auto-initialize semantic memory retriever');
+        return null;
     }
 
     return retriever;

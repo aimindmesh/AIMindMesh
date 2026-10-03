@@ -55,7 +55,10 @@ class SDPlugin : Plugin() {
             try {
                 val success = engine?.loadModel(modelPath, backend) ?: false
                 if (success) {
-                    call.resolve(JSObject().apply { put("success", true) })
+                    call.resolve(JSObject().apply {
+                        put("success", true)
+                        putModelInfo(this)
+                    })
                 } else {
                     call.reject("Failed to load SD model on $backend (path: $modelPath)")
                 }
@@ -81,8 +84,20 @@ class SDPlugin : Plugin() {
         val result = JSObject().apply {
             put("loaded", loaded)
             if (path != null) put("modelPath", path)
+            if (loaded) putModelInfo(this)
         }
         call.resolve(result)
+    }
+
+    /** What the loaded package can do: the UI hides editing/upscaling it does not support */
+    private fun putModelInfo(target: JSObject) {
+        val e = engine ?: return
+        val info = e.getModelInfo()
+        target.put("predictionType", e.getPredictionType().id)
+        target.put("hasVaeEncoder", info.hasVaeEncoder)
+        target.put("hasSuperResolution", info.hasSuperResolution)
+        target.put("textEmbeddingDim", info.embedDim)
+        target.put("unetQuantized", info.unetQuantized)
     }
 
     @PluginMethod
@@ -95,6 +110,11 @@ class SDPlugin : Plugin() {
             return
         }
 
+        // Bundles are GBs: extract off the shared Capacitor plugin thread
+        scope.launch(Dispatchers.IO) { copyFileBlocking(call, sourcePath, fileName) }
+    }
+
+    private fun copyFileBlocking(call: PluginCall, sourcePath: String, fileName: String) {
         try {
             val filesDir = context.filesDir
             val isZip = fileName.lowercase().endsWith(".zip") || sourcePath.lowercase().endsWith(".zip")
@@ -138,14 +158,15 @@ class SDPlugin : Plugin() {
                 return
             }
 
-            java.io.FileOutputStream(destFile).use { fos ->
-                val buffer = ByteArray(64 * 1024)
-                var len: Int
-                while (inputStream.read(buffer).also { len = it } > 0) {
-                    fos.write(buffer, 0, len)
+            inputStream.use { input ->
+                java.io.FileOutputStream(destFile).use { fos ->
+                    val buffer = ByteArray(64 * 1024)
+                    var len: Int
+                    while (input.read(buffer).also { len = it } > 0) {
+                        fos.write(buffer, 0, len)
+                    }
                 }
             }
-            inputStream.close()
 
             val ret = JSObject().apply {
                 put("path", destFile.absolutePath)
@@ -170,50 +191,30 @@ class SDPlugin : Plugin() {
             return
         }
 
-        val negativePrompt = call.getString("negativePrompt") ?: ""
-        val sourceImage = call.getString("sourceImage")
-        val strength = call.getFloat("strength") ?: 0.65f
-        val steps = call.getInt("steps") ?: 20
-        val cfgScale = call.getFloat("cfgScale") ?: 7.5f
-        val seed = call.getDouble("seed")?.toLong() ?: -1L
-        val width = call.getInt("width") ?: 512
-        val height = call.getInt("height") ?: 512
-        val aspectRatio = call.getString("aspectRatio") ?: "1:1"
-        val upscale = call.getInt("upscale") ?: 1
+        val request = SDRequest(
+            prompt = prompt,
+            negativePrompt = call.getString("negativePrompt") ?: "",
+            sourceImage = call.getString("sourceImage"),
+            strength = call.getFloat("strength") ?: 0.65f,
+            steps = call.getInt("steps") ?: 25,
+            cfgScale = call.getFloat("cfgScale") ?: 7.5f,
+            seed = call.getDouble("seed")?.toLong() ?: -1L,
+            aspectRatio = call.getString("aspectRatio") ?: "1:1",
+            upscale = call.getInt("upscale") ?: 1,
+            sampler = SamplerKind.parse(call.getString("sampler"))
+        )
 
         scope.launch {
             try {
-                val result = engine?.generateImage(
-                    prompt,
-                    negativePrompt,
-                    sourceImage,
-                    strength,
-                    steps,
-                    cfgScale,
-                    seed,
-                    width,
-                    height,
-                    aspectRatio,
-                    upscale
-                ) { step, totalSteps, timePerStep ->
-                    val progressObj = JSObject().apply {
+                val result = engine?.generateImage(request) { step, totalSteps, timePerStep ->
+                    notifyListeners("sdProgress", JSObject().apply {
                         put("step", step)
                         put("totalSteps", totalSteps)
                         put("timePerStep", timePerStep)
-                    }
-                    notifyListeners("sdProgress", progressObj)
+                    })
                 }
-
                 if (result != null) {
-                    val resObj = JSObject().apply {
-                        put("base64Image", result["base64Image"])
-                        put("generationTimeMs", result["generationTimeMs"])
-                        put("width", result["width"])
-                        put("height", result["height"])
-                        put("aspectRatio", result["aspectRatio"])
-                        put("upscale", result["upscale"])
-                    }
-                    call.resolve(resObj)
+                    call.resolve(JSObject().apply { result.forEach { (key, value) -> put(key, value) } })
                 } else {
                     call.reject("Failed to generate image")
                 }

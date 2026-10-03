@@ -2,12 +2,15 @@ import { useEffect, useState } from 'react';
 import { Database, Download, Trash2, RotateCcw, ShieldCheck, AlertCircle, Clock, Save } from 'lucide-react';
 import { adminApi } from '../../services/serverApi';
 import { Logger } from '../../utils/logger';
+import { saveBinaryFile } from '../../utils/saveFile';
+import type { RestoreStatus } from '@aimindmesh/api-types';
 
 export function BackupManagement() {
   const [backups, setBackups] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
   const [isRestoring, setIsRestoring] = useState<string | null>(null);
+  const [restoreStatus, setRestoreStatus] = useState<RestoreStatus | null>(null);
 
   const fetchBackups = async () => {
     setIsLoading(true);
@@ -21,8 +24,18 @@ export function BackupManagement() {
     }
   };
 
+  const fetchRestoreStatus = async () => {
+    try {
+      const res = await adminApi.getRestoreStatus();
+      setRestoreStatus(res.data);
+    } catch {
+      setRestoreStatus(null); // older servers have no restore-status route
+    }
+  };
+
   useEffect(() => {
     fetchBackups();
+    fetchRestoreStatus();
   }, []);
 
   const handleCreateBackup = async () => {
@@ -47,13 +60,24 @@ export function BackupManagement() {
     }
   };
 
+  const handleDownloadBackup = async (filename: string) => {
+    try {
+      const { data } = await adminApi.downloadBackup(filename);
+      await saveBinaryFile(data, filename);
+    } catch (err) {
+      Logger.error('Backup', 'Failed to download backup');
+    }
+  };
+
   const handleRestoreBackup = async (filename: string) => {
-    if (!window.confirm(`DANGER: This will overwrite your current server data with the contents of ${filename}. The server state will be reset. Continue?`)) return;
+    if (!window.confirm(`DANGER: This will overwrite your current server data with the contents of ${filename}. The server restarts to apply it. Continue?`)) return;
     
     setIsRestoring(filename);
     try {
-      await adminApi.restoreBackup(filename);
-      alert('Restore successful. You should restart the server container manually if it does not auto-restart.');
+      const { data } = await adminApi.restoreBackup(filename);
+      alert(data.message);
+      // Applied at the next boot: check the outcome after the restart
+      setTimeout(fetchRestoreStatus, data.restarting ? 15000 : 0);
     } catch (err: any) {
       alert(`Restore failed: ${err.response?.data?.error || err.message}`);
     } finally {
@@ -109,9 +133,22 @@ export function BackupManagement() {
             <p className="text-xs text-muted-foreground leading-relaxed">
               Backups include the full SQLite database (operational data, history, logs), 
               the core <code className="bg-white/5 px-1 rounded text-primary">config.json</code>, 
-              and all synchronized media assets. 
+              the wiki and the OpenClaw configuration. The Neo4j knowledge graph is not included:
+              back it up separately.
             </p>
           </div>
+
+          {restoreStatus?.pending && (
+            <p className="text-[11px] text-warning font-bold">
+              Restore of {restoreStatus.pending.filename} waiting for the server restart.
+            </p>
+          )}
+          {restoreStatus?.last && (
+            <p className={`text-[11px] font-bold ${restoreStatus.last.ok ? 'text-success' : 'text-error'}`}>
+              Last restore ({restoreStatus.last.filename}, {formatDate(restoreStatus.last.at)}):{' '}
+              {restoreStatus.last.ok ? 'applied' : `failed, previous data kept (${restoreStatus.last.error})`}
+            </p>
+          )}
 
           <div className="p-5 bg-warning/5 border border-warning/20 rounded-2xl flex gap-4">
             <AlertCircle className="w-5 h-5 text-warning shrink-0" />
@@ -171,14 +208,13 @@ export function BackupManagement() {
                       </td>
                       <td className="px-8 py-6 text-right">
                         <div className="flex items-center justify-end gap-3 opacity-0 group-hover:opacity-100 transition-opacity">
-                          <a 
-                            href={adminApi.getBackupDownloadUrl(backup.filename)}
-                            download={backup.filename}
+                          <button 
+                            onClick={() => handleDownloadBackup(backup.filename)}
                             className="p-2.5 bg-white/5 hover:bg-success/20 text-success rounded-lg transition-all"
                             title="Download to Local PC"
                           >
                             <Download size={14} />
-                          </a>
+                          </button>
                           <button 
                             onClick={() => handleRestoreBackup(backup.filename)}
                             disabled={!!isRestoring}

@@ -64,44 +64,8 @@ export const fileTools: ToolDefinition[] = [
         },
         requiresConfirmation: true,
         category: 'files'
-    },
-    {
-        name: 'take_photo', // Defined here but reused in mediaTools maybe?
-        description: 'Takes a photo using the device camera.',
-        parameters: {
-            type: Type.OBJECT,
-            properties: {
-                camera_facing: {
-                    type: Type.STRING,
-                    description: 'Which camera to use: "back" or "front". Default is "back".',
-                    enum: ['back', 'front']
-                }
-            },
-            required: []
-        },
-        requiresConfirmation: true,
-        category: 'files'
-    },
-    {
-        name: 'record_audio',
-        description: 'Records audio from the device microphone.',
-        parameters: {
-            type: Type.OBJECT,
-            properties: {
-                duration_seconds: {
-                    type: Type.NUMBER,
-                    description: 'Recording duration in seconds (default: 10, max: 60)'
-                },
-                filename: {
-                    type: Type.STRING,
-                    description: 'Optional: Custom filename for the recording'
-                }
-            },
-            required: []
-        },
-        requiresConfirmation: true,
-        category: 'files'
     }
+    // take_photo and record_audio are declared in mediaTools (a duplicate name makes Gemini reject the tool list)
 ];
 
 export async function executeDownloadFile(args: { url: string; filename: string }): Promise<ToolResult> {

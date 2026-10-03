@@ -4,11 +4,15 @@ import { TranscriptSegment } from '../../types/meeting';
 import { generateTextResponseStream } from '../../services/llm/llmService';
 import { logger } from '../../services/logger';
 import { FileSystemAdapter as Filesystem, Directory } from '../../utils/fileSystemAdapter';
+import { blobToBase64, filesystemRefFor } from '../../services/meeting/meetingStorage';
+import { audioExtensionForMime, guessAudioMimeType } from '../../services/meeting/audioPaths';
 
 interface UseMeetingAnalysisProps {
     transcript: TranscriptSegment[];
     speakerNames: Record<number, string>;
     playback: any; // Using any for now to avoid circular deps with playback hook types if not exported
+    /** Plain path of the saved meeting audio, when there is one */
+    audioFilePathRef?: React.MutableRefObject<string | null>;
     llmConfig: LLMConfig;
     personality: any;
     memories?: Memory[];
@@ -20,6 +24,7 @@ export const useMeetingAnalysis = ({
     transcript,
     speakerNames,
     playback,
+    audioFilePathRef,
     llmConfig,
     personality,
     memories,
@@ -100,40 +105,38 @@ export const useMeetingAnalysis = ({
         let tempFileName: string | null = null;
 
         try {
-            const response = await fetch(playback.recordedAudioUrl);
-            const audioBlob = await response.blob();
-            const mimeType = audioBlob.type || 'audio/webm';
-
-            // Convert blob to base64 for temp file storage
-            const arrayBuffer = await audioBlob.arrayBuffer();
-            const base64Audio = btoa(
-                new Uint8Array(arrayBuffer).reduce((data, byte) => data + String.fromCharCode(byte), '')
-            );
-
             let audioPath: string;
+            let mimeType: string;
+            const storedPath = audioFilePathRef?.current ?? null;
 
-            if (isLiteRT) {
-                // Save blob to temp file for native processing
-                const extension = mimeType.includes('webm') ? 'webm' : (mimeType.includes('mp4') ? 'mp4' : 'wav');
-                tempFileName = `temp_meeting_audio_${Date.now()}.${extension}`;
-
-                await Filesystem.writeFile({
-                    path: tempFileName,
-                    data: base64Audio,
-                    directory: Directory.Cache
-                });
-
-                // Get the full path for native plugin
-                const uriResult = await Filesystem.getUri({
-                    path: tempFileName,
-                    directory: Directory.Cache
-                });
-                audioPath = uriResult.uri;
-                logger.log('debug', '[MeetingMode] Saved audio to temp file:', audioPath);
+            if (isLiteRT && storedPath) {
+                // Native copy with a real extension: the recording never goes through JS memory
+                mimeType = guessAudioMimeType(storedPath);
+                tempFileName = `temp_meeting_audio_${Date.now()}.${audioExtensionForMime(mimeType)}`;
+                const source = filesystemRefFor(storedPath);
+                await Filesystem.copy({ from: source.path, directory: source.directory, to: tempFileName, toDirectory: Directory.Cache });
+                audioPath = (await Filesystem.getUri({ path: tempFileName, directory: Directory.Cache })).uri;
             } else {
-                // For Gemini, pass data URI
-                audioPath = `data:${mimeType};base64,${base64Audio}`;
+                const audioBlob = await (await fetch(playback.recordedAudioUrl)).blob();
+                mimeType = audioBlob.type || (storedPath ? guessAudioMimeType(storedPath) : 'audio/webm');
+                // FileReader encodes natively (the byte-by-byte string build froze on long meetings)
+                const base64Audio = await blobToBase64(audioBlob);
+
+                if (isLiteRT) {
+                    // Save blob to temp file for native processing
+                    tempFileName = `temp_meeting_audio_${Date.now()}.${audioExtensionForMime(mimeType)}`;
+                    await Filesystem.writeFile({
+                        path: tempFileName,
+                        data: base64Audio,
+                        directory: Directory.Cache
+                    });
+                    audioPath = (await Filesystem.getUri({ path: tempFileName, directory: Directory.Cache })).uri;
+                } else {
+                    // For Gemini, pass data URI
+                    audioPath = `data:${mimeType};base64,${base64Audio}`;
+                }
             }
+            logger.log('debug', '[MeetingMode] Audio prepared for analysis:', isLiteRT ? audioPath : mimeType);
 
             const prompt = "Analyze the audio content of this meeting. Provide a short summary and a list of key points or action items.";
 

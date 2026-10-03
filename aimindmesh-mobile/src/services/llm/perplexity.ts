@@ -5,6 +5,7 @@ import { StreamChunk } from './llmService';
 import { getReActSystemPromptCompact } from '../toolDefinitions';
 import { parseReActToolCalls } from '../tools';
 import { createThinkingParser } from './thinkingParser';
+import { toChatRole, lastUserText } from './roles';
 
 /**
  * Generates a streaming response from Perplexity API with tool and thinking support
@@ -61,6 +62,14 @@ export async function* generatePerplexityStream(
         }
     }
 
+    // Inject Workspace Documents Context (as the other providers do)
+    try {
+        const { contextInjector } = await import('./contextInjector');
+        systemPrompt = await contextInjector.buildSystemPromptWithContext(lastUserText(history), systemPrompt);
+    } catch (e) {
+        logger.log('warn', 'Perplexity: Failed to inject workspace context', e);
+    }
+
     // Add tool instructions if enabled
     if (llmConfig?.enableToolCalling) {
         systemPrompt += "\n" + getReActSystemPromptCompact(llmConfig.toolRules);
@@ -92,7 +101,7 @@ Your final answer goes AFTER the thinking tags.`;
 
     // Map history to API format
     const historyMessages = history.map(msg => ({
-        role: msg.role === 'model' ? 'assistant' : 'user',
+        role: toChatRole(msg.role),
         content: msg.text
     }));
 

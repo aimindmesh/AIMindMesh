@@ -142,7 +142,15 @@ const FeedView: React.FC<Props> = ({ serverSettings, onOpenThread, onUnreadCount
 
     const handleDelete = useCallback(async (insight: InsightItem) => {
         setItems(prev => prev.filter(i => i.id !== insight.id));
-        if (serverSettings) await deleteInsight(serverSettings, insight.id).catch(() => { });
+        if (!serverSettings) return;
+        try {
+            await deleteInsight(serverSettings, insight.id);
+        } catch (e: any) {
+            // Still on the server: put it back where it was
+            setItems(prev => prev.some(i => i.id === insight.id) ? prev
+                : [...prev, insight].sort((a, b) => b.created_at - a.created_at));
+            setError(`Delete failed: ${e?.message ?? 'connection error'}`);
+        }
     }, [serverSettings]);
 
     const handleCopy = useCallback((text: string) => {

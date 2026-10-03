@@ -2,6 +2,13 @@ import React from 'react';
 import { LLMConfig } from '../../../types';
 import { ModelDownloadProgress, downloadModel } from '../../../services/model/modelDownloader';
 import { getCleanModelName } from '../../../utils/stringUtils';
+import { useDownloadResume } from '../../../hooks/useDownloadResume';
+
+const GEMMA_3N_E4B = {
+    id: 'gemma-3n-e4b',
+    url: 'https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm',
+    filename: 'gemma-3n-E4B-it-int4.litertlm',
+};
 
 interface LiteRTSettingsProps {
     llmConfig: LLMConfig;
@@ -34,6 +41,17 @@ const LiteRTSettings: React.FC<LiteRTSettingsProps> = ({
     handleDeleteExternalLiteRTModel,
     handleImportLiteRTFile
 }) => {
+    const clearProgress = (id: string) => setDownloadProgress(prev => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+    });
+
+    // A download started before this screen was last closed keeps running natively
+    useDownloadResume([GEMMA_3N_E4B], setDownloadProgress, (_id, ok) => {
+        if (ok) setDownloadedLiteRTModels(prev => prev.includes(GEMMA_3N_E4B.filename) ? prev : [...prev, GEMMA_3N_E4B.filename]);
+    });
+
     return (
         <div className="mb-4 pt-4 border-t border-white/5">
             <label className="block text-sm font-medium text-text-primary mb-2">
@@ -277,8 +295,7 @@ const LiteRTSettings: React.FC<LiteRTSettingsProps> = ({
                                 <button
                                     onClick={async () => {
                                         triggerHaptic();
-                                        const url = 'https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm';
-                                        const filename = 'gemma-3n-E4B-it-int4.litertlm';
+                                        const { url, filename } = GEMMA_3N_E4B;
                                         try {
                                             await downloadModel(url, filename, (progress) => {
                                                 setDownloadProgress(prev => ({
@@ -289,6 +306,9 @@ const LiteRTSettings: React.FC<LiteRTSettingsProps> = ({
                                             setDownloadedLiteRTModels(prev => [...prev, filename]);
                                         } catch (e) {
                                             alert('Download failed: ' + (e as any).message);
+                                        } finally {
+                                            // A failed download must not leave the button disabled at its last percentage
+                                            clearProgress(GEMMA_3N_E4B.id);
                                         }
                                     }}
                                     disabled={!!downloadProgress['gemma-3n-e4b']}

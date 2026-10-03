@@ -65,16 +65,6 @@ class LlamaError extends Exception {
     }
 }
 
-class DownloadStatus {
-    public long totalBytes = 0;
-    public long downloadedBytes = 0;
-    public boolean completed = false;
-    public boolean failed = false;
-    public boolean cancelled = false;
-    public String error = null;
-    public String localPath = null;
-}
-
 // MARK: - Context Management
 class LlamaContext {
     private final int id;
@@ -277,12 +267,13 @@ public class LlamaCpp {
     private final ExecutorService inferenceExecutor = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
-    // Track active downloads
-    private final Map<String, DownloadStatus> activeDownloads = new ConcurrentHashMap<>();
+    // GGUF downloads (".part" file renamed on success)
+    private final GgufDownloader downloader;
 
     // Constructor to receive context
     public LlamaCpp(Context context) {
         this.context = context;
+        this.downloader = new GgufDownloader(context.getFilesDir());
     }
 
     // Native method declarations
@@ -319,40 +310,8 @@ public class LlamaCpp {
     private native String convertJsonSchemaToGrammarNative(String schemaJson);
 
     static {
-        try {
-
-            // Detect the current architecture and load the appropriate library
-            String arch = System.getProperty("os.arch");
-            String abi = android.os.Build.SUPPORTED_ABIS[0]; // Get primary ABI
-            String libraryName;
-
-            // Map Android ABI to library name
-            switch (abi) {
-                case "arm64-v8a":
-                    libraryName = "llama-cpp-arm64";
-                    break;
-                case "armeabi-v7a":
-                    libraryName = "llama-cpp-armeabi";
-                    break;
-                case "x86":
-                    libraryName = "llama-cpp-x86";
-                    break;
-                case "x86_64":
-                    libraryName = "llama-cpp-x86_64";
-                    break;
-                default:
-                    Log.w(TAG, "Unsupported ABI: " + abi + ", falling back to arm64-v8a");
-                    libraryName = "llama-cpp-arm64";
-                    break;
-            }
-
-            Log.i(TAG, "Loading native library for ABI: " + abi + " (library: " + libraryName + ")");
-            System.loadLibrary(libraryName);
-            Log.i(TAG, "Successfully loaded llama-cpp native library: " + libraryName);
-        } catch (UnsatisfiedLinkError e) {
-            Log.e(TAG, "Failed to load llama-cpp native library: " + e.getMessage());
-            throw e;
-        }
+        // Best variant for this CPU (the universal library is only the fallback)
+        NativeLibrarySelector.load();
     }
 
     // MARK: - Core initialization and management
@@ -381,178 +340,21 @@ public class LlamaCpp {
     public void downloadModel(String url, String filename, String hfToken, LlamaCallback<String> callback) {
         try {
             Log.i(TAG, "Starting download of model: " + filename + " from: " + url);
-
-            // Register download status
-            DownloadStatus status = new DownloadStatus();
-            activeDownloads.put(url, status);
-
-            // Get local path (we still use the native helper for path resolution if needed,
-            // but we can also just construct it here to be safe and consistent with Java
-            // logic)
-            // For now, let's trust downloadModelNative returns a valid path or just use
-            // filesDir
-            String localPath = new File(context.getFilesDir(), filename).getAbsolutePath();
-            status.localPath = localPath;
-
-            // Start download in background thread
-            new Thread(() -> {
-                try {
-                    downloadFile(url, localPath, hfToken, callback);
-                } catch (Exception e) {
-                    Log.e(TAG, "Error in download thread: " + e.getMessage());
-                    status.failed = true;
-                    status.error = e.getMessage();
-                    activeDownloads.put(url, status); // Update status
-                    // callback is usually called ONCE with success/failure of the START.
-                    // But here we are simulating "start was successful".
-                }
-            }).start();
-
-            // Return the local path immediately so UI knows where it will be
-            callback.onResult(LlamaResult.success(localPath));
-
+            // Returns the final local path right away; the client polls getDownloadProgress
+            callback.onResult(LlamaResult.success(downloader.start(url, filename, hfToken)));
         } catch (Exception e) {
             Log.e(TAG, "Error preparing download: " + e.getMessage());
             callback.onResult(LlamaResult.failure(new LlamaError("Download preparation failed: " + e.getMessage())));
         }
     }
 
-    private void downloadFile(String url, String localPath, String hfToken, LlamaCallback<String> callback) {
-        DownloadStatus status = activeDownloads.get(url);
-        if (status == null)
-            status = new DownloadStatus();
-
-        try {
-            HttpURLConnection connection = null;
-            URL downloadUrl = new URL(url);
-            int redirectCount = 0;
-
-            // Loop to handle redirects
-            while (redirectCount < 10) {
-                connection = (HttpURLConnection) downloadUrl.openConnection();
-                connection.setRequestMethod("GET");
-                connection.setConnectTimeout(30000);
-                connection.setReadTimeout(0); // No timeout for large files
-
-                // Add HF auth header if token provided
-                if (hfToken != null && !hfToken.isEmpty()) {
-                    connection.setRequestProperty("Authorization", "Bearer " + hfToken);
-                }
-
-                int responseCode = connection.getResponseCode();
-
-                // Handle redirects
-                if (responseCode == HttpURLConnection.HTTP_MOVED_PERM ||
-                        responseCode == HttpURLConnection.HTTP_MOVED_TEMP ||
-                        responseCode == 307 ||
-                        responseCode == 308) {
-
-                    String location = connection.getHeaderField("Location");
-                    if (location != null) {
-                        Log.i(TAG, "Redirecting to: " + location);
-                        downloadUrl = new URL(location);
-                        redirectCount++;
-                        connection.disconnect();
-                        continue; // try again with new URL
-                    }
-                }
-
-                if (responseCode != HttpURLConnection.HTTP_OK) {
-                    throw new IOException("HTTP error code: " + responseCode + " for URL: " + downloadUrl);
-                }
-
-                // If we get here, connection is good
-                break;
-            }
-
-            if (connection == null)
-                throw new IOException("Connection failed");
-
-            long fileSize = connection.getContentLengthLong();
-            status.totalBytes = fileSize;
-            Log.i(TAG, "File size: " + fileSize + " bytes");
-
-            try (InputStream inputStream = connection.getInputStream();
-                    FileOutputStream outputStream = new FileOutputStream(localPath)) {
-
-                byte[] buffer = new byte[8192];
-                long downloadedBytes = 0;
-                int bytesRead;
-
-                while ((bytesRead = inputStream.read(buffer)) != -1) {
-                    if (status.cancelled) {
-                        break;
-                    }
-
-                    outputStream.write(buffer, 0, bytesRead);
-                    downloadedBytes += bytesRead;
-                    status.downloadedBytes = downloadedBytes;
-
-                    // Log progress every 1MB
-                    if (downloadedBytes % (1024 * 1024) == 0) {
-                        double progress = fileSize > 0 ? (double) downloadedBytes / fileSize * 100 : 0;
-                        Log.i(TAG, String.format("Download progress: %.1f%% (%d/%d bytes)",
-                                progress, downloadedBytes, fileSize));
-                    }
-                }
-            }
-
-            if (status.cancelled) {
-                Log.i(TAG, "Download cancelled: " + url);
-                new File(localPath).delete();
-                activeDownloads.remove(url);
-                return;
-            }
-
-            // Verify download
-            File downloadedFile = new File(localPath);
-            if (downloadedFile.length() < 1024) {
-                throw new IOException("Download too small (" + downloadedFile.length()
-                        + " bytes). Likely invalid file or error page.");
-            }
-
-            Log.i(TAG, "Download completed successfully: " + localPath);
-            status.completed = true;
-            // No callback here, as we already returned success in downloadModel
-            // The client polls getDownloadProgress to know when it's done.
-
-        } catch (Exception e) {
-            Log.e(TAG, "Download failed: " + e.getMessage());
-            status.failed = true;
-            status.error = e.getMessage();
-
-            // Clean up partial file
-            try {
-                new File(localPath).delete();
-            } catch (Exception ignored) {
-            }
-        }
-    }
-
     public void getDownloadProgress(String url, LlamaCallback<Map<String, Object>> callback) {
         try {
-            // Check Java status first
-            DownloadStatus status = activeDownloads.get(url);
-            if (status != null) {
-                Map<String, Object> progress = new HashMap<>();
-                progress.put("bytesDownloaded", status.downloadedBytes);
-                progress.put("totalBytes", status.totalBytes);
-                progress.put("completed", status.completed);
-                progress.put("failed", status.failed);
-                progress.put("cancelled", status.cancelled);
-                progress.put("error", status.error);
-                callback.onResult(LlamaResult.success(progress));
-
-                // Cleanup if done
-                if (status.completed || status.failed || status.cancelled) {
-                    // Don't remove immediately so client can see the 'completed' state
-                    // Ideally we remove it on next call or after timeout
-                }
-                return;
+            Map<String, Object> progress = downloader.progress(url);
+            if (progress == null) {
+                // Fallback to native (legacy)
+                progress = getDownloadProgressNative(url);
             }
-
-            // Fallback to native (legacy)
-            Map<String, Object> progress = getDownloadProgressNative(url);
             if (progress != null) {
                 callback.onResult(LlamaResult.success(progress));
             } else {
@@ -566,14 +368,8 @@ public class LlamaCpp {
 
     public void cancelDownload(String url, LlamaCallback<Boolean> callback) {
         try {
-            DownloadStatus status = activeDownloads.get(url);
-            if (status != null) {
-                status.cancelled = true;
-                callback.onResult(LlamaResult.success(true));
-            } else {
-                boolean cancelled = cancelDownloadNative(url);
-                callback.onResult(LlamaResult.success(cancelled));
-            }
+            boolean cancelled = downloader.cancel(url) || cancelDownloadNative(url);
+            callback.onResult(LlamaResult.success(cancelled));
         } catch (Exception e) {
             Log.e(TAG, "Error cancelling download: " + e.getMessage());
             callback.onResult(LlamaResult.failure(new LlamaError("Cancel failed: " + e.getMessage())));
@@ -626,11 +422,12 @@ public class LlamaCpp {
                 throw new IOException("Failed to open input stream for: " + sourcePath);
             }
 
-            // Copy file in chunks to avoid OOM
+            // Copy to a .part file renamed at the end: an interrupted copy never looks like a model
+            File partFile = new File(targetFile.getPath() + ".part");
             try (InputStream fis = inputStream;
-                    FileOutputStream fos = new FileOutputStream(targetFile)) {
+                    FileOutputStream fos = new FileOutputStream(partFile)) {
 
-                byte[] buffer = new byte[10000000]; // 10MB buffer
+                byte[] buffer = new byte[1024 * 1024];
                 int bytesRead;
                 long copiedBytes = 0;
 
@@ -647,6 +444,10 @@ public class LlamaCpp {
                 }
             }
 
+            if (!partFile.renameTo(targetFile)) {
+                partFile.delete();
+                throw new IOException("Cannot move the copy into place: " + targetFile);
+            }
             Log.i(TAG, "File copied successfully to: " + targetFile.getAbsolutePath());
             callback.onResult(LlamaResult.success(targetFile.getAbsolutePath()));
 

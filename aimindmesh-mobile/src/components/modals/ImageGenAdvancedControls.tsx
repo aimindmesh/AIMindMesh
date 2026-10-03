@@ -1,4 +1,5 @@
 import React from 'react';
+import type { SDSampler } from 'sd-capacitor';
 
 interface ImageGenAdvancedControlsProps {
     showAdvanced: boolean;
@@ -9,6 +10,11 @@ interface ImageGenAdvancedControlsProps {
     setSteps: (val: number) => void;
     cfgScale: number;
     setCfgScale: (val: number) => void;
+    sampler: SDSampler;
+    setSampler: (val: SDSampler) => void;
+    /** null = a new random seed at every generation */
+    seed: number | null;
+    setSeed: (val: number | null) => void;
 }
 
 export const ImageGenAdvancedControls: React.FC<ImageGenAdvancedControlsProps> = ({
@@ -19,7 +25,11 @@ export const ImageGenAdvancedControls: React.FC<ImageGenAdvancedControlsProps> =
     steps,
     setSteps,
     cfgScale,
-    setCfgScale
+    setCfgScale,
+    sampler,
+    setSampler,
+    seed,
+    setSeed
 }) => {
     return (
         <div>
@@ -29,13 +39,13 @@ export const ImageGenAdvancedControls: React.FC<ImageGenAdvancedControlsProps> =
                 className="text-xs text-text-secondary hover:text-text-primary flex items-center gap-1 transition-colors"
             >
                 <span>{showAdvanced ? '▼' : '▶'}</span>
-                <span>Advanced Controls (Steps, CFG Scale, Negative Prompt)</span>
+                <span>Advanced Controls (Steps, CFG, Sampler, Seed, Negative Prompt)</span>
             </button>
 
             {showAdvanced && (
                 <div className="mt-3 space-y-3 p-3 bg-surface/30 rounded-xl border border-white/5 text-xs">
                     <div className="space-y-1">
-                        <label className="text-text-secondary">Negative Prompt:</label>
+                        <label className="text-text-secondary">Negative Prompt (English):</label>
                         <input
                             type="text"
                             value={negativePrompt}
@@ -68,6 +78,34 @@ export const ImageGenAdvancedControls: React.FC<ImageGenAdvancedControlsProps> =
                                 value={cfgScale}
                                 onChange={(e) => setCfgScale(parseFloat(e.target.value))}
                                 className="w-full accent-amber-400"
+                            />
+                        </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                        <div>
+                            <label className="text-text-secondary block mb-1">Sampler:</label>
+                            <select
+                                value={sampler}
+                                onChange={(e) => setSampler(e.target.value as SDSampler)}
+                                className="w-full bg-input text-text-primary rounded-lg p-2 text-xs border border-white/10"
+                            >
+                                <option value="euler">Euler (default)</option>
+                                <option value="dpmpp_2m">DPM++ 2M (sharper)</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label className="text-text-secondary block mb-1">Seed (empty = random):</label>
+                            <input
+                                type="number"
+                                min="0"
+                                inputMode="numeric"
+                                value={seed ?? ''}
+                                placeholder="random"
+                                onChange={(e) => {
+                                    const value = parseInt(e.target.value, 10);
+                                    setSeed(Number.isFinite(value) && value >= 0 ? value : null);
+                                }}
+                                className="w-full bg-input text-text-primary rounded-lg p-2 text-xs border border-white/10"
                             />
                         </div>
                     </div>

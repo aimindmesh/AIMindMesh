@@ -10,6 +10,8 @@ import { initializeNativeModel, checkMultimodalCapabilities } from './GGUF/initi
 import { processAudioAttachments, prepareImagesForProcessing } from './GGUF/mediaHandler';
 import { isToolCallingEnabled, hasDedicatedToolModel, extractToolCallsWithDedicatedModel } from './GGUF/toolHandler';
 import { syncGGUFContext } from './GGUF/contextSync';
+import { toChatRole } from '../roles';
+import { getResponseReserve } from '../context/unifiedContextManager';
 
 /**
  * Generate stream from Native GGUF model via Capacitor plugin
@@ -74,15 +76,15 @@ export async function* generateNativeGGUFStream(
     
     if (!appendMode) {
         logger.log('info', '[LLM_CHAIN] Running smart context refinement...');
-        const contextResult = smartContextRefinement(messagesToFormat, systemPromptToUse, llmConfig, maxResponseLength);
+        const contextResult = smartContextRefinement(messagesToFormat, systemPromptToUse, llmConfig, personality.llmParams?.maxTokens ?? maxResponseLength);
         messagesToUse = contextResult.messages;
         finalSystemPrompt = contextResult.systemPrompt;
     }
 
     // 5. Format Prompt using Native Template Engine
     logger.log('info', '[LLM_CHAIN] Assembling messages array for native prompt formatter...');
-    const messages = messagesToUse.map(msg => ({
-        role: msg.role === 'user' ? 'user' : 'assistant',
+    const messages: { role: string; content: string }[] = messagesToUse.map(msg => ({
+        role: toChatRole(msg.role),
         content: msg.text
     }));
 
@@ -99,15 +101,15 @@ export async function* generateNativeGGUFStream(
 
     // 6. Generate Stream
     const llmParams = personality.llmParams || {};
-    const nPredict = llmParams.maxTokens ?? (maxResponseLength || 1000);
+    // Same answer budget the context refinement reserved, so prompt + answer fit in nCtx
+    const nPredict = getResponseReserve(llmConfig.nCtx || llmConfig.contextSize || 2048, llmParams.maxTokens ?? (maxResponseLength || 1000));
     let fullGeneratedText = '';
 
     const thinkingParser = createThinkingParser();
     const internalController = new AbortController();
 
-    if (signal) {
-        signal.addEventListener('abort', () => internalController.abort());
-    }
+    const forwardAbort = () => internalController.abort();
+    signal?.addEventListener('abort', forwardAbort, { once: true });
 
     try {
         logger.log('info', `[LLM_CHAIN] Starting generateNativeStream with ${messages.length} messages. appendMode=${appendMode}`);
@@ -143,6 +145,8 @@ export async function* generateNativeGGUFStream(
         } else {
             throw error;
         }
+    } finally {
+        signal?.removeEventListener('abort', forwardAbort);
     }
 
     for (const parsedChunk of thinkingParser.flush()) {

@@ -6,15 +6,29 @@ import android.util.Log;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.concurrent.atomic.AtomicInteger;
 
 // Native Piper implementation using ONNX Runtime
 public class PiperSynthesizer {
     private static final String TAG = "PiperSynthesizer";
     private Context context;
     private android.media.AudioManager audioManager;
-    private String currentVoiceId;
-    private boolean isLoaded = false;
+    private volatile String currentVoiceId;
+    private volatile boolean isLoaded = false;
+
+    // The native ORT session is a global: load/unload while another thread synthesizes freed
+    // it mid-inference, so every native call holds this lock.
+    private final Object nativeLock = new Object();
+
+    // Playback state, touched from the speak threads, the plugin thread (stop) and the main
+    // looper (completion callbacks).
+    private final Object playerLock = new Object();
     private MediaPlayer mediaPlayer;
+    private Runnable pendingCompletion;
+    private File currentFile;
+
+    // Bumped by stop(): a speak() that was still synthesizing must not start playing afterwards.
+    private final AtomicInteger generation = new AtomicInteger();
 
     // Load native library
     static {
@@ -42,7 +56,7 @@ public class PiperSynthesizer {
     // Native methods
     private native boolean nativeLoadVoice(String modelPath, String configPath);
 
-    private native String nativeSynthesize(long[] phonemeIds);
+    private native String nativeSynthesize(long[] phonemeIds, String outputPath);
 
     private native void nativeUnload();
 
@@ -109,7 +123,10 @@ public class PiperSynthesizer {
             }
 
             Log.i(TAG, "Loading native voice model: " + modelFile.getAbsolutePath());
-            boolean success = nativeLoadVoice(modelFile.getAbsolutePath(), configFile.getAbsolutePath());
+            boolean success;
+            synchronized (nativeLock) {
+                success = nativeLoadVoice(modelFile.getAbsolutePath(), configFile.getAbsolutePath());
+            }
 
             if (success) {
                 // Extract voiceId from modelPath (e.g., "piper-voices/en_US-amy-medium.onnx" ->
@@ -131,78 +148,141 @@ public class PiperSynthesizer {
     }
 
     public void unloadVoice() {
-        if (isLoaded) {
-            nativeUnload();
-            this.isLoaded = false;
-            this.currentVoiceId = null;
+        synchronized (nativeLock) {
+            if (isLoaded) {
+                nativeUnload();
+                this.isLoaded = false;
+                this.currentVoiceId = null;
+            }
         }
     }
 
     public String synthesize(long[] phonemeIds) {
         Log.i(TAG, "synthesize called with " + phonemeIds.length + " phonemes");
-        if (!isLoaded) {
-            Log.e(TAG, "No voice loaded");
-            return null;
-        }
+        File out = new File(context.getCacheDir(), "piper_output.wav");
+        return synthesizeTo(phonemeIds, out) ? out.getAbsolutePath() : null;
+    }
 
-        return nativeSynthesize(phonemeIds);
+    private boolean synthesizeTo(long[] phonemeIds, File out) {
+        synchronized (nativeLock) {
+            if (!isLoaded) {
+                Log.e(TAG, "No voice loaded");
+                return false;
+            }
+            return nativeSynthesize(phonemeIds, out.getAbsolutePath()) != null;
+        }
     }
 
     public void speak(long[] phonemeIds, Runnable onComplete) {
         Log.i(TAG, "speak called with " + phonemeIds.length + " phonemes");
-        String audioPath = synthesize(phonemeIds);
-        if (audioPath != null) {
-            File file = new File(audioPath);
-            Log.i(TAG, "Audio file generated: " + audioPath + ", size: " + file.length() + " bytes");
-            if (file.length() > 100) { // Header is 44 bytes
-                playAudio(audioPath, onComplete);
-            } else {
-                Log.e(TAG, "Audio file is too small, likely empty or just header");
-                if (onComplete != null) {
-                    onComplete.run();
-                }
-            }
-        } else {
-            Log.e(TAG, "Synthesis failed, no audio generated");
-            if (onComplete != null) {
-                onComplete.run();
-            }
+        int gen = generation.get();
+        File out;
+        try {
+            // One file per utterance: a fixed path was overwritten while MediaPlayer still read it
+            out = File.createTempFile("piper_", ".wav", context.getCacheDir());
+        } catch (IOException e) {
+            Log.e(TAG, "Cannot create audio file", e);
+            onComplete.run();
+            return;
         }
+
+        if (!synthesizeTo(phonemeIds, out) || out.length() <= 100) { // Header is 44 bytes
+            Log.e(TAG, "Synthesis failed or produced no audio (" + out.length() + " bytes)");
+            out.delete();
+            onComplete.run();
+            return;
+        }
+        Log.i(TAG, "Audio file generated: " + out.getAbsolutePath() + ", size: " + out.length() + " bytes");
+        playAudio(out, onComplete, gen);
     }
 
-    private void playAudio(String path, Runnable onComplete) {
-        stop();
-        try {
-            mediaPlayer = new MediaPlayer();
-            mediaPlayer.setDataSource(path);
-            mediaPlayer.prepare();
-            mediaPlayer.start();
-            Log.i(TAG, "Audio playback started, duration: " + mediaPlayer.getDuration() + "ms");
-            mediaPlayer.setOnCompletionListener(mp -> {
-                Log.i(TAG, "Audio playback completed");
-                mp.release();
-                mediaPlayer = null;
-                // CRITICAL: Call completion callback AFTER audio finishes
-                if (onComplete != null) {
-                    onComplete.run();
+    private void playAudio(File file, Runnable onComplete, int gen) {
+        Runnable finished = null;
+        Runnable replaced = null;
+        synchronized (playerLock) {
+            if (gen != generation.get()) {
+                // stop() arrived while synthesizing: report done without playing
+                file.delete();
+                finished = onComplete;
+            } else {
+                replaced = detachPlayerLocked();
+                MediaPlayer mp = new MediaPlayer();
+                try {
+                    mp.setDataSource(file.getAbsolutePath());
+                    mp.setOnCompletionListener(this::onPlaybackFinished);
+                    mp.setOnErrorListener((player, what, extra) -> {
+                        Log.e(TAG, "Playback error " + what + "/" + extra);
+                        onPlaybackFinished(player);
+                        return true;
+                    });
+                    mp.prepare();
+                    mediaPlayer = mp;
+                    pendingCompletion = onComplete;
+                    currentFile = file;
+                    mp.start();
+                    Log.i(TAG, "Audio playback started, duration: " + mp.getDuration() + "ms");
+                } catch (IOException | RuntimeException e) {
+                    Log.e(TAG, "Failed to play audio", e);
+                    if (mediaPlayer == mp) {
+                        mediaPlayer = null;
+                        pendingCompletion = null;
+                        currentFile = null;
+                    }
+                    mp.release();
+                    file.delete();
+                    finished = onComplete;
                 }
-            });
-        } catch (IOException e) {
-            Log.e(TAG, "Failed to play audio", e);
-            if (onComplete != null) {
-                onComplete.run();
             }
         }
+        // Callbacks resolve plugin calls: run them outside the lock
+        if (replaced != null) replaced.run();
+        if (finished != null) finished.run();
+    }
+
+    private void onPlaybackFinished(MediaPlayer mp) {
+        Runnable done;
+        synchronized (playerLock) {
+            if (mp != mediaPlayer) {
+                return; // already detached by stop() or a newer utterance
+            }
+            Log.i(TAG, "Audio playback completed");
+            done = detachPlayerLocked();
+        }
+        // CRITICAL: Call completion callback AFTER audio finishes
+        if (done != null) done.run();
+    }
+
+    /** Stops and releases the current player; returns its pending completion (to run unlocked). */
+    private Runnable detachPlayerLocked() {
+        MediaPlayer mp = mediaPlayer;
+        Runnable done = pendingCompletion;
+        mediaPlayer = null;
+        pendingCompletion = null;
+        if (mp != null) {
+            try {
+                if (mp.isPlaying()) {
+                    mp.stop();
+                }
+            } catch (IllegalStateException e) {
+                Log.w(TAG, "MediaPlayer stop in invalid state", e);
+            }
+            mp.release();
+        }
+        if (currentFile != null) {
+            currentFile.delete();
+            currentFile = null;
+        }
+        return done;
     }
 
     public void stop() {
-        if (mediaPlayer != null) {
-            if (mediaPlayer.isPlaying()) {
-                mediaPlayer.stop();
-            }
-            mediaPlayer.release();
-            mediaPlayer = null;
+        generation.incrementAndGet();
+        Runnable done;
+        synchronized (playerLock) {
+            done = detachPlayerLocked();
         }
+        // Resolve the interrupted speak call instead of leaving its JS promise pending forever
+        if (done != null) done.run();
     }
 
     public boolean isVoiceLoaded() {

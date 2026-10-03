@@ -5,6 +5,10 @@ import { StreamChunk } from './llmService';
 import { getReActSystemPromptCompact } from '../toolDefinitions';
 import { parseReActToolCalls } from '../tools';
 import { createThinkingParser } from './thinkingParser';
+import { toChatRole, lastUserText } from './roles';
+import { resolveClaudeModel } from './claudeModels';
+
+export { DEFAULT_CLAUDE_MODEL, resolveClaudeModel } from './claudeModels';
 
 /**
  * Generates a streaming response from Anthropic (Claude) API with tool and thinking support
@@ -53,6 +57,14 @@ export async function* generateClaudeStream(
         }
     }
 
+    // Inject Workspace Documents Context (as the other providers do)
+    try {
+        const { contextInjector } = await import('./contextInjector');
+        systemPrompt = await contextInjector.buildSystemPromptWithContext(lastUserText(history), systemPrompt);
+    } catch (e) {
+        logger.log('warn', 'Claude: Failed to inject workspace context', e);
+    }
+
     // Add tool instructions if enabled
     if (llmConfig?.enableToolCalling) {
         systemPrompt += "\n" + getReActSystemPromptCompact(llmConfig.toolRules);
@@ -76,7 +88,7 @@ Your final answer goes AFTER the thinking tags.`;
 
     // Anthropic expects system prompt as a top-level parameter, not in messages
     const messages = history.map(msg => ({
-        role: msg.role === 'model' ? 'assistant' : 'user',
+        role: toChatRole(msg.role),
         content: msg.text
     }));
 
@@ -96,7 +108,7 @@ Your final answer goes AFTER the thinking tags.`;
                 'anthropic-dangerously-allow-browser': 'true' // Necessary for client-side usage
             },
             body: JSON.stringify({
-                model: model || 'claude-3-5-sonnet-latest',
+                model: resolveClaudeModel(model),
                 messages: messages,
                 system: systemPrompt,
                 stream: true,
@@ -109,7 +121,10 @@ Your final answer goes AFTER the thinking tags.`;
         if (!response.ok) {
             const errorText = await response.text();
             logger.log('error', 'Claude API error', { status: response.status, body: errorText });
-            throw new Error(`Claude API Error: ${response.status} ${response.statusText}`);
+            // The API's own message (e.g. "model: ...not found") tells the user what to fix
+            let detail = '';
+            try { detail = JSON.parse(errorText)?.error?.message || ''; } catch { /* not JSON */ }
+            throw new Error(`Claude API Error: ${response.status} ${response.statusText}${detail ? ` - ${detail}` : ''}`);
         }
 
         if (!response.body) throw new Error("No response body");

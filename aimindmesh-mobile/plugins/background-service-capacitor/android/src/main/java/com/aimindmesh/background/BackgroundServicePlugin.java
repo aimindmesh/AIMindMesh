@@ -19,10 +19,16 @@ public class BackgroundServicePlugin extends Plugin {
         intent.putExtra("title", title);
         intent.putExtra("body", body);
 
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            getContext().startForegroundService(intent);
-        } else {
-            getContext().startService(intent);
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                getContext().startForegroundService(intent);
+            } else {
+                getContext().startService(intent);
+            }
+        } catch (RuntimeException e) {
+            // Android 12+ refuses foreground-service starts while the app is in the background
+            call.reject("Could not start the background service: " + e.getMessage());
+            return;
         }
 
         call.resolve();

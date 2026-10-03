@@ -3,6 +3,7 @@ import { Message, Personality, LLMConfig } from '../../types';
 import { generateTextResponseStream } from '../llm/llmService';
 import { buildMemoryExtractionPrompt } from '../llm/promptBuilder';
 import { logger } from '../logger';
+import { memoryTaskConfig } from './memoryLlmConfig';
 
 export class MemoryExtractionService {
     private llmConfig: LLMConfig;
@@ -20,7 +21,7 @@ export class MemoryExtractionService {
     async extractAndSaveMemory(
         history: Message[],
         personality: Personality,
-        addMemoryCallback: (content: string, category: string) => void
+        addMemoryCallback: (content: string, category: string) => void | Promise<void>
     ): Promise<boolean> {
         // Only extract if we have enough context (at least 2 messages)
         if (history.length < 2) return false;
@@ -42,13 +43,9 @@ export class MemoryExtractionService {
             traits: []
         };
 
-        // Create a temporary config that disables tools for this specific extraction call
-        const extractionConfig: LLMConfig = {
-            ...this.llmConfig,
-            enableToolCalling: false, // STRICTLY FALSE
-            enableThinking: false, // We want raw JSON
-            // transform output to JSON if possible, but prompt handles it mostly
-        };
+        // No tools, no thinking (we want raw JSON) and no injected memories: a retrieved memory
+        // in the prompt would come back as a "new" fact
+        const extractionConfig: LLMConfig = memoryTaskConfig(this.llmConfig);
 
         // logger.log('debug', '[MemoryExtraction] Config:', JSON.stringify(extractionConfig));
 
@@ -79,9 +76,10 @@ export class MemoryExtractionService {
                 try {
                     const result = JSON.parse(jsonStr);
 
-                    if (result.memory && result.memory !== 'null' && result.memory !== 'NONE') {
+                    if (typeof result.memory === 'string' && result.memory.trim() && result.memory !== 'null' && result.memory !== 'NONE') {
                         logger.log('info', `[MemoryExtraction] Found memory: "${result.memory}" [${result.category}]`);
-                        addMemoryCallback(result.memory, result.category || 'general');
+                        // Awaited so a failed save is reported here instead of as an unhandled rejection
+                        await addMemoryCallback(result.memory.trim(), typeof result.category === 'string' && result.category.trim() ? result.category.trim() : 'other');
                         return true;
                     } else {
                         logger.log('debug', '[MemoryExtraction] No relevant memory found.');

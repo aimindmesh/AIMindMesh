@@ -14,6 +14,8 @@ export interface PendingItem {
   insightId: string;
   deviceId: string;
   createdAt: number;
+  /** Text of the insight (null if it was deleted meanwhile) */
+  content: string | null;
 }
 
 export class DeliveryScheduler {
@@ -100,11 +102,13 @@ export class DeliveryScheduler {
    * Returns queued insights for a specific device.
    */
   public static getPendingForDevice(deviceId: string): PendingItem[] {
+    // content: the insight text, shown by the device notification (null if the item was deleted)
     return db.prepare(`
-      SELECT id, insight_id as insightId, device_id as deviceId, created_at as createdAt
-      FROM pending_delivery
-      WHERE device_id = ? AND status = 'PENDING'
-      ORDER BY created_at ASC
+      SELECT pd.id, pd.insight_id as insightId, pd.device_id as deviceId, pd.created_at as createdAt, f.content
+      FROM pending_delivery pd
+      LEFT JOIN feed_items f ON f.id = pd.insight_id
+      WHERE pd.device_id = ? AND pd.status = 'PENDING'
+      ORDER BY pd.created_at ASC
       LIMIT 20
     `).all(deviceId) as PendingItem[];
   }

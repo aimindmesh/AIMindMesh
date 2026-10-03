@@ -1,5 +1,6 @@
 import { Logger } from '../utils/Logger';
 import db from '../db/sqlite';
+import { config } from '../config';
 
 export interface ActiveInference {
   id: string;
@@ -41,19 +42,7 @@ export class InferenceRegistry {
     this.activeInferences.set(id, info);
     
     try {
-      // Self-healing migration: Add provider column if missing
-      const tableInfo = db.prepare('PRAGMA table_info(inference_queue)').all() as any[];
-      if (!tableInfo.some(c => c.name === 'provider')) {
-        db.exec('ALTER TABLE inference_queue ADD COLUMN provider TEXT');
-        Logger.info('InferenceRegistry', 'Added provider column to inference_queue table');
-      }
-      if (!tableInfo.some(c => c.name === 'source_id')) {
-        db.exec('ALTER TABLE inference_queue ADD COLUMN source_id TEXT');
-      }
-      if (!tableInfo.some(c => c.name === 'completed_at')) {
-        db.exec('ALTER TABLE inference_queue ADD COLUMN completed_at INTEGER');
-      }
-
+      // Columns provider/source_id/completed_at come from the schema baseline (db/migrations.ts)
       db.prepare(`
         INSERT INTO inference_queue (id, type, task_name, prompt, model, provider, status, payload, created_at, source_id)
         VALUES (@id, @type, @task_name, @prompt, @model, @provider, @status, @payload, @created_at, @source_id)
@@ -182,7 +171,6 @@ export class InferenceRegistry {
 
   private static pruneHistory(): void {
     try {
-      const { config } = require('../config');
       const limit = config?.tasks?.retentionLimit || 1000;
 
       // 1. Prune COMPLETED tasks (standard limit)

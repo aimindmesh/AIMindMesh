@@ -18,7 +18,10 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.io.FileInputStream
 import java.util.concurrent.atomic.AtomicBoolean
@@ -31,6 +34,9 @@ class GenieEngine(private val context: Context) {
         private var activeModelMetadata: Map<String, Any?> = emptyMap()
         private var llmWrapper: LlmWrapper? = null
         private var vlmWrapper: VlmWrapper? = null
+        // Held by a generation for its whole duration: load/unload wait for it before destroying wrappers
+        private val wrapperMutex = Mutex()
+        private const val STOP_WAIT_MS = 15_000L
     }
 
     private val isGenerating = AtomicBoolean(false)
@@ -93,6 +99,10 @@ class GenieEngine(private val context: Context) {
         temperature: Float = 0.7f,
         topP: Float = 0.9f
     ): Boolean = withContext(Dispatchers.IO) {
+        if (isLoaded() && activeModelPath != null && (activeModelPath == modelPath || File(modelPath).absolutePath == activeModelPath)) {
+            Log.i(TAG, "Genie model already loaded: $activeModelPath")
+            return@withContext true
+        }
         ensureGenieXInitialized()
         wakeLock?.acquire(3 * 60 * 1000L)
         try {
@@ -145,6 +155,15 @@ class GenieEngine(private val context: Context) {
 
             if (modelDir == null) {
                 Log.e(TAG, "Could not find valid genie_config.json in $targetDir for source: $modelPath")
+                return@withContext false
+            }
+
+            if (activeModelPath == modelDir.absolutePath && isLoaded()) {
+                return@withContext true
+            }
+            // Free the previous NPU model first: only one fits, and an overwritten wrapper is never destroyed
+            if (!stopAndDestroyWrappers()) {
+                Log.e(TAG, "Previous Genie generation did not stop; not loading $modelPath")
                 return@withContext false
             }
 
@@ -258,41 +277,59 @@ class GenieEngine(private val context: Context) {
 
     suspend fun unloadModel(): Boolean = withContext(Dispatchers.IO) {
         try {
-            abortGeneration()
-            try {
-                vlmWrapper?.destroy()
-            } catch (e: Exception) {
-                Log.w(TAG, "Error destroying VlmWrapper", e)
-            }
-            try {
-                llmWrapper?.destroy()
-            } catch (e: Exception) {
-                Log.w(TAG, "Error destroying LlmWrapper", e)
-            }
-            vlmWrapper = null
-            llmWrapper = null
-            activeModelPath = null
-            activeModelMetadata = emptyMap()
-            isInitialized = false
-            Log.i(TAG, "Genie model unloaded successfully")
-            true
+            val ok = stopAndDestroyWrappers()
+            if (ok) Log.i(TAG, "Genie model unloaded successfully")
+            ok
         } catch (e: Exception) {
             Log.e(TAG, "Failed to unload Genie model", e)
             false
         }
     }
 
-    fun abortGeneration(): Boolean {
-        abortRequested.set(true)
-        isGenerating.set(false)
-        kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
-            try {
-                vlmWrapper?.stopStream()
-                llmWrapper?.stopStream()
-            } catch (e: Exception) {
-                Log.w(TAG, "Error stopping stream", e)
+    /**
+     * Stops a running stream synchronously, waits for the generation to release the wrappers,
+     * then destroys them. Returns false (nothing destroyed) if the generation does not stop.
+     */
+    private suspend fun stopAndDestroyWrappers(): Boolean {
+        if (llmWrapper == null && vlmWrapper == null) return true
+        requestStop()
+        val destroyed = withTimeoutOrNull(STOP_WAIT_MS) {
+            wrapperMutex.withLock {
+                try {
+                    vlmWrapper?.destroy()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error destroying VlmWrapper", e)
+                }
+                try {
+                    llmWrapper?.destroy()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error destroying LlmWrapper", e)
+                }
+                vlmWrapper = null
+                llmWrapper = null
+                activeModelPath = null
+                activeModelMetadata = emptyMap()
+                isInitialized = false
+                true
             }
         }
+        return destroyed == true
+    }
+
+    private suspend fun requestStop() {
+        abortRequested.set(true)
+        try {
+            vlmWrapper?.stopStream()
+            llmWrapper?.stopStream()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error stopping stream", e)
+        }
+    }
+
+    fun abortGeneration(): Boolean {
+        abortRequested.set(true)
+        // stopStream may block briefly: keep it off the caller's thread
+        kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch { requestStop() }
         return true
     }
 
@@ -303,6 +340,7 @@ class GenieEngine(private val context: Context) {
         topP: Float = 0.9f,
         stopSequences: List<String> = emptyList()
     ): Flow<Pair<String, Boolean>> = flow {
+        wrapperMutex.withLock {
         if (!isLoaded() || (llmWrapper == null && vlmWrapper == null)) {
             throw IllegalStateException("Genie NPU model is not loaded")
         }
@@ -365,6 +403,7 @@ class GenieEngine(private val context: Context) {
             if (wakeLock?.isHeld == true) {
                 try { wakeLock?.release() } catch (e: Exception) {}
             }
+        }
         }
     }.flowOn(Dispatchers.IO)
 }

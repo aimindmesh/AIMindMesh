@@ -62,7 +62,10 @@ public class KeepAliveService extends Service {
                 }
                 Log.d("KeepAliveDebug", "KeepAliveService startForeground called successfully");
             } catch (Exception e) {
+                // Not foreground (e.g. sticky restart from the background): stop instead of being killed for a missed deadline
                 Log.e("KeepAliveDebug", "KeepAliveService startForeground failed", e);
+                stopSelf();
+                return START_NOT_STICKY;
             }
         } else {
             startForeground(NOTIFICATION_ID, notification);

@@ -4,9 +4,12 @@
  * Handles RAG retrieval (memories + workspace docs), LLM call, UI state, and local notification.
  */
 
-import { useCallback } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import { LLMConfig, Personality, ProactiveSettings, Message } from '../types';
+import { ProactiveAction } from '../types/proactive';
+import { onProactiveAction } from '../services/proactive/ActionExecutor';
+import { useNativeProactiveSync } from '../services/proactive/nativeProactiveSync';
 import { getOrInitializeSemanticMemoryRetriever } from '../services/memory/semanticMemoryRetriever';
 import { DocumentRetriever } from '../services/documents/DocumentRetriever';
 import { buildProactiveMessagePrompt } from '../services/llm/promptBuilder';
@@ -43,7 +46,15 @@ export function useProactiveMessage({
     isVoiceMode,
     isAppActive,
     activeThreadId,
+    proactiveSettings,
 }: UseProactiveMessageOptions) {
+    // App passes the proactive settings here: the native job and MainActivity need them too
+    useNativeProactiveSync(proactiveSettings);
+
+    // Meeting briefings (interactive proactive actions) become a chat message plus a notification
+    const latest = useRef({ chat, personality, llmConfig, apiKey });
+    latest.current = { chat, personality, llmConfig, apiKey };
+    useEffect(() => onProactiveAction('chat', (action) => deliverChatAction(action, latest.current)), []);
 
     const handleProactiveMessage = useCallback(async () => {
         if (isProactiveThinking || incomingCall || isSettingsOpen || isVoiceMode) return;
@@ -119,4 +130,42 @@ export function useProactiveMessage({
     }, [isProactiveThinking, chat.messages, personality, llmConfig, apiKey, incomingCall, isSettingsOpen, isVoiceMode, isAppActive, activeThreadId]);
 
     return { handleProactiveMessage };
+}
+
+/** On-device engines: a background generation would drop their chat KV cache */
+const ON_DEVICE_PROVIDERS = ['litert', 'native-gguf'];
+
+async function deliverChatAction(
+    action: ProactiveAction,
+    { chat, personality, llmConfig, apiKey }: { chat: UseProactiveMessageOptions['chat']; personality: Personality; llmConfig: LLMConfig; apiKey: string }
+): Promise<void> {
+    const prompt: string = action.data?.message || '';
+    const start = action.data?.eventStart ? new Date(action.data.eventStart).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+    // Plain reminder when no model can run now: the briefing still arrives
+    let text = `📋 ${action.data?.eventTitle || action.data?.title || 'Upcoming event'}${start ? ` at ${start}` : ''}`;
+
+    if (prompt && !ON_DEVICE_PROVIDERS.includes(llmConfig.provider)) {
+        try {
+            const generated = await generateProactiveMessage(prompt, personality, llmConfig, apiKey);
+            if (generated?.trim()) text = generated;
+        } catch (e) {
+            logger.log('warn', '[Proactive] Briefing generation failed, sending the plain reminder', e);
+        }
+    }
+
+    chat.setMessages(prev => [...prev, { id: `${action.id}-msg`, role: 'model', text, timestamp: new Date() } as Message]);
+    try {
+        await LocalNotifications.schedule({
+            notifications: [{
+                id: Math.floor(Date.now() % 2147483647),
+                title: action.data?.title || personality.name,
+                body: text.length > 300 ? `${text.slice(0, 297)}...` : text,
+                schedule: { at: new Date() },
+                smallIcon: 'ic_launcher',
+                channelId: 'proactive-messages'
+            }]
+        });
+    } catch (e) {
+        logger.log('error', '[Proactive] Briefing notification failed', e);
+    }
 }

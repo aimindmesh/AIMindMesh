@@ -13,6 +13,7 @@ export class PiperTextToSpeechService {
 
     private currentVoiceId: string | null = null;
     private isSpeaking: boolean = false;
+    private sessionId = 0;
 
     // WASM paths (absolute URL for Android WebView)
     // On Android, assets are served from the app's origin
@@ -176,22 +177,14 @@ export class PiperTextToSpeechService {
         }
 
         logger.log('info', 'Starting Piper TTS', { text: text.substring(0, 50) });
+        const session = ++this.sessionId;
         this.isSpeaking = true;
+        let configUrl: string | null = null;
 
         try {
             // 1. Phonemize using WASM
             logger.log('info', 'Phonemizing text...');
-
-            // Workaround: Read the config file from filesystem and create a Blob URL
-            const configPath = `piper-voices/${this.currentVoiceId}.onnx.json`;
-            const configContent = await Filesystem.readFile({
-                path: configPath,
-                directory: Directory.Data,
-                encoding: Encoding.UTF8
-            });
-
-            const configBlob = new Blob([configContent.data as string], { type: 'application/json' });
-            const configUrl = URL.createObjectURL(configBlob);
+            configUrl = await this.createConfigUrl();
 
             const { phonemeIds } = await piperPhonemize(
                 this.PHONEMIZE_JS,
@@ -204,9 +197,12 @@ export class PiperTextToSpeechService {
             );
 
             logger.log('info', `Phonemization complete. Generated ${phonemeIds.length} phonemes.`);
+            if (session !== this.sessionId) return; // stopped while phonemizing
 
             // 2. Synthesize using Native Plugin
             await Piper.speak({ phonemeIds });
+            // A stop() resolves the native call early: the stopper owns the state, no onEnd
+            if (session !== this.sessionId) return;
 
             this.isSpeaking = false;
             logger.log('info', 'Piper TTS finished');
@@ -217,10 +213,14 @@ export class PiperTextToSpeechService {
                 onEnd();
             }
         } catch (error) {
-            this.isSpeaking = false;
-            this.resetIdleTimer(); // Reset even on error to cleanup
+            if (session === this.sessionId) {
+                this.isSpeaking = false;
+                this.resetIdleTimer(); // Reset even on error to cleanup
+            }
             logger.log('error', 'Failed to synthesize speech', error);
             throw error;
+        } finally {
+            if (configUrl) URL.revokeObjectURL(configUrl);
         }
     }
 
@@ -254,22 +254,18 @@ export class PiperTextToSpeechService {
             return;
         }
 
+        // Each call owns a session id: a stop() or a newer speak invalidates it, so an old
+        // loop cannot resume (and interleave its sentences) once the shared flag flips back.
+        const session = ++this.sessionId;
         this.isSpeaking = true;
+        let configUrl: string | null = null;
 
         try {
             // Read config once for phonemization
-            const configPath = `piper-voices/${this.currentVoiceId}.onnx.json`;
-            const configContent = await Filesystem.readFile({
-                path: configPath,
-                directory: Directory.Data,
-                encoding: Encoding.UTF8
-            });
-
-            const configBlob = new Blob([configContent.data as string], { type: 'application/json' });
-            const configUrl = URL.createObjectURL(configBlob);
+            configUrl = await this.createConfigUrl();
 
             // Process sentences sequentially
-            for (let i = 0; i < sentences.length && this.isSpeaking; i++) {
+            for (let i = 0; i < sentences.length && session === this.sessionId; i++) {
                 const sentence = sentences[i].trim();
                 if (!sentence) continue;
 
@@ -289,12 +285,14 @@ export class PiperTextToSpeechService {
                     sentence,
                     () => { }
                 );
+                if (session !== this.sessionId) break;
 
                 // Synthesize and play
                 await Piper.speak({ phonemeIds });
             }
 
-            URL.revokeObjectURL(configUrl);
+            if (session !== this.sessionId) return; // stopped: no onEnd, the stopper owns the state
+
             this.isSpeaking = false;
             logger.log('info', 'Streaming Piper TTS finished');
 
@@ -304,11 +302,28 @@ export class PiperTextToSpeechService {
                 onEnd();
             }
         } catch (error) {
-            this.isSpeaking = false;
-            this.resetIdleTimer();
+            if (session === this.sessionId) {
+                this.isSpeaking = false;
+                this.resetIdleTimer();
+            }
             logger.log('error', 'Streaming TTS failed', error);
             throw error;
+        } finally {
+            if (configUrl) URL.revokeObjectURL(configUrl);
         }
+    }
+
+    /** Blob URL of the current voice config, read by the phonemizer worker. */
+    private async createConfigUrl(): Promise<string> {
+        // Workaround: Read the config file from filesystem and create a Blob URL
+        const configPath = `piper-voices/${this.currentVoiceId}.onnx.json`;
+        const configContent = await Filesystem.readFile({
+            path: configPath,
+            directory: Directory.Data,
+            encoding: Encoding.UTF8
+        });
+        const configBlob = new Blob([configContent.data as string], { type: 'application/json' });
+        return URL.createObjectURL(configBlob);
     }
 
     /**
@@ -326,16 +341,18 @@ export class PiperTextToSpeechService {
      * Stop current speech
      */
     public async stop(): Promise<void> {
+        // Invalidate any in-flight speak loop, even one that is between sentences
+        this.sessionId++;
         if (!this.isSpeaking) {
             return;
         }
 
         logger.log('info', 'Stopping Piper TTS');
+        this.isSpeaking = false;
         this.resetIdleTimer(); // Ensure we eventually unload even if stopped manually
 
         try {
             await Piper.stop();
-            this.isSpeaking = false;
             logger.log('info', 'Piper TTS stopped');
         } catch (error) {
             logger.log('error', 'Failed to stop Piper TTS', error);
@@ -373,6 +390,14 @@ export class PiperTextToSpeechService {
      * Check if currently speaking
      */
     public isSpeakingNow(): boolean {
+        return this.isSpeaking;
+    }
+
+    /**
+     * True while a reply is being phonemized, synthesized or played: memory-pressure handlers
+     * must not unload the voice then (unload waits for the native synthesis lock anyway).
+     */
+    public isBusy(): boolean {
         return this.isSpeaking;
     }
 

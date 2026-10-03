@@ -94,7 +94,7 @@ const AgendaSettings: React.FC<AgendaSettingsProps> = ({
                 const result = await importAgendaData(text, false);
                 setStatusMessage({
                     type: 'success',
-                    text: `Imported ${result.eventsImported} events and ${result.notesImported} notes.`,
+                    text: `Imported ${result.eventsImported} events, ${result.notesImported} notes and ${result.tasksImported} tasks.`,
                 });
                 loadStats();
                 triggerHaptic();

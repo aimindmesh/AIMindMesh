@@ -301,6 +301,29 @@ export async function whisperModelExists(modelId: string): Promise<boolean> {
 }
 
 /**
+ * Relative path (under Directory.Data) the native plugin should load for a model id: the
+ * standalone `<id>.bin`, or the `<id>` directory of an imported ZIP bundle (the plugin finds
+ * the binary inside it). Bundles are listed as model ids, so always appending `.bin` made them
+ * impossible to load. Null when neither exists.
+ */
+export async function resolveWhisperModelRelativePath(modelId: string): Promise<string | null> {
+    const binPath = `${MODELS_DIR}/${modelId}.bin`;
+    try {
+        await Filesystem.stat({ path: binPath, directory: Directory.Data });
+        return binPath;
+    } catch {
+        // Not a standalone binary, try a bundle directory
+    }
+    const dirPath = `${MODELS_DIR}/${modelId}`;
+    try {
+        const stat = await Filesystem.stat({ path: dirPath, directory: Directory.Data });
+        return stat.type === 'directory' ? dirPath : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
  * List all locally available Whisper models (both standalone .bin and unpacked directory bundles)
  */
 export async function listLocalWhisperModels(): Promise<string[]> {

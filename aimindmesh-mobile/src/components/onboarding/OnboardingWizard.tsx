@@ -14,6 +14,7 @@
  */
 
 import React, { useState, useCallback, useEffect } from 'react';
+import { readSetting, storeSetting } from '../../services/security/secretStore';
 
 // ─── Constants ───────────────────────────────────────────
 
@@ -33,21 +34,47 @@ interface OnboardingWizardProps {
     onComplete: () => void;
 }
 
-// ─── Hook: Should Show Onboarding ────────────────────────
+// Present on any install that already ran the app: such users skip the wizard
+const EXISTING_INSTALL_KEYS = ['llm-config', 'chat-history', 'conversation-threads', 'companion-personality'];
+const SERVER_SETTINGS_KEY = 'aimindmesh-server-settings';
 
-export function useOnboardingShouldShow(): boolean {
+// ─── Should Show Onboarding ──────────────────────────────
+
+/** Read before App's first render: App writes its settings keys right after it */
+export function shouldShowOnboarding(): boolean {
     try {
-        return !localStorage.getItem(STORAGE_KEY);
+        if (localStorage.getItem(STORAGE_KEY)) return false;
+        if (EXISTING_INSTALL_KEYS.some(key => localStorage.getItem(key) !== null)) {
+            markOnboardingComplete();
+            return false;
+        }
+        return true;
     } catch {
         return true;
     }
 }
+
+/** @deprecated use shouldShowOnboarding (not a React hook) */
+export const useOnboardingShouldShow = shouldShowOnboarding;
 
 function markOnboardingComplete(): void {
     try {
         localStorage.setItem(STORAGE_KEY, Date.now().toString());
     } catch {
         // localStorage may be unavailable
+    }
+}
+
+/**
+ * The server step writes to storage directly; App holds its own copy in state. A storage
+ * event hands it the result once (not per keystroke, which would ping every partial URL).
+ */
+function publishServerSettings(): void {
+    try {
+        const value = readSetting<any>(SERVER_SETTINGS_KEY, null);
+        if (value) window.dispatchEvent(new StorageEvent('storage', { key: SERVER_SETTINGS_KEY, newValue: JSON.stringify(value) }));
+    } catch {
+        // App keeps its current settings
     }
 }
 
@@ -103,9 +130,8 @@ function StepServerSetup() {
 
     useEffect(() => {
         try {
-            const raw = localStorage.getItem('aimindmesh-server-settings');
-            if (raw) {
-                const s = JSON.parse(raw);
+            const s = readSetting<any>(SERVER_SETTINGS_KEY, null);
+            if (s) {
                 setEnabled(s.enabled || false);
                 setServerUrl(s.serverUrl || '');
                 setApiKey(s.apiKey || '');
@@ -115,10 +141,8 @@ function StepServerSetup() {
 
     const save = (field: string, value: any) => {
         try {
-            const raw = localStorage.getItem('aimindmesh-server-settings');
-            const s = raw ? JSON.parse(raw) : { enabled: false, serverUrl: '', apiKey: '' };
-            const next = { ...s, [field]: value };
-            localStorage.setItem('aimindmesh-server-settings', JSON.stringify(next));
+            const s = readSetting<any>(SERVER_SETTINGS_KEY, { enabled: false, serverUrl: '', apiKey: '' });
+            storeSetting(SERVER_SETTINGS_KEY, { ...s, [field]: value }); // API key to the secret store
         } catch { }
     };
 
@@ -226,7 +250,7 @@ function StepPrivacy() {
             </p>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxWidth: '380px', margin: '0 auto', textAlign: 'left' }}>
                 <div style={{ padding: '12px 16px', borderRadius: '10px', background: 'var(--color-surface)', color: 'var(--color-text-secondary)', fontSize: '13px' }}>
-                    🔐 <strong>API keys</strong> encrypted with Android Keystore (AES-256-GCM)
+                    🔐 <strong>API keys</strong> kept on this device and sent only to the provider (or your own server) they belong to
                 </div>
                 <div style={{ padding: '12px 16px', borderRadius: '10px', background: 'var(--color-surface)', color: 'var(--color-text-secondary)', fontSize: '13px' }}>
                     💾 <strong>All data</strong> stored locally in app-private storage
@@ -273,23 +297,27 @@ export const OnboardingWizard: React.FC<OnboardingWizardProps> = ({ onComplete }
     const [currentStep, setCurrentStep] = useState(0);
     const isLastStep = currentStep === STEPS.length - 1;
 
+    const finish = useCallback(() => {
+        markOnboardingComplete();
+        publishServerSettings();
+        onComplete();
+    }, [onComplete]);
+
     const handleNext = useCallback(() => {
         if (isLastStep) {
-            markOnboardingComplete();
-            onComplete();
+            finish();
         } else {
             setCurrentStep(prev => prev + 1);
         }
-    }, [isLastStep, onComplete]);
+    }, [isLastStep, finish]);
 
     const handleBack = useCallback(() => {
         setCurrentStep(prev => Math.max(0, prev - 1));
     }, []);
 
     const handleSkip = useCallback(() => {
-        markOnboardingComplete();
-        onComplete();
-    }, [onComplete]);
+        finish();
+    }, [finish]);
 
     return (
         <div style={{

@@ -73,11 +73,14 @@ const AgendaDayView: React.FC<AgendaDayViewProps> = ({
         const [startHour, startMin] = newEventStartTime.split(':').map(Number);
         const [endHour, endMin] = newEventEndTime.split(':').map(Number);
 
+        // An all-day event spans the whole day (the hidden time fields keep their defaults)
         const startTime = new Date(date);
-        startTime.setHours(startHour, startMin, 0, 0);
+        if (newEventAllDay) startTime.setHours(0, 0, 0, 0);
+        else startTime.setHours(startHour, startMin, 0, 0);
 
         const endTime = new Date(date);
-        endTime.setHours(endHour, endMin, 0, 0);
+        if (newEventAllDay) endTime.setHours(23, 59, 59, 999);
+        else endTime.setHours(endHour, endMin, 0, 0);
 
         try {
             await addEvent({

@@ -21,6 +21,8 @@ import java.util.HashMap;
 import java.util.Iterator;
 import okhttp3.*;
 import java.io.IOException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 @CapacitorPlugin(name = "LlamaCpp")
@@ -28,17 +30,16 @@ public class LlamaCppPlugin extends Plugin {
     private static final String TAG = "LlamaCppPlugin";
 
     private LlamaCpp implementation;
-
-    // LlamaCpp inference instances for streaming (new architecture)
-    // STATIC: Persist across Activity recreation (WebView reload)
-    private static Map<Integer, LlamaCppInference> inferenceInstances = new HashMap<>();
-    private static Map<Integer, String> loadedModelPaths = new HashMap<>();
+    private SmolLMController smol;
+    // Multi-GB file copies run here, not on the shared Capacitor plugin thread
+    private static final ExecutorService fileExecutor = Executors.newSingleThreadExecutor();
 
     @Override
     public void load() {
         super.load();
         // Initialize implementation with context
         implementation = new LlamaCpp(getContext());
+        smol = new SmolLMController(getContext(), implementation, this::notifyListeners);
         Log.i(TAG, "LlamaCppPlugin loaded successfully");
 
         // Register memory callbacks
@@ -195,7 +196,7 @@ public class LlamaCppPlugin extends Plugin {
         String chatTemplate = call.getString("chatTemplate", "");
         JSObject params = call.getObject("params", new JSObject());
 
-        LlamaCppInference inference = inferenceInstances.get(contextId);
+        LlamaCppInference inference = smol.get(contextId);
         if (inference != null && inference.isLoaded()) {
             try {
                 Log.i(TAG, "Calling inference.getFormattedChat() for context: " + contextId);
@@ -577,7 +578,7 @@ public class LlamaCppPlugin extends Plugin {
         int contextId = call.getInt("contextId", 0);
 
         // Check LlamaCpp inference instances first
-        LlamaCppInference inference = inferenceInstances.get(contextId);
+        LlamaCppInference inference = smol.get(contextId);
         if (inference != null) {
             JSObject ret = new JSObject();
             ret.put("vision", inference.isMultimodal());
@@ -794,7 +795,7 @@ public class LlamaCppPlugin extends Plugin {
         String sourcePath = call.getString("sourcePath", "");
         String fileName = call.getString("fileName", "");
 
-        implementation.copyFile(sourcePath, fileName, result -> {
+        fileExecutor.execute(() -> implementation.copyFile(sourcePath, fileName, result -> {
             if (result.isSuccess()) {
                 JSObject ret = new JSObject();
                 ret.put("path", result.getData());
@@ -802,7 +803,7 @@ public class LlamaCppPlugin extends Plugin {
             } else {
                 call.reject(result.getError().getMessage());
             }
-        });
+        }));
     }
 
     @PluginMethod
@@ -875,445 +876,66 @@ public class LlamaCppPlugin extends Plugin {
     }
 
     // =========================================================================
-    // MARK: - LlamaCpp Streaming API
+    // MARK: - LlamaCpp Streaming API (implemented in SmolLMController)
     // =========================================================================
 
-    /**
-     * Initialize a LlamaCpp inference context for streaming.
-     * 
-     */
-    /**
-     * Initialize a LlamaCpp inference context for streaming.
-     * 
-     */
     @PluginMethod
     public void initSmolLM(PluginCall call) {
-        int contextId = call.getInt("contextId", 0);
-        String modelPath = call.getString("modelPath", "");
-        String multimodalProj = call.getString("multimodalProj", ""); // Optional multimodal projector path
-        JSObject params = call.getObject("params", new JSObject());
-
-        if (modelPath == null || modelPath.isEmpty()) {
-            call.reject("Model path is required");
-            return;
-        }
-
-        // Synchronize to prevent race conditions during init
-        synchronized (LlamaCppPlugin.class) {
-            // Check if THIS specific model is already loaded in this slot
-            String loadedPath = loadedModelPaths.get(contextId);
-            LlamaCppInference existing = inferenceInstances.get(contextId);
-
-            if (existing != null && loadedPath != null && loadedPath.equals(modelPath)) {
-                Log.i(TAG, "🟢 Context " + contextId + " already has model " + modelPath + " loaded. Reusing...");
-
-                JSObject result = new JSObject();
-                result.put("contextId", contextId);
-                result.put("success", true);
-                result.put("architecture", "llamacpp");
-                result.put("reused", true);
-                call.resolve(result);
-                return;
-            }
-
-            // If different model or not loaded, close existing
-            if (existing != null) {
-                Log.i(TAG,
-                        "♻️ Context " + contextId + " has different model loaded (" + loadedPath + "). Unloading...");
-                existing.close();
-                inferenceInstances.remove(contextId);
-                loadedModelPaths.remove(contextId);
-            }
-
-            try {
-                LlamaCppInference inference = new LlamaCppInference();
-                LlamaCppInference.InferenceParams inferenceParams = new LlamaCppInference.InferenceParams()
-                        .withTemperature((float) params.optDouble("temperature", 0.7))
-                        .withMinP((float) params.optDouble("min_p", 0.1))
-                        .withContextSize(params.optInt("n_ctx", 2048))
-                        .withNumThreads(params.optInt("n_threads", 4))
-                        .withMmap(params.optBoolean("use_mmap", true))
-                        .withMlock(params.optBoolean("use_mlock", false))
-                        .withVulkan(params.optBoolean("use_vulkan", false))
-                        .withOpenCL(params.optBoolean("use_opencl", false))
-                        .withHexagon(params.optBoolean("use_hexagon", false))
-                        .withStoreChats(params.optBoolean("store_chats", true))
-                        .withNBatch(params.optInt("n_batch", 512))
-                        .withNUBatch(params.optInt("n_ubatch", 256))
-                        .withFlashAttn(params.optBoolean("flash_attn", true))
-                        .withCacheTypeK(params.optString("cache_type_k", "f16"))
-                        .withCacheTypeV(params.optString("cache_type_v", "f16"))
-                        .withNGpuLayers(params.optInt("n_gpu_layers", 99));
-
-                String chatTemplate = params.getString("chat_template");
-                if (chatTemplate != null && !chatTemplate.isEmpty()) {
-                    inferenceParams.withChatTemplate(chatTemplate);
-                }
-
-                // Resolve model path with search paths
-                String resolvedPath = implementation.resolveModelPath(modelPath);
-
-                Log.i(TAG, "Loading GGUF model: " + resolvedPath +
-                        (multimodalProj.isEmpty() ? "" : " and projector: " + multimodalProj));
-
-                // Pass multimodalProj to load
-                inference.load(resolvedPath, multimodalProj, inferenceParams);
-
-                // Add system prompt if provided
-                String systemPrompt = params.getString("system_prompt");
-                if (systemPrompt != null && !systemPrompt.isEmpty()) {
-                    inference.addSystemPrompt(systemPrompt);
-                }
-
-                inferenceInstances.put(contextId, inference);
-                loadedModelPaths.put(contextId, modelPath);
-
-                JSObject result = new JSObject();
-                result.put("contextId", contextId);
-                result.put("success", true);
-                result.put("architecture", "llamacpp");
-                call.resolve(result);
-
-            } catch (Exception e) {
-                Log.e(TAG, "Failed to initialize LlamaCpp inference: " + e.getMessage());
-                call.reject("Failed to initialize LlamaCpp inference: " + e.getMessage());
-            }
-        }
+        smol.init(call);
     }
 
-    /**
-     * Generate a streaming response.
-     * Emits tokens via Capacitor events as they are generated.
-     */
     @PluginMethod
     public void streamingCompletion(PluginCall call) {
-        int contextId = call.getInt("contextId", 0);
-        String prompt = call.getString("prompt", "");
-        JSArray imagesArray = call.getArray("images", new JSArray());
-
-        Log.i(TAG, "🚀 streamingCompletion called: contextId=" + contextId + " promptLen=" + (prompt != null ? prompt.length() : 0) + " instances=" + inferenceInstances.size());
-
-        LlamaCppInference inference = inferenceInstances.get(contextId);
-        if (inference == null) {
-            Log.e(TAG, "❌ streamingCompletion: No inference instance for contextId=" + contextId + ". Available: " + inferenceInstances.keySet());
-            call.reject("LlamaCpp context not found. Call initSmolLM first.");
-            return;
-        }
-
-        if (prompt == null || prompt.isEmpty()) {
-            Log.e(TAG, "❌ streamingCompletion: Empty prompt for contextId=" + contextId);
-            call.reject("Prompt is required");
-            return;
-        }
-
-        String[] images = new String[0];
-        if (imagesArray.length() > 0) {
-            try {
-                List<String> imageList = new ArrayList<>();
-                for (int i = 0; i < imagesArray.length(); i++) {
-                    imageList.add(imagesArray.getString(i));
-                }
-                images = imageList.toArray(new String[0]);
-            } catch (JSONException e) {
-                Log.e(TAG, "Failed to parse images: " + e.getMessage());
-            }
-        }
-
-        call.setKeepAlive(true);
-
-        final StringBuilder tokenBuffer = new StringBuilder();
-        final long[] lastEmitTime = {System.currentTimeMillis()};
-
-        inference.getResponseStreaming(
-                prompt,
-                images,
-                token -> {
-                    synchronized(tokenBuffer) {
-                        tokenBuffer.append(token);
-                        long now = System.currentTimeMillis();
-                        if (now - lastEmitTime[0] >= 100) {
-                            String batched = tokenBuffer.toString();
-                            tokenBuffer.setLength(0);
-                            lastEmitTime[0] = now;
-                            
-                            JSObject tokenEvent = new JSObject();
-                            tokenEvent.put("contextId", contextId);
-                            tokenEvent.put("token", batched);
-                            notifyListeners("smolLMToken", tokenEvent);
-                        }
-                    }
-                },
-                response -> {
-                    synchronized(tokenBuffer) {
-                        if (tokenBuffer.length() > 0) {
-                            JSObject tokenEvent = new JSObject();
-                            tokenEvent.put("contextId", contextId);
-                            tokenEvent.put("token", tokenBuffer.toString());
-                            notifyListeners("smolLMToken", tokenEvent);
-                            tokenBuffer.setLength(0);
-                        }
-                    }
-                    Log.i(TAG, "[LLM_CHAIN] Generation completed natively. text length: " + (response.text != null ? response.text.length() : 0));
-                    JSObject result = new JSObject();
-                    result.put("text", response.text);
-                    result.put("tokensPerSecond", response.tokensPerSecond);
-                    result.put("contextUsed", response.contextUsed);
-                    result.put("interrupted", response.interrupted);
-                    call.resolve(result);
-                },
-                error -> {
-                    Log.e(TAG, "[LLM_CHAIN] Generation failed natively: " + error.getMessage(), error);
-                    call.reject("Generation failed: " + error.getMessage());
-                });
+        smol.streamingCompletion(call);
     }
 
-    /**
-     * Generate a complete response (blocking).
-     */
     @PluginMethod
     public void smolLMCompletion(PluginCall call) {
-        int contextId = call.getInt("contextId", 0);
-        String prompt = call.getString("prompt", "");
-
-        LlamaCppInference inference = inferenceInstances.get(contextId);
-        if (inference == null) {
-            call.reject("LlamaCpp context not found. Call initSmolLM first.");
-            return;
-        }
-
-        if (prompt == null || prompt.isEmpty()) {
-            call.reject("Prompt is required");
-            return;
-        }
-
-        new Thread(() -> {
-            try {
-                String response = inference.getResponse(prompt);
-
-                JSObject result = new JSObject();
-                result.put("text", response);
-                result.put("tokensPerSecond", inference.getResponseGenerationSpeed());
-                result.put("contextUsed", inference.getContextLengthUsed());
-                call.resolve(result);
-
-            } catch (Exception e) {
-                call.reject("Generation failed: " + e.getMessage());
-            }
-        }, "LlamaCpp-Completion").start();
+        smol.completion(call);
     }
 
-    /**
-     * Add a message to the chat history.
-     */
     @PluginMethod
     public void addSmolLMMessage(PluginCall call) {
-        int contextId = call.getInt("contextId", 0);
-        String message = call.getString("message", "");
-        String role = call.getString("role", "user");
-
-        LlamaCppInference inference = inferenceInstances.get(contextId);
-        if (inference == null) {
-            call.reject("LlamaCpp context not found. Call initSmolLM first.");
-            return;
-        }
-
-        try {
-            switch (role) {
-                case "system":
-                    inference.addSystemPrompt(message);
-                    break;
-                case "assistant":
-                    inference.addAssistantMessage(message);
-                    break;
-                case "user":
-                default:
-                    inference.addUserMessage(message);
-                    break;
-            }
-            call.resolve();
-        } catch (Exception e) {
-            call.reject("Failed to add message: " + e.getMessage());
-        }
+        smol.addMessage(call);
     }
 
-    /**
-     * Interrupt an ongoing generation.
-     */
     @PluginMethod
     public void interruptSmolLM(PluginCall call) {
-        int contextId = call.getInt("contextId", 0);
-
-        LlamaCppInference inference = inferenceInstances.get(contextId);
-        if (inference != null) {
-            inference.interrupt();
-        }
-        call.resolve();
+        smol.interrupt(call);
     }
 
-    /**
-     * Get generation metrics.
-     */
     @PluginMethod
     public void getSmolLMMetrics(PluginCall call) {
-        int contextId = call.getInt("contextId", 0);
-
-        LlamaCppInference inference = inferenceInstances.get(contextId);
-        if (inference == null) {
-            call.reject("LlamaCpp context not found");
-            return;
-        }
-
-        JSObject result = new JSObject();
-        result.put("tokensPerSecond", inference.getResponseGenerationSpeed());
-        result.put("contextUsed", inference.getContextLengthUsed());
-        result.put("isGenerating", inference.isGenerating());
-        result.put("isLoaded", inference.isLoaded());
-        result.put("modelPath", loadedModelPaths.get(contextId));
-        result.put("messageCount", inference.getMessageCount());
-
-        try {
-            String metricsJson = inference.getMetrics();
-            JSONObject metrics = new JSONObject(metricsJson);
-
-            Iterator<String> keys = metrics.keys();
-            while (keys.hasNext()) {
-                String key = keys.next();
-                result.put(key, metrics.get(key));
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "Failed to parse detailed metrics: " + e.getMessage());
-        }
-
-        call.resolve(result);
+        smol.metrics(call);
     }
 
-    /**
-     * Resets the context (history and KV cache).
-     */
     @PluginMethod
     public void resetSmolLMContext(PluginCall call) {
-        int contextId = call.getInt("contextId", 0);
-
-        LlamaCppInference inference = inferenceInstances.get(contextId);
-        if (inference == null) {
-            call.reject("LlamaCpp context not found");
-            return;
-        }
-
-        inference.resetContext();
-        call.resolve();
+        smol.reset(call);
     }
 
-    /**
-     * Release a context.
-     */
     @PluginMethod
     public void releaseSmolLM(PluginCall call) {
-        int contextId = call.getInt("contextId", 0);
-
-        synchronized (LlamaCppPlugin.class) {
-            LlamaCppInference inference = inferenceInstances.remove(contextId);
-            loadedModelPaths.remove(contextId);
-
-            if (inference != null) {
-                inference.close();
-                Log.i(TAG, "LlamaCpp context " + contextId + " released");
-            }
-        }
-        call.resolve();
+        smol.release(call);
     }
 
     @PluginMethod
     public void saveKvCache(PluginCall call) {
-        int contextId = call.getInt("contextId", 0);
-        String slotName = call.getString("slot", "chat");
-        
-        LlamaCppInference inference = inferenceInstances.get(contextId);
-        if (inference == null) {
-            call.reject("No inference instance for contextId " + contextId);
-            return;
-        }
-        
-        String filepath = getContext().getFilesDir() + "/kv_cache/" + slotName + "_" + contextId + ".bin";
-        new File(getContext().getFilesDir(), "kv_cache").mkdirs();
-        
-        boolean success = inference.saveState(filepath, 0);
-        if (success) {
-            Log.i(TAG, "KV cache saved for context " + contextId + " to " + filepath);
-            JSObject ret = new JSObject();
-            ret.put("success", true);
-            ret.put("filepath", filepath);
-            call.resolve(ret);
-        } else {
-            call.reject("Failed to save KV cache for context " + contextId);
-        }
+        smol.saveKvCache(call);
     }
 
     @PluginMethod
     public void restoreKvCache(PluginCall call) {
-        int contextId = call.getInt("contextId", 0);
-        String slotName = call.getString("slot", "chat");
-        
-        LlamaCppInference inference = inferenceInstances.get(contextId);
-        if (inference == null) {
-            call.reject("No inference instance for contextId " + contextId);
-            return;
-        }
-        
-        String filepath = getContext().getFilesDir() + "/kv_cache/" + slotName + "_" + contextId + ".bin";
-        File stateFile = new File(filepath);
-        
-        if (!stateFile.exists()) {
-            JSObject ret = new JSObject();
-            ret.put("success", false);
-            ret.put("reason", "file_not_found");
-            call.resolve(ret);
-            return;
-        }
-        
-        boolean success = inference.loadState(filepath, 0);
-        if (success) {
-            Log.i(TAG, "KV cache restored for context " + contextId + " from " + filepath);
-            JSObject ret = new JSObject();
-            ret.put("success", true);
-            call.resolve(ret);
-        } else {
-            call.reject("Failed to restore KV cache for context " + contextId);
-        }
+        smol.restoreKvCache(call);
     }
 
     @PluginMethod
     public void invalidateKvCache(PluginCall call) {
-        int contextId = call.getInt("contextId", 0);
-        String slotName = call.getString("slot", "chat");
-        
-        String filepath = getContext().getFilesDir() + "/kv_cache/" + slotName + "_" + contextId + ".bin";
-        File stateFile = new File(filepath);
-        
-        boolean deleted = false;
-        if (stateFile.exists()) {
-            deleted = stateFile.delete();
-            Log.i(TAG, "KV cache invalidated for context " + contextId + ": " + (deleted ? "deleted" : "delete failed"));
-        }
-        
-        JSObject ret = new JSObject();
-        ret.put("success", deleted || !stateFile.exists());
-        call.resolve(ret);
+        smol.invalidateKvCache(call);
     }
 
-    /**
-     * Release all contexts.
-     */
     @PluginMethod
     public void releaseAllSmolLM(PluginCall call) {
-        synchronized (LlamaCppPlugin.class) {
-            for (LlamaCppInference inference : inferenceInstances.values()) {
-                inference.close();
-            }
-            inferenceInstances.clear();
-            loadedModelPaths.clear();
-            Log.i(TAG, "All LlamaCpp contexts released");
-        }
-        call.resolve();
+        smol.releaseAll(call);
     }
 }

@@ -11,12 +11,21 @@ import java.util.Map;
 
 public class AutoUtils {
 
+    /** Row titles must not be empty (Row.Builder.setTitle throws) */
+    public static String nonEmpty(String value, String fallback) {
+        return value == null || value.trim().isEmpty() ? fallback : value;
+    }
+
     public static List<Map<String, String>> parseCalendarEvents(String json) {
         List<Map<String, String>> events = new ArrayList<>();
         try {
             JSONArray array = new JSONArray(json);
+            long now = System.currentTimeMillis();
             for (int i = 0; i < array.length(); i++) {
                 JSONObject obj = array.getJSONObject(i);
+                // The list is persisted: it can be shown long after the app synced it
+                long endMs = obj.optLong("endMs", 0);
+                if (endMs > 0 && endMs < now) continue;
                 Map<String, String> event = new HashMap<>();
                 event.put("title", obj.optString("title", "No Title"));
                 event.put("startTime", obj.optString("startTime", ""));
@@ -39,7 +48,8 @@ public class AutoUtils {
                 Map<String, String> task = new HashMap<>();
                 task.put("id", obj.optString("id", ""));
                 task.put("text", obj.optString("text", ""));
-                task.put("isCompleted", String.valueOf(obj.optBoolean("completed", false)));
+                // The app sends isCompleted ("completed" in older payloads)
+                task.put("isCompleted", String.valueOf(obj.optBoolean("isCompleted", obj.optBoolean("completed", false))));
                 tasks.add(task);
             }
         } catch (JSONException e) {
@@ -75,7 +85,7 @@ public class AutoUtils {
                                     if (allTasks.has(taskId)) {
                                         JSONObject t = allTasks.getJSONObject(taskId);
                                         Map<String, String> taskMap = new HashMap<>();
-                                        taskMap.put("content", t.optString("content", ""));
+                                        taskMap.put("content", nonEmpty(t.optString("content", ""), "Untitled task"));
                                         tasks.add(taskMap);
                                     }
                                 }

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { AIMindMeshServerSettings } from '../services/llm/providers/serverProvider';
 import { logger } from '../services/logger';
 import { triggerHaptic } from '../services/native';
+import { createLineDecoder, parseSseData } from '../services/streamLines';
 
 interface ServerAgentViewProps {
     settings: AIMindMeshServerSettings;
@@ -22,12 +23,14 @@ const ServerAgentView: React.FC<ServerAgentViewProps> = ({ settings, provider })
     const [messages, setMessages] = useState<AgentMessage[]>([]);
     const [input, setInput] = useState('');
     const [isThinking, setIsThinking] = useState(false);
-    const [, setSessions] = useState<any[]>([]);
     const [, setSkills] = useState<any[]>([]);
     const scrollRef = useRef<HTMLDivElement>(null);
 
+    const serverReady = !!(settings.enabled && settings.serverUrl);
+    const baseUrl = settings.serverUrl.replace(/\/$/, '');
+
     useEffect(() => {
-        fetchAgentContext();
+        if (serverReady) fetchAgentContext();
     }, [settings]);
 
     useEffect(() => {
@@ -38,14 +41,8 @@ const ServerAgentView: React.FC<ServerAgentViewProps> = ({ settings, provider })
 
     const fetchAgentContext = async () => {
         try {
-            const [sessResp, skillResp] = await Promise.all([
-                fetch(`${settings.serverUrl}/api/agent/sessions`, { headers: { 'x-api-key': settings.apiKey } }),
-                fetch(`${settings.serverUrl}/api/agent/skills`, { headers: { 'x-api-key': settings.apiKey } })
-            ]);
-            if (sessResp.ok) {
-                const data = await sessResp.json();
-                setSessions(data.sessions || []);
-            }
+            // The server has no session listing endpoint: only skills are fetched
+            const skillResp = await fetch(`${baseUrl}/api/agent/skills`, { headers: { 'x-api-key': settings.apiKey } });
             if (skillResp.ok) {
                 const data = await skillResp.json();
                 setSkills(data.skills || []);
@@ -66,7 +63,7 @@ const ServerAgentView: React.FC<ServerAgentViewProps> = ({ settings, provider })
 
         try {
             // Use the streaming endpoint so tokens arrive progressively
-            const resp = await fetch(`${settings.serverUrl}/api/agent/task/stream`, {
+            const resp = await fetch(`${baseUrl}/api/agent/task/stream`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -84,30 +81,38 @@ const ServerAgentView: React.FC<ServerAgentViewProps> = ({ settings, provider })
             if (!reader) throw new Error('ReadableStream not supported');
 
             let assistantMsg = '';
+            let streamError = '';
+            // Events can be split across network chunks: only complete lines are parsed
+            const lines = createLineDecoder();
+            const handleLine = (line: string) => {
+                const data = parseSseData(line);
+                if (!data || data === '[DONE]') return;
+                try {
+                    const chunk = JSON.parse(data);
+                    // Server streams { delta } for both openclaw and hermes providers
+                    if (chunk.delta) {
+                        assistantMsg += chunk.delta;
+                        updateLastMessage('assistant', assistantMsg);
+                    }
+                    if (chunk.error) {
+                        streamError = String(chunk.error);
+                        logger.log('warn', '[ServerAgentView] Stream error chunk', chunk.error);
+                    }
+                } catch {
+                    // Not JSON: ignored
+                }
+            };
 
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
+                lines.push(value).forEach(handleLine);
+            }
+            lines.end().forEach(handleLine);
 
-                const text = new TextDecoder().decode(value);
-                const lines = text.split('\n').filter(l => l.trim());
-
-                for (const line of lines) {
-                    if (line === 'data: [DONE]') break;
-                    try {
-                        const chunk = JSON.parse(line.replace(/^data: /, ''));
-                        // Server streams { delta } for both openclaw and hermes providers
-                        if (chunk.delta) {
-                            assistantMsg += chunk.delta;
-                            updateLastMessage('assistant', assistantMsg);
-                        }
-                        if (chunk.error) {
-                            logger.log('warn', '[ServerAgentView] Stream error chunk', chunk.error);
-                        }
-                    } catch {
-                        // Ignore partial JSON or blank lines
-                    }
-                }
+            if (streamError) {
+                setMessages(prev => [...prev, { role: 'assistant', content: `⚠️ Agent error: ${streamError}` }]);
+                return;
             }
 
             // If no tokens arrived (e.g. empty stream), show a fallback
@@ -134,6 +139,18 @@ const ServerAgentView: React.FC<ServerAgentViewProps> = ({ settings, provider })
     };
 
     const isHermes = activeProvider === 'hermes';
+
+    if (!serverReady) {
+        return (
+            <div className="flex flex-col items-center justify-center h-full text-center p-6 bg-background">
+                <span className="text-5xl">{isHermes ? '🔮' : '🤖'}</span>
+                <h2 className="text-lg font-bold text-text-primary mt-4">Server agent unavailable</h2>
+                <p className="text-sm text-text-secondary mt-2 max-w-xs">
+                    Enable the AIMindMesh Server in Settings to talk with the {isHermes ? 'Hermes' : 'OpenClaw'} agent.
+                </p>
+            </div>
+        );
+    }
 
     return (
         <div className="flex flex-col h-full bg-background animate-fade-in">

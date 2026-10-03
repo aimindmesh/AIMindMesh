@@ -174,10 +174,8 @@ async function* innerGenerateStream(
     });
     if (!success) throw new Error('Failed to initialize LiteRT model');
 
-    // Register tools for native function calling (LiteRT v0.14+)
-    if (llmConfig.enableToolCalling) {
-        await registerLiteRTTools(llmConfig.toolRules as Record<string, string> | undefined);
-    }
+    // Register tools for native function calling (LiteRT v0.14+); disabled tools clear the native list
+    await registerLiteRTTools(llmConfig.toolRules as Record<string, string> | undefined, !!llmConfig.enableToolCalling);
 
     // [KV CACHE] Restore session if current native context is empty and setting is enabled
     const currentCount = await getLiteRTMessageCount();

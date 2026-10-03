@@ -8,30 +8,14 @@
 import fs from 'fs/promises';
 import fsSync from 'fs';
 import path from 'path';
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import { Logger } from '../utils/Logger';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-export interface WikiPage {
-  slug: string;        // URL-safe identifier, e.g. "deep-learning"
-  folder?: string;     // Optional subdirectory, e.g. "topics", "concepts"
-  title: string;
-  body: string;        // Markdown body (no frontmatter)
-  neo4jId?: string;    // Optional back-link to Neo4j concept/insight node
-  tags: string[];
-  sources?: { type: string; id: string }[]; // Multimodal source tracking
-  updatedAt: string;   // ISO 8601 timestamp
-}
-
-export interface WikiPageSummary {
-  slug: string;
-  folder?: string;
-  title: string;
-  tags: string[];
-  updatedAt: string;
-  neo4jId?: string;
-}
+// Shared with the clients (types/api.ts)
+import type { WikiPage, WikiPageSummary } from '../types/api';
+export type { WikiPage, WikiPageSummary };
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -289,13 +273,20 @@ export class WikiManager {
    */
   public static async commitChanges(message: string): Promise<void> {
     if (!this.gitEnabled) return;
-    const cmd = `cd "${this.storageDir}" && git add -A && git commit -m "${message.replace(/"/g, '\\"')}" --allow-empty`;
-    exec(cmd, (err, _stdout, stderr) => {
-      if (err) {
-        Logger.warn('WikiManager', `Git commit failed: ${stderr?.trim() ?? err.message}`);
-      } else {
-        Logger.debug('WikiManager', `Git commit: ${message}`);
+    // execFile (no shell): the commit message can contain LLM-generated text
+    const cwd = this.storageDir;
+    execFile('git', ['add', '-A'], { cwd }, (addErr, _out, addStderr) => {
+      if (addErr) {
+        Logger.warn('WikiManager', `Git commit failed: ${addStderr?.trim() || addErr.message}`);
+        return;
       }
+      execFile('git', ['commit', '-m', message, '--allow-empty'], { cwd }, (err, _stdout, stderr) => {
+        if (err) {
+          Logger.warn('WikiManager', `Git commit failed: ${stderr?.trim() || err.message}`);
+        } else {
+          Logger.debug('WikiManager', `Git commit: ${message}`);
+        }
+      });
     });
   }
 }

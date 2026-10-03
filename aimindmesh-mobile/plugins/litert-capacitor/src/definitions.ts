@@ -109,7 +109,8 @@ export interface LiteRTPlugin {
 
     /**
      * Register tool definitions for native function calling (LiteRT v0.14+).
-     * Must be called after initModel and before generateResponse/Stream.
+     * They are appended to the first message of each native conversation;
+     * an empty list turns native tool prompting off.
      */
     registerTools(options: { tools: LiteRTToolDefinition[] }): Promise<{ success: boolean }>;
 

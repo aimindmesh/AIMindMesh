@@ -117,7 +117,7 @@ export const agentApi = {
     api.get<{ available: boolean; version: string }>('/api/agent/hermes/status'),
 
   runHermesTask: (prompt: string, sessionKey: string) =>
-    api.post<{ reply: string; durationMs: number }>('/api/agent/hermes/task', { prompt, sessionKey }),
+    api.post<{ reply: string; durationMs: number }>('/api/agent/task', { prompt, sessionKey, provider: 'hermes' }),
 
   getHermesConfig: () =>
     api.get<{ configYaml: string; envFile: string }>('/api/agent/hermes/config'),
@@ -133,27 +133,8 @@ export interface OpenClawGoogleAuthConfig {
   primaryModel: string;
 }
 
-export interface IngestionJob {
-  id: string;
-  status: 'PENDING' | 'EXTRACTING' | 'CHUNKING' | 'VECTORIZING' | 'INDEXING' | 'DONE' | 'ERROR' | 'SKIPPED' | 'CANCELLED';
-  docId?: string;
-  source: string;
-  totalChunks: number;
-  doneChunks: number;
-  progress: number;
-  error?: string;
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface KGDocument {
-  id: string;
-  title: string;
-  source: string;
-  mimeType: string;
-  chunkCount: number;
-  date: number;
-}
+export type { IngestionJob, KGDocument } from '@aimindmesh/api-types';
+import type { IngestionJob, KGDocument, RestoreStagedResponse, RestoreStatus, SuccessResponse } from '@aimindmesh/api-types';
 
 export const documentApi = {
   getJobs: () =>
@@ -223,10 +204,11 @@ export const adminApi = {
     api.get<{ history: any[] }>('/api/admin/queue/history', { params: { limit, status } }),
 
   deleteTask: (id: string) =>
-    api.delete<{ ok: boolean }>(`/api/admin/queue/item/${id}`),
+    api.delete<SuccessResponse>(`/api/admin/queue/item/${id}`),
 
-  clearQueueHistory: (status?: 'FAILED' | 'ALL') =>
-    api.delete<{ ok: boolean }>('/api/admin/queue/history', { params: { status } }),
+  // FAILED must hit /queue/failed: /queue/history always clears the whole history
+  clearQueueHistory: (status: 'FAILED' | 'ALL' = 'ALL') =>
+    api.delete<SuccessResponse>(status === 'FAILED' ? '/api/admin/queue/failed' : '/api/admin/queue/history'),
 
   retryInference: (id: string) =>
     api.post<{ ok: boolean }>(`/api/admin/queue/retry/${id}`),
@@ -245,16 +227,17 @@ export const adminApi = {
     api.post<{ ok: boolean; filename: string }>('/api/admin/backups'),
 
   restoreBackup: (filename: string) =>
-    api.post<{ ok: boolean; message: string }>('/api/admin/backups/restore', { filename }),
+    api.post<RestoreStagedResponse>('/api/admin/backups/restore', { filename }),
+
+  getRestoreStatus: () =>
+    api.get<RestoreStatus>('/api/admin/backups/restore-status'),
 
   deleteBackup: (filename: string) =>
     api.delete<{ ok: boolean }>(`/api/admin/backups/${filename}`),
 
-  getBackupDownloadUrl: (filename: string) => {
-    const appConfig = useConfigStore.getState().config;
-    const baseUrl = appConfig?.server?.url?.replace(/\/$/, '') || '';
-    return `${baseUrl}/api/admin/backups/download/${filename}?apiKey=${appConfig?.server?.api_key}`;
-  },
+  // Fetched with the x-api-key header: the key must never travel in a URL
+  downloadBackup: (filename: string) =>
+    api.get<ArrayBuffer>(`/api/admin/backups/download/${encodeURIComponent(filename)}`, { responseType: 'arraybuffer' }),
 
   getTaskStats: (unit: 'hour' | 'day' = 'hour', hours?: number) =>
     api.get<{ stats: any[] }>('/api/admin/stats/tasks', { params: { unit, hours } }),

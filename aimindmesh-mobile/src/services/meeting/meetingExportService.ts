@@ -62,6 +62,25 @@ function getSpeakerName(speakerId: number, speakerNames: Record<number, string>)
     return speakerNames[speakerId] || `Speaker ${speakerId + 1}`;
 }
 
+/** Transcript and names are user text: unescaped they broke (or injected into) the PDF page */
+function escapeHtml(text: string): string {
+    return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+/**
+ * Cue times. Segments without timing (start = end, e.g. old meetings) get a 3 s cue, otherwise
+ * players never show them.
+ */
+function cueTimes(seg: { start_ms?: number; end_ms?: number }): { start: number; end: number } {
+    const start = Math.max(0, Math.round(seg.start_ms ?? 0));
+    const end = Math.round(seg.end_ms ?? 0);
+    return { start, end: end > start ? end : start + 3000 };
+}
+
 // ─── Export Formatters ───────────────────────────────────
 
 /**
@@ -109,8 +128,7 @@ export function toSRT(
     const lines: string[] = [];
 
     meeting.transcript.forEach((seg, idx) => {
-        const start = seg.start_ms ?? 0;
-        const end = seg.end_ms ?? start + 3000; // Fallback 3s if no end
+        const { start, end } = cueTimes(seg);
 
         lines.push(`${idx + 1}`);
         lines.push(`${msToSRTTime(start)} --> ${msToSRTTime(end)}`);
@@ -136,11 +154,11 @@ export function toVTT(
     const lines: string[] = ['WEBVTT', ''];
 
     meeting.transcript.forEach((seg, idx) => {
-        const start = seg.start_ms ?? 0;
-        const end = seg.end_ms ?? start + 3000;
+        const { start, end } = cueTimes(seg);
 
+        // ">" or newlines in a name would end the <v> voice tag
         const name = options.includeSpeakerLabels
-            ? getSpeakerName(seg.speakerId, meeting.speakerNames)
+            ? getSpeakerName(seg.speakerId, meeting.speakerNames).replace(/[<>\r\n]/g, ' ')
             : undefined;
 
         // VTT supports voice spans: <v Speaker>text</v>
@@ -177,7 +195,7 @@ export function toHTMLForPDF(
     html += `<div class="meta">`;
     html += `<strong>Date:</strong> ${date.toLocaleDateString()} ${date.toLocaleTimeString()}<br>`;
     html += `<strong>Duration:</strong> ${formatDuration(meeting.duration)}<br>`;
-    html += `<strong>Speakers:</strong> ${Object.values(meeting.speakerNames).join(', ') || 'Unknown'}`;
+    html += `<strong>Speakers:</strong> ${escapeHtml(Object.values(meeting.speakerNames).join(', ')) || 'Unknown'}`;
     html += `</div><hr>`;
 
     for (const seg of meeting.transcript) {
@@ -186,9 +204,9 @@ export function toHTMLForPDF(
             html += `<span class="time">${formatTimestamp(meeting.timestamp + seg.start_ms)}</span> `;
         }
         if (options.includeSpeakerLabels) {
-            html += `<span class="speaker">${getSpeakerName(seg.speakerId, meeting.speakerNames)}:</span> `;
+            html += `<span class="speaker">${escapeHtml(getSpeakerName(seg.speakerId, meeting.speakerNames))}:</span> `;
         }
-        html += seg.text;
+        html += escapeHtml(seg.text);
         html += `</div>`;
     }
 
@@ -198,8 +216,9 @@ export function toHTMLForPDF(
 
 // ─── Helpers ─────────────────────────────────────────────
 
-function formatDuration(ms: number): string {
-    const totalSec = Math.floor(ms / 1000);
+/** SavedMeeting.duration is in seconds (it was formatted as milliseconds) */
+function formatDuration(seconds: number): string {
+    const totalSec = Math.floor(seconds || 0);
     const h = Math.floor(totalSec / 3600);
     const m = Math.floor((totalSec % 3600) / 60);
     const s = totalSec % 60;

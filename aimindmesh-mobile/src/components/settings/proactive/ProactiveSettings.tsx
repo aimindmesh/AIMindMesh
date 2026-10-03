@@ -213,7 +213,7 @@ const ProactiveSettings: React.FC<ProactiveSettingsProps> = ({ settings, onSetti
                     <div className="pt-3 border-t border-white/5 space-y-3">
                         <CheckboxRow
                             label="Auto-Summarize Context"
-                            desc="Automatically compress older chat messages when context fills up"
+                            desc="When context fills up, the model gets a summary of older messages (the chat keeps them all)"
                             checked={safeSettings.contextAwareness.enableAutoSummarization}
                             onChange={(v: boolean) => handleNestedChange('contextAwareness', 'enableAutoSummarization', v)}
                             disabled={!safeSettings.enabled}

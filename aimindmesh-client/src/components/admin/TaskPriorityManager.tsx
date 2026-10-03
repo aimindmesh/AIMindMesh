@@ -4,7 +4,7 @@ import { GripVertical, ChevronUp, ChevronDown, Network } from 'lucide-react';
 interface TaskPriorityManagerProps {
   priorities: Record<string, string[]>;
   onChange: (newPriorities: Record<string, string[]>) => void;
-  availableNodes: { id: string; name?: string }[];
+  availableNodes: { id: string; name?: string | null }[];
 }
 
 export function TaskPriorityManager({ priorities, onChange, availableNodes }: TaskPriorityManagerProps) {

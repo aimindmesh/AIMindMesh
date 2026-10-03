@@ -8,19 +8,9 @@ import { AIMindMeshServerSettings } from '../types';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-export interface WikiPageSummary {
-  slug: string;
-  folder?: string;
-  title: string;
-  tags: string[];
-  updatedAt: string;
-  neo4jId?: string;
-}
-
-export interface WikiPage extends WikiPageSummary {
-  body: string; // Raw Markdown content
-  sources?: { type: string; id: string }[];
-}
+// Shared with the server (aimindmesh-server/src/types/api.ts)
+export type { WikiPageSummary, WikiPage } from '@aimindmesh/api-types';
+import type { WikiPageSummary, WikiPage } from '@aimindmesh/api-types';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 

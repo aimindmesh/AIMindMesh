@@ -12,17 +12,8 @@ find_library(ANDROID_LIB android)
 set(LLAMACPP_PLUGIN_DIR ${CMAKE_SOURCE_DIR}/../../../../../plugins/llama-cpp-capacitor)
 set(LLAMACPP_CPP_DIR ${LLAMACPP_PLUGIN_DIR}/cpp)
 
-if(LLAMACPP_BUILD_OPENCL)
-    add_definitions(-DLM_GGML_USE_OPENCL)
-    add_definitions(-DLM_GGML_OPENCL_USE_ADRENO_KERNELS)
-    add_definitions(-DLM_GGML_OPENCL_EMBED_KERNELS)
-    add_definitions(-DLM_GGML_OPENCL_SOA_Q)
-    include_directories(${LLAMACPP_CPP_DIR}/opencl-headers)
-    include_directories(${LLAMACPP_CPP_DIR}/ggml-opencl/kernels)
-    list(APPEND LLAMA_CORE_SOURCES
-        ${LLAMACPP_CPP_DIR}/ggml-opencl/ggml-opencl.cpp
-    )
-endif()
+# CPU only. (An OpenCL block used to sit here: its sources were overwritten by the
+# set(LLAMA_CORE_SOURCES ...) below, so it was never compiled. Removed.)
 
 # Include directories
 include_directories(

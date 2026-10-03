@@ -1,11 +1,14 @@
 import { registerPlugin, PluginListenerHandle } from '@capacitor/core';
 import { logger } from '../../../logger';
-import { getFormattedToolDefinitions } from '../../../toolDefinitions';
+import { TOOL_DEFINITIONS } from '../../../toolDefinitions';
 import {
     LiteRTPlugin,
     LiteRTConfig,
     LiteRTInitOptions
 } from './types';
+import { buildLiteRTToolSpecs } from './toolSchema';
+import type { NativeSessionSnapshot } from './sessionTracking';
+import { ensureResident, markUnloaded } from '../../../model/modelOrchestrator';
 
 // Register plugin
 export const LiteRT = registerPlugin<LiteRTPlugin>('LiteRT');
@@ -14,13 +17,19 @@ export const state = {
     isInitialized: false,
     tokenListenerHandle: null as PluginListenerHandle | null,
     lastSystemPrompt: '',
-    lastRunWasBackground: false
+    lastRunWasBackground: false,
+    /** History the native conversation was built from (null = do not append to it) */
+    sessionSnapshot: null as NativeSessionSnapshot | null,
+    /** Whether native tool prompting is on; null = unknown (e.g. after a WebView reload) */
+    toolsRegistered: null as boolean | null
 };
 
 /**
  * Initialize the LiteRT LLM with a model file
  */
 export async function initLiteRTModel(config: LiteRTConfig): Promise<boolean> {
+    // Outside the try: a ModelBusyError (model needed by a recording) must reach the caller
+    await ensureResident('litert');
     try {
         logger.log('debug', '[LiteRT] Initializing model:', config.modelPath);
 
@@ -66,38 +75,36 @@ export async function initLiteRTModel(config: LiteRTConfig): Promise<boolean> {
     }
 }
 
-export async function registerLiteRTTools(toolRules?: Record<string, string>): Promise<boolean> {
+/**
+ * Registers the app's tools (JSON schemas from TOOL_DEFINITIONS) for native tool prompting,
+ * or turns native tool prompting off when `enabled` is false.
+ */
+export async function registerLiteRTTools(toolRules?: Record<string, string>, enabled = true): Promise<boolean> {
     try {
-        const tools = getFormattedToolDefinitions(toolRules);
-        if (!tools || tools.trim().length === 0) {
-            logger.log('warn', '[LiteRT] No tool definitions to register');
-            return false;
-        }
-
-        const toolDefs = tools.split('\n\n').filter(t => t.trim().length > 0).map(block => {
-            const lines = block.split('\n');
-            const name = lines.find(l => l.startsWith('function:'))?.replace('function:', '').trim() || 'unknown';
-            const description = lines.find(l => l.startsWith('description:'))?.replace('description:', '').trim() || '';
-            const paramsLine = lines.find(l => l.startsWith('parameters:'))?.replace('parameters:', '').trim() || '{}';
-            let params: Record<string, unknown> = {};
-            try { params = JSON.parse(paramsLine); } catch { params = {}; }
-            return { name, description, parameters: params };
-        });
-
-        if (toolDefs.length === 0) {
-            return false;
+        const toolDefs = enabled ? buildLiteRTToolSpecs(TOOL_DEFINITIONS, toolRules) : [];
+        if (enabled && toolDefs.length === 0) {
+            logger.log('warn', '[LiteRT] No tool definitions to register (all denied)');
         }
 
         const result = await LiteRT.registerTools({ tools: toolDefs });
         if (result.success) {
-            logger.log('info', `[LiteRT] Registered ${toolDefs.length} tools for native function calling`);
-            return true;
+            state.toolsRegistered = toolDefs.length > 0;
+            logger.log('info', state.toolsRegistered
+                ? `[LiteRT] Registered ${toolDefs.length} tools for native function calling`
+                : '[LiteRT] Native tool prompting disabled');
+            return state.toolsRegistered;
         }
         return false;
     } catch (error: any) {
         logger.log('error', '[LiteRT] Failed to register tools:', error);
         return false;
     }
+}
+
+/** Turns native tool prompting off when tool calling is disabled (registration when on is done by the provider). */
+export async function syncLiteRTTools(enableToolCalling: boolean | undefined): Promise<void> {
+    if (enableToolCalling || state.toolsRegistered === false) return;
+    await registerLiteRTTools(undefined, false);
 }
 
 /**
@@ -151,9 +158,11 @@ export async function releaseLiteRTModel(): Promise<void> {
             state.tokenListenerHandle = null;
         }
 
+        state.sessionSnapshot = null;
         await LiteRT.releaseSession();
         await LiteRT.releaseModel();
         state.isInitialized = false;
+        markUnloaded('litert');
         logger.log('debug', '[LiteRT] Model and session released');
     } catch (error) {
         logger.log('error', '[LiteRT] Release error:', error);
@@ -165,6 +174,7 @@ export async function releaseLiteRTModel(): Promise<void> {
  */
 export async function releaseLiteRTSession(): Promise<void> {
     try {
+        // sessionSnapshot is kept: a reset is always followed by the full history of the snapshot
         await LiteRT.releaseSession();
         logger.log('info', '[LiteRT] Native session released');
     } catch (error) {

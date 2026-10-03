@@ -5,14 +5,20 @@ export interface MeetingActionCandidate {
   confidence: number;
 }
 
+// Whole words: "focus" also matched "focused", "create" matched "creature"
+const ACTION_PATTERN = /\b(should|need to|let's|create|build|focus)\b/i;
+// Lines come in as "Speaker name: text"
+const SPEAKER_PREFIX = /^[^:]{1,40}:\s+/;
+
 export function extractMeetingCandidates(transcript: string): MeetingActionCandidate[] {
   const candidates: MeetingActionCandidate[] = [];
   const lines = transcript.split(/\n+/).map(l => l.trim()).filter(Boolean);
   for (const line of lines) {
-    if (/should|need to|let's|create|build|focus/i.test(line)) {
+    if (ACTION_PATTERN.test(line)) {
+      const statement = line.replace(SPEAKER_PREFIX, '');
       candidates.push({
         type: 'directive',
-        title: line.slice(0, 80),
+        title: statement.slice(0, 80),
         summary: line,
         confidence: 0.6,
       });

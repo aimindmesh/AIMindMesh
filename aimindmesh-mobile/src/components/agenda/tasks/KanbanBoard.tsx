@@ -12,7 +12,9 @@ import {
 } from 'react-beautiful-dnd';
 import { CalendarTask, TaskStatus, KanbanBoard as KanbanBoardType, TaskStats, TaskFilterOptions } from '../../../types/calendar';
 import * as TaskDB from '../../../services/calendar/taskDatabase';
+import { generateUpcomingOccurrences } from '../../../services/calendar/taskRecurrence';
 import { logger } from '../../../services/logger';
+import { matchesTaskFilters, moveTaskInBoard } from './kanbanMove';
 import TaskCard from './TaskCard';
 import TaskDetailModal from './TaskDetailModal';
 import TaskFilters from './TaskFilters';
@@ -50,11 +52,15 @@ const KanbanBoard: React.FC<KanbanBoardProps> = ({ onTaskSelect }) => {
     const [selectedTask, setSelectedTask] = useState<CalendarTask | null>(null);
     const [isLoading, setIsLoading] = useState(true);
     const [activeFilters, setActiveFilters] = useState<TaskFilterOptions>({});
+    const [idsWithSubtasks, setIdsWithSubtasks] = useState<Set<string>>(new Set());
+
+    const isVisible = (task: CalendarTask) => matchesTaskFilters(task, activeFilters, idsWithSubtasks);
 
     const loadBoard = useCallback(async () => {
         try {
             const data = await TaskDB.getKanbanBoard();
             setBoard(data);
+            setIdsWithSubtasks(await TaskDB.getTaskIdsWithSubtasks());
         } catch (error) {
             logger.log('error', '[KanbanBoard] Failed to load board', error);
         }
@@ -77,6 +83,8 @@ const KanbanBoard: React.FC<KanbanBoardProps> = ({ onTaskSelect }) => {
         const init = async () => {
             setIsLoading(true);
             await TaskDB.migrateTasksTable();
+            // Recurring series get their next occurrence once the latest is done or past due
+            await generateUpcomingOccurrences();
             await loadBoard();
             await loadStats();
             setIsLoading(false);
@@ -96,23 +104,22 @@ const KanbanBoard: React.FC<KanbanBoardProps> = ({ onTaskSelect }) => {
             return;
         }
 
-        // Optimistic update
-        const sourceStatus = source.droppableId as TaskStatus;
+        // Optimistic update (indexes are positions in the filtered columns)
         const destStatus = destination.droppableId as TaskStatus;
+        const moved = moveTaskInBoard(board, draggableId, destStatus, destination.index, isVisible);
+        if (!moved) return;
 
-        const newBoard = { ...board };
-        const [movedTask] = newBoard[sourceStatus].splice(source.index, 1);
-
-        // Update the task status
-        const updatedTask = { ...movedTask, status: destStatus };
-        newBoard[destStatus].splice(destination.index, 0, updatedTask);
-
-        setBoard(newBoard);
+        setBoard(moved.board);
 
         try {
             // Update database
-            await TaskDB.moveTask(draggableId, destStatus, destination.index);
-            await TaskDB.reorderTasks(destStatus, newBoard[destStatus].map(t => t.id));
+            await TaskDB.moveTask(draggableId, destStatus, moved.order);
+            await TaskDB.reorderTasks(destStatus, moved.board[destStatus].map(t => t.id));
+
+            // Completing a recurring task created its next occurrence: show it
+            if (destStatus === 'done' && moved.board.done[moved.order]?.recurrenceRule) {
+                await loadBoard();
+            }
 
             // Reload stats
             await loadStats();
@@ -273,16 +280,7 @@ const KanbanBoard: React.FC<KanbanBoardProps> = ({ onTaskSelect }) => {
                                                 }`}
                                             style={{ minHeight: '400px' }}
                                         >
-                                            {board[column.id].filter(task => {
-                                                if (activeFilters.assignee && task.assignee !== activeFilters.assignee) return false;
-                                                if (activeFilters.priority && activeFilters.priority.length > 0 && !activeFilters.priority.includes(task.priority)) return false;
-                                                if (activeFilters.hasSubtasks && !task.parentTaskId) return false; // Approximation
-                                                if (activeFilters.hasPomodoroTarget && !task.pomodoroTarget) return false;
-                                                if (activeFilters.tags && activeFilters.tags.length > 0) {
-                                                    if (!activeFilters.tags.some(t => task.tags.includes(t))) return false;
-                                                }
-                                                return true;
-                                            }).map((task, index) => (
+                                            {board[column.id].filter(isVisible).map((task, index) => (
                                                 <Draggable
                                                     key={task.id}
                                                     draggableId={task.id}

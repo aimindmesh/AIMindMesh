@@ -199,6 +199,11 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                             disabled={isInputDisabled}
                             onKeyDown={(e) => {
                                 if (e.key === 'Enter' && !e.shiftKey) {
+                                    // While an answer is streaming the button is "Stop": Enter must not start another one
+                                    if (isLoading) {
+                                        e.preventDefault();
+                                        return;
+                                    }
                                     onSendMessage(e);
                                 }
                             }}

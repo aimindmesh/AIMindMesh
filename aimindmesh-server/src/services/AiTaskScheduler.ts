@@ -11,6 +11,7 @@ import { documentIngester } from './DocumentIngester';
 import { GiteaService } from './GiteaService';
 import * as FCMDispatcher from './FCMDispatcher';
 import { DeliveryScheduler } from './DeliveryScheduler';
+import { resolveAiTaskRouting } from './aiTasks/aiTaskRouting';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -24,8 +25,13 @@ export class AiTaskScheduler {
   private static ingester = documentIngester;
 
   public static async init(): Promise<void> {
-    this.migrateDB();
     await fs.mkdir(TASKS_BASE_DIR, { recursive: true });
+    // Executions are awaited in-process: after a restart nothing will ever complete them
+    const interrupted = db.prepare(`
+      UPDATE ai_task_executions SET status = 'failed', error_message = 'Interrupted by a server restart', completed_at = ?, updated_at = ?
+      WHERE status IN ('running', 'queued')
+    `).run(Date.now(), Date.now()).changes;
+    if (interrupted > 0) Logger.warn('AiTaskScheduler', `${interrupted} execution(s) interrupted by the restart marked as failed`);
     await this.reloadAllSchedules();
     Logger.info('AiTaskScheduler', 'Task engine initialized', { tasks: this.cronJobs.size + this.timeouts.size });
   }
@@ -198,18 +204,20 @@ export class AiTaskScheduler {
       const context = ""; // Simplified for now
 
       // ── Step 2: INFERENCE ───────────────────────────────────────────────────
-      const taskType: TaskType = task.model === 'openclaw' ? 'AGENTIC_TASK' : 'SCHEDULED_TASK';
+      // Provider/model interpretation (incl. legacy rows with the provider name in `model`)
+      const target = resolveAiTaskRouting(task);
+      const taskType: TaskType = target.taskType;
       
-      Logger.info('AiTaskScheduler', `[Task:${task.title}] Calling InferenceRouter (Model: ${task.model})`);
+      Logger.info('AiTaskScheduler', `[Task:${task.title}] Calling InferenceRouter (Provider: ${target.provider}, Model: ${target.model ?? 'default'})`);
 
       const routeResult = await InferenceRouter.routeTask({
         type: taskType,
         prompt: task.promptTemplate + (context ? `\n\nContext:\n${context}` : ""),
         options: {
           taskName: task.title,
-          routing: task.provider !== 'auto' ? task.provider : undefined,
-          model: task.model && task.model !== 'auto' ? task.model : undefined,
-          sessionKey: task.provider === 'openclaw' ? `task:${task.id}:${execId}` : undefined,
+          routing: target.routing,
+          model: target.model,
+          sessionKey: target.provider === 'openclaw' ? `task:${task.id}:${execId}` : undefined,
           thinking: true
         }
       });
@@ -341,34 +349,6 @@ export class AiTaskScheduler {
     const exec = this.getExecution(execId);
     if (!exec?.artifactPath) return null;
     return fs.readFile(exec.artifactPath, 'utf-8').catch(() => null);
-  }
-
-  private static migrateDB(): void {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS ai_tasks (
-        id TEXT PRIMARY KEY, title TEXT NOT NULL, prompt_template TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', provider TEXT NOT NULL DEFAULT 'auto',
-        output_format TEXT NOT NULL DEFAULT 'markdown', storage_policy TEXT NOT NULL DEFAULT 'server_disk',
-        requires_review INTEGER NOT NULL DEFAULT 1, cron_expression TEXT, scheduled_at INTEGER,
-        status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS ai_task_executions (
-        execution_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, status TEXT NOT NULL, started_at INTEGER, completed_at INTEGER,
-        error_message TEXT, artifact_path TEXT, gitea_commit_url TEXT, output_summary TEXT, updated_at INTEGER NOT NULL,
-        FOREIGN KEY (task_id) REFERENCES ai_tasks(id) ON DELETE CASCADE
-      );
-      CREATE INDEX IF NOT EXISTS idx_ai_task_executions_task_id ON ai_task_executions(task_id);
-    `);
-
-    // Self-healing migration for provider column
-    try {
-      const tableInfo = db.prepare('PRAGMA table_info(ai_tasks)').all() as any[];
-      if (!tableInfo.some(c => c.name === 'provider')) {
-        db.exec("ALTER TABLE ai_tasks ADD COLUMN provider TEXT NOT NULL DEFAULT 'auto'");
-        Logger.info('AiTaskScheduler', 'Added provider column to ai_tasks table');
-      }
-    } catch (e: any) {
-      Logger.error('AiTaskScheduler', `Migration error: ${e.message}`);
-    }
   }
 
   private static persistExecution(exec: AiTaskExecution): void {

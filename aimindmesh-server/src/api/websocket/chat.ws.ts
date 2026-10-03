@@ -5,6 +5,8 @@ import { NotificationService } from '../../services/NotificationService';
 import db from '../../db/sqlite';
 import crypto from 'crypto';
 import { autoEvolutionPipeline } from '../../services/AutoEvolutionPipeline';
+import { deleteConversation } from '../../services/conversations';
+import { handleCompletion } from './chatCompletion';
 
 function getOrCreateDefaultConversation(): string {
   const existing = db.prepare('SELECT id FROM conversations ORDER BY created_at ASC LIMIT 1').get() as any;
@@ -17,6 +19,17 @@ function getOrCreateDefaultConversation(): string {
 
 export default async function (fastify: FastifyInstance) {
   fastify.get('/ws/chat', { websocket: true }, (connection, req) => {
+    // Stateless streaming for the mobile app: no history, no conversations, no notifications
+    if ((req.query as { mode?: string } | undefined)?.mode === 'completion') {
+      const send = (msg: object) => { if (connection.readyState === 1) connection.send(JSON.stringify(msg)); };
+      connection.on('message', (message: any) => {
+        let payload: any;
+        try { payload = JSON.parse(message.toString()); } catch { return send({ type: 'error', message: 'Invalid JSON' }); }
+        if (payload?.type === 'completion') void handleCompletion(send, payload);
+      });
+      return;
+    }
+
     Logger.info('ChatWS', `New neural link established from ${req.ip}`);
     const clientId = crypto.randomUUID();
     let activeConversationId: string = getOrCreateDefaultConversation();
@@ -69,8 +82,7 @@ export default async function (fastify: FastifyInstance) {
         }
 
         if (payload.type === 'delete_conversation') {
-          db.prepare('DELETE FROM direct_chats WHERE conversation_id = ?').run(payload.conversationId);
-          db.prepare('DELETE FROM conversations WHERE id = ?').run(payload.conversationId);
+          deleteConversation(payload.conversationId);
           Logger.info('ChatWS', `Deleted conversation: ${payload.conversationId}`);
           activeConversationId = getOrCreateDefaultConversation();
           sendConversationList();
@@ -131,8 +143,8 @@ export default async function (fastify: FastifyInstance) {
             tokensEstimate: Math.round(payload.content.length / 4),
             options: { ...payload.options, taskName: payload.options?.taskName || 'Chat Session' }
           }, (update) => {
-            streamingStarted = true;
             if (update.type === 'token') {
+              streamingStarted = true; // thinking alone does not deliver the answer
               connection.send(JSON.stringify({ type: 'delta', content: update.content }));
             } else if (update.type === 'thinking') {
               connection.send(JSON.stringify({ type: 'thought', content: update.content }));

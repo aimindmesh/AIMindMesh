@@ -3,6 +3,9 @@ package com.aimindmesh.whisper;
 import android.content.Context;
 import android.util.Log;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.util.ArrayList;
 import java.util.List;
 
@@ -33,15 +36,22 @@ public class WhisperContext {
     private Context appContext;
     private boolean isLoaded = false;
 
+    // whisper_full is neither reentrant on one context nor safe against whisper_free: calls
+    // run one at a time (callers wait), and a release() that arrives mid-inference is deferred
+    // until that inference returns instead of freeing the context under it.
+    private final Object lock = new Object();
+    private boolean busy = false;
+    private boolean releasePending = false;
+
     // Static block to load native library
     static {
         try {
-            System.loadLibrary("whisper");
+            // whisper and ggml are linked statically into this library (no libwhisper.so)
             System.loadLibrary("whisper-capacitor");
             Log.i(TAG, "Whisper native library loaded");
         } catch (UnsatisfiedLinkError e) {
             Log.e(TAG, "Failed to load whisper native library. " +
-                    "Make sure libwhisper.so and libwhisper-capacitor.so are in android/libs/<abi>/", e);
+                    "Make sure libwhisper-capacitor.so is packaged for this ABI", e);
         }
     }
 
@@ -56,18 +66,62 @@ public class WhisperContext {
      * @return true if successful
      */
     public boolean loadModel(String modelPath) {
-        if (isLoaded) {
-            release();
-        }
+        synchronized (lock) {
+            if (busy || releasePending) {
+                // Each load uses a fresh WhisperContext; reusing one mid-inference is a bug
+                throw new IllegalStateException("Context is busy");
+            }
+            if (isLoaded) {
+                freeLocked();
+            }
 
-        try {
-            contextPtr = nativeLoadModel(modelPath);
-            isLoaded = contextPtr != 0;
-            return isLoaded;
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to load model", e);
-            return false;
+            try {
+                contextPtr = nativeLoadModel(modelPath);
+                isLoaded = contextPtr != 0;
+                return isLoaded;
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to load model", e);
+                return false;
+            }
         }
+    }
+
+    /** Waits for exclusive use of the context; throws if it is (being) released. */
+    private long beginCall() {
+        synchronized (lock) {
+            while (busy && !releasePending) {
+                try {
+                    lock.wait();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Interrupted while waiting for Whisper", e);
+                }
+            }
+            if (!isLoaded || contextPtr == 0 || releasePending) {
+                throw new IllegalStateException("Model not loaded");
+            }
+            busy = true;
+            return contextPtr;
+        }
+    }
+
+    private void endCall() {
+        synchronized (lock) {
+            busy = false;
+            if (releasePending) {
+                freeLocked();
+            }
+            lock.notifyAll();
+        }
+    }
+
+    private void freeLocked() {
+        if (contextPtr != 0) {
+            nativeRelease(contextPtr);
+            contextPtr = 0;
+        }
+        isLoaded = false;
+        releasePending = false;
     }
 
     /**
@@ -79,12 +133,12 @@ public class WhisperContext {
      * @return TranscriptResult with text and segments
      */
     public TranscriptResult transcribe(String audioPath, String language, boolean translate) {
-        if (!isLoaded || contextPtr == 0) {
-            throw new IllegalStateException("Model not loaded");
+        long ctx = beginCall();
+        try {
+            return parseResult(nativeTranscribeFile(ctx, audioPath, language, translate));
+        } finally {
+            endCall();
         }
-
-        String resultJson = nativeTranscribeFile(contextPtr, audioPath, language, translate);
-        return parseResult(resultJson);
     }
 
     /**
@@ -95,12 +149,12 @@ public class WhisperContext {
      * @return TranscriptResult with text and segments
      */
     public TranscriptResult transcribeAudio(float[] samples, String language) {
-        if (!isLoaded || contextPtr == 0) {
-            throw new IllegalStateException("Model not loaded");
+        long ctx = beginCall();
+        try {
+            return parseResult(nativeTranscribeAudio(ctx, samples, language));
+        } finally {
+            endCall();
         }
-
-        String resultJson = nativeTranscribeAudio(contextPtr, samples, language);
-        return parseResult(resultJson);
     }
 
     /**
@@ -133,13 +187,12 @@ public class WhisperContext {
             int speechPadMs,
             boolean conditionOnPreviousText,
             boolean wordTimestamps) {
-        if (!isLoaded || contextPtr == 0) {
-            throw new IllegalStateException("Model not loaded");
-        }
-
-        // Call optimized native method with all parameters
-        String resultJson = nativeTranscribeAudioOptimized(
-                contextPtr,
+        long ctx = beginCall();
+        String resultJson;
+        try {
+            // Call optimized native method with all parameters
+            resultJson = nativeTranscribeAudioOptimized(
+                ctx,
                 samples,
                 language,
                 nThreads,
@@ -152,6 +205,9 @@ public class WhisperContext {
                 speechPadMs,
                 conditionOnPreviousText,
                 wordTimestamps);
+        } finally {
+            endCall();
+        }
         return parseResult(resultJson);
     }
 
@@ -159,11 +215,15 @@ public class WhisperContext {
      * Release resources
      */
     public void release() {
-        if (contextPtr != 0) {
-            nativeRelease(contextPtr);
-            contextPtr = 0;
+        synchronized (lock) {
+            if (busy) {
+                // Freed by endCall() once the running inference returns; queued callers bail out
+                releasePending = true;
+                lock.notifyAll();
+                return;
+            }
+            freeLocked();
         }
-        isLoaded = false;
     }
 
     /**
@@ -179,71 +239,30 @@ public class WhisperContext {
         }
 
         try {
-            // Simple JSON parsing (avoid bringing in a JSON library)
             // Expected format:
             // {"text":"...","segments":[{"text":"...","start":0,"end":100},...]}
+            // org.json (part of Android) handles escaped quotes/brackets that the old
+            // indexOf-based parser cut the transcript at.
+            JSONObject root = new JSONObject(json);
+            result.text = root.optString("text", "");
 
-            // Extract text
-            int textStart = json.indexOf("\"text\":\"") + 8;
-            int textEnd = json.indexOf("\"", textStart);
-            if (textStart > 7 && textEnd > textStart) {
-                result.text = json.substring(textStart, textEnd)
-                        .replace("\\n", "\n")
-                        .replace("\\\"", "\"");
-            } else {
-                result.text = "";
-            }
-
-            // Extract segments
-            int segmentsStart = json.indexOf("\"segments\":[");
-            if (segmentsStart > 0) {
-                int segmentsEnd = json.indexOf("]", segmentsStart);
-                String segmentsStr = json.substring(segmentsStart + 12, segmentsEnd);
-
-                // Parse each segment
-                int pos = 0;
-                while (pos < segmentsStr.length()) {
-                    int segStart = segmentsStr.indexOf("{", pos);
-                    int segEnd = segmentsStr.indexOf("}", segStart);
-                    if (segStart < 0 || segEnd < 0)
-                        break;
-
-                    String segStr = segmentsStr.substring(segStart, segEnd + 1);
+            JSONArray segments = root.optJSONArray("segments");
+            if (segments != null) {
+                for (int i = 0; i < segments.length(); i++) {
+                    JSONObject segObj = segments.optJSONObject(i);
+                    if (segObj == null) continue;
                     Segment seg = new Segment();
-
-                    // Parse segment text
-                    int stextStart = segStr.indexOf("\"text\":\"") + 8;
-                    int stextEnd = segStr.indexOf("\"", stextStart);
-                    if (stextStart > 7 && stextEnd > stextStart) {
-                        seg.text = segStr.substring(stextStart, stextEnd);
-                    }
-
-                    // Parse start time
-                    int startStart = segStr.indexOf("\"start\":") + 8;
-                    int startEnd = segStr.indexOf(",", startStart);
-                    if (startEnd < 0)
-                        startEnd = segStr.indexOf("}", startStart);
-                    if (startStart > 7 && startEnd > startStart) {
-                        seg.startMs = (long) Double.parseDouble(segStr.substring(startStart, startEnd).trim());
-                    }
-
-                    // Parse end time
-                    int endStart = segStr.indexOf("\"end\":") + 6;
-                    int endEnd = segStr.indexOf(",", endStart);
-                    if (endEnd < 0)
-                        endEnd = segStr.indexOf("}", endStart);
-                    if (endStart > 5 && endEnd > endStart) {
-                        seg.endMs = (long) Double.parseDouble(segStr.substring(endStart, endEnd).trim());
-                    }
-
+                    seg.text = segObj.optString("text", "");
+                    seg.startMs = segObj.optLong("start", 0);
+                    seg.endMs = segObj.optLong("end", 0);
                     result.segments.add(seg);
-                    pos = segEnd + 1;
                 }
             }
-
         } catch (Exception e) {
+            // Never surface raw JSON as transcript text
             Log.e(TAG, "Failed to parse result JSON", e);
-            result.text = json; // Fallback: use raw response as text
+            result.text = "";
+            result.segments.clear();
         }
 
         return result;
@@ -331,12 +350,11 @@ public class WhisperContext {
             boolean vadFilter,
             boolean conditionOnPreviousText,
             SegmentCallback callback) {
-        if (!isLoaded || contextPtr == 0) {
-            throw new IllegalStateException("Model not loaded");
-        }
-
-        String resultJson = nativeTranscribeAudioStreaming(
-                contextPtr,
+        long ctx = beginCall();
+        String resultJson;
+        try {
+            resultJson = nativeTranscribeAudioStreaming(
+                ctx,
                 samples,
                 language,
                 nThreads,
@@ -347,6 +365,9 @@ public class WhisperContext {
                 vadFilter,
                 conditionOnPreviousText,
                 callback);
+        } finally {
+            endCall();
+        }
         return parseResult(resultJson);
     }
 

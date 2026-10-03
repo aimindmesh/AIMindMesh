@@ -67,8 +67,8 @@ struct voxtral_context {
     // KV cache position tracker
     llama_pos n_past = 0;
 
-    // Processing state
-    std::atomic<bool> is_processing{false};
+    // Held for a whole inference; reset/release take it so they never free state in use
+    std::mutex state_mutex;
 
     // Configuration
     int n_threads = 4;
@@ -288,9 +288,9 @@ Java_com_aimindmesh_mobile_voxtral_VoxtralInferenceEngine_nativeProcessAudio(
         return VOXTRAL_ERR_NULL_HANDLE;
     }
 
-    // Prevent concurrent processing
-    bool expected = false;
-    if (!ctx->is_processing.compare_exchange_strong(expected, true)) {
+    // Prevent concurrent processing (the Kotlin engine also serializes calls)
+    std::unique_lock<std::mutex> state_lock(ctx->state_mutex, std::try_to_lock);
+    if (!state_lock.owns_lock()) {
         LOGW("Audio processing already in progress, skipping chunk");
         return VOXTRAL_OK;
     }
@@ -300,7 +300,6 @@ Java_com_aimindmesh_mobile_voxtral_VoxtralInferenceEngine_nativeProcessAudio(
     // Get samples from JNI array
     jfloat* samples = env->GetFloatArrayElements(j_audio_samples, nullptr);
     if (samples == nullptr) {
-        ctx->is_processing.store(false);
         return VOXTRAL_ERR_AUDIO_FAILED;
     }
 
@@ -310,7 +309,6 @@ Java_com_aimindmesh_mobile_voxtral_VoxtralInferenceEngine_nativeProcessAudio(
 
     // Check if we have enough data to process
     if (ctx->audio_buffer.size() < MIN_PROCESS_SAMPLES) {
-        ctx->is_processing.store(false);
         return VOXTRAL_ERR_BUFFERING;  // Still buffering
     }
 
@@ -327,7 +325,6 @@ Java_com_aimindmesh_mobile_voxtral_VoxtralInferenceEngine_nativeProcessAudio(
     if (audio_bitmap == nullptr) {
         LOGE("Failed to create audio bitmap from %zu samples", ctx->audio_buffer.size());
         ctx->audio_buffer.clear();
-        ctx->is_processing.store(false);
         return VOXTRAL_ERR_AUDIO_FAILED;
     }
 
@@ -347,7 +344,6 @@ Java_com_aimindmesh_mobile_voxtral_VoxtralInferenceEngine_nativeProcessAudio(
         LOGE("Failed to init input chunks");
         mtmd_bitmap_free(audio_bitmap);
         ctx->audio_buffer.clear();
-        ctx->is_processing.store(false);
         return VOXTRAL_ERR_OOM;
     }
 
@@ -358,7 +354,6 @@ Java_com_aimindmesh_mobile_voxtral_VoxtralInferenceEngine_nativeProcessAudio(
         LOGE("mtmd_tokenize failed with code %d", tokenize_ret);
         mtmd_input_chunks_free(chunks);
         ctx->audio_buffer.clear();
-        ctx->is_processing.store(false);
         return VOXTRAL_ERR_ENCODE_FAILED;
     }
 
@@ -391,7 +386,6 @@ Java_com_aimindmesh_mobile_voxtral_VoxtralInferenceEngine_nativeProcessAudio(
     if (eval_ret != 0) {
         LOGE("mtmd_helper_eval_chunks failed with code %d", eval_ret);
         ctx->audio_buffer.clear();
-        ctx->is_processing.store(false);
         return VOXTRAL_ERR_DECODE_FAILED;
     }
 
@@ -404,7 +398,6 @@ Java_com_aimindmesh_mobile_voxtral_VoxtralInferenceEngine_nativeProcessAudio(
     if (n_tokens < 0) {
         LOGE("Sampling loop failed with code %d", n_tokens);
         ctx->audio_buffer.clear();
-        ctx->is_processing.store(false);
         return n_tokens;  // Return the error code
     }
 
@@ -412,7 +405,6 @@ Java_com_aimindmesh_mobile_voxtral_VoxtralInferenceEngine_nativeProcessAudio(
 
     // Clear buffer after processing (non-overlapping chunks for streaming)
     ctx->audio_buffer.clear();
-    ctx->is_processing.store(false);
 
     return n_tokens;
 }
@@ -450,6 +442,7 @@ Java_com_aimindmesh_mobile_voxtral_VoxtralInferenceEngine_nativeResetContext(
     if (ctx == nullptr) return;
 
     LOGI("Resetting Voxtral context");
+    std::lock_guard<std::mutex> state_lock(ctx->state_mutex);
 
     // Clear KV cache
     auto memory = llama_get_memory(ctx->llama_ctx);
@@ -497,14 +490,9 @@ Java_com_aimindmesh_mobile_voxtral_VoxtralInferenceEngine_nativeReleaseModel(
 
     LOGI("Releasing Voxtral resources");
 
-    // Wait for any in-progress processing
-    while (ctx->is_processing.load()) {
-        LOGW("Waiting for processing to complete before release...");
-        // Brief sleep to avoid spinning
-        struct timespec ts = {0, 10000000}; // 10ms
-        nanosleep(&ts, nullptr);
-    }
-
+    {
+    // Waits for an in-progress inference; Kotlin guarantees no call starts after release
+    std::lock_guard<std::mutex> state_lock(ctx->state_mutex);
     if (ctx->sampler) {
         llama_sampler_free(ctx->sampler);
         ctx->sampler = nullptr;
@@ -523,6 +511,7 @@ Java_com_aimindmesh_mobile_voxtral_VoxtralInferenceEngine_nativeReleaseModel(
     if (ctx->llama_model) {
         llama_model_free(ctx->llama_model);
         ctx->llama_model = nullptr;
+    }
     }
 
     delete ctx;

@@ -77,6 +77,18 @@ class LLMInference {
     // Track consecutive incomplete/invalid UTF-8 pieces
     int _incompleteTokensCount = 0;
 
+    // Sampling: load-time defaults and the values of the active sampler (per-request overrides)
+    float _minP = 0.05f;
+    float _defaultTemp = 0.8f;
+    float _defaultTopP = 0.95f;
+    float _activeTemp = -1.0f;
+    float _activeTopP = -1.0f;
+    // Max tokens for the current completion (0 = unlimited)
+    int _nPredict = 0;
+
+    // llama abort callback: makes a running llama_decode stop as soon as interrupt() is called
+    static bool abortCallback(void* data);
+
 public:
     /**
      * Loads the GGUF model with specified parameters.
@@ -188,6 +200,12 @@ public:
      * Interrupts the current generation.
      */
     void interrupt();
+
+    /**
+     * Per-request sampling options, applied before startCompletion().
+     * temperature < 0 or topP <= 0 restore the load-time values; nPredict <= 0 means no limit.
+     */
+    void setSamplingOverrides(float temperature, float topP, int nPredict);
 
     /**
      * Cleans up after completion, optionally storing the response in history.

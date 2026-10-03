@@ -3,6 +3,7 @@ import { ToolDefinition, ToolResult } from './types';
 import { searchWeb, formatSearchResultsForContext } from '../webSearch';
 import { logger } from '../logger';
 import { TextEmbedding } from 'text-embedding-capacitor';
+import { embedText } from '../model/embedding/embeddingRuntime';
 import { DocumentChunker } from '../documents/DocumentChunker';
 
 export const webTools: ToolDefinition[] = [
@@ -141,6 +142,16 @@ export async function executeSearchWeb(args: { query: string; num_results?: numb
     }
 }
 
+function parseHeadersJson(raw?: string): Record<string, string> | undefined {
+    if (!raw) return undefined;
+    try {
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' ? parsed : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 export async function executeReadWebPage(args: { url: string; query?: string; method?: string; headers?: string; body?: string }): Promise<ToolResult> {
     try {
         const { CapacitorHttp } = await import('@capacitor/core');
@@ -163,7 +174,8 @@ export async function executeReadWebPage(args: { url: string; query?: string; me
                         url: args.url,
                         query: args.query,
                         method: args.method || 'GET',
-                        headers: args.headers,
+                        // The tool receives headers as a JSON string; the server expects an object
+                        headers: parseHeadersJson(args.headers),
                         body: args.body
                     },
                     connectTimeout: 10000,
@@ -214,14 +226,20 @@ export async function executeReadWebPage(args: { url: string; query?: string; me
         logger.log('info', `RAG: Split page into ${chunks.length} chunks`);
 
         // 2. Embed query
-        const queryEmbeddingRes = await TextEmbedding.generateEmbedding({ text: args.query });
-        const queryEmbedding = queryEmbeddingRes.embedding;
+        // Through the embedding runtime (model prefixes such as E5 "query: "), raw plugin call if no model is tracked
+        const embed = async (text: string, kind: 'query' | 'passage'): Promise<ArrayLike<number>> => {
+            try {
+                return (await embedText(text, kind)).vector;
+            } catch {
+                return (await TextEmbedding.generateEmbedding({ text })).embedding;
+            }
+        };
+        const queryEmbedding = await embed(args.query, 'query');
 
         // 3. Embed chunks and calculate similarity
         const similarities = await Promise.all(chunks.map(async (chunkText: string, index: number) => {
             try {
-                const chunkEmbeddingRes = await TextEmbedding.generateEmbedding({ text: chunkText });
-                const chunkEmbedding = chunkEmbeddingRes.embedding;
+                const chunkEmbedding = await embed(chunkText, 'passage');
 
                 let dotProduct = 0;
                 let normQuery = 0;

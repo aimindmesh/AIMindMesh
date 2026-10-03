@@ -2,7 +2,6 @@ import * as cron from 'node-cron';
 import { Logger } from '../utils/Logger';
 import { config } from '../config';
 import fs from 'fs';
-import path from 'path';
 import db from '../db/sqlite';
 import { getSession } from '../db/neo4j';
 import { ImprovementDetector, ImprovementCandidate } from './ImprovementDetector';
@@ -15,6 +14,8 @@ import { InferenceRouter } from './InferenceRouter';
 import { IntentClassifier } from './IntentClassifier';
 import { GiteaService } from './GiteaService';
 import { v4 as uuidv4 } from 'uuid';
+import { normalizeRepoName, canWrite, resolveLocalServerPath } from './evolution/EvolutionPathPolicy';
+import { checkCandidate, checkOutput, sanitizeOutput, isDailyLimitReached, getDailyLimit } from './evolution/EvolutionGuards';
 
 export class AutoEvolutionPipeline {
   private detector = new ImprovementDetector();
@@ -24,6 +25,7 @@ export class AutoEvolutionPipeline {
 
   private job: cron.ScheduledTask | null = null;
   private isRunning = false;
+  private bootDone = false;
 
   public async init() {
     // ✅ CRITICAL FIX [2026-04-30]: Clear existing job before re-scheduling
@@ -40,10 +42,11 @@ export class AutoEvolutionPipeline {
       Logger.info('AutoEvolutionPipeline', 'Disabled by configuration');
     }
 
-    // Register listener for evolution tasks (resiliency)
+    // init() runs again on every config PATCH: the listener must not be added twice,
+    // and a candidate being validated right now must not be "recovered"
+    if (this.bootDone) return;
+    this.bootDone = true;
     this.registerInferenceListener();
-
-    // Startup recovery: check for candidates stuck in 'generating'
     this.recoverStuckCandidates();
   }
 
@@ -59,7 +62,14 @@ export class AutoEvolutionPipeline {
     });
   }
 
+  /** Startup only: no validation can be in flight in a process that just started. */
   private recoverStuckCandidates() {
+    const validating = db.prepare(`SELECT id FROM evolution_candidates WHERE status = 'validating'`).all() as { id: string }[];
+    for (const cand of validating) {
+      Logger.warn('AutoEvolutionPipeline', `[RECOVERY] Validation of [${cand.id}] interrupted by a restart: back to pending`);
+      this.updateCandidateStatus(cand.id, 'pending');
+    }
+
     const stuck = db.prepare(`SELECT * FROM evolution_candidates WHERE status = 'generating'`).all() as any[];
     for (const cand of stuck) {
       // If there's an active task for this in the registry, let the listener handle it.
@@ -84,13 +94,8 @@ export class AutoEvolutionPipeline {
     Logger.info('AutoEvolutionPipeline', 'Starting evolution cycle...');
 
     try {
-      // 1. Check daily rate limit
-      const startOfDay = new Date().setHours(0, 0, 0, 0);
-      const todayCount = db.prepare(
-        `SELECT COUNT(*) as c FROM evolution_proposals WHERE created_at > ? AND status != 'failed'`
-      ).get(startOfDay) as { c: number };
-
-      if (!manual && todayCount.c >= (config.autoEvolution?.maxProposalsPerDay ?? 3)) {
+      // 1. Check daily rate limit (proposals + candidates in flight, shared with chat requests)
+      if (!manual && isDailyLimitReached()) {
         Logger.info('AutoEvolutionPipeline', 'Daily limit reached, skipping cycle');
         return;
       }
@@ -147,19 +152,24 @@ export class AutoEvolutionPipeline {
 
     const repository = candidate.repository || candidate.repo_name || 'AIMindMesh';
 
+    // Path policy first: no file read, LLM call or commit for protected/secret targets
+    const guard = checkCandidate(candidate);
+    if (!guard.ok) {
+      await this.recordFailure(candidate, 'protected_path', guard.reason ?? 'Path not allowed');
+      return;
+    }
+    if (Array.isArray(candidate.affectedComponents)) candidate.affectedComponents = guard.affected;
+
     // 5. Update status
     this.updateCandidateStatus(candidate.id, 'generating');
 
     // 6. Check file existence before generation (Safety Check)
     const targetComp = candidate.targetComponent || candidate.target_component;
-    const repoPath = config.autoEvolution?.repoLocalPath ?? '/app';
-    const localPath = targetComp.startsWith('aimindmesh-server/')
-      ? targetComp.substring('aimindmesh-server/'.length)
-      : targetComp;
-    const absPath = path.resolve(repoPath, localPath);
+    // Only self-repo, non-secret files inside the server checkout are read locally
+    const absPath = resolveLocalServerPath(repository, targetComp);
     
-    if (!fs.existsSync(absPath)) {
-      Logger.info('AutoEvolutionPipeline', `File ${targetComp} not found locally (localPath: ${localPath}), will attempt Gitea fetch during generation.`);
+    if (!absPath || !fs.existsSync(absPath)) {
+      Logger.info('AutoEvolutionPipeline', `File ${targetComp} not found locally, will attempt Gitea fetch during generation.`);
     }
 
     // 7. Generate code
@@ -167,7 +177,7 @@ export class AutoEvolutionPipeline {
       // ★ NEW [v2.0]: Save original content for cross-signature check
       let originalContent: string | undefined;
       try {
-        if (fs.existsSync(absPath)) {
+        if (absPath && fs.existsSync(absPath)) {
           originalContent = fs.readFileSync(absPath, 'utf-8');
           db.prepare(`UPDATE evolution_candidates SET original_content = ? WHERE id = ?`)
             .run(originalContent, candidate.id);
@@ -210,6 +220,15 @@ export class AutoEvolutionPipeline {
         return;
       }
 
+      // Every path the output would commit must pass the policy (also for candidates queued before it existed)
+      const repository = candidate.repository || 'AIMindMesh';
+      sanitizeOutput(repository, generationOutput);
+      const outputCheck = checkOutput(repository, candidate.target_component || candidate.targetComponent, generationOutput);
+      if (!outputCheck.ok) {
+        await this.recordFailure(candidate, 'protected_path', `Output touches paths not allowed for auto-evolution: ${outputCheck.denied.join(', ')}`);
+        return;
+      }
+
       // 7. Validate
       this.updateCandidateStatus(candidate.id, 'validating');
       
@@ -218,7 +237,8 @@ export class AutoEvolutionPipeline {
       const validationResult = await this.validator.validate(
         candidate.target_component || candidate.targetComponent,
         generationOutput,
-        originalContent
+        originalContent,
+        { repository }
       );
 
       if (!validationResult.passed) {
@@ -373,9 +393,8 @@ export class AutoEvolutionPipeline {
       );
     } catch (e) {
       Logger.warn('AutoEvolutionPipeline', `Could not fetch branch content, falling back to local file`);
-      const repoPath = config.autoEvolution?.repoLocalPath ?? '/app';
-      const localPath = path.resolve(repoPath, candidate.target_component || candidate.targetComponent);
-      currentBranchContent = fs.existsSync(localPath)
+      const localPath = resolveLocalServerPath(proposal.repository ?? 'AIMindMesh', candidate.target_component || candidate.targetComponent);
+      currentBranchContent = localPath && fs.existsSync(localPath)
         ? fs.readFileSync(localPath, 'utf-8')
         : proposal.modifiedContent ?? '';
     }
@@ -404,12 +423,24 @@ export class AutoEvolutionPipeline {
         return;
       }
 
+      const repository = proposal.repository ?? 'AIMindMesh';
+      sanitizeOutput(repository, output);
+      const outputCheck = checkOutput(repository, candidate.target_component || candidate.targetComponent, output);
+      if (!outputCheck.ok) {
+        // "⚠️ **Iteration" prefix: FeedbackService ignores the bot's own comments (no webhook loop)
+        await this.gitea.addPullRequestComment(proposal.pr_number, repository,
+          `⚠️ **Iteration ${newIteration} blocked:** the output touches paths not allowed for auto-evolution (${outputCheck.denied.join(', ')}).`
+        );
+        db.prepare(`UPDATE evolution_proposals SET feedback_status = 'has_feedback' WHERE id = ?`).run(proposalId);
+        return;
+      }
+
       const originalContent = candidate.original_content ?? undefined;
       const validationResult = await this.validator.validate(
         candidate.target_component || candidate.targetComponent,
         output,
         originalContent,
-        { feedbacks: pendingFeedbacks }
+        { feedbacks: pendingFeedbacks, repository }
       );
 
       if (!validationResult.passed) {
@@ -480,9 +511,21 @@ export class AutoEvolutionPipeline {
         return { success: false, message: 'Intent classified as general chat' };
       }
 
+      // Guardrails: chat requests share the daily cap and the path policy (checked before any repo is created)
+      if (isDailyLimitReached()) {
+        return { success: true, message: `Daily auto-evolution limit reached (${getDailyLimit()}). The request was not started: retry tomorrow or start it from the Evolution panel.` };
+      }
+      const requestedTarget = intent.taskMetadata?.targetFiles?.[0] || 'README.md';
+
       // 2. Resolve or Create Project
       let repoName = intent.projectName || 'AIMindMesh';
+      if (!normalizeRepoName(repoName)) {
+        return { success: true, message: `Invalid project name "${repoName}": use letters, digits, ".", "_" or "-".` };
+      }
       if (intent.category === 'NEW_PROJECT') {
+        if (!canWrite(repoName, requestedTarget)) {
+          return { success: true, message: `The requested file "${requestedTarget}" is not a valid path for auto-evolution.` };
+        }
         await GiteaService.createRepository(repoName, `User-driven project: ${repoName}`);
       } else {
         // Verify existing project
@@ -494,6 +537,10 @@ export class AutoEvolutionPipeline {
         }
       }
 
+      if (!canWrite(repoName, requestedTarget)) {
+        return { success: true, message: `The requested file "${requestedTarget}" is protected and cannot be modified by auto-evolution.` };
+      }
+
       // 3. Create Manual Candidate
       const title = intent.taskMetadata?.goal || `User Request: ${repoName}`;
       const candidate: ImprovementCandidate = {
@@ -503,7 +550,7 @@ export class AutoEvolutionPipeline {
         title: title,
         description: prompt,
         repository: repoName,
-        targetComponent: intent.taskMetadata?.targetFiles?.[0] || 'README.md',
+        targetComponent: requestedTarget,
         affectedComponents: intent.taskMetadata?.targetFiles || [],
         changeScope: intent.category === 'NEW_PROJECT' ? 'multi_file' : 'single_file',
         targetLanguage: 'typescript',
@@ -520,7 +567,9 @@ export class AutoEvolutionPipeline {
 
       // 4. Trigger evolution
       // For user requests, we use AGENTIC mode (OpenClaw) for better results
-      void this.executeEvolutionForCandidate(candidate, { routing: 'OPENCLAW' });
+      this.executeEvolutionForCandidate(candidate, { routing: 'OPENCLAW' }).catch(err =>
+        Logger.error('AutoEvolutionPipeline', `User-driven evolution failed for [${candidate.id}]: ${err.message}`)
+      );
 
       return { 
         success: true, 

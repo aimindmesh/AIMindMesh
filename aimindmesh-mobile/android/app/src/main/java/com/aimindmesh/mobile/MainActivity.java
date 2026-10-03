@@ -4,9 +4,11 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
 import android.webkit.PermissionRequest;
-import android.webkit.WebChromeClient;
+
+import org.json.JSONObject;
 
 import com.getcapacitor.BridgeActivity;
+import com.getcapacitor.BridgeWebChromeClient;
 import com.aimindmesh.mobile.litert.LiteRTPlugin;
 import com.aimindmesh.llama.LlamaCppPlugin;
 
@@ -18,26 +20,11 @@ import com.aimindmesh.mobile.performance.SystemMonitorPlugin;
 import com.aimindmesh.auto.AndroidAutoPlugin;
 import com.aimindmesh.mobile.audio.AudioPlaybackPlugin;
 import com.aimindmesh.mobile.security.SecureStoragePlugin;
-import com.aimindmesh.mobile.security.ApiKeyMigration;
 import com.aimindmesh.mobile.meeting.MeetingExportPlugin;
 import com.aimindmesh.fcm.FCMCapacitorPlugin;
-import android.content.BroadcastReceiver;
 import android.content.Context;
-import android.content.IntentFilter;
 
 public class MainActivity extends BridgeActivity {
-
-    private final BroadcastReceiver proactiveReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            long timestamp = intent.getLongExtra("timestamp", 0);
-            String jsCode = "window.dispatchEvent(new CustomEvent('proactiveCheck', { detail: { timestamp: " + timestamp
-                    + " } }));";
-            if (getBridge() != null && getBridge().getWebView() != null) {
-                getBridge().getWebView().post(() -> getBridge().getWebView().evaluateJavascript(jsCode, null));
-            }
-        }
-    };
 
     private static final String SCHEME_COMPANION = "companion";
 
@@ -66,8 +53,7 @@ public class MainActivity extends BridgeActivity {
 
         super.onCreate(savedInstanceState);
 
-        // Migrate API keys from plain-text SharedPreferences to Android Keystore
-        ApiKeyMigration.INSTANCE.migrateIfNeeded(this);
+        // API keys are moved to the Android Keystore by the JS secret store (secretStore.ts)
 
         // Check for Keep Alive preference and start service if enabled
         android.util.Log.d("KeepAliveDebug", "MainActivity onCreate called");
@@ -106,25 +92,30 @@ public class MainActivity extends BridgeActivity {
 
         android.util.Log.d("ProactiveDebug", "proactiveEnabled: " + proactiveEnabled);
 
+        // Periodic WorkManager job (survives background limits, unlike the old service)
         try {
             if (proactiveEnabled) {
-                android.util.Log.d("ProactiveDebug", "Attempting to start ProactiveBackgroundService");
-                Intent proactiveIntent = new Intent(this, com.aimindmesh.mobile.proactive.ProactiveBackgroundService.class);
-                startService(proactiveIntent);
+                com.aimindmesh.mobile.proactive.ProactiveScheduler.INSTANCE.schedule(this);
             } else {
-                android.util.Log.d("ProactiveDebug", "ProactiveBackgroundService not enabled, ensuring it is stopped");
-                Intent proactiveIntent = new Intent(this, com.aimindmesh.mobile.proactive.ProactiveBackgroundService.class);
-                stopService(proactiveIntent);
+                com.aimindmesh.mobile.proactive.ProactiveScheduler.INSTANCE.cancel(this);
             }
         } catch (Exception e) {
-            android.util.Log.w("ProactiveDebug", "BackgroundService start/stop handled", e);
+            android.util.Log.w("ProactiveDebug", "Proactive scheduling failed", e);
         }
 
-        getBridge().getWebView().setWebChromeClient(new WebChromeClient() {
+        // Capacitor's client stays in charge (runtime RECORD_AUDIO/CAMERA requests, file chooser,
+        // JS dialogs): only the origin check is added in front of its permission handling
+        getBridge().getWebView().setWebChromeClient(new BridgeWebChromeClient(getBridge()) {
             @Override
             public void onPermissionRequest(final PermissionRequest request) {
-                // Permission granting must be executed on the UI thread.
-                runOnUiThread(() -> request.grant(request.getResources()));
+                // Grant mic/camera only to the bundled app (served from localhost), never to navigated pages
+                Uri origin = request.getOrigin();
+                boolean isAppOrigin = origin != null && "localhost".equals(origin.getHost());
+                if (isAppOrigin) {
+                    super.onPermissionRequest(request);
+                } else {
+                    runOnUiThread(request::deny);
+                }
             }
         });
 
@@ -142,14 +133,8 @@ public class MainActivity extends BridgeActivity {
         handleWidgetIntent(getIntent());
         // Handle shortcut intent
         handleShortcutIntent(getIntent());
-
-        // Register proactive check receiver
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            registerReceiver(proactiveReceiver, new IntentFilter("com.aimindmesh.PROACTIVE_CHECK"),
-                    Context.RECEIVER_NOT_EXPORTED);
-        } else {
-            registerReceiver(proactiveReceiver, new IntentFilter("com.aimindmesh.PROACTIVE_CHECK"));
-        }
+        // A recreated activity (savedInstanceState) must not reopen voice mode
+        if (savedInstanceState == null) handleAssistantIntent(getIntent());
 
     }
 
@@ -159,6 +144,26 @@ public class MainActivity extends BridgeActivity {
         setIntent(intent);
         handleWidgetIntent(intent);
         handleShortcutIntent(intent);
+        handleAssistantIntent(intent);
+    }
+
+    /**
+     * Opened as the assistant (ACTION_ASSIST, or AssistantSession after the wake word):
+     * the web app opens voice mode. The request is kept until JS reads it, since on a cold
+     * start the event below fires before the app's listener exists.
+     */
+    private void handleAssistantIntent(Intent intent) {
+        if (intent == null)
+            return;
+
+        boolean assist = Intent.ACTION_ASSIST.equals(intent.getAction())
+                || intent.getBooleanExtra("wakeWordDetected", false);
+        if (!assist)
+            return;
+
+        PerformancePlugin.setPendingLaunchAction("voice");
+        String jsCode = "window.dispatchEvent(new CustomEvent('assistantLaunch'));";
+        getBridge().getWebView().post(() -> getBridge().getWebView().evaluateJavascript(jsCode, null));
     }
 
     private void handleWidgetIntent(Intent intent) {
@@ -170,7 +175,8 @@ public class MainActivity extends BridgeActivity {
             String host = data.getHost();
             if (host != null) {
                 // Pass the widget action to the web app via JavaScript
-                String jsCode = "window.dispatchEvent(new CustomEvent('widgetAction', { detail: '" + host + "' }));";
+                // JSONObject.quote escapes the value: intent data must never be able to break out into JS
+                String jsCode = "window.dispatchEvent(new CustomEvent('widgetAction', { detail: " + JSONObject.quote(host) + " }));";
                 getBridge().getWebView().post(() -> getBridge().getWebView().evaluateJavascript(jsCode, null));
             }
         }
@@ -183,21 +189,12 @@ public class MainActivity extends BridgeActivity {
         String route = intent.getStringExtra("route");
         if (route != null) {
             // Pass the shortcut action to the web app via JavaScript
-            String jsCode = "window.dispatchEvent(new CustomEvent('shortcutAction', { detail: '" + route + "' }));";
+            // JSONObject.quote escapes the value: the exported activity accepts this extra from any app
+            String jsCode = "window.dispatchEvent(new CustomEvent('shortcutAction', { detail: " + JSONObject.quote(route) + " }));";
             getBridge().getWebView().post(() -> getBridge().getWebView().evaluateJavascript(jsCode, null));
 
             // Also notify Android Auto Plugin if we want the car screen to sync
             AndroidAutoPlugin.setInitialRoute(route);
-        }
-    }
-
-    @Override
-    public void onDestroy() {
-        super.onDestroy();
-        try {
-            unregisterReceiver(proactiveReceiver);
-        } catch (Exception e) {
-            // Ignore
         }
     }
 

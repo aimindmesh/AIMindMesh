@@ -462,15 +462,15 @@ export async function organizationRoutes(app: FastifyInstance) {
     try {
       const { ideaId } = request.params as { ideaId: string };
       const row = db.prepare('SELECT id FROM organization_ideas WHERE id = ?').get(ideaId);
-      if (!row) {
-        return reply.status(404).send({ error: 'Idea not found' });
-      }
-      db.prepare('DELETE FROM organization_ideas WHERE id = ?').run(ideaId);
+      if (!row) return reply.status(404).send({ error: 'Idea not found' });
+      db.transaction(() => { // designs reference the idea (FK)
+        db.prepare('DELETE FROM organization_product_designs WHERE idea_id = ?').run(ideaId);
+        db.prepare('DELETE FROM organization_ideas WHERE id = ?').run(ideaId);
+      })();
 
       await auditService.log({
         eventType: 'idea:delete',
-        actorType: 'human',
-        actorId: 'human',
+        actorType: 'human', actorId: 'human',
         targetType: 'idea',
         targetId: ideaId,
         payload: {}
@@ -943,19 +943,7 @@ Format:
     }
   });
 
-  // ─── GITEA CI/CD WEBHOOK ──────────────────────────────────────────────────
-  // Receives workflow_run / check_run events from Gitea and updates repo status.
-  app.post('/webhooks/gitea', async (request: FastifyRequest, reply: FastifyReply) => {
-    try {
-      const payload = request.body as any;
-      const { VentureOrchestrator } = await import('../../services/organization/VentureOrchestrator');
-      VentureOrchestrator.handleCiWebhook(payload);
-      return reply.status(200).send({ ok: true });
-    } catch (e: any) {
-      // Always return 200 to prevent Gitea from disabling the webhook
-      return reply.status(200).send({ ok: false, error: e.message });
-    }
-  });
+  // POST /webhooks/gitea (CI/CD events) lives in ./giteaWebhook.ts: it needs the raw body for HMAC verification
 
   app.get('/ideas/:ideaId/design', async (request: FastifyRequest, reply: FastifyReply) => {
     try {

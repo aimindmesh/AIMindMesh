@@ -59,23 +59,20 @@ const AIMindMeshServerSettingsPanel: React.FC<Props> = ({ settings, onChange, is
     const refreshUnsyncedCount = async () => {
         try {
             const { getMeetingDatabase } = await import('../../../services/database/meetingDatabase');
-            const { getKnowledgeDatabase } = await import('../../../services/database/knowledgeDatabase');
             const { getMemoryDatabase } = await import('../../../services/memory/memoryDatabase');
 
             const mdb = await getMeetingDatabase();
-            const kdb = await getKnowledgeDatabase();
             const memdb = await getMemoryDatabase();
 
-            const [mRes, sRes, dRes, memRes] = await Promise.all([
+            // Documents are not synced (the server has no handler for them)
+            const [mRes, sRes, memRes] = await Promise.all([
                 mdb.query('SELECT COUNT(*) as count FROM meetings WHERE is_synced = 0'),
                 mdb.query('SELECT COUNT(*) as count FROM meeting_segments WHERE is_synced = 0'),
-                kdb.query('SELECT COUNT(*) as count FROM documents WHERE is_synced = 0'),
                 memdb.query('SELECT COUNT(*) as count FROM memories WHERE is_synced = 0')
             ]);
 
             const total = (mRes.values?.[0]?.count || 0) + 
                           (sRes.values?.[0]?.count || 0) + 
-                          (dRes.values?.[0]?.count || 0) + 
                           (memRes.values?.[0]?.count || 0);
             
             setUnsyncedCount(total);

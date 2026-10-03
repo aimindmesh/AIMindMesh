@@ -7,50 +7,47 @@ import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
 
 /**
- * Capacitor plugin bridging JavaScript to SecureStorageManager.
- * Provides encrypted API key CRUD and hardware-backing diagnostics.
+ * Capacitor plugin bridging the JS secret store (src/services/security/secretStore.ts)
+ * to SecureStorageManager. Keys are the secret ids used by the app, e.g.
+ * "gemini-api-key" or "aimindmesh-server-settings.apiKey".
  */
 @CapacitorPlugin(name = "SecureStorage")
 class SecureStoragePlugin : Plugin() {
 
+    /** { encrypted, hardwareBacked }: the JS side migrates secrets only when encrypted */
     @PluginMethod
-    fun saveApiKey(call: PluginCall) {
+    fun status(call: PluginCall) {
+        val encrypted = SecureStorageManager.currentMode(context) == SecureStorageManager.Mode.ENCRYPTED
+        call.resolve(JSObject().apply {
+            put("encrypted", encrypted)
+            put("hardwareBacked", encrypted && SecureStorageManager.isHardwareBackedKeystoreAvailable(context))
+        })
+    }
+
+    /** Resolves only when the value was committed and read back. */
+    @PluginMethod
+    fun set(call: PluginCall) {
         val key   = call.getString("key")   ?: return call.reject("key required")
         val value = call.getString("value") ?: return call.reject("value required")
+        if (SecureStorageManager.saveApiKey(context, key, value)) call.resolve()
+        else call.reject("write not verified")
+    }
 
-        SecureStorageManager.saveApiKey(context, key, value)
-        call.resolve()
+    /** { values: { key: string } }: keys without a stored value are left out */
+    @PluginMethod
+    fun getMany(call: PluginCall) {
+        val keys = call.getArray("keys")?.toList<String>() ?: return call.reject("keys required")
+        val values = JSObject()
+        SecureStorageManager.getMany(context, keys).forEach { (key, value) ->
+            if (value != null) values.put(key, value)
+        }
+        call.resolve(JSObject().apply { put("values", values) })
     }
 
     @PluginMethod
-    fun getApiKey(call: PluginCall) {
+    fun remove(call: PluginCall) {
         val key = call.getString("key") ?: return call.reject("key required")
-        val value = SecureStorageManager.getApiKey(context, key)
-
-        call.resolve(JSObject().apply {
-            put("value", value ?: "")
-            put("found", value != null)
-        })
-    }
-
-    @PluginMethod
-    fun deleteApiKey(call: PluginCall) {
-        val key = call.getString("key") ?: return call.reject("key required")
-        SecureStorageManager.deleteApiKey(context, key)
-        call.resolve()
-    }
-
-    @PluginMethod
-    fun deleteAllKeys(call: PluginCall) {
-        SecureStorageManager.deleteAllKeys(context)
-        call.resolve()
-    }
-
-    @PluginMethod
-    fun isHardwareBacked(call: PluginCall) {
-        val hw = SecureStorageManager.isHardwareBackedKeystoreAvailable()
-        call.resolve(JSObject().apply {
-            put("hardwareBacked", hw)
-        })
+        if (SecureStorageManager.deleteApiKey(context, key)) call.resolve()
+        else call.reject("remove failed")
     }
 }

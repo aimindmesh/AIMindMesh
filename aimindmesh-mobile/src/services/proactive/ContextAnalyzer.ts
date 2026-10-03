@@ -1,6 +1,6 @@
 
 import { getRecentMemories, getMemoryCount } from '../memory/memoryDatabase';
-import { getAllEvents } from '../calendar/calendarService';
+import { getAllEvents, systemCalendarVisible } from '../calendar/calendarService';
 import { getUpcomingTasks, getOverdueTasks } from '../calendar/taskDatabase';
 import { Message, LLMConfig } from '../../types/index';
 // @ts-ignore - Plugins might not be installed yet, handling gracefully
@@ -8,7 +8,22 @@ import { Device } from '@capacitor/device';
 import { Network } from '@capacitor/network';
 import { isMobile } from '../../utils/platform';
 import { estimateContextUsage } from '../llm/contextMonitor';
+import { getProviderContextWindow } from '../llm/context/unifiedContextManager';
+import { readSetting } from '../security/secretStore';
 import { logger } from '../logger';
+import { CalendarEvent as BriefingEvent, toBriefingEvents } from './meetingBriefingService';
+import { applyContextSummary } from '../llm/contextSummaryStore';
+import { getActiveThreadId } from '../llm/threadManager';
+
+/**
+ * Context window of the configured model: the provider's window for remote providers
+ * (nCtx/contextSize describe on-device models only), else the on-device setting.
+ */
+export function getContextWindow(llmConfig: Partial<LLMConfig> | null | undefined): number {
+    if (!llmConfig) return 2048;
+    return (llmConfig.provider && getProviderContextWindow(llmConfig.provider))
+        || llmConfig.nCtx || llmConfig.contextSize || 2048;
+}
 
 export interface ProactiveContext {
     timestamp: number;
@@ -35,7 +50,7 @@ export interface ProactiveContext {
     };
     data: {
         recentMemories: any[];
-        upcomingEvents: any[];
+        upcomingEvents: BriefingEvent[];
         overdueTasks: any[];
         upcomingTasks: any[];
         recentChatHistory: Message[];
@@ -172,12 +187,16 @@ class ContextAnalyzer {
         }
     }
 
-    private async getUpcomingEventsSafe() {
+    private async getUpcomingEventsSafe(): Promise<BriefingEvent[]> {
         try {
             const now = new Date();
             const endOfDay = new Date();
             endOfDay.setHours(23, 59, 59, 999);
-            return await getAllEvents(now, endOfDay);
+            // Near midnight, still reach the events of the next hours
+            const end = new Date(Math.max(endOfDay.getTime(), now.getTime() + 2 * 60 * 60 * 1000));
+            // Briefing shape: { start: ms } (the database returns startTime: Date)
+            // Meetings usually live in the system calendar: included when the Agenda shows it
+            return toBriefingEvents(await getAllEvents(now, end, await systemCalendarVisible()));
         } catch (e) {
             console.error('Failed to get events', e);
             return [];
@@ -228,25 +247,15 @@ class ContextAnalyzer {
                 return { messageCount: 0, contextUsage: 0 };
             }
 
-            // Get LLM config from settings
-            const settingsItem = window.localStorage.getItem('settings');
-            let contextSize = 2048; // Default
+            // Context window of the model in use (App stores its config under 'llm-config')
+            const contextSize = getContextWindow(readSetting<Partial<LLMConfig> | null>('llm-config', null));
 
-            if (settingsItem) {
-                try {
-                    const settings = JSON.parse(settingsItem);
-                    const llmConfig: LLMConfig = settings.llmConfig;
-                    contextSize = llmConfig.nCtx || llmConfig.contextSize || 2048;
-                } catch (e) {
-                    logger.log('warn', '[ContextAnalyzer] Failed to parse LLM config', e);
-                }
-            }
-
-            // Estimate context usage
-            const estimate = estimateContextUsage(messages, '', contextSize);
+            // Usage of what the model actually receives: the thread's summary replaces what it covers
+            const modelHistory = applyContextSummary(messages, getActiveThreadId());
+            const estimate = estimateContextUsage(modelHistory, '', contextSize);
 
             return {
-                messageCount: messages.length,
+                messageCount: modelHistory.length,
                 contextUsage: estimate.usagePercent
             };
 

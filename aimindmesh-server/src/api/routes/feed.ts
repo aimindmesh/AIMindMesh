@@ -1,11 +1,19 @@
 import { FastifyInstance } from 'fastify';
 import { FeedManager } from '../../services/FeedManager';
 import { InferenceRouter } from '../../services/InferenceRouter';
+import { DebateEngine } from '../../services/DebateEngine';
+import { ProactiveEngine } from '../../services/ProactiveEngine';
 
 export default async function (fastify: FastifyInstance) {
   fastify.get('/', async (request, reply) => {
     const { limit, offset, unreadOnly } = request.query as any;
     return FeedManager.getFeed(parseInt(limit) || 20, parseInt(offset) || 0, unreadOnly === 'true');
+  });
+
+  fastify.delete('/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!FeedManager.deleteItem(id)) return reply.code(404).send({ error: 'Feed item not found' });
+    return { success: true };
   });
 
   fastify.post('/:id/read', async (request, reply) => {
@@ -17,7 +25,6 @@ export default async function (fastify: FastifyInstance) {
   fastify.post('/:id/reply', async (request, reply) => {
     const { id } = request.params as any;
     const { content } = request.body as any;
-    const { DebateEngine } = require('../../services/DebateEngine');
     
     const debateThread = DebateEngine.getThreadByInsightId(id);
     if (debateThread) {
@@ -64,7 +71,6 @@ export default async function (fastify: FastifyInstance) {
   fastify.post('/:id/debate/status', async (request, reply) => {
     const { id } = request.params as any;
     const { status } = request.body as any;
-    const { DebateEngine } = require('../../services/DebateEngine');
 
     try {
       await DebateEngine.updateThreadStatus(id, status);
@@ -76,7 +82,6 @@ export default async function (fastify: FastifyInstance) {
 
   fastify.get('/:id/debate', async (request, reply) => {
     const { id } = request.params as any;
-    const { DebateEngine } = require('../../services/DebateEngine');
     const messages = DebateEngine.getDebateMessages(id);
     const thread = DebateEngine.getThreadByInsightId(id);
     return { thread, messages };
@@ -88,7 +93,6 @@ export default async function (fastify: FastifyInstance) {
   });
 
   fastify.post('/trigger', async (request, reply) => {
-    const { ProactiveEngine } = require('../../services/ProactiveEngine');
     // Run in background
     ProactiveEngine.runCycle().catch((err: any) => {
       console.error('Manual proactive cycle failed:', err);

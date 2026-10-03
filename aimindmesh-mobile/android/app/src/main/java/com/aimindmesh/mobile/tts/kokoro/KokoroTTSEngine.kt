@@ -66,6 +66,8 @@ class KokoroTTSEngine(private val context: Context) {
     }
 
     fun release() {
+        // Frees the native model now; dropping the reference left hundreds of MB to the finalizer
+        tts?.release()
         tts = null
     }
 }

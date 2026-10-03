@@ -89,7 +89,9 @@ export class FeedbackService {
 
     // Trigger automatico se richiesto e sotto il limite di iterazioni
     if (options?.autoTrigger && currentIteration < this.MAX_ITERATIONS) {
-      setImmediate(() => autoEvolutionPipeline.regenerateFromFeedback(proposalId));
+      setImmediate(() => autoEvolutionPipeline.regenerateFromFeedback(proposalId).catch(err =>
+        Logger.error('FeedbackService', `Automatic regeneration failed for proposal ${proposalId}: ${err.message}`)
+      ));
     }
 
     return record;

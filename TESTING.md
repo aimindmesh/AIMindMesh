@@ -1,858 +1,245 @@
 # 🧪 AIMindMesh — Testing Guide
 
-> **Status**: Manual + Automated Testing Strategy  
-> **Scope**: Mobile (Android), Server (Node.js/TypeScript), Infrastructure  
-> **Co-authored with**: Claude (Anthropic) & Perplexity AI
+> Describes the tests that **actually exist** and the manual checks still needed.
+> Automated coverage today is server-side only; the apps are type-checked in CI and tested manually.
 
 ---
 
 ## 📋 Table of Contents
-
-1. [Philosophy & Strategy](#1-philosophy--strategy)
-2. [Server — Unit & Integration Tests](#2-server--unit--integration-tests)
-3. [Mobile — Inference Engine Tests](#3-mobile--inference-engine-tests)
-4. [Mobile — Plugin Tests (LiteRT / Llama.cpp / MNN)](#4-mobile--plugin-tests-litert--llamacpp--mnn)
-5. [End-to-End Mesh Tests](#5-end-to-end-mesh-tests)
-6. [Performance Benchmarks](#6-performance-benchmarks)
-7. [Security & Privacy Tests](#7-security--privacy-tests)
-8. [Auto-Evolution Pipeline Tests](#8-auto-evolution-pipeline-tests)
-9. [Manual Device Testing Checklist](#9-manual-device-testing-checklist)
-10. [CI/CD Integration](#10-cicd-integration)
+1. [Strategy](#1-strategy)
+2. [Server — Automated Tests (Vitest)](#2-server--automated-tests-vitest)
+3. [Shared API Contract](#3-shared-api-contract)
+4. [Continuous Integration (Gitea Actions)](#4-continuous-integration-gitea-actions)
+5. [Clean-Clone Check](#5-clean-clone-check)
+6. [End-to-End Mesh Checks (Manual)](#6-end-to-end-mesh-checks-manual)
+7. [Security Checks (Manual, on the VPS)](#7-security-checks-manual-on-the-vps)
+8. [Manual Device Testing Checklist](#8-manual-device-testing-checklist)
+9. [Gaps](#9-gaps)
 
 ---
 
-## 1. Philosophy & Strategy
+## 1. Strategy
 
-AIMindMesh follows a **layered testing pyramid**:
-[ E2E Mesh Tests] <- few, slow, high confidence
-[ Integration Tests] <- server services + APIs
-[ Unit Tests (pure logic)] <- fast, deterministic
-[ Manual Device Validation] <- NPU/GPU/hardware features
+| Layer | How it is verified | Where |
+|---|---|---|
+| Server logic, security, auto-evolution guardrails | Vitest (automated) | `aimindmesh-server/test/` |
+| Client ⇄ server contract | Shared types + `tsc` in all apps | `aimindmesh-server/src/types/api.ts` |
+| Desktop, admin mobile apps | `tsc --noEmit` (automated), manual checklists | CI + §8 |
+| Mobile app | `tsc --noEmit` + Vitest unit tests of pure logic (automated), JVM tests, manual device checklist | CI + §2 + §8 |
+| Native Android / NPU / audio | Manual on a physical Snapdragon device | §8 |
+| Deployment & network exposure | Manual checks on the VPS | §7 |
 
-text
-
-Key principle: **hardware-dependent code** (LiteRT NPU, Adreno OpenCL, dynamic library loading)
-is validated manually on physical devices, while pure logic is covered by automated tests.
+Tests never use real services: the server suite runs on an in-memory SQLite database, a test configuration (`test/fixtures/config.ts`, the real `config.json` is never read) and with all outgoing HTTP calls disabled.
 
 ---
 
-## 2. Server — Unit & Integration Tests
-
-### Setup
+## 2. Server — Automated Tests (Vitest)
 
 ```bash
 cd aimindmesh-server
-npm install
-npm run test          # run all tests
-npm run test:watch    # watch mode
-npm run test:coverage # coverage report
+npm test                 # vitest run (~25 s, most of it the real tsc checks)
+npm run typecheck:test   # type-checks src/ + test/ (tsconfig.test.json)
 ```
 
-Install test dependencies if not present:
+| File | Covers |
+|---|---|
+| `auth.test.ts` | API keys (global + per-node, constant-time), `authHook` on REST and WebSocket upgrades (401 without `?token=`), self-authenticated routes, `/dl/` installers, log redaction |
+| `nodesWs.test.ts` | `/ws/nodes`: a worker can only stream/resolve the tasks dispatched to it |
+| `giteaWebhooks.test.ts` | HMAC `X-Gitea-Signature` on both Gitea webhooks (missing secret, wrong signature, valid delivery), raw-body parser isolation |
+| `configRedaction.test.ts` | `GET /api/admin/config` masking, `PATCH` ignoring masked values and prototype-polluting keys |
+| `backup.test.ts` | Backup download/restore/delete reject path traversal |
+| `restore.test.ts` | Backup content (snapshot, no live DB / Neo4j / FreeLLMAPI), staged restore applied at boot, stale `-wal` dropped, full rollback on error, 2-attempt cap, unsafe/old/newer archives |
+| `migrations.test.ts` | Versioned schema: fresh DB, no-op re-run, production DB at version 0 (data kept, duplicates tolerated), failed migration leaves `user_version` untouched, newer DB refused |
+| `sync.test.ts` | Sync push in one transaction, no segment loss on meeting updates, mobile thread format, namespaced message ids, memory ids for the KG, server-clock pull cursor, deletion tombstones (no resurrection) |
+| `foreignKeys.test.ts` | Feed delete and insight merge with queued deliveries, conversation delete, insight text for contextual delivery |
+| `logRetention.test.ts` | `system_logs`/`sync_logs`/`fcm_logs` pruning in batches, retention parsing |
+| `chatCompletionWs.test.ts` | `/ws/chat?mode=completion`: ack/delta/thought/done/error with `requestId`, non-streaming providers, stateless |
+| `kgLinks.test.ts` | Insight→Concept links by id, relation types sanitized, concept upsert never wipes embedding or enriched description |
+| `lockTimeouts.test.ts` | Per-engine inference lock timeouts |
+| `shellSafety.test.ts` | No shell injection via uploaded file names (`local-stt`, with a fake `whisper`), wiki commit messages, reverse-dependency grep |
+| `evolutionPolicy.test.ts` | Auto-evolution path policy: normalization, secrets, protected baseline, `.noautoedit`, `protected_paths`, guards |
+| `patchTypecheck.test.ts` | Real `tsc` on the patched sources: valid change passes, type errors (target, additional files, generated tests) are blocked, new dependencies only warn |
+| `contextBuilder.test.ts` | Nothing secret or outside the checkout reaches an LLM prompt |
+| `pipeline.test.ts` | Pipeline entry points: protected targets/outputs fail early, daily cap and path policy for chat requests; listener registered and stuck candidates recovered once |
+| `council.test.ts` | The autonomous AI council needs a human before creating repositories (unless `organization.allowAutoRepoCreation`) |
+| `contracts.test.ts` | Client/server contract fixes: `/api/chat` response + routing, empty JSON bodies, `DELETE /api/feed/:id`, `GET /api/ai-tasks/:id`, AI task provider routing, evolution process options, protected-paths insert, CI webhook registration |
+| `contract-types.test.ts` | Compile-time: server internal types stay compatible with `src/types/api.ts` |
 
+### Writing new tests
+*   Put them in `aimindmesh-server/test/*.test.ts` (outside `src/`, so they never reach the build).
+*   Mock modules with `vi.mock(...)`. Static imports and `await import()` are intercepted; **inline `require()` is not**, so tested code should use imports.
+*   `src/config.ts` is automatically replaced by `test/fixtures/config.ts` (see `vitest.config.mts`); mutate `config` inside a test file if needed.
+*   `fetch` and axios fail by default: stub them explicitly (`vi.spyOn(axios, 'get')`).
+*   `aimindmesh-server/test/fcmDispatcher.test.ts` covers the data-only FCM control messages (`WAKE_FOR_INFERENCE`, `SYNC_REQUEST`).
+
+### Mobile app — automated tests (Vitest)
 ```bash
-npm install --save-dev jest ts-jest @types/jest supertest @types/supertest
+cd aimindmesh-mobile && npm test        # vitest run: test/*.test.ts, pure logic only (Capacitor plugins mocked)
 ```
+| Prefix | Covers |
+|---|---|
+| `chat-` | Context budgets per provider, history compression, stop-sequence buffering, tool catalogue (no duplicates, handlers executed, shell quoting), agent loop runs/confirmations, global document context |
+| `voice-` | Provider id normalization and voice-chat routing, TTS stop/session tokens, Whisper live chunking, Vosk permission/start-stop races, wake-word state sync |
+| `meeting-` | Rolling PCM buffer offsets, timeline and pauses, Voxtral slices, hybrid merge, speaker label alignment and AHC, save transaction, export cues, foreground service |
+| `memory-` | Embedding codec and model tags, re-embedding runtime, self-match exclusion, page numbering, ids/categories, batched ingestion with cleanup |
+| `agenda-` | Reminders, recurrence, rate limit, briefing window, Kanban index mapping, calendar sync ids, Android Auto payloads |
+| `shell-` | Thread save, settings reset only on open, memory pressure levels, NDJSON/SSE parsing, download verification, NodeWorker idempotency, desktop persistence, setup |
+| `native-` | LiteRT tool schemas and session tracking |
+| `model-` | Model residency: one heavy model at a time, engine switches, image/meeting/voice sessions, pins, memory pressure, chat model preload, voice-call RAM guard |
+| `image-` | Chat prompts for Stable Diffusion (LLM rewrite, cleanup, fallbacks), the image a tool call edits ("last"), tool pictures as chat attachments |
 
-Add to `package.json`:
+JVM unit tests (pure Kotlin/Java logic): `cd aimindmesh-mobile/android && ./gradlew :app:testDebugUnitTest` (`DeliveryClientTest`, `StopSequenceFilterTest`) and `./gradlew :sd-capacitor:testDebugUnitTest`: Stable Diffusion noise schedule and timesteps, Euler and DPM++ 2M converging on a Gaussian with the closed-form denoiser (epsilon and v), prediction-type probe, prompt weights, aspect crops and mirrored margins, CLIP tokenizer against reference ids.
 
-```json
-{
-  "scripts": {
-    "test": "jest",
-    "test:watch": "jest --watch",
-    "test:coverage": "jest --coverage"
-  },
-  "jest": {
-    "preset": "ts-jest",
-    "testEnvironment": "node",
-    "testMatch": ["**/__tests__/**/*.test.ts"],
-    "coverageDirectory": "coverage",
-    "collectCoverageFrom": ["src/**/*.ts", "!src/**/*.example.ts"]
-  }
-}
-```
+The SD native tensor reader (`qnn_graph_io.cpp`) can be checked on a PC with the QAIRT SDK: compile it for x86_64 with a small harness and the SDK's `lib/x86_64-linux-clang/libQnnSystem.so`, then compare its output with `qnn-context-binary-utility --context_binary <file> --json_file <out>`.
 
 ---
 
-### 2.1 InferenceRouter
+## 3. Shared API Contract
 
-**File**: `src/__tests__/InferenceRouter.test.ts`
-
-```typescript
-import { InferenceRouter } from '../services/InferenceRouter';
-
-describe('InferenceRouter', () => {
-  let router: InferenceRouter;
-
-  beforeEach(() => {
-    router = new InferenceRouter(/* mock config */);
-  });
-
-  describe('Task Routing', () => {
-    it('should route EMBED tasks to the embedding provider', async () => {
-      const result = await router.route({ type: 'embed', payload: 'test text' });
-      expect(result.provider).toBe('embed');
-    });
-
-    it('should route COMPLEX tasks to Gemini or OpenRouter', async () => {
-      const result = await router.route({ type: 'complex', payload: 'complex reasoning task' });
-      expect(['gemini', 'openrouter']).toContain(result.provider);
-    });
-
-    it('should route EVOLUTION tasks to the evolution provider', async () => {
-      const result = await router.route({ type: 'evolution', payload: 'refactor this function' });
-      expect(result.provider).toBe('evolution');
-    });
-
-    it('should fallback gracefully when primary provider is unavailable', async () => {
-      jest.spyOn(router as any, 'isPrimaryAvailable').mockResolvedValue(false);
-      const result = await router.route({ type: 'complex', payload: 'test' });
-      expect(result.provider).toBeDefined();
-      expect(result.fallback).toBe(true);
-    });
-
-    it('should respect per-task-type provider overrides from config', async () => {
-      const result = await router.route({ type: 'lightweight', payload: 'simple task' });
-      expect(result.provider).toBe('ollama');
-    });
-  });
-
-  describe('Node Selection', () => {
-    it('should prefer nodes with lower thermal throttling', () => {
-      const nodes = [
-        { id: 'mobile', thermal: 85, capability: 0.8 },
-        { id: 'pc', thermal: 40, capability: 1.0 },
-      ];
-      const selected = (router as any).selectNode(nodes, 'complex');
-      expect(selected.id).toBe('pc');
-    });
-
-    it('should exclude nodes that exceed quota', () => {
-      const nodes = [
-        { id: 'vps', quota: { used: 100, max: 100 } },
-        { id: 'pc', quota: { used: 10, max: 100 } },
-      ];
-      const selected = (router as any).selectNode(nodes, 'embed');
-      expect(selected.id).toBe('pc');
-    });
-  });
-});
-```
+`aimindmesh-server/src/types/api.ts` holds the HTTP contract (types only, no imports). The desktop, admin and mobile apps import it with `import type { … } from '@aimindmesh/api-types'` (path alias in each `tsconfig`). Changing a field there breaks `tsc` in every app that relies on it, which is the point.
 
 ---
 
-### 2.2 AutoEvolutionPipeline
+## 4. Continuous Integration (Gitea Actions)
 
-**File**: `src/__tests__/AutoEvolutionPipeline.test.ts`
+**File**: `.gitea/workflows/ci.yml` — runs on push to `master`, on pull requests and manually.
 
-```typescript
-import { AutoEvolutionPipeline } from '../services/AutoEvolutionPipeline';
+| Job | Steps |
+|---|---|
+| `server` | `cp src/config.ts.example src/config.ts` · `npm ci` · `tsc --noEmit` · `npm run typecheck:test` · `npm test` |
+| `client` | `npm ci` · `tsc --noEmit` |
+| `admin-mobile` | `npm ci --legacy-peer-deps` · `tsc -p tsconfig.app.json --noEmit` |
+| `mobile` | `npm ci` · `tsc --noEmit` · `npm test` |
 
-describe('AutoEvolutionPipeline', () => {
-  let pipeline: AutoEvolutionPipeline;
-
-  beforeEach(() => {
-    pipeline = new AutoEvolutionPipeline(/* mock dependencies */);
-  });
-
-  it('should detect improvement opportunity from feedback', async () => {
-    const feedback = { type: 'bug', description: 'inference crashes on empty input' };
-    const opportunity = await pipeline.detectOpportunity(feedback);
-    expect(opportunity).not.toBeNull();
-    expect(opportunity?.priority).toBeGreaterThan(0);
-  });
-
-  it('should build multi-file context before generating patch', async () => {
-    const spy = jest.spyOn(pipeline as any, 'buildMultiFileContext');
-    await pipeline.runCycle({ dryRun: true });
-    expect(spy).toHaveBeenCalled();
-  });
-
-  it('should NOT commit patch if validation fails', async () => {
-    jest.spyOn(pipeline as any, 'validate').mockResolvedValue({ passed: false, reason: 'syntax error' });
-    const commitSpy = jest.spyOn(pipeline as any, 'commitToGitea');
-    await pipeline.runCycle({ dryRun: false });
-    expect(commitSpy).not.toHaveBeenCalled();
-  });
-
-  it('should send FCM notification after successful evolution', async () => {
-    jest.spyOn(pipeline as any, 'validate').mockResolvedValue({ passed: true });
-    const fcmSpy = jest.spyOn(pipeline as any, 'notifyMobile');
-    await pipeline.runCycle({ dryRun: false });
-    expect(fcmSpy).toHaveBeenCalled();
-  });
-});
-```
+*   Branches written by the auto-evolution engine (`feature/auto-*`, `fail/*`) are **skipped**: running them would execute LLM-written code on the runner. Their patches are type-checked by the server before the PR is opened.
+*   The runner must be registered on the VPS with the hardened configuration in `infrastructure/docker/services/gitea/act_runner/` (see `DEVELOPMENT_GUIDE.md`).
 
 ---
 
-### 2.3 KGManager (Neo4j Knowledge Graph)
+## 5. Clean-Clone Check
 
-**File**: `src/__tests__/KGManager.test.ts`
+Local `node_modules` and untracked files can hide problems CI would hit. Before a release, run the CI commands on a copy that contains only versioned files:
 
-```typescript
-import { KGManager } from '../services/KGManager';
-
-const mockDriver = {
-  session: () => ({
-    run: jest.fn().mockResolvedValue({ records: [] }),
-    close: jest.fn(),
-  }),
-};
-
-describe('KGManager', () => {
-  let kg: KGManager;
-
-  beforeEach(() => {
-    kg = new KGManager(mockDriver as any);
-  });
-
-  it('should create entity node with correct labels', async () => {
-    const session = mockDriver.session();
-    await kg.upsertEntity({ id: 'test-1', type: 'Person', name: 'Andrea' });
-    expect(session.run).toHaveBeenCalledWith(
-      expect.stringContaining('MERGE'),
-      expect.objectContaining({ name: 'Andrea' })
-    );
-  });
-
-  it('should create relationship between two entities', async () => {
-    await kg.upsertRelationship('entity-1', 'entity-2', 'KNOWS');
-    const session = mockDriver.session();
-    expect(session.run).toHaveBeenCalledWith(
-      expect.stringContaining('KNOWS'),
-      expect.any(Object)
-    );
-  });
-
-  it('should return empty array for unknown entity queries', async () => {
-    const results = await kg.query('MATCH (n:Unknown) RETURN n');
-    expect(results).toEqual([]);
-  });
-});
+```bash
+mkdir -p /tmp/aimm-clean && git ls-files -co --exclude-standard -z | tar --null -T - -cf - | tar -xf - -C /tmp/aimm-clean
 ```
+
+Then run the steps of §4 in each project of `/tmp/aimm-clean`.
 
 ---
 
-### 2.4 GeminiQueueManager
+## 6. End-to-End Mesh Checks (Manual)
 
-**File**: `src/__tests__/GeminiQueueManager.test.ts`
+Run from a device connected to the WireGuard VPN (server at `10.2.0.1:3030`).
 
-```typescript
-import { GeminiQueueManager } from '../services/GeminiQueueManager';
-
-describe('GeminiQueueManager', () => {
-  it('should respect rate limits and queue excess requests', async () => {
-    const manager = new GeminiQueueManager({ rateLimit: 2 });
-    const promises = Array.from({ length: 5 }, (_, i) =>
-      manager.enqueue({ prompt: `task ${i}` })
-    );
-    const results = await Promise.all(promises);
-    expect(results).toHaveLength(5);
-  });
-
-  it('should retry on 429 with exponential backoff', async () => {
-    const manager = new GeminiQueueManager({ rateLimit: 10 });
-    jest
-      .spyOn(manager as any, 'callGemini')
-      .mockRejectedValueOnce({ status: 429 })
-      .mockResolvedValueOnce({ text: 'ok' });
-    const result = await manager.enqueue({ prompt: 'test' });
-    expect(result.text).toBe('ok');
-  });
-});
+```bash
+KEY=<server apiKey>
+# Health
+curl -H "x-api-key: $KEY" http://10.2.0.1:3030/api/health
+# Node registration (as the PC client does)
+curl -X POST -H "x-api-key: $KEY" -H 'content-type: application/json' \
+     -d '{"id":"test-node","type":"pc_client","name":"Test"}' http://10.2.0.1:3030/api/nodes/register
+# Chat through the router (response has content, response, usedNode)
+curl -X POST -H "x-api-key: $KEY" -H 'content-type: application/json' \
+     -d '{"messages":[{"role":"user","content":"ping"}]}' http://10.2.0.1:3030/api/chat
+# Memory sync to the KG
+curl -X POST -H "x-api-key: $KEY" -H 'content-type: application/json' \
+     -d '{"content":"test memory","category":"test","source":"manual"}' http://10.2.0.1:3030/api/kg/memories
 ```
+*   **FCM**: `POST /api/admin/fcm/test` → notification on the device within a few seconds.
+*   **Worker node**: enable "Participate as Worker" on the phone, route a chat with `options.routing = <device id>` and check the answer comes from the phone (`usedNode`).
 
 ---
 
-### 2.5 API Endpoint Tests
+## 7. Security Checks (Manual, on the VPS)
 
-**File**: `src/__tests__/api.test.ts`
-
-```typescript
-import request from 'supertest';
-import app from '../index';
-
-describe('POST /api/inference', () => {
-  it('should return 401 without auth token', async () => {
-    const res = await request(app).post('/api/inference').send({ prompt: 'hello' });
-    expect(res.status).toBe(401);
-  });
-
-  it('should return 200 with valid auth and prompt', async () => {
-    const res = await request(app)
-      .post('/api/inference')
-      .set('Authorization', `Bearer ${process.env.TEST_AUTH_TOKEN}`)
-      .send({ prompt: 'hello', type: 'lightweight' });
-    expect(res.status).toBe(200);
-    expect(res.body.response).toBeDefined();
-  });
-
-  it('should validate input — reject empty prompt', async () => {
-    const res = await request(app)
-      .post('/api/inference')
-      .set('Authorization', `Bearer ${process.env.TEST_AUTH_TOKEN}`)
-      .send({ prompt: '' });
-    expect(res.status).toBe(400);
-  });
-});
-
-describe('GET /api/nodes', () => {
-  it('should return registered nodes list', async () => {
-    const res = await request(app)
-      .get('/api/nodes')
-      .set('Authorization', `Bearer ${process.env.TEST_AUTH_TOKEN}`);
-    expect(res.status).toBe(200);
-    expect(Array.isArray(res.body.nodes)).toBe(true);
-  });
-});
+```bash
+# Ports: 3030, 7474, 7687 bound only to 127.0.0.1 and 10.2.0.1
+ss -tlnp | grep -E ':(3030|7474|7687)\b'
+# WebSockets reject missing tokens (expect HTTP 401)
+curl -i -N -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+     -H 'Sec-WebSocket-Key: dGVzdA==' http://127.0.0.1:3030/ws/chat
+# Secrets are masked
+curl -s -H "x-api-key: $KEY" http://127.0.0.1:3030/api/admin/config | grep -c '\*\*\*\*\*\*\*\*'
+# LLM proxy refuses requests without their own key (expect 401)
+curl -i -X POST http://127.0.0.1:3030/api/freellmapi-proxy/v1/chat/completions -d '{}' -H 'content-type: application/json'
+# Gitea webhook without signature (expect 401)
+curl -i -X POST http://127.0.0.1:3030/api/evolution/gitea/webhook -d '{}' -H 'content-type: application/json'
 ```
+*   **Secrets not in git**: `git check-ignore -v aimindmesh-server/config.json aimindmesh-server/openclaw-config/openclaw.json` must match a rule.
+*   **DNS privacy**: with the VPN up, `nslookup example.com` must answer from the PiHole on the WireGuard network, not from a public resolver.
 
 ---
 
-## 3. Mobile — Inference Engine Tests
-
-### Setup (Kotlin/Android)
-
-Add to `plugins/*/android/build.gradle`:
-
-```groovy
-dependencies {
-    testImplementation 'junit:junit:4.13.2'
-    testImplementation 'org.mockito:mockito-core:5.+'
-    androidTestImplementation 'androidx.test.ext:junit:1.1.5'
-    androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'
-}
-```
-
-Run tests:
-
-```bash
-# Unit tests (JVM, no device needed)
-./gradlew :plugins:litert-capacitor:test
-./gradlew :plugins:llama-cpp-capacitor:test
-./gradlew :plugins:mnn-capacitor:test
-
-# Instrumented tests (requires connected device/emulator)
-./gradlew :plugins:litert-capacitor:connectedAndroidTest
-```
-
----
-
-## 4. Mobile — Plugin Tests (LiteRT / Llama.cpp / MNN)
-
-### 4.1 LiteRTPlugin — Hardware Backend Detection
-
-**File**: `plugins/litert-capacitor/android/src/test/java/com/aimindmesh/mobile/litert/LiteRTPluginTest.kt`
-
-```kotlin
-import org.junit.Test
-import org.junit.Assert.*
-import com.aimindmesh.mobile.litert.LiteRTPlugin
-
-class LiteRTPluginTest {
-
-    @Test
-    fun `should select NPU backend when QNN libs are available`() {
-        val plugin = LiteRTPlugin()
-        val backend = plugin.selectBackend(
-            nativeLibDir = "/data/app/com.aimindmesh.mobile/lib/arm64",
-            openClAvailable = true,
-            qnnAvailable = true
-        )
-        assertEquals("NPU", backend.name)
-    }
-
-    @Test
-    fun `should fallback to GPU when NPU is unavailable`() {
-        val plugin = LiteRTPlugin()
-        val backend = plugin.selectBackend(
-            nativeLibDir = "",
-            openClAvailable = true,
-            qnnAvailable = false
-        )
-        assertEquals("GPU", backend.name)
-    }
-
-    @Test
-    fun `should fallback to CPU when both NPU and GPU are unavailable`() {
-        val plugin = LiteRTPlugin()
-        val backend = plugin.selectBackend(
-            nativeLibDir = "",
-            openClAvailable = false,
-            qnnAvailable = false
-        )
-        assertEquals("CPU", backend.name)
-    }
-
-    @Test
-    fun `should enable MTP speculative decoding on GPU backend`() {
-        val plugin = LiteRTPlugin()
-        val config = plugin.buildInferenceConfig(backend = "GPU", mtpEnabled = true)
-        assertTrue(config.multiTokenPrediction)
-    }
-
-    @Test
-    fun `should serialize and restore KV cache correctly`() {
-        val plugin = LiteRTPlugin()
-        val cacheDir = createTempDir("litert_cache")
-        val sessionId = "test-session-001"
-        plugin.saveKVCache(sessionId, cacheDir)
-        val restored = plugin.loadKVCache(sessionId, cacheDir)
-        assertNotNull(restored)
-    }
-}
-```
-
-### 4.2 LiteRTPlugin — Instrumented Device Tests
-
-**File**: `plugins/litert-capacitor/android/src/androidTest/java/com/aimindmesh/mobile/litert/LiteRTDeviceTest.kt`
-
-```kotlin
-import androidx.test.ext.junit.runners.AndroidJUnit4
-import androidx.test.platform.app.InstrumentationRegistry
-import org.junit.Test
-import org.junit.runner.RunWith
-import org.junit.Assert.*
-import com.aimindmesh.mobile.litert.OpenClSamplerDetector
-
-@RunWith(AndroidJUnit4::class)
-class LiteRTDeviceTest {
-
-    @Test
-    fun openClDetector_returns_boolean_without_crash() {
-        val context = InstrumentationRegistry.getInstrumentation().targetContext
-        val detector = OpenClSamplerDetector(context)
-        val isSupported = detector.isSupported()
-        assertNotNull(isSupported)
-    }
-
-    @Test
-    fun nativeLibDir_is_accessible_at_runtime() {
-        val context = InstrumentationRegistry.getInstrumentation().targetContext
-        val nativeLibDir = context.applicationInfo.nativeLibraryDir
-        assertTrue("Native lib dir must exist", java.io.File(nativeLibDir).exists())
-    }
-
-    @Test
-    fun kvCache_restoresContextAfterRestart() {
-        val context = InstrumentationRegistry.getInstrumentation().targetContext
-        val plugin = LiteRTPlugin(context)
-        val sessionId = "bench-session-001"
-        val cacheDir = context.getExternalFilesDir("litert_cache")!!
-
-        plugin.generate("My name is Andrea.", sessionId, saveCache = true, cacheDir = cacheDir)
-        val secondResult = plugin.generate("What is my name?", sessionId, loadCache = true, cacheDir = cacheDir)
-
-        assertTrue("Should remember context", secondResult.contains("Andrea"))
-    }
-}
-```
-
----
-
-### 4.3 LlamaCppInference — Dynamic Library Loading
-
-**File**: `plugins/llama-cpp-capacitor/android/src/test/java/com/aimindmesh/llama/LlamaCppInferenceTest.java`
-
-```java
-import org.junit.Test;
-import org.junit.Before;
-import static org.junit.Assert.*;
-import com.aimindmesh.llama.LlamaCppInference;
-
-public class LlamaCppInferenceTest {
-
-    private LlamaCppInference engine;
-
-    @Before
-    public void setup() {
-        engine = new LlamaCppInference();
-    }
-
-    @Test
-    public void loadOptimalLibrary_selectsCorrectVariantForFeatureSet() {
-        String[] features = { "dotprod", "fp16", "i8mm" };
-        String lib = engine.selectLibraryVariant(features);
-        assertTrue("Should select i8mm variant for Gen 3",
-            lib.contains("i8mm") || lib.contains("gen3"));
-    }
-
-    @Test
-    public void loadOptimalLibrary_fallsBackToBaseLibOnOldSoC() {
-        String[] features = {};
-        String lib = engine.selectLibraryVariant(features);
-        assertEquals("libsmollm.so", lib);
-    }
-
-    @Test
-    public void vulkanAndOpenCLFlags_areIndependent() {
-        engine.setUseVulkan(true);
-        engine.setUseOpenCL(false);
-        assertTrue(engine.isVulkanEnabled());
-        assertFalse(engine.isOpenCLEnabled());
-    }
-
-    @Test
-    public void inference_doesNotCrashOnEmptyPrompt() {
-        try {
-            engine.generate("", 128);
-        } catch (IllegalArgumentException e) {
-            assertTrue(e.getMessage().contains("empty"));
-        }
-    }
-}
-```
-
----
-
-### 4.4 MNN — Backend Binding
-
-**File**: `plugins/mnn-capacitor/android/src/test/java/com/antigravity/mnn/MnnInferenceEngineTest.java`
-
-```java
-import org.junit.Test;
-import static org.junit.Assert.*;
-import com.antigravity.mnn.MnnInferenceEngine;
-
-public class MnnInferenceEngineTest {
-
-    @Test
-    public void mnnBridge_initializesWithoutException() {
-        MnnInferenceEngine engine = new MnnInferenceEngine();
-        assertNotNull(engine);
-    }
-
-    @Test
-    public void mnnBridge_supportsVulkanBackend() {
-        MnnInferenceEngine engine = new MnnInferenceEngine();
-        boolean result = engine.isBackendSupported("VULKAN");
-        assertNotNull(result);
-    }
-}
-```
-
----
-
-## 5. End-to-End Mesh Tests
-
-These tests require a running infrastructure (WireGuard VPN + Server + at least one mobile node).
-
-### Prerequisites
-
-```bash
-cd aimindmesh-server
-docker-compose up -d
-docker-compose ps
-curl http://localhost:3000/health
-ping 10.8.0.2  # mobile node WireGuard IP
-```
-
-### 5.1 Node Registration
-
-```bash
-curl -X POST http://10.8.0.1:3000/api/nodes/register \
-  -H "Authorization: Bearer $AUTH_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "nodeId": "mobile-01",
-    "type": "mobile",
-    "capabilities": ["litert", "llama-cpp", "mnn"],
-    "hardware": {
-      "soc": "Snapdragon 8 Gen 3",
-      "npu": true,
-      "openCL": true
-    }
-  }'
-# Expected: 200 OK, nodeId in response
-```
-
-### 5.2 Inference Delegation (Mobile -> Server)
-
-```bash
-curl -X POST http://10.8.0.1:3000/api/inference \
-  -H "Authorization: Bearer $AUTH_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "Explain quantum entanglement", "type": "complex", "originNode": "mobile-01"}'
-# Expected: response from cloud provider (Gemini/OpenRouter), latency < 10s
-```
-
-### 5.3 Knowledge Graph Sync
-
-```bash
-curl -X POST http://10.8.0.1:3000/api/memory \
-  -H "Authorization: Bearer $AUTH_TOKEN" \
-  -d '{"content": "Test memory entry", "source": "mobile-01"}'
-
-# Verify in Neo4j browser (bolt://localhost:7687):
-# MATCH (m:Memory {source: "mobile-01"}) RETURN m LIMIT 5
-```
-
-### 5.4 FCM Push Delivery
-
-```bash
-curl -X POST http://10.8.0.1:3000/api/insights/push \
-  -H "Authorization: Bearer $AUTH_TOKEN" \
-  -d '{"title": "Test Insight", "body": "E2E test notification", "targetNode": "mobile-01"}'
-# Expected: notification appears on device within 5s
-```
-
----
-
-## 6. Performance Benchmarks
-
-### 6.1 Mobile Inference Benchmarks (Manual — On Device)
-
-Run on a **physical Snapdragon device** (not emulator). Use logcat to capture timings.
-
-| Benchmark | Model | Backend | Target TPS |
-|-----------|-------|---------|------------|
-| LiteRT Gemma 2B | `.litertlm` | NPU (QNN) | >= 30 tok/s |
-| LiteRT Gemma 2B | `.litertlm` | GPU (OpenCL) | >= 20 tok/s |
-| LiteRT Gemma 2B + MTP | `.litertlm` | GPU + MTP | >= 35 tok/s |
-| llama.cpp 3B GGUF Q4 | `.gguf` | OpenCL (Adreno) | >= 15 tok/s |
-| llama.cpp 3B GGUF Q4 | `.gguf` | Vulkan | >= 12 tok/s |
-| MNN 1.5B | `.mnn` | NPU | >= 40 tok/s |
-
-### 6.2 Server Inference Routing Latency
-
-```bash
-# Routing overhead should be < 50ms
-time curl -X POST http://localhost:3000/api/inference \
-  -H "Authorization: Bearer $AUTH_TOKEN" \
-  -d '{"prompt": "ping", "type": "lightweight"}'
-```
-
-### 6.3 KV Cache Resume Test
-
-```kotlin
-@Test
-fun kvCache_restoresContextAfterRestart() {
-    val sessionId = "bench-session-001"
-    val cacheDir = context.getExternalFilesDir("litert_cache")!!
-    plugin.generate("My name is Andrea.", sessionId, saveCache = true, cacheDir = cacheDir)
-    val result = plugin.generate("What is my name?", sessionId, loadCache = true, cacheDir = cacheDir)
-    assertTrue("Should remember context", result.contains("Andrea"))
-}
-```
-
----
-
-## 7. Security & Privacy Tests
-
-### 7.1 Authentication
-
-```bash
-for path in "/api/inference" "/api/nodes" "/api/memory" "/api/evolution/trigger"; do
-  status=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:3000$path)
-  echo "POST $path -> $status (expected 401)"
-done
-```
-
-### 7.2 WireGuard Tunnel Isolation
-
-```bash
-# Must NOT be reachable on public IP
-curl --max-time 3 http://<PUBLIC_VPS_IP>:3000/api/nodes
-# Expected: timeout or connection refused
-
-# Reachable only on WireGuard IP
-curl http://10.8.0.1:3000/api/nodes -H "Authorization: Bearer $AUTH_TOKEN"
-# Expected: 200 OK
-```
-
-### 7.3 OpenClaw Token Protection
-
-```bash
-git check-ignore -v aimindmesh-server/openclaw-config/
-# Expected: .gitignore matches the path
-
-git log --all --full-history -- "**/*.json" | grep -i "token"
-# Expected: no results
-```
-
-### 7.4 DNS Privacy (PiHole + Unbound)
-
-```bash
-dig @10.8.0.1 google.com
-# Expected: Server = 10.8.0.1, not 8.8.8.8
-# On Android: set Private DNS to 10.8.0.1
-# Check PiHole query log to confirm mobile device traffic is visible
-```
-
----
-
-## 8. Auto-Evolution Pipeline Tests
-
-### 8.1 Dry Run Validation
-
-```bash
-curl -X POST http://10.8.0.1:3000/api/evolution/trigger \
-  -H "Authorization: Bearer $AUTH_TOKEN" \
-  -d '{"mode": "dry-run", "target": "InferenceRouter"}'
-
-# Expected:
-# {
-#   "status": "dry-run-complete",
-#   "patchPreview": "...",
-#   "validationResult": { "passed": true },
-#   "committed": false
-# }
-```
-
-### 8.2 Gitea Branch Verification
-
-```bash
-curl http://<GITEA_URL>/api/v1/repos/<owner>/<repo>/branches \
-  -H "Authorization: token $GITEA_TOKEN" | jq '.[].name' | grep "evolution/"
-# Expected: "evolution/YYYY-MM-DD-HHMMSS"
-```
-
-### 8.3 Kasm Sandbox Test
-
-```bash
-curl -X POST http://10.8.0.1:3000/api/openclaw/sandbox/test \
-  -H "Authorization: Bearer $AUTH_TOKEN"
-# Expected: workspace created, hello-world script executed, workspace destroyed
-```
-
----
-
-## 9. Manual Device Testing Checklist
+## 8. Manual Device Testing Checklist
 
 Use this checklist for every release build on a **physical Snapdragon device**.
 
 ### Hardware Inference
-
 - [ ] LiteRT loads `.litertlm` model without crash
-- [ ] NPU backend selected on Snapdragon 8 Gen 2/3 (logcat: `Backend.NPU`)
+- [ ] NPU backend selected on Snapdragon 8 Gen 2/3/Elite (logcat: `Backend.NPU`)
 - [ ] OpenCL detection runs without crash on unsupported devices (fallback to CPU)
-- [ ] MTP speculative decoding active on GPU (logcat: `MTP enabled`)
-- [ ] llama.cpp selects correct `libsmollm.so` variant (logcat: `loadOptimalLibrary`)
-- [ ] VRAM Guardian triggers history compression under memory pressure
-- [ ] KV Cache saves to `cache/litert_cache/` after session ends
-- [ ] KV Cache restores context correctly after app kill + reopen
+- [ ] Genie (QNN) loads an NPU model and reports TTFT/TPS (`adb logcat -s GenieEngine GeniePlugin`)
+- [ ] Stable Diffusion on NPU generates an image (`adb logcat -s SDPlugin SDEngine QnnSdEngineNative QnnGraphIO`): the log shows `tensors from binary` for every graph and the detected `prediction` (Qualcomm SD 2.1: `v_prediction`)
+- [ ] The UberRealistic package (`sd2.1lora`, float tensors) loads and generates; compare the same prompt and seed with the Qualcomm package, Euler vs DPM++ 2M
+- [ ] Edit a portrait photo from the gallery: upright, same proportions, low strength (40%) keeps the composition; a package without `vae_encoder.bin` shows an error instead of a random image
+- [ ] 16:9 with 4x: 2048×1152, not stretched; with the seed's "reuse" button the same prompt gives the same picture
+- [ ] `/image un gatto rosso su un divano` → the reply shows the English prompt used; `/edit` after it (no attachment) edits the generated picture; asking the assistant to "make it night" edits the last picture and shows it in the answer
+- [ ] Open and close the image screen 5 times: RAM (System Monitor) goes back to the LLM-only level each time (SD contexts really freed)
+- [ ] KV Cache saves to `cache/litert_cache/` after session ends and restores after app kill + reopen
 
 ### Voice & Audio
-
 - [ ] VAD detects speech start/end correctly in noisy environment
 - [ ] 3-pass diarization assigns correct speaker labels across 3+ speakers
 - [ ] Durable recording survives 30+ minutes without memory exhaustion
 - [ ] Audio routed correctly via earpiece in Call privacy mode
+- [ ] Kokoro / Piper TTS speak in the selected language
 
 ### Android Auto
-
 - [ ] App appears correctly in Android Auto launcher
 - [ ] `GridTemplate` dashboard loads without crash
-- [ ] Agenda items visible from car head unit
-- [ ] Kanban board accessible from car head unit
+- [ ] Agenda and Kanban visible from the car head unit
 - [ ] Privacy call mode routes audio to earpiece/car speakers
 
 ### Network & Sync
+- [ ] Mobile connects to the server via WireGuard on app startup
+- [ ] Node registers and shows ONLINE in the admin panel (WebSocket with `token`)
+- [ ] Offline mode activates when WireGuard disconnects; sync resumes when it reconnects
+- [ ] FCM notifications delivered within a few seconds of a server push
+- [ ] Chat with provider *AIMindMesh Server* streams token by token and the final answer is still there after reopening the thread
+- [ ] Server unreachable before answering: the fallback provider answers once (no duplicated text)
+- [ ] Sync Now shows "Sync completed"; a chat written on device A appears in the same thread on device B, once
+- [ ] Contextual delivery mode: an insight queued for the device arrives as a notification within 15-30 min with the app in background (`adb logcat -s ProactiveWorker DeliveryClient`)
 
-- [ ] Mobile connects to server via WireGuard on app startup
-- [ ] Node registers and appears in server NodeRegistry
-- [ ] Offline mode activates when WireGuard disconnects
-- [ ] Sync resumes automatically when connection is restored
-- [ ] FCM notifications delivered within 5s of server push
+### Native libraries
+- [ ] Whisper transcription works, and a GGUF model runs through Genie (GenieX's `libggml*.so` are the only ones in the APK)
+- [ ] `adb logcat -s NativeLibrarySelector` names a CPU-specific llama library on Snapdragon 8 Gen 2+ (not the universal one)
 
-### Evolution Notifications
+### Phase 5 fixes (to confirm on the device)
+- [ ] New chat saved in the thread list; Settings edits survive switching app; Back closes overlays before leaving the app
+- [ ] Meeting: record, edit a segment, Back → asks, saves; second recording does not touch the first; screen off for 2 min still records; Vosk tap-to-play at the right time; export Markdown/SRT/audio shares
+- [ ] GGUF reply interrupted by dictation does not crash; a tool call followed by more text continues without "Generation already in progress"
+- [ ] Stop on Piper/Kokoro voices stops at once; Whisper + Kokoro call stays offline (no Gemini Live)
+- [ ] Mic permission prompt and file picker inside the WebView; Vosk/Voxtral ask for the microphone on first use
+- [ ] After the update, memories/documents become searchable again once background re-embedding ends; `multilingual-e5-small` loads
+- [ ] Task reminder 1 h before due date; proactive off cancels the WorkManager job; Android Auto shows data after killing the app
+- [ ] Termux command runs (Termux `allow-external-apps=true`); assistant gesture opens voice mode
+- [ ] Kill the app while recording a meeting, reopen Meeting mode: one "recovered" notice, audio and transcript present
+- [ ] Delete a meeting on device A, sync both: it disappears on device B and does not come back after B syncs
+- [ ] Long chat with Auto-Summarize on: the thread keeps every message after a summary
+- [ ] RAM (System Monitor overlay): at launch only the chat LLM; open the image screen → LLM out, SD in; close it → SD out, LLM back; same with `/image` in chat
+- [ ] Meeting with Voxtral: LLM out during the meeting, back after closing; a voice call with an on-device LLM + Voxtral shows the "do not fit in RAM" message
 
-- [ ] FCM notification appears when evolution cycle completes
-- [ ] Tapping notification opens evolution log in app
-
----
-
-## 10. CI/CD Integration
-
-### Gitea Actions Workflow
-
-**File**: `.gitea/workflows/ci.yml`
-
-```yaml
-name: CI
-
-on:
-  push:
-    branches: [main, develop, 'evolution/**']
-  pull_request:
-    branches: [main]
-
-jobs:
-  server-tests:
-    runs-on: ubuntu-latest
-    services:
-      neo4j:
-        image: neo4j:5
-        env:
-          NEO4J_AUTH: neo4j/testpassword
-        ports:
-          - 7687:7687
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
-        with:
-          node-version: '20'
-      - name: Install dependencies
-        run: cd aimindmesh-server && npm ci
-      - name: Run unit tests
-        run: cd aimindmesh-server && npm test
-      - name: Run coverage
-        run: cd aimindmesh-server && npm run test:coverage
-      - name: Upload coverage
-        uses: actions/upload-artifact@v3
-        with:
-          name: coverage-report
-          path: aimindmesh-server/coverage/
-
-  mobile-unit-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-java@v3
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-      - name: Run LiteRT plugin tests
-        run: cd aimindmesh-mobile && ./gradlew :plugins:litert-capacitor:test
-      - name: Run Llama.cpp plugin tests
-        run: cd aimindmesh-mobile && ./gradlew :plugins:llama-cpp-capacitor:test
-      - name: Run MNN plugin tests
-        run: cd aimindmesh-mobile && ./gradlew :plugins:mnn-capacitor:test
-
-  security-scan:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - name: Verify gitignore protects sensitive files
-        run: |
-          git check-ignore -v aimindmesh-server/openclaw-config/ || echo "WARNING: openclaw-config not gitignored"
-          git check-ignore -v aimindmesh-server/src/config.ts || echo "WARNING: config.ts not gitignored"
-```
+### Security
+- [ ] After updating, the API keys still work after an app restart, and `localStorage` no longer contains them (WebView inspector, debug build)
+- [ ] `adb shell am start -n com.aimindmesh.mobile/.MainActivity --es route "x'}));alert(1);//"` executes no JavaScript; the kanban / call / agenda shortcuts still work
+- [ ] Release build is not listed in `chrome://inspect`
+- [ ] Settings → Docs shows the current `TECHNICAL_SPECIFICATION.md`
 
 ---
 
-## Appendix — Test Environment Variables
+## 9. Gaps
 
-Create `aimindmesh-server/.env.test`:
-
-```env
-NODE_ENV=test
-TEST_AUTH_TOKEN=test-token-do-not-use-in-production
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=testpassword
-GEMINI_API_KEY=your-test-key
-OPENROUTER_API_KEY=your-test-key
-GITEA_URL=http://localhost:3001
-GITEA_TOKEN=your-gitea-test-token
-```
-
-> ⚠️ Never commit `.env.test` with real API keys. Use test/sandbox keys only.
-
----
-
-*Testing Guide — AIMindMesh v1.x*  
-*Co-authored with Perplexity AI & Claude (Anthropic)*  
-*Licensed under PolyForm Noncommercial 1.0.0*
+*   No automated tests for the desktop and admin apps yet (only type-checking); the mobile app has unit tests for pure logic only, not for React components or native plugins.
+*   Android: JVM unit tests for pure logic only (proactive worker, Stable Diffusion scheduler/tokenizer/geometry); no instrumented tests, and the NPU graphs run only on the device.
+*   No end-to-end test against a running server, Neo4j and Gitea.

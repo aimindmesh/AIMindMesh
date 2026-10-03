@@ -5,6 +5,7 @@
  */
 
 import { logger } from '../logger';
+import { ensureResident, isHeavyWhisperModel, markUnloaded } from '../model/modelOrchestrator';
 
 // Plugin import will be available after native build
 let Whisper: any = null;
@@ -44,6 +45,9 @@ export class WhisperSTTService {
     private _isModelLoaded = false;
     private currentModelId: string | null = null;
     private initialized = false;
+    // Device-recommended thread count from getDeviceOptimization(); the native loadModel
+    // ignores nThreads, so it has to be applied per transcription call.
+    private recommendedThreads: number | null = null;
 
     constructor() {
         logger.log('info', 'WhisperSTTService initialized');
@@ -94,34 +98,28 @@ export class WhisperSTTService {
                 await this.unloadModel();
             }
 
-            // In Whisper.cpp plugin, modelPath can be relative to whisper-models or absolute
-            const modelPath = modelId.includes('/') ? modelId : `whisper-models/${modelId}.bin`;
-
-            // Memory coordination: try to unload main LLM to free RAM
-            try {
-                const { releaseAllSmolLM, isSmolLMLoaded } = await import('../llm/smolLM');
-                if (isSmolLMLoaded('chat') || isSmolLMLoaded('tool')) {
-                    logger.log('info', '[WhisperSTT] Unloading main LLM to free memory for Whisper...');
-                    await releaseAllSmolLM();
-                    logger.log('info', '[WhisperSTT] Main LLM unloaded successfully');
+            // In Whisper.cpp plugin, modelPath can be relative to whisper-models or absolute;
+            // a bare id is either `<id>.bin` or an imported bundle directory `<id>`
+            let modelPath = modelId;
+            if (!modelId.includes('/')) {
+                const { resolveWhisperModelRelativePath } = await import('./whisperModelDownloader');
+                const resolved = await resolveWhisperModelRelativePath(modelId);
+                if (!resolved) {
+                    throw new Error(`Whisper model ${modelId} not found. Please download it first.`);
                 }
-            } catch (e) {
-                // Not critical — LLM might not be loaded
-                logger.log('debug', '[WhisperSTT] LLM unload skipped (not loaded or unavailable)');
+                modelPath = resolved;
             }
+
+            // Memory coordination: a medium/large model frees the LLM (any engine) and other
+            // heavy models first; tiny/base/small may stay next to the LLM
+            await ensureResident('whisper', { heavy: isHeavyWhisperModel(modelId) });
 
             // Determine optimal thread count based on device
             const deviceInfo = await this.getDeviceOptimization();
             const nThreads = deviceInfo.recommendedThreads;
+            this.recommendedThreads = nThreads;
 
             logger.log('info', `Using ${nThreads} threads for Whisper model (SoC: ${deviceInfo.soc})`);
-
-            // Check if model exists before loading
-            const { whisperModelExists } = await import('./whisperModelDownloader');
-            const exists = await whisperModelExists(modelId);
-            if (!exists && !modelId.includes('/')) {
-                throw new Error(`Whisper model ${modelId} not found. Please download it first.`);
-            }
 
             await Whisper.loadModel({
                 modelPath,
@@ -152,6 +150,7 @@ export class WhisperSTTService {
             await Whisper.unloadModel();
             this._isModelLoaded = false;
             this.currentModelId = null;
+            markUnloaded('whisper');
             logger.log('info', 'Whisper model unloaded');
         } catch (error) {
             logger.log('error', 'Failed to unload Whisper model', error);
@@ -292,7 +291,8 @@ export class WhisperSTTService {
             throw new Error('Whisper plugin not available');
         }
 
-        if (!this.isModelLoaded) {
+        // The JS flag can be stale after a WebView reload while native still holds the model
+        if (!this._isModelLoaded && !(await this.checkModelLoaded())) {
             throw new Error('No Whisper model loaded. Call loadModel first.');
         }
 
@@ -331,7 +331,8 @@ export class WhisperSTTService {
             throw new Error('Whisper plugin not available');
         }
 
-        if (!this.isModelLoaded) {
+        // The JS flag can be stale after a WebView reload while native still holds the model
+        if (!this._isModelLoaded && !(await this.checkModelLoaded())) {
             throw new Error('No Whisper model loaded. Call loadModel first.');
         }
 
@@ -356,7 +357,7 @@ export class WhisperSTTService {
             temperature: (config as any).whisperTemperature ?? config.temperature ?? profileConfig.temperature ?? 0.0,
             beamSize: (config as any).whisperBeamSize ?? config.beamSize ?? profileConfig.beamSize ?? 5,
             bestOf: (config as any).whisperBestOf ?? config.bestOf ?? profileConfig.bestOf ?? 1,
-            threads: (config as any).whisperThreads ?? 4, // Add threads support
+            threads: (config as any).whisperThreads ?? this.recommendedThreads ?? 4, // Add threads support
             initialPrompt: config.initialPrompt ?? (isItalian ? italianPrompt : ''),
             // VAD parameters
             vadFilter: config.vadFilter ?? profileConfig.vadFilter ?? false,
@@ -402,7 +403,8 @@ export class WhisperSTTService {
             throw new Error('Whisper plugin not available');
         }
 
-        if (!this.isModelLoaded) {
+        // The JS flag can be stale after a WebView reload while native still holds the model
+        if (!this._isModelLoaded && !(await this.checkModelLoaded())) {
             throw new Error('No Whisper model loaded. Call loadModel first.');
         }
 
@@ -493,7 +495,8 @@ export class WhisperSTTService {
             throw new Error('Whisper plugin not available');
         }
 
-        if (!this.isModelLoaded) {
+        // The JS flag can be stale after a WebView reload while native still holds the model
+        if (!this._isModelLoaded && !(await this.checkModelLoaded())) {
             throw new Error('No Whisper model loaded. Call loadModel first.');
         }
 
@@ -518,7 +521,7 @@ export class WhisperSTTService {
                 temperature: (config as any).whisperTemperature ?? config.temperature ?? 0.0,
                 beamSize: (config as any).whisperBeamSize ?? config.beamSize ?? 1, // Greedy for speed
                 bestOf: (config as any).whisperBestOf ?? config.bestOf ?? 1,
-                threads: (config as any).whisperThreads ?? 4,
+                threads: (config as any).whisperThreads ?? this.recommendedThreads ?? 4,
                 initialPrompt: config.initialPrompt ?? (isItalian ? whisperProfiles.italianPrompts.fastPreview : ''),
                 vadFilter: config.vadFilter ?? false,
                 conditionOnPreviousText: config.conditionOnPreviousText ?? false

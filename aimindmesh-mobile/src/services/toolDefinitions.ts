@@ -21,7 +21,8 @@ import { mediaTools } from './tools/mediaTools';
 export * from './tools/types';
 
 /**
- * All available tools for the AI
+ * All available tools for the AI. Names are unique (first definition wins): Gemini rejects a
+ * tool list with a repeated function name.
  */
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
     ...webTools,
@@ -33,7 +34,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     ...documentTools,
     ...workspaceTools,
     ...mediaTools
-];
+].filter((tool, index, all) => all.findIndex(t => t.name === tool.name) === index);
 
 /**
  * Get function declarations in Gemini format
@@ -44,7 +45,10 @@ export function getGeminiFunctionDeclarations(toolRules: Record<string, string> 
         .map(tool => ({
             name: tool.name,
             description: tool.description,
-            parameters: tool.parameters as any // Cast to any because our Schema is slightly more specific but compatible
+            // A parameterless tool is declared without a schema: an OBJECT with no properties can be rejected
+            ...(Object.keys(tool.parameters.properties).length > 0
+                ? { parameters: tool.parameters as any } // Our Schema is slightly more specific but compatible
+                : {})
         }));
 }
 

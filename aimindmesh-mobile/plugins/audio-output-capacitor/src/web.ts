@@ -12,4 +12,9 @@ export class AudioOutputWeb extends WebPlugin implements AudioOutputPlugin {
         console.log('getSpeakerphoneStatus called on web, not supported');
         return Promise.resolve({ enabled: false });
     }
+
+    async resetAudioMode(): Promise<void> {
+        // No call routing on web
+        return Promise.resolve();
+    }
 }

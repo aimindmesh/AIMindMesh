@@ -163,6 +163,9 @@ const ThreadListModal: React.FC<ThreadListModalProps> = ({
     const handleDelete = (threadId: string) => {
         if (window.confirm('Delete this conversation? This cannot be undone.')) {
             triggerHaptic('MEDIUM');
+            // The open chat still shows this conversation: its next save would store it again.
+            // Leaving it first also flushes its pending save before the delete.
+            if (threadId === activeThreadId) onNewConversation();
             deleteThread(threadId);
             refreshData();
         }

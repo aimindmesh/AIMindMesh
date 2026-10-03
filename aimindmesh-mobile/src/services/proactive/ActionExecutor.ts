@@ -1,9 +1,21 @@
 
 import { ProactiveAction, ProactiveActionType } from '../../types/proactive';
+import { readSetting } from '../security/secretStore';
+import { getActiveThreadId } from '../llm/threadManager';
 import { activityLogger } from './ActivityLogger';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import { logger } from '../logger';
 import { proactiveNotificationService } from './ProactiveNotificationService';
+
+const CHAT_HISTORY_KEY = 'chat-history';
+/** Providers that cannot generate without their key (same rule as the memory extraction) */
+const KEYED_PROVIDERS = ['gemini', 'perplexity', 'claude'];
+
+function getProviderApiKey(provider: string): string {
+    const key = provider === 'perplexity' ? 'perplexity-api-key'
+        : provider === 'claude' ? 'claude-api-key' : 'gemini-api-key';
+    return readSetting<string>(key, '');
+}
 
 // Event bus for UI interactions
 type ActionHandler = (action: ProactiveAction) => Promise<void>;
@@ -131,14 +143,9 @@ class ActionExecutor {
             // Perform memory deduplication and summarization
             const resultDetails: any = {};
 
-            // Get LLM config from localStorage
-            const llmConfigStr = localStorage.getItem('llm-config');
-            const apiKey = localStorage.getItem('gemini-api-key') || '';
-            let llmConfig: any = null;
-
-            if (llmConfigStr) {
-                llmConfig = JSON.parse(llmConfigStr);
-            }
+            // Settings with their secrets (the raw key used to keep its JSON quotes)
+            const llmConfig: any = readSetting<any>('llm-config', null);
+            const apiKey = readSetting<string>('gemini-api-key', '');
 
             if (!llmConfig || !apiKey) {
                 logger.log('warn', '[ActionExecutor] Cannot perform memory maintenance: LLM config or API key missing');
@@ -186,11 +193,14 @@ class ActionExecutor {
             // Perform context summarization
             logger.log('info', `[ActionExecutor] Starting context summarization (usage: ${Math.round(action.data.currentUsage * 100)}%, count: ${action.data.messageCount})`);
 
-            const { summarizeConversation } = await import('../llm/contextSummarization');
+            const { summarizeForModel } = await import('../llm/contextSummarization');
+            const { applyContextSummary, saveContextSummary } = await import('../llm/contextSummaryStore');
 
-            // Get chat history from localStorage
-            const historyItem = localStorage.getItem('chat-history');
-            if (!historyItem) {
+            // The summary belongs to the active thread and only shortens what the model receives:
+            // the conversation itself (chat-history and the saved thread) is never rewritten
+            const threadId = getActiveThreadId();
+            const historyItem = localStorage.getItem(CHAT_HISTORY_KEY);
+            if (!historyItem || !threadId) {
                 logger.log('warn', '[ActionExecutor] No chat history found');
                 action.result = { success: false, reason: 'no_history' };
                 return;
@@ -203,19 +213,15 @@ class ActionExecutor {
                 return value;
             });
 
-            // Get LLM config and API key
-            const settingsItem = localStorage.getItem('settings');
-            if (!settingsItem) {
-                logger.log('warn', '[ActionExecutor] Settings not found');
-                action.result = { success: false, reason: 'no_settings' };
+            // Model config and its key, as App stores them ('llm-config', '<provider>-api-key')
+            const llmConfig: any = readSetting<any>('llm-config', null);
+            if (!llmConfig) {
+                logger.log('warn', '[ActionExecutor] LLM config not found');
+                action.result = { success: false, reason: 'no_llm_config' };
                 return;
             }
-
-            const settings = JSON.parse(settingsItem);
-            const llmConfig: any = settings.llmConfig;
-            const apiKey = settings.apiKey;
-
-            if (!apiKey) {
+            const apiKey = getProviderApiKey(llmConfig.provider);
+            if (KEYED_PROVIDERS.includes(llmConfig.provider) && !apiKey) {
                 logger.log('warn', '[ActionExecutor] API key not found');
                 action.result = { success: false, reason: 'no_api_key' };
                 return;
@@ -228,28 +234,39 @@ class ActionExecutor {
                 return;
             }
 
-            // Perform summarization
-            const summarized = await summarizeConversation(
-                messages,
-                llmConfig,
-                action.data.threshold,
-                apiKey
-            );
+            const modelHistory = applyContextSummary(messages, threadId);
+            const result = await summarizeForModel(modelHistory, llmConfig, action.data.threshold, apiKey || undefined);
+            if (!result) {
+                action.result = { success: false, reason: 'nothing_summarized' };
+                return;
+            }
 
-            // Save back to localStorage
-            localStorage.setItem('chat-history', JSON.stringify(summarized));
+            // The covered messages must still be in the conversation (it may have been cleared meanwhile)
+            const stillCovered = (): boolean => {
+                try {
+                    const current: { id?: string }[] = JSON.parse(localStorage.getItem(CHAT_HISTORY_KEY) || '[]');
+                    return Array.isArray(current) && current.some(m => m?.id === result.coversUpToId);
+                } catch {
+                    return false;
+                }
+            };
+            if (getActiveThreadId() !== threadId || !stillCovered()) {
+                logger.log('info', '[ActionExecutor] Chat changed during summarization, result discarded');
+                action.result = { success: false, reason: 'history_changed' };
+                return;
+            }
+            saveContextSummary({ threadId, summary: result.summary, coversUpToId: result.coversUpToId, createdAt: Date.now() });
 
             logger.log('info', `[ActionExecutor] Context summarization complete`, {
-                originalCount: messages.length,
-                newCount: summarized.length,
-                saved: messages.length - summarized.length
+                modelHistory: modelHistory.length,
+                summarized: result.summarizedCount
             });
 
             action.result = {
                 success: true,
-                originalCount: messages.length,
-                newCount: summarized.length,
-                messagesSaved: messages.length - summarized.length
+                originalCount: modelHistory.length,
+                newCount: modelHistory.length - result.summarizedCount + 1,
+                messagesSaved: result.summarizedCount - 1
             };
         }
     }

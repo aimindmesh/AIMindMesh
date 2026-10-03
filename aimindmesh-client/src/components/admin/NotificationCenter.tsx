@@ -24,20 +24,20 @@ export function NotificationCenter({ status, fcmLogs, onTestNotification, config
     <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 animate-in fade-in duration-500">
       <div className="xl:col-span-2 flex flex-col gap-6">
         {/* Gateway Status */}
-        <div className={`p-8 rounded-[40px] border-2 flex items-center justify-between shadow-2xl transition-all ${status?.fcmStatus ? 'bg-success/5 border-success/30' : 'bg-error/5 border-error/30'}`}>
+        <div className={`p-8 rounded-[40px] border-2 flex items-center justify-between shadow-2xl transition-all ${status?.fcmStatus?.configured ? 'bg-success/5 border-success/30' : 'bg-error/5 border-error/30'}`}>
           <div className="flex items-center gap-6">
-            <div className={`p-4 rounded-3xl ${status?.fcmStatus ? 'bg-success text-white' : 'bg-error text-white'} shadow-lg`}>
+            <div className={`p-4 rounded-3xl ${status?.fcmStatus?.configured ? 'bg-success text-white' : 'bg-error text-white'} shadow-lg`}>
               <Bell size={32} />
             </div>
             <div>
               <h3 className="font-black text-2xl tracking-tighter italic uppercase">Neural Push Gateway</h3>
               <p className="text-sm text-foreground/70 font-bold mt-1">
-                {status?.fcmStatus ? 'Relay established via Firebase Cloud Messaging' : 'Gateway dormant - Verify service account credentials'}
+                {status?.fcmStatus?.configured ? 'Relay established via Firebase Cloud Messaging' : 'Gateway dormant - Verify service account credentials'}
               </p>
             </div>
           </div>
-          <div className={`px-6 py-2 rounded-2xl text-xs font-black uppercase tracking-[0.2em] border-2 ${status?.fcmStatus ? 'bg-success/20 border-success/40 text-success' : 'bg-error/20 border-error/40 text-error'}`}>
-            {status?.fcmStatus ? 'ACTIVE_LINK' : 'VOID_SIGNAL'}
+          <div className={`px-6 py-2 rounded-2xl text-xs font-black uppercase tracking-[0.2em] border-2 ${status?.fcmStatus?.configured ? 'bg-success/20 border-success/40 text-success' : 'bg-error/20 border-error/40 text-error'}`}>
+            {status?.fcmStatus?.configured ? 'ACTIVE_LINK' : 'VOID_SIGNAL'}
           </div>
         </div>
 

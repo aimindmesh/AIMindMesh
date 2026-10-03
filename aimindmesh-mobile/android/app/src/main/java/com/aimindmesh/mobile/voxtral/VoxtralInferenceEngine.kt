@@ -11,8 +11,12 @@ import java.util.concurrent.LinkedBlockingQueue
  * PCM audio → mel spectrogram → CLIP encoding → llama decode → text tokens.
  */
 class VoxtralInferenceEngine {
+    // Every native call holds this lock: release() can never free the context under a running chunk
+    private val lock = Any()
+    @Volatile
     private var nativeHandle: Long = 0
     private val tokenQueue: BlockingQueue<String> = LinkedBlockingQueue()
+    @Volatile
     private var isRunning = false
 
     companion object {
@@ -87,7 +91,7 @@ class VoxtralInferenceEngine {
         modelPath: String,
         mmprojPath: String,
         nThreads: Int = 4
-    ): Boolean {
+    ): Boolean = synchronized(lock) {
         if (nativeHandle != 0L) {
             Log.w(TAG, "Model already initialized, releasing previous instance")
             release()
@@ -100,12 +104,12 @@ class VoxtralInferenceEngine {
 
         if (nativeHandle == 0L) {
             Log.e(TAG, "Failed to initialize model")
-            return false
+            return@synchronized false
         }
 
         isRunning = true
         Log.i(TAG, "Model initialized successfully (handle: $nativeHandle)")
-        return true
+        true
     }
 
     /**
@@ -114,18 +118,18 @@ class VoxtralInferenceEngine {
      * @param audioData Float array of PCM audio samples (16kHz mono)
      * @return Number of tokens generated, or -1 on error
      */
-    fun processAudioChunk(audioData: FloatArray): Int {
+    fun processAudioChunk(audioData: FloatArray): Int = synchronized(lock) {
         if (nativeHandle == 0L) {
             Log.e(TAG, "Cannot process audio: model not initialized")
-            return VOXTRAL_ERR_NULL_HANDLE
+            return@synchronized VOXTRAL_ERR_NULL_HANDLE
         }
 
         if (!isRunning) {
             Log.w(TAG, "Engine is not running")
-            return VOXTRAL_OK
+            return@synchronized VOXTRAL_OK
         }
 
-        return try {
+        try {
             val result = nativeProcessAudio(nativeHandle, audioData, audioData.size)
 
             when {
@@ -151,9 +155,8 @@ class VoxtralInferenceEngine {
      * 
      * @return Token string, or null if queue is empty
      */
-    fun pollToken(): String? {
-        if (nativeHandle == 0L) return null
-        return nativeGetToken(nativeHandle)
+    fun pollToken(): String? = synchronized(lock) {
+        if (nativeHandle == 0L) null else nativeGetToken(nativeHandle)
     }
 
     /**
@@ -175,7 +178,7 @@ class VoxtralInferenceEngine {
      * Reset the context (KV cache, audio buffer, token queue)
      * Useful between transcription sessions.
      */
-    fun resetContext() {
+    fun resetContext() = synchronized(lock) {
         if (nativeHandle != 0L) {
             Log.d(TAG, "Resetting Voxtral context")
             nativeResetContext(nativeHandle)
@@ -186,18 +189,15 @@ class VoxtralInferenceEngine {
      * Check if the native model is loaded and ready
      */
     fun isModelLoaded(): Boolean {
-        if (nativeHandle == 0L) return false
-        return try {
-            nativeIsModelLoaded(nativeHandle)
-        } catch (e: Exception) {
-            false
-        }
+        // nativeInitModel only returns a handle once model, context and mtmd are all loaded;
+        // no lock here so status checks never wait for a chunk being transcribed
+        return nativeHandle != 0L
     }
 
     /**
      * Release native resources
      */
-    fun release() {
+    fun release() = synchronized(lock) {
         if (nativeHandle != 0L) {
             Log.d(TAG, "Releasing Voxtral model (handle: $nativeHandle)")
             isRunning = false

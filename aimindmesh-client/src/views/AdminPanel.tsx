@@ -18,26 +18,8 @@ import { TaskOrchestrator } from '../components/admin/TaskOrchestrator';
 import { BackupManagement } from '../components/admin/BackupManagement';
 import { StatisticsView } from '../components/admin/StatisticsView';
 import { QuarantineView } from '../components/admin/QuarantineView';
+import type { AdminServerStatus as ServerStatus } from '../types/adminStatus';
 
-interface ServerNode {
-  id: string; type: string; status: string; url: string; models?: string[]; last_heartbeat?: number; version?: string; address?: string;
-}
-
-interface ServerStatus {
-  nodes: ServerNode[]; geminiUsage: number; openrouterUsage: number; cpu: number; ram: { total: string; used: string; percent: number }; fcmStatus?: boolean; dailyQuotaCap?: number; openrouterDailyQuotaCap?: number; coreCount?: number;
-  infrastructureBrake: boolean;
-  openClawHealth?: {
-    isHealthy: boolean;
-    statusMessage: string;
-    lastCheck: number;
-  };
-  openrouterCredits?: {
-    balance: number;
-    total_usage: number;
-    total_credits: number;
-    lastChecked: number;
-  } | null;
-}
 
 interface ServerConfig {
   proactive?: { enabled: boolean; intervalHours?: number; relevanceThreshold?: number; quietHoursStart?: string; quietHoursEnd?: string; };
@@ -176,7 +158,7 @@ export default function AdminPanel() {
   }, [activeTab, loadTasks]);
 
   useEffect(() => {
-    let timeoutId: NodeJS.Timeout;
+    let timeoutId: ReturnType<typeof setTimeout>;
     let isMounted = true;
 
     const poll = async () => {

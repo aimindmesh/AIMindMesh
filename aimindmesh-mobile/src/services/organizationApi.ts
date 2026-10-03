@@ -1,77 +1,8 @@
 import { AIMindMeshServerSettings } from '../types';
+import type { Directive, OrgRole, IdeaProposal, AuditLogEntry, DiscoveryConfig } from '@aimindmesh/api-types';
 
-export interface Directive {
-  id: string;
-  title: string;
-  description: string;
-  goalType: 'explore' | 'build' | 'improve' | 'stop' | 'pivot' | 'research';
-  constraints: Record<string, any>;
-  priority: number;
-  status: 'active' | 'completed' | 'cancelled';
-  createdBy: string;
-  supersedesId?: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface OrgRole {
-  id: string;
-  name: string;
-  description: string;
-  mission: string;
-  systemPrompt: string;
-  providerPreferences: Record<string, any>;
-  toolPermissions: string[];
-  memoryNamespace: string;
-  status: 'active' | 'paused' | 'archived';
-  approvalPolicy: Record<string, any>;
-  canRecruit: boolean;
-  canProposeRepo: boolean;
-  canProvisionValidation: boolean;
-  createdBy: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface IdeaProposal {
-  id: string;
-  title: string;
-  problemStatement: string;
-  summary: string;
-  sourceSignals: string[];
-  strategicScore: number;
-  feasibilityScore: number;
-  noveltyScore: number;
-  overallScore: number;
-  status: 'proposed' | 'reviewing' | 'approved' | 'rejected';
-  analysisSynthesis?: string | null;
-  humanFeedback?: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface AuditLogEntry {
-  id: string;
-  event_type: string;
-  actor_type: string;
-  actor_id: string;
-  target_type: string;
-  target_id: string;
-  payload: string;
-  created_at: string;
-}
-
-export interface DiscoveryConfig {
-  enabled: boolean;
-  cronExpression: string;
-  maxTopicsPerCycle: number;
-  minScoreThreshold: number;
-  autoCouncil: boolean;
-  minAutoCouncilScore: number;
-  lastRunAt: string | null;
-  updatedAt: string;
-  isRunning?: boolean;
-}
+// Organization types come from the server contract (aimindmesh-server/src/types/api.ts)
+export type { Directive, OrgRole, IdeaProposal, AuditLogEntry, DiscoveryConfig };
 
 function headers(settings: AIMindMeshServerSettings) {
   return {

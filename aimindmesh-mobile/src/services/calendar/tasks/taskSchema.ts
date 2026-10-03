@@ -54,27 +54,27 @@ export async function migrateTasksTable(dbInstance?: SQLiteDBConnection): Promis
         );
 
         if (result.values && result.values.length > 0) {
-            logger.log('info', '[TaskDB] Tasks table already exists, skipping migration');
-            return;
+            logger.log('info', '[TaskDB] Tasks table already exists');
+        } else {
+            logger.log('info', '[TaskDB] Creating calendar_tasks table...');
+
+            // Create table
+            await db.execute(TASK_SCHEMA);
+
+            // Create indexes
+            for (const indexSql of TASK_INDEXES) {
+                await db.execute(indexSql);
+            }
+
+            logger.log('info', '[TaskDB] Migration complete - calendar_tasks table created');
         }
-
-        logger.log('info', '[TaskDB] Creating calendar_tasks table...');
-
-        // Create table
-        await db.execute(TASK_SCHEMA);
-
-        // Create indexes
-        for (const indexSql of TASK_INDEXES) {
-            await db.execute(indexSql);
-        }
-
-        logger.log('info', '[TaskDB] Migration complete - calendar_tasks table created');
     } catch (error) {
         logger.log('error', '[TaskDB] Failed to migrate tasks table', error);
         throw error;
     }
 
     // ─── AI Delegation Migration ───────────────────────────────────────────────────
+    // Also for tables created before these columns existed (createTask writes them)
     try {
         const columnsToAdd = [
             { name: 'assignee',        definition: "TEXT NOT NULL DEFAULT 'user'" },
@@ -82,7 +82,10 @@ export async function migrateTasksTable(dbInstance?: SQLiteDBConnection): Promis
             { name: 'server_task_id',  definition: 'TEXT' },
         ];
 
-        for (const col of columnsToAdd) {
+        const info = await db.query('PRAGMA table_info(calendar_tasks)');
+        const existing = new Set((info.values || []).map((row: any) => row.name));
+
+        for (const col of columnsToAdd.filter(c => !existing.has(c.name))) {
             try {
                 await db.execute(`ALTER TABLE calendar_tasks ADD COLUMN ${col.name} ${col.definition}`);
                 logger.log('info', `[TaskDB] Column added: ${col.name}`);

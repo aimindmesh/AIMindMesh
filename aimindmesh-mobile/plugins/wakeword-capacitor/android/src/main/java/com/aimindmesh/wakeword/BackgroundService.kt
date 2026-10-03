@@ -14,6 +14,10 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
@@ -37,8 +41,17 @@ class BackgroundService : Service() {
         const val BROADCAST_WAKE_WORD_DETECTED = "com.aimindmesh.wakeword.DETECTED"
         const val EXTRA_WAKE_WORD = "wakeWord"
         const val EXTRA_CONFIDENCE = "confidence"
+        // JS keeps its own listening flag: without these it never learned that the service
+        // stopped (notification Stop, audio/model errors) and could neither stop nor restart it
+        const val BROADCAST_STATE_CHANGED = "com.aimindmesh.wakeword.STATE_CHANGED"
+        const val EXTRA_IS_LISTENING = "isListening"
+        const val BROADCAST_ERROR = "com.aimindmesh.wakeword.ERROR"
+        const val EXTRA_ERROR = "error"
+        const val EXTRA_ERROR_CODE = "code"
         
         var isRunning = false
+        /** True while wake-word detection (not just a training session) is capturing audio. */
+        @Volatile var isListening = false
         private var instance: BackgroundService? = null
 
         fun getTrainingAudio(): String? {
@@ -65,7 +78,11 @@ class BackgroundService : Service() {
     private var cooldownMs: Long = 2000
     private var consecutiveFrames: Int = 8
 
-    private val serviceScope = CoroutineScope(Dispatchers.Default)
+    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private var detectionJob: Job? = null
+    @Volatile private var destroyed = false
+    // Whether the app asked for wake-word listening (vs. a service started only for training)
+    private var listeningRequested = false
 
     override fun onCreate() {
         super.onCreate()
@@ -88,7 +105,9 @@ class BackgroundService : Service() {
                 handleStartListening(intent)
             }
             ACTION_STOP_LISTENING -> {
+                listeningRequested = false
                 stopSelf()
+                return START_NOT_STICKY
             }
             ACTION_UPDATE_CONFIG -> {
                 handleUpdateConfig(intent)
@@ -98,7 +117,10 @@ class BackgroundService : Service() {
             }
             ACTION_STOP_TRAINING -> {
                 wakeWordDetector?.stopTraining()
-                stopSelf()
+                // Closing the training wizard used to kill active wake-word listening too
+                if (!listeningRequested) {
+                    stopSelf()
+                }
             }
             ACTION_SAVE_PROFILE -> {
                 val name = intent.getStringExtra("name")
@@ -127,6 +149,7 @@ class BackgroundService : Service() {
         bufferSize = intent.getIntExtra("bufferSize", 20)
         cooldownMs = intent.getLongExtra("cooldownMs", 2000)
         consecutiveFrames = intent.getIntExtra("consecutiveFrames", 8)
+        listeningRequested = true
 
         // Show foreground notification
         startForeground(1, createNotification("In ascolto...", "AMM Mobile è pronto"))
@@ -171,7 +194,8 @@ class BackgroundService : Service() {
 
         val currentModel = modelName ?: return
         
-        serviceScope.launch {
+        detectionJob?.cancel()
+        detectionJob = serviceScope.launch {
             try {
                 if (wakeWordDetector == null) {
                     wakeWordDetector = WakeWordDetector(this@BackgroundService)
@@ -188,9 +212,13 @@ class BackgroundService : Service() {
                 val loaded = wakeWordDetector?.loadModels(currentModel)
                 if (loaded != true) {
                     Log.e(TAG, "Failed to load models in background service")
+                    broadcastError("Failed to load wake word models", "MODEL_ERROR")
                     stopSelf()
                     return@launch
                 }
+                // Stopped or restarted while models were loading: starting the mic now would
+                // leave an AudioRecord running with no service to stop it
+                if (destroyed || !isActive) return@launch
 
                 // Start Audio
                 audioProcessor = AudioProcessor(
@@ -202,18 +230,39 @@ class BackgroundService : Service() {
                     },
                     onError = { error ->
                         Log.e(TAG, "Audio error: $error")
+                        broadcastError(error, "AUDIO_ERROR")
                         stopSelf()
                     }
                 )
                 
                 audioProcessor?.start()
-                Log.i(TAG, "Background detection started")
+                if (audioProcessor?.isRecording == true) {
+                    isListening = true
+                    broadcastState(true)
+                    Log.i(TAG, "Background detection started")
+                }
                 
             } catch (e: Exception) {
                 Log.e(TAG, "Error starting detection", e)
+                broadcastError(e.message ?: "Error starting detection", "UNKNOWN_ERROR")
                 stopSelf()
             }
         }
+    }
+
+    private fun broadcastState(listening: Boolean) {
+        sendBroadcast(Intent(BROADCAST_STATE_CHANGED).apply {
+            putExtra(EXTRA_IS_LISTENING, listening)
+            setPackage(packageName)
+        })
+    }
+
+    private fun broadcastError(message: String, code: String) {
+        sendBroadcast(Intent(BROADCAST_ERROR).apply {
+            putExtra(EXTRA_ERROR, message)
+            putExtra(EXTRA_ERROR_CODE, code)
+            setPackage(packageName)
+        })
     }
 
     private fun processAudio(rawAudio: FloatArray, amplifiedAudio: FloatArray) {
@@ -250,6 +299,7 @@ class BackgroundService : Service() {
     }
 
     private fun stopDetection() {
+        isListening = false
         audioProcessor?.stop()
         audioProcessor = null
         wakeWordDetector?.release()
@@ -271,7 +321,10 @@ class BackgroundService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        destroyed = true
+        serviceScope.cancel()
         stopService()
+        broadcastState(false)
         Log.i(TAG, "BackgroundService destroyed")
         if (instance == this) instance = null
     }

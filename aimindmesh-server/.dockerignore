@@ -8,3 +8,15 @@ openclaw-config
 backups
 *.db
 *.log
+# Secrets: provided at runtime via volumes / env_file, never baked into the image
+config.json
+.env
+.env.*
+firebase-service-account.json
+*.bak
+# Tests are not part of the image
+test
+vitest.config.mts
+tsconfig.test.json
+# Private deployment scripts
+deploy_*.sh

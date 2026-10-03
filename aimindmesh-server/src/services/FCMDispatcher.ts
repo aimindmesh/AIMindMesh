@@ -12,6 +12,37 @@ export interface FCMPayload {
 }
 const SERVICE_ACCOUNT_PATH = config.fcm?.serviceAccountPath ?? './firebase-service-account.json';
 
+/**
+ * Control messages for the app, not for the user. Sent data-only: a message with a
+ * `notification` block reaches a backgrounded app only as a tray notification, so its code
+ * would never connect the node or run the sync.
+ */
+export const CONTROL_MESSAGE_TYPES = new Set(['WAKE_FOR_INFERENCE', 'SYNC_REQUEST']);
+
+/** FCM v1 `message` for one device. FCM data values must be strings. */
+export function buildFcmMessage(fcmToken: string, payload: FCMPayload) {
+  const data: Record<string, string> = payload.data ?? {};
+  if (CONTROL_MESSAGE_TYPES.has(data.type)) {
+    return {
+      token: fcmToken,
+      // title/body travel as data: the app shows them itself if it is not running
+      data: { ...data, title: payload.title, body: payload.body },
+      android: { priority: 'high' }
+    };
+  }
+  return {
+    token: fcmToken,
+    notification: {
+      title: payload.title,
+      body: payload.body
+    },
+    data,
+    android: {
+      priority: 'high'
+    }
+  };
+}
+
 // Lazy init — nothing runs at module load time
 let _auth: GoogleAuth | null = null;
 let _fcmUrl: string | null = null;
@@ -71,19 +102,7 @@ export async function sendToDevice(fcmToken: string, payload: FCMPayload): Promi
   try {
     const accessToken = await getAccessToken();
 
-    const body = {
-      message: {
-        token: fcmToken,
-        notification: {
-          title: payload.title,
-          body: payload.body
-        },
-        data: payload.data ?? {},
-        android: {
-          priority: 'high'
-        }
-      }
-    };
+    const body = { message: buildFcmMessage(fcmToken, payload) };
 
     Logger.debug('FCM', 'Synaptic pulse dispatching', body);
     const response = await fetch(fcmUrl, {

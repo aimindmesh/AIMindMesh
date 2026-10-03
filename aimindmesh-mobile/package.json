@@ -12,8 +12,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri",
-    "desktop": "tauri dev"
+    "test": "vitest run"
   },
   "dependencies": {
     "@blocknote/core": "^0.49.0",
@@ -34,7 +33,6 @@
     "@capacitor/status-bar": "^7.0.3",
     "@capawesome/capacitor-file-picker": "^7.2.0",
     "@ebarooni/capacitor-calendar": "^7.2.0",
-    "@emotion/react": "^11.14.0",
     "@google/genai": "^1.27.0",
     "@mantine/core": "^8.3.18",
     "@mantine/hooks": "^8.3.18",
@@ -42,8 +40,6 @@
     "@tauri-apps/plugin-clipboard-manager": "^2.3.2",
     "@tauri-apps/plugin-dialog": "^2.6.0",
     "@tauri-apps/plugin-fs": "^2.4.5",
-    "@tauri-apps/plugin-shell": "^2.3.5",
-    "@types/react-beautiful-dnd": "^13.1.8",
     "android-auto-capacitor": "file:plugins/android-auto-capacitor",
     "audio-output-capacitor": "file:plugins/audio-output-capacitor",
     "background-service-capacitor": "file:plugins/background-service-capacitor",
@@ -53,9 +49,6 @@
     "litert-capacitor": "file:plugins/litert-capacitor",
     "llama-cpp-capacitor": "file:plugins/llama-cpp-capacitor",
     "mammoth": "^1.11.0",
-    "mobx": "^6.15.4",
-    "mobx-persist-store": "^1.1.8",
-    "mobx-react": "^9.2.2",
     "pdfjs-dist": "^5.4.624",
     "piper-capacitor": "file:plugins/piper-capacitor",
     "piper-wasm": "^0.1.4",
@@ -78,6 +71,7 @@
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/cli": "^2.10.0",
     "@types/react": "^18.2.0",
+    "@types/react-beautiful-dnd": "^13.1.8",
     "@types/react-dom": "^18.2.0",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
@@ -92,7 +86,8 @@
     "prettier-plugin-java": "^2.8.1",
     "tailwindcss": "^3.4.4",
     "typescript": "^5.2.2",
-    "vite": "^7.1.12"
+    "vite": "^7.1.12",
+    "vitest": "^3.2.7"
   },
   "overrides": {
     "eslint": "^9.26.0",

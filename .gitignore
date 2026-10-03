@@ -97,6 +97,8 @@ ws_test.js
 *.db
 *.sqlite
 data/
+# ...but the mobile app's src/data holds source code (in-app documentation module)
+!aimindmesh-mobile/src/data/
 openclaw-workspace/
 openclaw-config/
 
@@ -114,6 +116,9 @@ openclaw-config/
 **/models/
 **/Models/
 **/InitialConfiguration/models/
+# ...but llama.cpp keeps per-architecture *source code* in models/ dirs (compiled by the plugin and Voxtral)
+!aimindmesh-mobile/plugins/llama-cpp-capacitor/cpp/models/
+!aimindmesh-mobile/plugins/llama-cpp-capacitor/cpp/tools/mtmd/models/
 
 # Infrastructure Secrets
 infrastructure/docker/core/config.json
@@ -160,4 +165,19 @@ aimindmesh-mobile/scripts/download_realesrgan_job.py
 aimindmesh-mobile/scripts/exported_realesrgan/
 aimindmesh-mobile/scripts/download_uberrealistic_models.py
 aimindmesh-mobile/scripts/export_uberrealistic.py
-.gitignore
+
+# Gitea Actions runner (registration token)
+infrastructure/docker/services/gitea/act_runner/config.yaml
+infrastructure/docker/services/gitea/act_runner/docker-compose.yml
+infrastructure/docker/services/gitea/act_runner/data/
+
+# Build outputs and unused binaries (removed in Phase 3, must not come back)
+aimindmesh-mobile/lib/
+aimindmesh-mobile/android/app/release/
+aimindmesh-mobile/release/
+aimindmesh-admin-mobile/android/app/release/
+aimindmesh-admin-mobile/release/
+**/onnxruntime_extracted/
+
+# Private deployment notes for AI assistants (VPS host, container map)
+GEMINI.local.md

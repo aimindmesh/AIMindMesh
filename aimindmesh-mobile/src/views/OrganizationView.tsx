@@ -6,11 +6,12 @@ import { triggerHaptic } from '../services/native';
 
 interface OrganizationViewProps {
   serverSettings: AIMindMeshServerSettings | undefined;
+  isActive?: boolean; // false while the tab is hidden: polling pauses
 }
 
 type TabType = 'directives' | 'ideas' | 'repos' | 'roles' | 'audit';
 
-const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) => {
+const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings, isActive = true }) => {
   const {
     directives, ideas, roles, auditLogs, repositories, hrProposals, discoveryConfig,
     loading, error,
@@ -95,12 +96,11 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
       setRepoLogs(null);
       return;
     }
+    if (!isActive) return;
     fetchRepoLogs(selectedRepoForLogs.repo_name);
-    const interval = setInterval(() => {
-      fetchRepoLogs(selectedRepoForLogs.repo_name);
-    }, 4000);
+    const interval = setInterval(() => fetchRepoLogs(selectedRepoForLogs.repo_name), 4000);
     return () => clearInterval(interval);
-  }, [selectedRepoForLogs, fetchRepoLogs]);
+  }, [selectedRepoForLogs, fetchRepoLogs, isActive]);
 
   const loadData = useCallback(async () => {
     if (!serverSettings?.enabled) return;
@@ -120,11 +120,7 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
   };
 
   useEffect(() => {
-    if (selectedIdea) {
-      setHumanFeedbackText(selectedIdea.humanFeedback || '');
-    } else {
-      setHumanFeedbackText('');
-    }
+    setHumanFeedbackText(selectedIdea?.humanFeedback || '');
   }, [selectedIdea]);
 
   const handleSaveIdea = async () => {
@@ -148,10 +144,11 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings }) =
   };
 
   useEffect(() => {
+    if (!isActive) return; // hidden tab: refreshed when shown again
     loadData();
     const interval = setInterval(loadData, 30000);
     return () => clearInterval(interval);
-  }, [loadData]);
+  }, [loadData, isActive]);
 
   useEffect(() => {
     if (discoveryConfig && !discoverySettings) {

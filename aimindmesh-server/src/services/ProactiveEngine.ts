@@ -210,8 +210,9 @@ export class ProactiveEngine {
     try {
       const enriched = JSON.parse(reply);
       for (const fact of enriched.facts ?? []) {
-        await KGManager.upsertConcept(fact.conceptName, fact.content, []);
-        await KGManager.linkConcepts(insightId, fact.conceptName, fact.relation, 0.8);
+        // The insight is an :Insight node: link it to the concept by the id upsertConcept returns
+        const conceptId = await KGManager.upsertConcept(fact.conceptName, fact.content, []);
+        if (conceptId) await KGManager.linkInsightToConcept(insightId, conceptId, fact.relation, 0.8);
       }
       Logger.info('ProactiveEngine', 'KG enriched for insight ' + insightId, { factsAdded: enriched.facts?.length });
     } catch (e) {

@@ -15,6 +15,8 @@ export function useOverlapDetection({ transcript, setTranscript }: UseOverlapDet
     const processedCountRef = useRef(0);
 
     useEffect(() => {
+        // A new or shorter transcript (new meeting, reprocessing) starts the count over
+        if (transcript.length < processedCountRef.current) processedCountRef.current = 0;
         if (transcript.length < 2) return;
 
         const newFrom = processedCountRef.current;
@@ -42,9 +44,10 @@ export function useOverlapDetection({ transcript, setTranscript }: UseOverlapDet
             }
         }
 
-        if (overlapIds.size > 0) {
+        // Only when something changes: a new array each time would trigger a save for nothing
+        if (transcript.some(seg => overlapIds.has(seg.id) && !seg.overlap)) {
             setTranscript(prev => prev.map(seg =>
-                overlapIds.has(seg.id) ? { ...seg, overlap: true } : seg
+                overlapIds.has(seg.id) && !seg.overlap ? { ...seg, overlap: true } : seg
             ));
             logger.log('debug', `Overlap detected: ${overlapIds.size} segments with simultaneous speech`);
         }

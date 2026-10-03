@@ -12,6 +12,19 @@ export interface ActivityLogEntry {
     interactionType?: 'clicked' | 'dismissed' | 'snoozed' | 'completed';
 }
 
+/**
+ * Actions that reached the user or ran since `since`, each counted once: an action writes
+ * several rows (pending, executing, completed...), and blocked ones ('ignored') never count,
+ * otherwise a blocked action would keep the hourly limit full forever.
+ */
+export function countDeliveredActions(log: ActivityLogEntry[], since: number): number {
+    const delivered = new Set<string>();
+    for (const entry of log) {
+        if (entry.timestamp > since && entry.status !== 'ignored') delivered.add(entry.actionId);
+    }
+    return delivered.size;
+}
+
 class ActivityLogger {
     private LOG_KEY = 'proactive_activity_log';
     private maxEntries = 1000;
@@ -82,6 +95,11 @@ class ActivityLogger {
         return stats;
     }
 
+    /** Distinct delivered actions in the last `hours` (rate limiting) */
+    async countDelivered(hours: number): Promise<number> {
+        return countDeliveredActions(await this.getLog(), Date.now() - hours * 60 * 60 * 1000);
+    }
+
     async getLog(): Promise<ActivityLogEntry[]> {
         try {
             const value = localStorage.getItem(this.LOG_KEY);
@@ -92,9 +110,10 @@ class ActivityLogger {
         }
     }
 
+    /** Last time an action of this type ran or was shown (blocked attempts do not count) */
     async getLastActionTime(actionType: string): Promise<number | null> {
         const log = await this.getLog();
-        const matching = log.filter(e => e.actionType === actionType);
+        const matching = log.filter(e => e.actionType === actionType && e.status !== 'ignored');
         if (matching.length === 0) return null;
 
         // Return most recent timestamp

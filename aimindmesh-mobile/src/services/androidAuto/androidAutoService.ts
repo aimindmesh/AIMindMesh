@@ -18,6 +18,39 @@ const AndroidAuto = registerPlugin<AndroidAutoPlugin>('AndroidAuto');
 
 import { Capacitor } from '@capacitor/core';
 
+export interface AutoCalendarEvent {
+    title: string;
+    startTime: Date;
+    endTime: Date;
+    isAllDay?: boolean;
+    location?: string;
+    notes?: string;
+}
+
+const sameDay = (a: Date, b: Date) =>
+    a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+
+/**
+ * Calendar payload for CalendarScreen: the list spans a week, so events not of today carry
+ * their date, and all-day events show no clock time.
+ */
+export function buildAutoCalendarPayload(events: AutoCalendarEvent[], now: Date = new Date()): string {
+    const time = (d: Date) => d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const day = (d: Date) => d.toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' });
+
+    return JSON.stringify(events.map(e => {
+        const datePrefix = sameDay(e.startTime, now) ? '' : `${day(e.startTime)} `;
+        return {
+            title: e.title,
+            startTime: e.isAllDay ? `${datePrefix}All day`.trim() : `${datePrefix}${time(e.startTime)}`,
+            endTime: e.isAllDay ? '' : time(e.endTime),
+            description: e.location || e.notes || '',
+            // The car may show this list long after the sync: past events are dropped there
+            endMs: e.endTime.getTime()
+        };
+    }));
+}
+
 export class AndroidAutoService {
     async initialize(): Promise<void> {
         if (!Capacitor.isNativePlatform()) return;

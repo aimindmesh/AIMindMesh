@@ -1,9 +1,10 @@
 import fs from 'fs';
 import path from 'path';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { config } from '../config';
 import { Logger } from '../utils/Logger';
 import { GiteaEvolutionService } from './GiteaEvolutionService';
+import { isSelfRepo, canSendToLLM, isLocalPathAllowed } from './evolution/EvolutionPathPolicy';
 
 export interface FileContext {
   path: string;
@@ -38,12 +39,27 @@ export class MultiFileContextBuilder {
     affectedComponents: string[] = []
   ): Promise<MultiFileContext> {
     const warnings: string[] = [];
+    Logger.info('MultiFileContextBuilder', `Building context for ${targetComponent} (Impact: ${estimatedImpact})`);
+
+    // Other repositories: local files would be this server's own files, so read from Gitea only
+    if (!isSelfRepo(repository)) {
+      if (!this.giteaService) throw new Error(`Cannot load ${targetComponent}: no Gitea access for repository ${repository}`);
+      const content = await this.giteaService.getFileContent(targetComponent, repository);
+      return {
+        target: { path: targetComponent, content, relationship: 'target', tier: 1, truncated: false },
+        relatedFiles: [],
+        totalTokenEstimate: this.estimateTokens(content),
+        warnings,
+      };
+    }
+
     const localTargetComp = targetComponent.startsWith('aimindmesh-server/')
       ? targetComponent.substring('aimindmesh-server/'.length)
       : targetComponent;
     const targetPath = path.join(this.repoPath, localTargetComp);
-
-    Logger.info('MultiFileContextBuilder', `Building context for ${targetComponent} (Impact: ${estimatedImpact})`);
+    if (!canSendToLLM(repository, targetComponent) || !isLocalPathAllowed(targetPath, this.repoPath)) {
+      throw new Error(`Target ${targetComponent} is a secret or out-of-repository path and cannot be sent to an LLM`);
+    }
 
     // ── Tier 1: Target file ───────────────────────────────────────────────
     const targetContent = await this.readFile(targetPath, targetComponent, repository);
@@ -193,12 +209,27 @@ export class MultiFileContextBuilder {
     try {
       const basename = path.basename(targetComponent, path.extname(targetComponent));
       // Using grep -r to find files importing the target
-      // We look for "from" followed by something and then the basename
-      const cmd = `grep -rl "from.*${basename}" "${this.repoPath}" --include="*.ts" 2>/dev/null | head -10`;
-      const result = execSync(cmd, { encoding: 'utf-8', timeout: 5000 });
+      // We look for "from" followed by something and then the basename.
+      // execFileSync (no shell): the basename comes from LLM output and must not reach a shell.
+      const escapedBasename = basename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const pattern = 'from.*' + escapedBasename;
+      let result = '';
+      try {
+        result = execFileSync(
+          'grep',
+          ['-rlE', pattern, this.repoPath, '--include=*.ts', '--exclude-dir=node_modules',
+           '--exclude-dir=openclaw-config', '--exclude-dir=openclaw-workspace', '--exclude-dir=hermes-data',
+           '--exclude-dir=data', '--exclude-dir=backups', '--exclude-dir=dist'],
+          { encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }
+        );
+      } catch (err: any) {
+        // grep exits 1 when nothing matches, 2 on unreadable files (matches are still on stdout)
+        result = typeof err.stdout === 'string' ? err.stdout : '';
+      }
       return result
         .split('\n')
         .filter(Boolean)
+        .slice(0, 10)
         .map(p => path.relative(this.repoPath, p))
         .filter(p => {
           const localTarget = targetComponent.startsWith('aimindmesh-server/')
@@ -279,15 +310,12 @@ export class MultiFileContextBuilder {
   }
 
   private extractConfigTypes(usedKeys: string[]): string | null {
-    const configPath = [
-      path.join(this.repoPath, 'src/config.ts'),
-      path.join(this.repoPath, 'src/config/index.ts'),
-      path.join(this.repoPath, 'src/config/config.ts'),
-    ].find(p => fs.existsSync(p));
-    
-    if (!configPath) return null;
+    // Only the ServerConfig interface is shared: the defaults in config.ts hold deployment hosts
+    const raw = [path.join(this.repoPath, 'src/config.ts'), path.join(this.repoPath, 'src/config.ts.example')]
+      .map(p => this.extractServerConfigInterface(p))
+      .find((block): block is string => !!block);
+    if (!raw) return null;
 
-    const raw = fs.readFileSync(configPath, 'utf-8');
     const lines = raw.split('\n');
     const topLevelKeys = [...new Set(usedKeys.map(k => k.split('.')[0]))];
     const relevant: string[] = ['// Config types (keys used by target file)'];
@@ -312,6 +340,19 @@ export class MultiFileContextBuilder {
       }
     }
     return relevant.length > 1 ? relevant.join('\n') : null;
+  }
+
+  private extractServerConfigInterface(file: string): string | null {
+    if (!fs.existsSync(file)) return null;
+    const raw = fs.readFileSync(file, 'utf-8');
+    const start = raw.indexOf('export interface ServerConfig');
+    if (start < 0) return null;
+    let depth = 0;
+    for (let i = raw.indexOf('{', start); i >= 0 && i < raw.length; i++) {
+      if (raw[i] === '{') depth++;
+      else if (raw[i] === '}' && --depth === 0) return raw.slice(start, i + 1);
+    }
+    return null;
   }
 
   private extractRelevantLines(content: string, targetBasename: string): string {
@@ -383,6 +424,8 @@ export class MultiFileContextBuilder {
   }
 
   private async readFileLocal(absPath: string): Promise<string | null> {
+    // Related files end up in the prompt: stay inside the checkout and away from secrets
+    if (!isLocalPathAllowed(absPath, this.repoPath)) return null;
     try {
       return fs.existsSync(absPath) ? fs.readFileSync(absPath, 'utf-8') : null;
     } catch {

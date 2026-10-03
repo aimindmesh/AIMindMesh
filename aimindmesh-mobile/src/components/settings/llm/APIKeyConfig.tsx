@@ -1,6 +1,7 @@
 import React from 'react';
 import { LLMConfig } from '../../../types';
 import { RefreshIcon } from '../../../constants';
+import { resolveClaudeModel } from '../../../services/llm/claudeModels';
 
 interface APIKeyConfigProps {
     llmConfig: LLMConfig;
@@ -176,15 +177,13 @@ const APIKeyConfig: React.FC<APIKeyConfigProps> = ({
                     <select
                         name="claudeModel"
                         id="claudeModel"
-                        value={llmConfig.claudeModel || 'claude-sonnet-4-5'}
+                        value={resolveClaudeModel(llmConfig.claudeModel)}
                         onChange={(e) => handleLlmChange({ claudeModel: e.target.value })}
                         className="block w-full bg-input border-surface rounded-md shadow-sm py-2 px-3 text-text-primary focus:outline-none focus:ring-1 focus:ring-orange-500 text-sm"
                     >
                         <option value="claude-sonnet-4-5">Claude Sonnet 4.5 (New)</option>
                         <option value="claude-haiku-4-5">Claude Haiku 4.5 (Fast)</option>
                         <option value="claude-opus-4-5">Claude Opus 4.5 (Powerful)</option>
-                        <option value="claude-3-5-sonnet-latest">Claude 3.5 Sonnet (Legacy)</option>
-                        <option value="claude-3-opus-latest">Claude 3 Opus (Legacy)</option>
                     </select>
                 </div>
             </div>

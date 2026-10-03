@@ -1,6 +1,5 @@
 package com.aimindmesh.auto;
 
-import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
@@ -9,16 +8,7 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 @CapacitorPlugin(name = "AndroidAuto")
 public class AndroidAutoPlugin extends Plugin {
 
-    // Static storage for data sharing with Car Service
-    private static String kanbanData = "{}";
-    private static String calendarData = "[]";
-    private static String tasksData = "[]";
-
-    // Settings defaults
-    private static boolean showCallMode = true;
-    private static boolean showCalendar = true;
-    private static boolean showToDo = true;
-    private static boolean showKanban = true;
+    // Data and toggles live in AutoDataStore (persisted: the car service can run without the app)
     private static String initialRoute = null;
 
     public static void setInitialRoute(String route) {
@@ -31,34 +21,6 @@ public class AndroidAutoPlugin extends Plugin {
 
     public static void clearInitialRoute() {
         initialRoute = null;
-    }
-
-    public static String getKanbanData() {
-        return kanbanData;
-    }
-
-    public static String getCalendarData() {
-        return calendarData;
-    }
-
-    public static String getTasksData() {
-        return tasksData;
-    }
-
-    public static boolean isCallModeEnabled() {
-        return showCallMode;
-    }
-
-    public static boolean isCalendarEnabled() {
-        return showCalendar;
-    }
-
-    public static boolean isToDoEnabled() {
-        return showToDo;
-    }
-
-    public static boolean isKanbanEnabled() {
-        return showKanban;
     }
 
     @PluginMethod
@@ -82,36 +44,21 @@ public class AndroidAutoPlugin extends Plugin {
             return;
         }
 
-        switch (type) {
-            case "kanban":
-                kanbanData = payload;
-                break;
-            case "calendar":
-                calendarData = payload;
-                break;
-            case "todo":
-                tasksData = payload;
-                break;
-            default:
-                // No-op for unknown types
-                break;
-        }
-
-        // Notify listener if we implement real-time updates to car screen
+        // Unknown types are ignored
+        AutoDataStore.saveData(getContext(), type, payload);
         call.resolve();
     }
 
     @PluginMethod
     public void updateSettings(PluginCall call) {
-        if (call.hasOption("showCallMode"))
-            showCallMode = call.getBoolean("showCallMode");
-        if (call.hasOption("showCalendar"))
-            showCalendar = call.getBoolean("showCalendar");
-        if (call.hasOption("showToDo"))
-            showToDo = call.getBoolean("showToDo");
-        if (call.hasOption("showKanban"))
-            showKanban = call.getBoolean("showKanban");
-
+        String[] toggles = {
+                AutoDataStore.SHOW_CALL_MODE, AutoDataStore.SHOW_CALENDAR,
+                AutoDataStore.SHOW_TODO, AutoDataStore.SHOW_KANBAN
+        };
+        for (String toggle : toggles) {
+            Boolean value = call.getBoolean(toggle);
+            if (value != null) AutoDataStore.saveToggle(getContext(), toggle, value);
+        }
         call.resolve();
     }
 }

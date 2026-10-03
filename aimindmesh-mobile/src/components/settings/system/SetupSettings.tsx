@@ -8,24 +8,15 @@ interface SetupSettingsProps {
 }
 
 const SetupSettings: React.FC<SetupSettingsProps> = ({ serverSettings }) => {
-    const [progress, setProgress] = useState<SetupProgress>({
-        currentStepIndex: 0,
-        totalSteps: 0,
-        currentStepName: '',
-        percentage: 0,
-        status: 'idle',
-        logs: []
-    });
+    // A setup started before this screen was last closed is still running: show where it is
+    const [progress, setProgress] = useState<SetupProgress>(() => setupService.getProgress());
 
     const logsEndRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
-        setupService.setProgressListener((p) => {
-            setProgress(p);
-            // If completed, we could trigger a callback to parent to refresh settings
-            // but setupService already updates localStorage, and SettingsModal 
-            // uses its own local state which might need manual update.
-        });
+        // Applied settings reach the open settings screen through App's state (useSettingsState)
+        setupService.setProgressListener(setProgress);
+        return () => setupService.setProgressListener(() => { });
     }, []);
 
     useEffect(() => {

@@ -1,17 +1,13 @@
 import { create } from 'zustand';
 import { serverApi } from '../services/serverApi';
 import { Logger } from '../utils/logger';
+import type { IngestionJobState, KGDocument } from '@aimindmesh/api-types';
 
-export type JobStatus = 'PENDING' | 'EXTRACTING' | 'CHUNKING' | 'VECTORIZING' | 'INDEXING' | 'DONE' | 'ERROR';
+// Wire formats from the server contract (GET /api/documents, /api/documents/jobs)
+export type JobStatus = IngestionJobState;
 
-export interface DocumentInfo {
-  id: string; 
-  title: string; 
-  url?: string; 
-  date: number; 
-  nodeCount: number;
-  chunkCount?: number;
-}
+/** The server returns no url/nodeCount: kept optional for older payloads */
+export type DocumentInfo = KGDocument & { url?: string; nodeCount?: number };
 
 export interface UploadJob {
   id: string;

@@ -313,16 +313,18 @@ export function useWakeWord(options: UseWakeWordOptions): UseWakeWordResult {
         }
     }, [enabled, isInitialized, isLoading, initialize]);
     
-    // Start/stop listening based on enabled state
+    // Start/stop listening based on enabled state. Driven by `enabled` only: the old
+    // `!enabled && isListening` guard depended on a state event, so disabling never stopped the
+    // service; and re-starting on every isListening=false would override the notification Stop.
     useEffect(() => {
         if (!isInitialized || !isModelLoaded) return;
         
-        if (enabled && !isListening) {
+        if (enabled) {
             startListening();
-        } else if (!enabled && isListening) {
+        } else {
             stopListening();
         }
-    }, [enabled, isInitialized, isModelLoaded, isListening, startListening, stopListening]);
+    }, [enabled, isInitialized, isModelLoaded, startListening, stopListening]);
     
     // Cleanup on unmount
     useEffect(() => {

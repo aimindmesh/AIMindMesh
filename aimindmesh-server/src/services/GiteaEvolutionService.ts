@@ -7,6 +7,8 @@ import { config } from '../config';
 import { Logger } from '../utils/Logger';
 import { ImprovementCandidate } from './ImprovementDetector';
 import { CodeGenerationOutput } from './CodeGenerationTask';
+import { normalizeRepoPath } from './evolution/EvolutionPathPolicy';
+import { checkOutput } from './evolution/EvolutionGuards';
 
 const execAsync = promisify(exec);
 
@@ -33,8 +35,15 @@ export class GiteaEvolutionService {
   ): Promise<EvolutionProposal> {
     if (!this.token) throw new Error('GITEA_TOKEN not configured');
 
-    const targetComp = candidate.targetComponent || candidate.target_component;
+    const rawTarget = candidate.targetComponent || candidate.target_component;
     const sourceId = candidate.sourceId || candidate.source_id;
+
+    // Last line of defense: nothing protected or secret reaches a branch, whatever the entry point
+    const pathCheck = checkOutput(repository, rawTarget, output);
+    if (!pathCheck.ok) {
+      throw new Error(`Refusing to commit paths not allowed for auto-evolution: ${pathCheck.denied.join(', ')}`);
+    }
+    const targetComp = normalizeRepoPath(repository, rawTarget)!;
 
     const slug = candidate.title
       .toLowerCase()
@@ -57,15 +66,17 @@ export class GiteaEvolutionService {
     // ★ NEW: Commit additional files
     if (output.additionalFiles && output.additionalFiles.length > 0) {
       for (const addFile of output.additionalFiles) {
-        const addCommitMsg = `auto(evolution): update ${addFile.path} — ${addFile.reason}`;
-        await this.commitFile(branchName, addFile.path, addFile.content, addCommitMsg, repository);
-        Logger.info('GiteaEvolutionService', `Additional file committed: ${addFile.path}`);
+        if (!addFile?.path || !addFile.content) continue;
+        const addPath = normalizeRepoPath(repository, addFile.path)!;
+        const addCommitMsg = `auto(evolution): update ${addPath} — ${addFile.reason}`;
+        await this.commitFile(branchName, addPath, addFile.content, addCommitMsg, repository);
+        Logger.info('GiteaEvolutionService', `Additional file committed: ${addPath}`);
       }
     }
 
     // Commit the test file if present
     if (output.unitTestContent && output.unitTestPath) {
-      await this.commitFile(branchName, output.unitTestPath, output.unitTestContent, `auto(evolution): add unit tests for ${candidate.title}`, repository);
+      await this.commitFile(branchName, normalizeRepoPath(repository, output.unitTestPath)!, output.unitTestContent, `auto(evolution): add unit tests for ${candidate.title}`, repository);
     }
 
     // 3. Get the latest commit hash
@@ -294,12 +305,17 @@ ${output.explanation}
       await this.commitFile(branchName, 'README.md', readme, `fail: record error for ${candidate.id}`, repository);
 
       // 3. Commit the "bad" code for analysis
-      const targetComp = candidate.target_component || candidate.targetComponent;
-      await this.commitFile(branchName, targetComp, output.modifiedFileContent, `fail: modified code for ${candidate.id}`, repository);
+      // Paths come from LLM output: unsafe ones (traversal, URL characters) are skipped
+      const targetComp = normalizeRepoPath(repository, candidate.target_component || candidate.targetComponent);
+      if (targetComp) {
+        await this.commitFile(branchName, targetComp, output.modifiedFileContent, `fail: modified code for ${candidate.id}`, repository);
+      }
 
       if (output.additionalFiles && output.additionalFiles.length > 0) {
         for (const addFile of output.additionalFiles) {
-          await this.commitFile(branchName, addFile.path, addFile.content, `fail: additional code for ${addFile.path}`, repository);
+          const addPath = normalizeRepoPath(repository, addFile?.path);
+          if (!addPath || !addFile.content) continue;
+          await this.commitFile(branchName, addPath, addFile.content, `fail: additional code for ${addPath}`, repository);
         }
       }
 
@@ -371,8 +387,13 @@ ${output.explanation}
   ): Promise<void> {
     if (!this.token) throw new Error('GITEA_TOKEN not configured');
 
-    const targetComp = candidate.targetComponent || candidate.target_component;
     const repository = proposal.repository || 'AIMindMesh';
+    const rawTarget = candidate.targetComponent || candidate.target_component;
+    const pathCheck = checkOutput(repository, rawTarget, output);
+    if (!pathCheck.ok) {
+      throw new Error(`Refusing to commit paths not allowed for auto-evolution: ${pathCheck.denied.join(', ')}`);
+    }
+    const targetComp = normalizeRepoPath(repository, rawTarget)!;
     const branchName = proposal.branch_name;
     const prNumber = proposal.pr_number;
 
@@ -386,13 +407,14 @@ ${output.explanation}
 
     for (const addFile of output.additionalFiles ?? []) {
       if (!addFile.path || !addFile.content) continue;
-      const msg = `auto(evolution): update ${addFile.path} (iter ${iterationCount}) — ${addFile.reason}`;
-      await this.commitFile(branchName, addFile.path, addFile.content, msg, repository);
+      const addPath = normalizeRepoPath(repository, addFile.path)!;
+      const msg = `auto(evolution): update ${addPath} (iter ${iterationCount}) — ${addFile.reason}`;
+      await this.commitFile(branchName, addPath, addFile.content, msg, repository);
     }
 
     if (output.unitTestContent && output.unitTestPath) {
       await this.commitFile(
-        branchName, output.unitTestPath, output.unitTestContent,
+        branchName, normalizeRepoPath(repository, output.unitTestPath)!, output.unitTestContent,
         `auto(evolution): update tests (iter ${iterationCount})`, repository
       );
     }

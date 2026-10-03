@@ -1,10 +1,9 @@
 import { useEffect, useRef } from 'react';
-import { androidAutoService } from '../services/androidAuto/androidAutoService';
+import { androidAutoService, buildAutoCalendarPayload } from '../services/androidAuto/androidAutoService';
 import { TodoItem } from '../services/todoTypes';
-import { getAllEvents } from '../services/calendar/calendarService';
-import { getKanbanBoard } from '../services/calendar/taskDatabase';
+import { getAllEvents, systemCalendarVisible } from '../services/calendar/calendarService';
+import { getKanbanBoard, buildAutoKanbanPayload } from '../services/calendar/taskDatabase';
 import { logger } from '../services/logger';
-import { TaskStatus } from '../types/calendar';
 
 interface AndroidAutoSettings {
     enabled: boolean;
@@ -72,16 +71,10 @@ export const useAndroidAutoSync = (
                 const nextWeek = new Date();
                 nextWeek.setDate(now.getDate() + 7);
 
-                const events = await getAllEvents(now, nextWeek, true);
+                // System events only when the Agenda shows them, never with a permission prompt
+                const events = await getAllEvents(now, nextWeek, await systemCalendarVisible());
 
-                const eventPayload = events.map(e => ({
-                    title: e.title,
-                    startTime: e.startTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-                    endTime: e.endTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-                    description: e.location || e.notes || ''
-                }));
-
-                const payloadStr = JSON.stringify(eventPayload);
+                const payloadStr = buildAutoCalendarPayload(events, now);
                 if (payloadStr === prevCalendarRef.current) return;
                 prevCalendarRef.current = payloadStr;
 
@@ -105,48 +98,8 @@ export const useAndroidAutoSync = (
         const syncKanban = async () => {
             try {
                 const board = await getKanbanBoard();
-
-                // Transform denormalized board to normalized structure expected by AutoUtils.java
-                // Expected: { columns: { [id]: { title, taskIds: [] } }, columnOrder: [], tasks: { [id]: { content } } }
-
-                const columnOrder: TaskStatus[] = ['backlog', 'todo', 'in-progress', 'review', 'done'];
-                const columnTitles: Record<TaskStatus, string> = {
-                    'backlog': 'Backlog',
-                    'todo': 'To Do',
-                    'in-progress': 'In Progress',
-                    'review': 'Review',
-                    'done': 'Done'
-                };
-
-                const columns: Record<string, any> = {};
-                const tasks: Record<string, any> = {};
-
-                columnOrder.forEach(status => {
-                    const statusTasks = board[status] || [];
-                    const taskIds = statusTasks.map(t => t.id);
-
-                    columns[status] = {
-                        id: status,
-                        title: columnTitles[status],
-                        taskIds: taskIds
-                    };
-
-                    statusTasks.forEach(t => {
-                        tasks[t.id] = {
-                            id: t.id,
-                            content: t.title,
-                            // Add other fields if needed by KanbanScreen.java
-                        };
-                    });
-                });
-
-                const normalizedBoard = {
-                    columns,
-                    columnOrder,
-                    tasks
-                };
-
-                const payloadStr = JSON.stringify(normalizedBoard);
+                // Same normalized shape as the sync after each task change (AutoUtils.java reads it)
+                const payloadStr = buildAutoKanbanPayload(board);
                 if (payloadStr === prevKanbanRef.current) return;
                 prevKanbanRef.current = payloadStr;
 

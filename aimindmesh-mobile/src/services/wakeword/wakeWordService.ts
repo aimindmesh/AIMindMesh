@@ -137,7 +137,9 @@ export class WakeWordService {
 
     public async startListening(): Promise<boolean> {
         if (!(await this.ensureAvailable()) || !this.isModelLoaded) return false;
-        if (this.isCurrentlyListening) return true;
+        // Trust the native service, not the cached flag: the service can stop on its own
+        // (notification "Stop", audio/model errors, end of a training session)
+        if (this.isCurrentlyListening && await this.checkListening()) return true;
         try {
             const result = await OpenWakeWord.startListening({
                 modelName: this.config.modelName,
@@ -154,7 +156,8 @@ export class WakeWordService {
     }
 
     public async stopListening(): Promise<void> {
-        if (!OpenWakeWord || !this.isCurrentlyListening) return;
+        // Not gated on the cached flag: it can be false while the native service still runs
+        if (!OpenWakeWord) return;
         try {
             await OpenWakeWord.stopListening();
             this.isCurrentlyListening = false;

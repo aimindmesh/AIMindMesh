@@ -2,7 +2,7 @@
  * LlamaCppInference.java - High-performance LLM inference wrapper
  * 
  * Provides native llama.cpp integration for GGUF models, including:
- * - CPU feature detection for optimal library loading
+ * - Optimal native library for the CPU (NativeLibrarySelector)
  * - Token-by-token streaming
  * - Proper chat history management
  * - Performance metrics
@@ -10,20 +10,27 @@
 
 package com.aimindmesh.llama;
 
-import android.os.Build;
 import android.util.Log;
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileReader;
-import java.io.IOException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 public class LlamaCppInference {
     private static final String TAG = "LlamaCppInference";
-    private long nativePtr = 0L;
-    private AtomicBoolean isGenerating = new AtomicBoolean(false);
+    // close() waits this long for a running generation before handing the free to native
+    private static final long CLOSE_WAIT_MS = 10_000L;
+    private volatile long nativePtr = 0L;
+    private final AtomicBoolean isGenerating = new AtomicBoolean(false);
+    private volatile boolean interruptRequested = false;
+    private volatile Thread generationThread;
     private boolean isMultimodal = false;
+
+    /** Optional per-request generation options; defaults keep the load-time behaviour. */
+    public static class GenerationOptions {
+        public int nPredict = 0;          // <= 0: no limit
+        public float temperature = -1f;   // < 0: load-time temperature
+        public float topP = -1f;          // <= 0: load-time top_p
+        public String[] stop = new String[0];
+    }
 
     // Inference parameters for model initialization
     public static class InferenceParams {
@@ -151,96 +158,8 @@ public class LlamaCppInference {
     }
 
     static {
-        try {
-            loadOptimalLibrary();
-        } catch (UnsatisfiedLinkError e) {
-            Log.e(TAG, "Failed to load native library: " + e.getMessage());
-            throw e;
-        }
-    }
-
-    /**
-     * Load the most optimal native library based on CPU features.
-     */
-    private static void loadOptimalLibrary() {
-        String cpuFeatures = getCPUFeatures();
-        boolean hasFp16 = cpuFeatures.contains("fp16") || cpuFeatures.contains("fphp");
-        boolean hasDotProd = cpuFeatures.contains("dotprod") || cpuFeatures.contains("asimddp");
-        boolean hasSve = cpuFeatures.contains("sve");
-        boolean hasI8mm = cpuFeatures.contains("i8mm");
-        boolean isAtLeastArmV82 = cpuFeatures.contains("asimd") &&
-                cpuFeatures.contains("crc32") &&
-                cpuFeatures.contains("aes");
-        boolean isAtLeastArmV84 = cpuFeatures.contains("dcpop") && cpuFeatures.contains("uscat");
-
-        Log.d(TAG, "CPU features: " + cpuFeatures);
-        Log.d(TAG, "- hasFp16: " + hasFp16);
-        Log.d(TAG, "- hasDotProd: " + hasDotProd);
-        Log.d(TAG, "- hasSve: " + hasSve);
-        Log.d(TAG, "- hasI8mm: " + hasI8mm);
-        Log.d(TAG, "- isAtLeastArmV82: " + isAtLeastArmV82);
-        Log.d(TAG, "- isAtLeastArmV84: " + isAtLeastArmV84);
-
-        // Check if running on emulator
-        boolean isEmulated = Build.HARDWARE.contains("goldfish") || Build.HARDWARE.contains("ranchu");
-        Log.d(TAG, "isEmulated: " + isEmulated);
-
-        String libraryName = "llama_cpp"; // Default fallback
-
-        if (!isEmulated && supportsArm64V8a()) {
-            if (isAtLeastArmV84 && hasSve && hasI8mm && hasFp16 && hasDotProd) {
-                libraryName = "llama_cpp_v8_4_fp16_dotprod_i8mm_sve";
-            } else if (isAtLeastArmV84 && hasSve && hasFp16 && hasDotProd) {
-                libraryName = "llama_cpp_v8_4_fp16_dotprod_sve";
-            } else if (isAtLeastArmV84 && hasI8mm && hasFp16 && hasDotProd) {
-                libraryName = "llama_cpp_v8_4_fp16_dotprod_i8mm";
-            } else if (isAtLeastArmV84 && hasFp16 && hasDotProd) {
-                libraryName = "llama_cpp_v8_4_fp16_dotprod";
-            } else if (isAtLeastArmV82 && hasFp16 && hasDotProd) {
-                libraryName = "llama_cpp_v8_2_fp16_dotprod";
-            } else if (isAtLeastArmV82 && hasFp16) {
-                libraryName = "llama_cpp_v8_2_fp16";
-            } else {
-                libraryName = "llama_cpp_v8";
-            }
-        } else if (!isEmulated && Build.SUPPORTED_32_BIT_ABIS.length > 0 &&
-                "armeabi-v7a".equals(Build.SUPPORTED_32_BIT_ABIS[0])) {
-            libraryName = "llama_cpp_v7a";
-        }
-
-        Log.i(TAG, "Loading native library: lib" + libraryName + ".so");
-        System.loadLibrary(libraryName);
-        Log.i(TAG, "Successfully loaded native library: " + libraryName);
-    }
-
-    /**
-     * Read CPU features from /proc/cpuinfo.
-     */
-    private static String getCPUFeatures() {
-        try {
-            File cpuInfoFile = new File("/proc/cpuinfo");
-            if (!cpuInfoFile.exists())
-                return "";
-
-            try (BufferedReader reader = new BufferedReader(new FileReader(cpuInfoFile))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    if (line.toLowerCase().startsWith("features")) {
-                        int colonIndex = line.indexOf(':');
-                        if (colonIndex > 0) {
-                            return line.substring(colonIndex + 1).trim().toLowerCase();
-                        }
-                    }
-                }
-            }
-        } catch (IOException e) {
-            Log.e(TAG, "Failed to read CPU features: " + e.getMessage());
-        }
-        return "";
-    }
-
-    private static boolean supportsArm64V8a() {
-        return Build.SUPPORTED_ABIS.length > 0 && "arm64-v8a".equals(Build.SUPPORTED_ABIS[0]);
+        // Best variant for this CPU, shared with LlamaCpp (one library per process)
+        NativeLibrarySelector.load();
     }
 
     /**
@@ -358,7 +277,7 @@ public class LlamaCppInference {
             Consumer<Response> onComplete,
             Consumer<Exception> onError) {
 
-        getResponseStreaming(query, new String[0], onToken, onComplete, onError);
+        getResponseStreaming(query, new String[0], null, onToken, onComplete, onError);
     }
 
     public void getResponseStreaming(
@@ -367,163 +286,196 @@ public class LlamaCppInference {
             Consumer<String> onToken,
             Consumer<Response> onComplete,
             Consumer<Exception> onError) {
+        getResponseStreaming(query, images, null, onToken, onComplete, onError);
+    }
 
-        verifyHandle();
+    public void getResponseStreaming(
+            String query,
+            String[] images,
+            GenerationOptions options,
+            Consumer<String> onToken,
+            Consumer<Response> onComplete,
+            Consumer<Exception> onError) {
 
-        if (isGenerating.get()) {
-            onError.accept(new IllegalStateException("Generation already in progress"));
-            return;
-        }
-
-        isGenerating.set(true);
-
-        new Thread(() -> {
-            StringBuilder fullResponse = new StringBuilder();
-            boolean wasInterrupted = false;
-
-            try {
-                Log.d(TAG, "[LLM_CHAIN] Calling startCompletionNative for query length: " + (query != null ? query.length() : 0));
-                startCompletionNative(nativePtr, query, images);
-                Log.d(TAG, "[LLM_CHAIN] startCompletionNative finished. Starting loop.");
-
-                long lastEmitTime = System.currentTimeMillis();
-                StringBuilder buffer = new StringBuilder();
-
-                Log.d(TAG, "[LLM_CHAIN] Entering completionLoopNative...");
-                String piece = completionLoopNative(nativePtr);
-                int loopCount = 0;
-                
-                while (!"[EOG]".equals(piece)) {
-                    loopCount++;
-                    Log.d(TAG, "[LLM_CHAIN] Loop " + loopCount + " received piece: [" + piece + "], empty? " + piece.isEmpty());
-                    
-                    if (!piece.isEmpty()) {
-                        fullResponse.append(piece);
-                        buffer.append(piece);
-                    } else {
-                        // Yield to OS during heavy prompt chunk decoding to prevent GPU starvation and UI ANRs
-                        try {
-                            Thread.sleep(10);
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                        }
-                    }
-
-                    long now = System.currentTimeMillis();
-                    // Flush buffer every 50ms to prevent Capacitor JS bridge stutter
-                    if (buffer.length() > 0 && (now - lastEmitTime > 50)) {
-                        Log.d(TAG, "[LLM_CHAIN] Emitting buffered tokens to Capacitor: [" + buffer.toString() + "]");
-                        onToken.accept(buffer.toString());
-                        buffer.setLength(0);
-                        lastEmitTime = now;
-                    }
-
-                    Log.d(TAG, "[LLM_CHAIN] Calling completionLoopNative for next piece...");
-                    piece = completionLoopNative(nativePtr);
-                }
-                
-                Log.d(TAG, "[LLM_CHAIN] Generation loop exited with [EOG]. Total loops: " + loopCount);
-
-                // Flush any final remaining tokens before [EOG]
-                if (buffer.length() > 0) {
-                    Log.d(TAG, "[LLM_CHAIN] Emitting final buffered tokens: [" + buffer.toString() + "]");
-                    onToken.accept(buffer.toString());
-                }
-
-                Log.d(TAG, "[LLM_CHAIN] Calling stopCompletionNative...");
-                stopCompletionNative(nativePtr);
-                Log.d(TAG, "[LLM_CHAIN] stopCompletionNative finished.");
-
-            } catch (IllegalStateException e) {
-                if (e.getMessage() != null && e.getMessage().contains("interrupt")) {
-                    wasInterrupted = true;
-                    stopCompletionNative(nativePtr);
-                } else {
-                    isGenerating.set(false);
-                    onError.accept(e);
-                    return;
-                }
-            } catch (Exception e) {
-                isGenerating.set(false);
-                onError.accept(e);
+        final long ptr;
+        synchronized (this) {
+            ptr = nativePtr;
+            if (ptr == 0L) {
+                onError.accept(new IllegalStateException("Model not loaded. Call load() first."));
                 return;
             }
+            if (!isGenerating.compareAndSet(false, true)) {
+                onError.accept(new IllegalStateException("Generation already in progress"));
+                return;
+            }
+            interruptRequested = false;
+            final GenerationOptions opts = options != null ? options : new GenerationOptions();
+            generationThread = new Thread(
+                    () -> runGeneration(ptr, query, images, opts, onToken, onComplete, onError),
+                    "LlamaCpp-Generation");
+            generationThread.start();
+        }
+    }
 
+    /** Generation thread body. Uses the handle captured at start: close() may zero nativePtr meanwhile. */
+    private void runGeneration(long ptr, String query, String[] images, GenerationOptions opts,
+            Consumer<String> onToken, Consumer<Response> onComplete, Consumer<Exception> onError) {
+        StringBuilder fullResponse = new StringBuilder();
+        StopSequenceFilter stopFilter = new StopSequenceFilter(opts.stop);
+        Exception failure = null;
+        try {
+            setSamplingNative(ptr, opts.temperature, opts.topP, opts.nPredict);
+            startCompletionNative(ptr, query, images != null ? images : new String[0]);
+
+            long lastEmitTime = System.currentTimeMillis();
+            StringBuilder buffer = new StringBuilder();
+            String piece = completionLoopNative(ptr);
+            while (!"[EOG]".equals(piece) && !interruptRequested) {
+                if (!piece.isEmpty()) {
+                    String out = stopFilter.push(piece);
+                    fullResponse.append(out);
+                    buffer.append(out);
+                    if (stopFilter.isStopped()) break;
+                } else {
+                    // Yield to OS during heavy prompt chunk decoding to prevent GPU starvation and UI ANRs
+                    try {
+                        Thread.sleep(10);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+
+                long now = System.currentTimeMillis();
+                // Flush buffer every 50ms to prevent Capacitor JS bridge stutter
+                if (buffer.length() > 0 && (now - lastEmitTime > 50)) {
+                    onToken.accept(buffer.toString());
+                    buffer.setLength(0);
+                    lastEmitTime = now;
+                }
+                piece = completionLoopNative(ptr);
+            }
+
+            String tail = stopFilter.flush();
+            fullResponse.append(tail);
+            buffer.append(tail);
+            if (buffer.length() > 0) {
+                onToken.accept(buffer.toString());
+            }
+            stopCompletionNative(ptr);
+        } catch (Exception e) {
+            // After interrupt()/close() the handle may be gone: that is a normal stop, not an error
+            if (!interruptRequested) failure = e;
+        } finally {
+            synchronized (this) {
+                generationThread = null;
+            }
             isGenerating.set(false);
+        }
 
-            Response response = new Response(
-                    fullResponse.toString(),
-                    getResponseGenerationSpeed(),
-                    getContextLengthUsed(),
-                    wasInterrupted);
-            onComplete.accept(response);
-
-        }, "LlamaCpp-Generation").start();
+        try {
+            if (failure != null) {
+                onError.accept(failure);
+            } else {
+                // Native getters return 0 for a handle closed meanwhile
+                onComplete.accept(new Response(fullResponse.toString(),
+                        getResponseGenerationSpeedNative(ptr), getContextSizeUsedNative(ptr), interruptRequested));
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Generation callback failed", e);
+        }
     }
 
     /**
      * Generate a response synchronously (blocking).
      */
     public String getResponse(String query) {
-        verifyHandle();
-
-        StringBuilder response = new StringBuilder();
-        startCompletionNative(nativePtr, query, new String[0]);
-
-        String piece = completionLoopNative(nativePtr);
-        while (!"[EOG]".equals(piece)) {
-            response.append(piece);
-            piece = completionLoopNative(nativePtr);
+        final long ptr;
+        synchronized (this) {
+            ptr = nativePtr;
+            if (ptr == 0L) throw new IllegalStateException("Model not loaded. Call load() first.");
+            if (!isGenerating.compareAndSet(false, true)) throw new IllegalStateException("Generation already in progress");
+            interruptRequested = false;
+            generationThread = Thread.currentThread();
         }
-
-        stopCompletionNative(nativePtr);
-        return response.toString();
+        try {
+            setSamplingNative(ptr, -1f, -1f, 0);
+            StringBuilder response = new StringBuilder();
+            startCompletionNative(ptr, query, new String[0]);
+            String piece = completionLoopNative(ptr);
+            while (!"[EOG]".equals(piece) && !interruptRequested) {
+                response.append(piece);
+                piece = completionLoopNative(ptr);
+            }
+            stopCompletionNative(ptr);
+            return response.toString();
+        } finally {
+            synchronized (this) {
+                generationThread = null;
+            }
+            isGenerating.set(false);
+        }
     }
 
     /**
-     * Interrupt the current generation.
+     * Interrupt the current generation: a decode in progress aborts, the loop then ends.
      */
     public void interrupt() {
-        if (nativePtr != 0L) {
-            interruptNative(nativePtr);
+        interruptRequested = true;
+        long ptr = nativePtr;
+        if (ptr != 0L) {
+            interruptNative(ptr);
         }
     }
 
     /**
-     * Close the model and free all resources.
+     * Close the model and free all resources. Waits for a running generation to stop; if it
+     * does not in time, native frees the model when that generation's current call returns.
      */
     public void close() {
-        if (nativePtr != 0L) {
-            interrupt();
-            closeNative(nativePtr);
+        final long ptr;
+        final Thread running;
+        synchronized (this) {
+            ptr = nativePtr;
+            if (ptr == 0L) return;
             nativePtr = 0L;
-            Log.i(TAG, "Model closed");
+            running = generationThread;
         }
+        interruptRequested = true;
+        interruptNative(ptr);
+        if (running != null && running != Thread.currentThread()) {
+            try {
+                running.join(CLOSE_WAIT_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        closeNative(ptr);
+        Log.i(TAG, "Model closed");
     }
 
     /**
      * Check if a model is loaded.
      */
     public boolean isLoaded() {
-        return nativePtr != 0L && isModelLoadedNative(nativePtr);
+        long ptr = nativePtr;
+        return ptr != 0L && isModelLoadedNative(ptr);
     }
 
     /**
      * Get the number of messages in the chat history.
      */
     public int getMessageCount() {
-        if (nativePtr != 0L) {
-            return getMessageCountNative(nativePtr);
-        }
-        return 0;
+        long ptr = nativePtr;
+        return ptr != 0L ? getMessageCountNative(ptr) : 0;
     }
 
     /**
      * Explicitly reset the context (history and KV cache).
      */
     public void resetContext() {
-        if (nativePtr != 0L) {
-            resetContextNative(nativePtr);
+        long ptr = nativePtr;
+        if (ptr != 0L) {
+            resetContextNative(ptr);
         }
     }
 
@@ -534,10 +486,8 @@ public class LlamaCppInference {
      * @return true on success
      */
     public boolean saveState(String filepath, int seqId) {
-        if (nativePtr != 0L) {
-            return saveStateNative(nativePtr, filepath, seqId);
-        }
-        return false;
+        long ptr = nativePtr;
+        return ptr != 0L && saveStateNative(ptr, filepath, seqId);
     }
 
     /**
@@ -547,10 +497,8 @@ public class LlamaCppInference {
      * @return true on success
      */
     public boolean loadState(String filepath, int seqId) {
-        if (nativePtr != 0L) {
-            return loadStateNative(nativePtr, filepath, seqId);
-        }
-        return false;
+        long ptr = nativePtr;
+        return ptr != 0L && loadStateNative(ptr, filepath, seqId);
     }
 
     /**
@@ -590,6 +538,8 @@ public class LlamaCppInference {
     private native String completionLoopNative(long modelPtr);
 
     private native void interruptNative(long modelPtr);
+
+    private native void setSamplingNative(long modelPtr, float temperature, float topP, int nPredict);
 
     private native void stopCompletionNative(long modelPtr);
 

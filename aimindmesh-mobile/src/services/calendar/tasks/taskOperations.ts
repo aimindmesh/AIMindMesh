@@ -4,6 +4,12 @@ import { getCalendarDatabase } from '../calendarDatabase';
 import { CalendarTask, TaskStatus, CreateTaskInput, UpdateTaskInput } from '../../../types/calendar';
 import { generateTaskId, parseTaskRow } from './taskHelpers';
 import { syncKanbanToAuto } from './taskSync';
+import { scheduleTaskNotification, cancelTaskNotification } from '../taskNotifications';
+import { ensureNextOccurrence } from '../taskRecurrence';
+import { AiTaskService } from '../AiTaskService';
+
+/** Updates that change whether or when a task needs its reminder */
+const REMINDER_FIELDS = ['status', 'dueDate', 'assignee', 'title', 'parentTaskId'];
 
 /**
  * Get the next task order for a given status column
@@ -74,6 +80,8 @@ export async function createTask(
         );
 
         logger.log('info', `[TaskDB] Task created: ${newTask.id} - ${newTask.title}`);
+        // Every creation path (modal, assistant tools, recurrence) gets its reminder here
+        void scheduleTaskNotification(newTask);
         return newTask;
     } catch (error) {
         logger.log('error', '[TaskDB] Failed to create task', error);
@@ -91,6 +99,8 @@ export async function updateTask(
     updates: UpdateTaskInput
 ): Promise<void> {
     const db = await getCalendarDatabase();
+    // Unassigning an AI task must also remove it from the server scheduler
+    const before = updates.assignee !== undefined ? await getTaskById(id) : null;
 
     // Auto-set completedAt when marking as done
     if (updates.status === 'done' && !updates.completedAt) {
@@ -166,6 +176,31 @@ export async function updateTask(
     } finally {
         syncKanbanToAuto().catch(e => logger.log('warn', '[TaskDB] Failed to sync to Auto', e));
     }
+
+    await afterTaskUpdate(id, updates, before);
+}
+
+/**
+ * Side effects of an update, for every caller (board drag, modal, assistant tools):
+ * reminder rescheduled or cancelled, next occurrence of a completed recurring task,
+ * server copy of an AI task removed when it goes back to the user.
+ */
+async function afterTaskUpdate(id: string, updates: UpdateTaskInput, before: CalendarTask | null): Promise<void> {
+    try {
+        if (before?.assignee === 'ai' && updates.assignee === 'user') {
+            void AiTaskService.deleteTask(id);
+        }
+        if (!Object.keys(updates).some(key => REMINDER_FIELDS.includes(key))) return;
+
+        const task = await getTaskById(id);
+        if (!task) return;
+        await scheduleTaskNotification(task);
+        if (updates.status === 'done' && task.recurrenceRule) {
+            await ensureNextOccurrence(task);
+        }
+    } catch (error) {
+        logger.log('warn', '[TaskDB] Post-update work failed', error);
+    }
 }
 
 /**
@@ -173,6 +208,7 @@ export async function updateTask(
  */
 export async function deleteTask(id: string): Promise<void> {
     const db = await getCalendarDatabase();
+    const task = await getTaskById(id);
 
     try {
         // Delete subtasks first (cascade)
@@ -188,6 +224,9 @@ export async function deleteTask(id: string): Promise<void> {
         );
 
         logger.log('info', `[TaskDB] Task deleted: ${id}`);
+        void cancelTaskNotification(id);
+        // Otherwise its cron job keeps running on the server
+        if (task?.assignee === 'ai') void AiTaskService.deleteTask(id);
     } catch (error) {
         logger.log('error', '[TaskDB] Failed to delete task', error);
         throw error;

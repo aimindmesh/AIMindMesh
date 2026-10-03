@@ -5,6 +5,7 @@ import { GiteaEvolutionService } from '../../services/GiteaEvolutionService';
 import { feedbackService, FeedbackLabel } from '../../services/FeedbackService';
 import { Logger } from '../../utils/Logger';
 import { config } from '../../config';
+import { normalizeRouting, normalizeModel } from '../../utils/routing';
 
 export default async function evolutionRoutes(fastify: FastifyInstance, options: FastifyPluginOptions) {
   const gitea = new GiteaEvolutionService();
@@ -83,8 +84,11 @@ export default async function evolutionRoutes(fastify: FastifyInstance, options:
   fastify.post('/candidates/:id/process', async (request, reply) => {
     const { id } = request.params as { id: string };
     try {
+      // Optional provider/model chosen in the admin UI (validated: they end up in router options)
+      const body = (request.body ?? {}) as { routing?: unknown; model?: unknown };
+      const options = { routing: normalizeRouting(body.routing), model: normalizeModel(body.model) };
       // Run in background but notify starting
-      autoEvolutionPipeline.processSpecificCandidate(id).catch(err => {
+      autoEvolutionPipeline.processSpecificCandidate(id, options).catch(err => {
         Logger.error('EvolutionRouter', `Manual candidate processing failed: ${err.message}`);
       });
       return { success: true, message: 'Candidate processing started in background' };
@@ -97,7 +101,13 @@ export default async function evolutionRoutes(fastify: FastifyInstance, options:
   fastify.delete('/candidates/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
     try {
-      db.prepare(`DELETE FROM evolution_candidates WHERE id = ?`).run(id);
+      // Proposals are the audit trail of real changes: they are never deleted implicitly
+      const proposals = db.prepare(`SELECT COUNT(*) AS c FROM evolution_proposals WHERE candidate_id = ?`).get(id) as { c: number };
+      if (proposals.c > 0) return reply.code(409).send({ error: 'Candidate has proposals: delete them first' });
+      db.transaction(() => {
+        db.prepare(`DELETE FROM evolution_attempts WHERE candidate_id = ?`).run(id);
+        db.prepare(`DELETE FROM evolution_candidates WHERE id = ?`).run(id);
+      })();
       Logger.info('EvolutionRouter', `Candidate ${id} deleted manually.`);
       return { success: true };
     } catch (err: any) {
@@ -119,8 +129,11 @@ export default async function evolutionRoutes(fastify: FastifyInstance, options:
         }
       }
 
-      // 2. Delete from DB
-      db.prepare(`DELETE FROM evolution_proposals WHERE id = ?`).run(id);
+      // 2. Delete from DB, with its review feedback (FK)
+      db.transaction(() => {
+        db.prepare(`DELETE FROM evolution_feedback WHERE proposal_id = ?`).run(id);
+        db.prepare(`DELETE FROM evolution_proposals WHERE id = ?`).run(id);
+      })();
       Logger.info('EvolutionRouter', `Proposal ${id} deleted manually.`);
       return { success: true };
     } catch (err: any) {
@@ -135,7 +148,8 @@ export default async function evolutionRoutes(fastify: FastifyInstance, options:
 
   fastify.post('/protected-paths', async (request, reply) => {
     const { path, reason } = request.body as { path: string, reason?: string };
-    db.prepare(`INSERT INTO protected_paths (path, reason, created_at) VALUES (?, ?, ?)`)
+    // Column is added_at (created_at made every insert fail)
+    db.prepare(`INSERT INTO protected_paths (path, reason, added_at) VALUES (?, ?, ?)`)
       .run(path, reason || '', Date.now());
     return { success: true };
   });
@@ -190,7 +204,9 @@ export default async function evolutionRoutes(fastify: FastifyInstance, options:
     const { routing, model } = (request.body as any) ?? {};
 
     // Non blocca — rigenerazione asincrona
-    setImmediate(() => autoEvolutionPipeline.regenerateFromFeedback(id, { routing, model }));
+    setImmediate(() => autoEvolutionPipeline.regenerateFromFeedback(id, { routing, model }).catch(err =>
+      Logger.error('EvolutionRouter', `Regeneration failed for proposal ${id}: ${err.message}`)
+    ));
 
     return { success: true, message: 'Improvement cycle started in background.' };
   });
@@ -214,44 +230,5 @@ export default async function evolutionRoutes(fastify: FastifyInstance, options:
     }
   });
 
-  /**
-   * POST /api/evolution/gitea/webhook
-   * Riceve i webhook da Gitea (es: Issue Comment).
-   */
-  fastify.post('/gitea/webhook', async (request, reply) => {
-    // Rispondi subito (evita timeout Gitea)
-    reply.code(200).send({ received: true });
-
-    try {
-      const event = request.headers['x-gitea-event'];
-      const payload = request.body as any;
-
-      Logger.info('EvolutionRouter', `Webhook received - Event: ${event}, Action: ${payload?.action}`);
-
-      if (event !== 'issue_comment') return;
-      if (payload.action !== 'created') return;
-      if (!payload.issue?.pull_request) {
-         Logger.info('EvolutionRouter', `Webhook ignored: not a pull request comment.`);
-         return;
-      }
-
-      const prNumber = payload.issue.number;
-      const comment = payload.comment?.body ?? '';
-      const author = payload.comment?.user?.login ?? 'unknown';
-
-      // Trova proposta corrispondente
-      const proposal = db.prepare(`SELECT id FROM evolution_proposals WHERE pr_number = ?`)
-        .get(prNumber) as any;
-      
-      if (!proposal) {
-        Logger.info('EvolutionRouter', `Webhook ignored: No proposal found for PR #${prNumber}`);
-        return;
-      }
-
-      Logger.info('EvolutionRouter', `Ingesting Gitea comment for PR #${prNumber}`);
-      await feedbackService.ingestGiteaComment(proposal.id, comment, author);
-    } catch (err: any) {
-      Logger.error('EvolutionRouter', `Webhook error: ${err.message}`);
-    }
-  });
+  // POST /api/evolution/gitea/webhook lives in ./giteaWebhook.ts (needs the raw body for HMAC verification)
 }

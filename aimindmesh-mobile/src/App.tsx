@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Keyboard } from '@capacitor/keyboard';
-import { Personality, LLMConfig, SpeechConfig, ProactiveFrequency, ResponseStyle, WakeWordSettings, DEFAULT_WAKE_WORD_SETTINGS, ThemeConfig, DEFAULT_THEME_CONFIG, ProactiveSettings, Settings, AIMindMeshServerSettings, DEFAULT_AIMINDMESH_SERVER_SETTINGS } from './types';
-import { useLocalStorage } from './hooks/useLocalStorage';
+import { Settings } from './types';
+import { useAppSettings } from './hooks/useAppSettings';
 import { useAppLifecycle } from './hooks/useAppLifecycle';
 import { useModelLoader } from './hooks/useModelLoader';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
@@ -16,12 +16,12 @@ import { useAndroidAutoSync } from './hooks/useAndroidAutoSync';
 import { useThreadManager } from './hooks/useThreadManager';
 import { useAppDatabase } from './hooks/useAppDatabase';
 import { useAppMemories } from './hooks/useAppMemories';
-import { useAppInteractions } from './hooks/useAppInteractions';
+import { useAppInteractions, AppBackHandlers } from './hooks/useAppInteractions';
 import { useAppServices } from './hooks/useAppServices';
 import { setKnowledgeDbPingEnabled } from './services/database/knowledgeDatabase';
-import { applyTheme, getThemeColors } from './components/settings/system/ThemeSettings';
 import { initMemoryMonitor } from './services/native/memoryMonitor';
 import { unlockTtsAudioContextSync } from './services/tts/speech';
+import { migrateLegacyKeepAlive, useKeepAlive } from './services/performance/keepAliveSetting';
 import VoiceChatOverlay from './components/overlays/VoiceChatOverlay';
 import IncomingCallOverlay from './components/overlays/IncomingCallOverlay';
 import SystemMonitor from './components/overlays/SystemMonitor';
@@ -33,95 +33,35 @@ import TodoListView from './components/agenda/TodoListView';
 import ToolConfirmationModal from './components/modals/ToolConfirmationModal';
 import ImageGenModal from './components/modals/ImageGenModal';
 import { ChatArea } from './components/chat/ChatArea';
-import { PRESET_PERSONALITIES } from './constants';
 import { useProactiveSuggestions } from './hooks/useProactiveSuggestions';
 import { SuggestionCard } from './components/Proactive/SuggestionCard';
-import { DEFAULT_PROACTIVE_SETTINGS } from './types/proactive';
-import { AgendaSettings, DEFAULT_AGENDA_SETTINGS } from './services/calendar/calendarService';
 import SettingsModal from './components/settings/SettingsModal';
+import { OnboardingWizard, shouldShowOnboarding } from './components/onboarding/OnboardingWizard';
 // v4.0.0 Feed imports
-import FeedView from './views/FeedView';
-import FeedThreadView from './views/FeedThreadView';
 import { InsightItem } from './services/feedService';
 import { useServerMode } from './hooks/useServerMode';
 import { useProactiveMessage } from './hooks/useProactiveMessage';
 import { AppNavbar } from './components/layout/AppNavbar';
-import ServerAgentView from './views/ServerAgentView';
-import LibraryView from './views/LibraryView';
-import WikiView from './views/WikiView';
-import OrganizationView from './views/OrganizationView';
-
-const DEFAULT_LLM_CONFIG: LLMConfig = {
-  provider: 'gemini',
-  localEndpoint: 'http://localhost:11434/v1',
-  localModel: 'llama3',
-  selectedGGUF: 'Phi-3-mini-4k-instruct-q4f32_1-MLC',
-  enableThinking: true,
-  enableToolCalling: true,
-  nCtx: 2048,
-  useMmap: true,
-};
+import { AppTabContent, AppTab } from './components/layout/AppTabContent';
 
 const App: React.FC = () => {
   // --- Global Settings & State ---
-  const [customPersonalities, setCustomPersonalities] = useLocalStorage<Record<string, Personality>>('custom-personalities', {});
-  const [personality, setPersonality] = useLocalStorage<Personality>('companion-personality', PRESET_PERSONALITIES.aria);
-  const [llmConfig, setLlmConfig] = useLocalStorage<LLMConfig>('llm-config', DEFAULT_LLM_CONFIG);
-  const [speechConfigRaw, setSpeechConfig] = useLocalStorage<SpeechConfig>('speech-config', { ttsProvider: 'offline', sttProvider: 'offline' });
-  
-  // Normalize legacy provider IDs ('gemini' -> 'online', 'system' -> 'offline') to ensure UI panels render correctly
-  const speechConfig = React.useMemo(() => {
-    let tts = speechConfigRaw.ttsProvider;
-    let stt = speechConfigRaw.sttProvider;
-    if ((tts as unknown as string) === 'gemini') tts = 'online';
-    if ((tts as unknown as string) === 'system') tts = 'offline';
-    if ((stt as unknown as string) === 'gemini') stt = 'online';
-    if ((stt as unknown as string) === 'system') stt = 'offline';
-    return { ...speechConfigRaw, ttsProvider: tts, sttProvider: stt };
-  }, [speechConfigRaw]);
-  const [apiKey, setApiKey] = useLocalStorage<string>('gemini-api-key', '');
-  const [perplexityApiKey, setPerplexityApiKey] = useLocalStorage<string>('perplexity-api-key', '');
-  const [claudeApiKey, setClaudeApiKey] = useLocalStorage<string>('claude-api-key', '');
-  const [hfToken, setHfToken] = useLocalStorage<string>('hf-token', '');
+  const cfg = useAppSettings();
+  const { personality, llmConfig, setLlmConfig, speechConfig, apiKey, perplexityApiKey, claudeApiKey, aimindmeshServer, proactiveSettings } = cfg;
 
-  const [autoPlayAudio, setAutoPlayAudio] = useLocalStorage('app-settings-autoplay', false);
-  const [proactiveFrequency, setProactiveFrequency] = useLocalStorage<ProactiveFrequency>('proactive-frequency', 'off');
-  const [responseStyle, setResponseStyle] = useLocalStorage<ResponseStyle>('response-style', 'normal');
-  const [enableDnd, setEnableDnd] = useLocalStorage<boolean>('enable-dnd', false);
-  const [dndStart, setDndStart] = useLocalStorage<string>('dnd-start', '22:00');
-  const [dndEnd, setDndEnd] = useLocalStorage<string>('dnd-end', '08:00');
-  const [wakeWordConfig, setWakeWordConfig] = useLocalStorage<WakeWordSettings>('wake-word-config', DEFAULT_WAKE_WORD_SETTINGS);
-  const [agendaSettings, setAgendaSettings] = useLocalStorage<AgendaSettings>('agenda-settings', DEFAULT_AGENDA_SETTINGS);
-  const [themeConfig, setThemeConfig] = useLocalStorage<ThemeConfig>('theme-config', DEFAULT_THEME_CONFIG);
-  const [enableSystemMonitor, setEnableSystemMonitor] = useLocalStorage<boolean>('enable-system-monitor', false);
-  const [systemMonitorFrequency, setSystemMonitorFrequency] = useLocalStorage<number>('system-monitor-frequency', 1000);
-  const [showRam, setShowRam] = useLocalStorage<boolean>('system-monitor-show-ram', true);
-  const [showAppRam, setShowAppRam] = useLocalStorage<boolean>('system-monitor-show-app-ram', true);
-  const [showCpu, setShowCpu] = useLocalStorage<boolean>('system-monitor-show-cpu', true);
-  const [showGpu, setShowGpu] = useLocalStorage<boolean>('system-monitor-show-gpu', true);
-  const [androidAutoSettings, setAndroidAutoSettings] = useLocalStorage<any>('android-auto-settings', {
-    enabled: true,
-    showCallMode: true,
-    showCalendar: true,
-    showToDo: true,
-    showKanban: true
-  });
-  const [disableKnowledgeDbPing, setDisableKnowledgeDbPing] = useLocalStorage<boolean>('disable-knowledge-db-ping', true);
-  const [proactiveSettings, setProactiveSettings] = useLocalStorage<ProactiveSettings>('proactive-settings', DEFAULT_PROACTIVE_SETTINGS);
-  const [enableNotificationVibration, setEnableNotificationVibration] = useLocalStorage<boolean>('enable-notification-vibration', true);
-  const [saveMeetingAudio, setSaveMeetingAudio] = useLocalStorage<boolean>('save-meeting-audio', true);
-
-  // v4.0.0 — AIMindMesh Server
-  const [aimindmeshServer, setAimindmeshServer] = useLocalStorage<AIMindMeshServerSettings>('aimindmesh-server-settings', DEFAULT_AIMINDMESH_SERVER_SETTINGS);
-  const [autoSyncNewMemories, setAutoSyncNewMemories] = useLocalStorage<boolean>('auto-sync-new-memories', false);
+  // One keep-alive flag (Settings → App → Performance) for the native services and the background features
+  migrateLegacyKeepAlive(llmConfig.keepAlive);
+  const [keepAlive] = useKeepAlive();
 
   // v4.0.0 — Feed navigation state
-  type AppTab = 'chat' | 'feed' | 'server-agent' | 'library' | 'wiki' | 'organization';
   const [activeAppTab, setActiveAppTab] = useState<AppTab>('chat');
   const [feedUnreadCount, setFeedUnreadCount] = useState(0);
   const [openFeedInsight, setOpenFeedInsight] = useState<InsightItem | null>(null);
+  const [showOnboarding, setShowOnboarding] = useState(shouldShowOnboarding);
 
   // --- UI State & Interactions (Hook) ---
+  // Back steps for what App renders itself, filled in after the chat hook below
+  const backHandlersRef = useRef<AppBackHandlers | null>(null);
   const {
     isSettingsOpen, setIsSettingsOpen,
     isVoiceMode, setIsVoiceMode,
@@ -134,10 +74,7 @@ const App: React.FC = () => {
     initialView,
     toast, showToast: showToastProxy, hideToast,
     justAcceptedCall, setJustAcceptedCall
-  } = useAppInteractions({
-    pendingToolCall: null,
-    handleConfirmTool: (c: boolean, r: boolean) => (window as any).chat?.handleConfirmTool(c, r)
-  });
+  } = useAppInteractions(backHandlersRef);
 
   // --- Utils ---
   const showToast = useCallback((message: string, type: 'success' | 'error' | 'info' = 'success') => {
@@ -157,28 +94,25 @@ const App: React.FC = () => {
   } = useAppMemories({
     showToast: showToastInternal,
     serverSettings: aimindmeshServer,
-    autoSyncNewMemories
+    autoSyncNewMemories: cfg.autoSyncNewMemories
   });
+
+  // The memory categorization flag is kept by useAppMemories
+  const modalSettings = useMemo(() => ({ ...cfg.modalSettings, enableAiMemoryCategorization }), [cfg.modalSettings, enableAiMemoryCategorization]);
+  const { saveSettings } = cfg;
+  const handleSaveSettings = useCallback((newSettings: Settings) => {
+    saveSettings(newSettings);
+    setEnableAiMemoryCategorization(newSettings.enableAiMemoryCategorization ?? true);
+  }, [saveSettings, setEnableAiMemoryCategorization]);
 
   const { dbReady } = useAppDatabase(showToastProxy);
 
-  // --- Config Migration (Ensure defaults for new features) ---
   useEffect(() => {
     // Initialize native memory monitor
     initMemoryMonitor();
-    
+
     // Disable webview auto-scroll when keyboard opens
     Keyboard.setScroll({ isDisabled: true }).catch(err => logger.log('error', '[App] Failed to disable keyboard scroll', err));
-    
-    // Check if critical new flags are undefined and default them to true
-    if (llmConfig.enableThinking === undefined || llmConfig.enableToolCalling === undefined) {
-      logger.log('info', '[App] Migrating LLM config with new defaults');
-      setLlmConfig(prev => ({
-        ...prev,
-        enableThinking: prev.enableThinking ?? true,
-        enableToolCalling: prev.enableToolCalling ?? true
-      }));
-    }
   }, []); // Run once on mount
 
   // v4.0.0 — Server mode lifecycle (FCM + heartbeat + proactive fallback)
@@ -186,15 +120,8 @@ const App: React.FC = () => {
 
   // --- Hooks ---
   const { todos, addTodo, completeTodo, deleteTodo } = useTodoList();
-  const { isNativeLLMLoading } = useModelLoader(llmConfig, speechConfig);
-  const { isAppActive } = useAppLifecycle(!!llmConfig.keepAlive);
-
-  // Sync KeepAlive on mount for persistence
-  useEffect(() => {
-    if (llmConfig.keepAlive) {
-      import('./services/performancePlugin').then(p => p.default.startKeepAlive()).catch(e => logger.log('error', 'Failed to start KeepAlive on mount', e));
-    }
-  }, []);
+  const { isNativeLLMLoading } = useModelLoader(llmConfig);
+  const { isAppActive } = useAppLifecycle(keepAlive, isVoiceMode);
 
   // --- Keyboard Shortcuts ---
   useKeyboardShortcuts(
@@ -205,15 +132,13 @@ const App: React.FC = () => {
   useNotificationPermission();
 
   // --- Android Auto Sync ---
-  useAndroidAutoSync(todos, androidAutoSettings, dbReady);
+  useAndroidAutoSync(todos, cfg.androidAutoSettings, dbReady);
 
-  // --- Apply Theme ---
-  useEffect(() => { applyTheme(getThemeColors(themeConfig), themeConfig.presetId === 'system'); }, [themeConfig]);
   // --- Sync Knowledge DB Ping ---
-  useEffect(() => { setKnowledgeDbPingEnabled(!disableKnowledgeDbPing); }, [disableKnowledgeDbPing]);
-
+  useEffect(() => { setKnowledgeDbPingEnabled(!cfg.disableKnowledgeDbPing); }, [cfg.disableKnowledgeDbPing]);
 
   // --- Wake Word ---
+  const { wakeWordConfig } = cfg;
   useWakeWord({
     enabled: wakeWordConfig.enabled && !isNativeLLMLoading,
     modelName: wakeWordConfig.modelName,
@@ -249,8 +174,8 @@ const App: React.FC = () => {
     personality,
     speechConfig,
     { gemini: apiKey, perplexity: perplexityApiKey, claude: claudeApiKey },
-    responseStyle,
-    autoPlayAudio || isVoiceMode,
+    cfg.responseStyle,
+    cfg.autoPlayAudio || isVoiceMode,
     chatContext,
     activeThreadIdState,
     (toolName, rule) => setLlmConfig(prev => ({
@@ -260,13 +185,8 @@ const App: React.FC = () => {
     aimindmeshServer
   );
 
-  // Expose chat to window for useAppInteractions back button handler proxy
-  useEffect(() => {
-    (window as any).chat = chat;
-  }, [chat]);
-
   // Services (Extraction, Summarization, Proactive)
-  useAppServices(chat, llmConfig, isAppActive, apiKey, perplexityApiKey, claudeApiKey, personality, addMemory, activeThreadIdState, showToast);
+  useAppServices(chat, llmConfig, isAppActive, apiKey, perplexityApiKey, claudeApiKey, personality, addMemory, activeThreadIdState, showToast, keepAlive);
 
   const { suggestions, acceptSuggestion, dismissSuggestion } = useProactiveSuggestions();
 
@@ -293,7 +213,7 @@ const App: React.FC = () => {
     proactiveSettings,
   });
 
-  const isAppIdle = !isSettingsOpen && !isVoiceMode && !incomingCall && !isProactiveThinking && (isAppActive || !!llmConfig.keepAlive);
+  const isAppIdle = !isSettingsOpen && !isVoiceMode && !incomingCall && !isProactiveThinking && (isAppActive || keepAlive);
 
   const handleEngagement = useCallback(() => {
     const isCall = Math.random() < 0.2;
@@ -305,19 +225,33 @@ const App: React.FC = () => {
   }, [handleProactiveMessage, personality, proactiveSettings]);
 
   useProactiveEngagement({
-    frequency: proactiveFrequency,
+    frequency: cfg.proactiveFrequency,
     isIdle: isAppIdle,
     onEngage: handleEngagement,
-    enableDnd,
-    dndStart,
-    dndEnd,
-    idleDetails: { isSettingsOpen, isVoiceMode, incomingCall: !!incomingCall, isProactiveThinking, isAppActive, keepAlive: !!llmConfig.keepAlive }
+    enableDnd: cfg.enableDnd,
+    dndStart: cfg.dndStart,
+    dndEnd: cfg.dndEnd,
+    idleDetails: { isSettingsOpen, isVoiceMode, incomingCall: !!incomingCall, isProactiveThinking, isAppActive, keepAlive }
   });
 
   // --- Image Studio (Qualcomm NPU) State & Handlers ---
   const [isImageGenModalOpen, setIsImageGenModalOpen] = useState(false);
   const [imageGenSourceImage, setImageGenSourceImage] = useState<string | undefined>(undefined);
   const [imageGenPrompt, setImageGenPrompt] = useState<string | undefined>(undefined);
+
+  // Back button: overlays and navigation App owns (read by the listener in useAppInteractions)
+  backHandlersRef.current = {
+    closeOverlay: () => {
+      if (chat.pendingToolCall) { chat.handleConfirmTool(false, false); return true; }
+      if (isImageGenModalOpen) { setIsImageGenModalOpen(false); return true; }
+      return false;
+    },
+    navigateBack: () => {
+      if (activeAppTab === 'feed' && openFeedInsight) { setOpenFeedInsight(null); return true; }
+      if (activeAppTab !== 'chat') { setActiveAppTab('chat'); return true; }
+      return false;
+    }
+  };
 
   const handleOpenImageStudio = useCallback(() => {
     const attached = chat.pendingImages[0];
@@ -333,7 +267,7 @@ const App: React.FC = () => {
 
   const handleEditImageFromChat = useCallback((imgSrc: string) => {
     setImageGenSourceImage(imgSrc);
-    setImageGenPrompt('Modify this image: ');
+    setImageGenPrompt(''); // SD needs a description of the result, not an instruction
     setIsImageGenModalOpen(true);
   }, []);
 
@@ -354,9 +288,14 @@ const App: React.FC = () => {
     <div className="fixed inset-0 bg-background overflow-hidden flex flex-col pt-safe">
       {/* Tab content area */}
       <div className="flex-1 overflow-hidden relative">
-        {/* Chat Tab */}
-        {activeAppTab === 'chat' && (
-          <div className="h-full">
+        <AppTabContent
+          activeTab={activeAppTab}
+          serverSettings={aimindmeshServer}
+          agentProvider={llmConfig.serverSideAgentProvider || 'openclaw'}
+          openFeedInsight={openFeedInsight}
+          onOpenFeedInsight={setOpenFeedInsight}
+          onFeedUnreadCountChange={setFeedUnreadCount}
+          chat={
             <ChatArea
               messages={chat.messages}
               personality={personality}
@@ -389,58 +328,8 @@ const App: React.FC = () => {
               onOpenSettings={() => setIsSettingsOpen(true)}
               onClearChat={handleClearChat}
             />
-          </div>
-        )}
-
-        {/* Feed Tab */}
-        {activeAppTab === 'feed' && (
-          <div className="h-full">
-            {openFeedInsight && aimindmeshServer ? (
-              <FeedThreadView
-                insight={openFeedInsight}
-                serverSettings={aimindmeshServer}
-                onClose={() => setOpenFeedInsight(null)}
-              />
-            ) : (
-              <FeedView
-                serverSettings={aimindmeshServer?.enabled ? aimindmeshServer : undefined}
-                onOpenThread={(insight) => setOpenFeedInsight(insight)}
-                onUnreadCountChange={setFeedUnreadCount}
-              />
-            )}
-          </div>
-        )}
-
-        {/* Server Agent Tab */}
-        {activeAppTab === 'server-agent' && aimindmeshServer && (
-          <div className="h-full">
-            <ServerAgentView
-              settings={aimindmeshServer}
-              provider={llmConfig.serverSideAgentProvider || 'openclaw'}
-            />
-          </div>
-        )}
-
-        {/* Library Tab */}
-        {activeAppTab === 'library' && (
-          <div className="h-full">
-            <LibraryView serverSettings={aimindmeshServer?.enabled ? aimindmeshServer : undefined} />
-          </div>
-        )}
-
-        {/* Wiki Tab */}
-        {activeAppTab === 'wiki' && (
-          <div className="h-full">
-            <WikiView serverSettings={aimindmeshServer?.enabled ? aimindmeshServer : undefined} />
-          </div>
-        )}
-
-        {/* Organization Tab */}
-        {activeAppTab === 'organization' && (
-          <div className="h-full">
-            <OrganizationView serverSettings={aimindmeshServer?.enabled ? aimindmeshServer : undefined} />
-          </div>
-        )}
+          }
+        />
       </div>
 
       {/* Bottom Navigation Bar */}
@@ -457,74 +346,8 @@ const App: React.FC = () => {
       <SettingsModal
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}
-        settings={{
-          personality, llmConfig, speechConfig, apiKey, perplexityApiKey, claudeApiKey, hfToken,
-          autoPlayAudio, enableDnd, dndStart, dndEnd, responseStyle, proactiveFrequency, enableAiMemoryCategorization,
-          wakeWord: wakeWordConfig,
-          theme: themeConfig,
-          enableSystemMonitor,
-          systemMonitorFrequency,
-          showRam,
-          showAppRam,
-
-          showCpu,
-          showGpu,
-          androidAuto: androidAutoSettings,
-          disableKnowledgeDbPing,
-          proactive: proactiveSettings,
-          enableNotificationVibration,
-          saveMeetingAudio,
-          aimindmeshServer,
-          autoSyncNewMemories
-        }}
-        onSave={(newSettings: Settings) => {
-          setPersonality(newSettings.personality);
-          setLlmConfig(newSettings.llmConfig);
-          setSpeechConfig(newSettings.speechConfig);
-          setApiKey(newSettings.apiKey);
-          setPerplexityApiKey(newSettings.perplexityApiKey || '');
-          setClaudeApiKey(newSettings.claudeApiKey || '');
-          setHfToken(newSettings.hfToken || '');
-          setAutoPlayAudio(newSettings.autoPlayAudio);
-          setEnableDnd(newSettings.enableDnd);
-          setDndStart(newSettings.dndStart);
-          setDndEnd(newSettings.dndEnd);
-          setResponseStyle(newSettings.responseStyle);
-          setProactiveFrequency(newSettings.proactiveFrequency);
-          setEnableAiMemoryCategorization(newSettings.enableAiMemoryCategorization ?? true);
-          setEnableSystemMonitor(newSettings.enableSystemMonitor ?? false);
-          setSystemMonitorFrequency(newSettings.systemMonitorFrequency ?? 1000);
-          setShowRam(newSettings.showRam ?? true);
-          setShowAppRam(newSettings.showAppRam ?? true);
-          setShowCpu(newSettings.showCpu ?? true);
-          setShowGpu(newSettings.showGpu ?? true);
-          setDisableKnowledgeDbPing(newSettings.disableKnowledgeDbPing ?? true);
-          if (newSettings.wakeWord) {
-            setWakeWordConfig(newSettings.wakeWord);
-          }
-          if (newSettings.theme) {
-            setThemeConfig(newSettings.theme);
-            applyTheme(getThemeColors(newSettings.theme), newSettings.theme.presetId === 'system');
-          }
-          if (newSettings.androidAuto) {
-            setAndroidAutoSettings(newSettings.androidAuto);
-          }
-          if (newSettings.proactive) {
-            setProactiveSettings(newSettings.proactive);
-          }
-          if (newSettings.enableNotificationVibration !== undefined) {
-            setEnableNotificationVibration(newSettings.enableNotificationVibration);
-          }
-          if (newSettings.saveMeetingAudio !== undefined) {
-            setSaveMeetingAudio(newSettings.saveMeetingAudio);
-          }
-          if (newSettings.aimindmeshServer) {
-            setAimindmeshServer(newSettings.aimindmeshServer);
-          }
-          if (newSettings.autoSyncNewMemories !== undefined) {
-            setAutoSyncNewMemories(newSettings.autoSyncNewMemories);
-          }
-        }}
+        settings={modalSettings}
+        onSave={handleSaveSettings}
         memories={memories}
         onAddMemory={addMemory}
         onDeleteMemory={deleteMemory}
@@ -536,15 +359,11 @@ const App: React.FC = () => {
         onUpdateMemoryCategory={updateMemoryCategory}
         onExportMemories={exportMemories}
         onImportMemories={importMemories}
-        customPersonalities={customPersonalities}
-        onSaveCustomPersonality={(id: string, p: Personality) => setCustomPersonalities(prev => ({ ...prev, [id]: p }))}
-        onDeleteCustomPersonality={(id: string) => setCustomPersonalities(prev => {
-          const newCustom = { ...prev };
-          delete newCustom[id];
-          return newCustom;
-        })}
-        agendaSettings={agendaSettings}
-        onAgendaSettingsChange={setAgendaSettings}
+        customPersonalities={cfg.customPersonalities}
+        onSaveCustomPersonality={cfg.saveCustomPersonality}
+        onDeleteCustomPersonality={cfg.deleteCustomPersonality}
+        agendaSettings={cfg.agendaSettings}
+        onAgendaSettingsChange={cfg.setAgendaSettings}
       />
 
       {isVoiceMode && (
@@ -556,6 +375,7 @@ const App: React.FC = () => {
             setJustAcceptedCall(false);
           }}
           sendMessage={chat.sendMessage}
+          onSaveTranscript={(role, text) => chat.setMessages(prev => [...prev, { id: `${Date.now()}_${role}`, role, text, timestamp: new Date() }])}
           isSpeaking={chat.isSpeaking}
           isLoading={chat.isLoading}
           currentThinking={chat.messages[chat.messages.length - 1]?.thinking}
@@ -577,13 +397,13 @@ const App: React.FC = () => {
         />
       )}
 
-      {enableSystemMonitor && (
+      {cfg.enableSystemMonitor && (
         <SystemMonitor
-          frequency={systemMonitorFrequency}
-          showRam={showRam}
-          showAppRam={showAppRam}
-          showCpu={showCpu}
-          showGpu={showGpu}
+          frequency={cfg.systemMonitorFrequency}
+          showRam={cfg.showRam}
+          showAppRam={cfg.showAppRam}
+          showCpu={cfg.showCpu}
+          showGpu={cfg.showGpu}
         />
       )}
 
@@ -601,8 +421,8 @@ const App: React.FC = () => {
       {isAgendaOpen && (
         <AgendaMode
           onClose={() => setIsAgendaOpen(false)}
-          defaultView={initialView as any || agendaSettings.defaultView}
-          showSystemCalendar={agendaSettings.showSystemCalendar}
+          defaultView={initialView as any || cfg.agendaSettings.defaultView}
+          showSystemCalendar={cfg.agendaSettings.showSystemCalendar}
           llmConfig={llmConfig}
           apiKey={apiKey}
           personality={personality}
@@ -678,6 +498,8 @@ const App: React.FC = () => {
         onInsertIntoChat={handleInsertGeneratedImage}
       />
 
+      {/* First launch: guided setup above everything */}
+      {showOnboarding && <OnboardingWizard onComplete={() => setShowOnboarding(false)} />}
     </div>
   );
 };

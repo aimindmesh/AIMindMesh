@@ -6,6 +6,9 @@ import { createThinkingParser } from '../thinkingParser';
 import { buildSystemPrompt } from '../promptBuilder';
 import { getReActSystemPromptCompact } from '../../toolDefinitions';
 import { Genie } from 'genie-capacitor';
+import { toChatRole } from '../roles';
+import { refineContext, getResponseReserve } from '../context/unifiedContextManager';
+import { ensureResident, markUnloaded } from '../../model/modelOrchestrator';
 
 let activeGenieModelPath: string | null = null;
 
@@ -17,6 +20,7 @@ export async function initGenieModel(modelPath: string, llmConfig?: LLMConfig): 
             return true;
         }
 
+        await ensureResident('genie');
         logger.log('info', `[GenieProvider] Initializing model on Qualcomm Hexagon NPU: ${modelPath}`);
         const result = await Genie.loadModel({
             modelPath,
@@ -40,10 +44,20 @@ export async function initGenieModel(modelPath: string, llmConfig?: LLMConfig): 
     }
 }
 
+/** Native truth: a model may have been loaded before a WebView reload */
+export async function isGenieModelLoaded(): Promise<boolean> {
+    try {
+        return (await Genie.isLoaded()).loaded;
+    } catch {
+        return activeGenieModelPath !== null;
+    }
+}
+
 export async function unloadGenieModel(): Promise<void> {
     try {
         await Genie.unloadModel();
         activeGenieModelPath = null;
+        markUnloaded('genie');
         logger.log('info', '[GenieProvider] Qualcomm NPU model unloaded');
     } catch (e) {
         logger.log('warn', '[GenieProvider] Error unloading model', e);
@@ -76,6 +90,15 @@ export async function* generateGenieNPUStream(
         systemPrompt += '\nIMPORTANT: Before answering, reason step-by-step. Show your thinking process enclosed in <thinking> and </thinking> tags.\nYour final answer goes AFTER the thinking tags.';
     }
 
+    // llmService skips pruning for on-device engines: fit history and answer in the NPU context here
+    const llmParams = personality.llmParams || {};
+    const contextLength = llmConfig.contextSize || llmConfig.nCtx || 4096;
+    const requestedTokens = llmParams.maxTokens ?? (maxResponseLength || 2048);
+    const refined = refineContext(history, systemPrompt, llmConfig, requestedTokens, contextLength);
+    history = refined.messages;
+    systemPrompt = refined.systemPrompt;
+    const maxTokens = getResponseReserve(contextLength, requestedTokens);
+
     // Format chat prompt formatted for Qwen / Gemma / Llama
     let formattedPrompt = '';
     const isQwen = modelPath.toLowerCase().includes('qwen');
@@ -85,7 +108,7 @@ export async function* generateGenieNPUStream(
         // ChatML format for Qwen 2.5 / 3.5
         formattedPrompt = `<|im_start|>system\n${systemPrompt}<|im_end|>\n`;
         for (const msg of history) {
-            const role = msg.role === 'user' ? 'user' : 'assistant';
+            const role = toChatRole(msg.role);
             formattedPrompt += `<|im_start|>${role}\n${msg.text}<|im_end|>\n`;
         }
         formattedPrompt += '<|im_start|>assistant\n';
@@ -93,7 +116,7 @@ export async function* generateGenieNPUStream(
         // Gemma turn format
         formattedPrompt = `<start_of_turn>system\n${systemPrompt}<end_of_turn>\n`;
         for (const msg of history) {
-            const role = msg.role === 'user' ? 'user' : 'model';
+            const role = msg.role === 'model' ? 'model' : 'user';
             formattedPrompt += `<start_of_turn>${role}\n${msg.text}<end_of_turn>\n`;
         }
         formattedPrompt += '<start_of_turn>model\n';
@@ -101,7 +124,7 @@ export async function* generateGenieNPUStream(
         // Generic transcript format
         formattedPrompt = `System: ${systemPrompt}\n\n`;
         for (const msg of history) {
-            const role = msg.role === 'user' ? 'User' : personality.name;
+            const role = msg.role === 'model' ? personality.name : 'User';
             formattedPrompt += `${role}: ${msg.text}\n\n`;
         }
         formattedPrompt += `${personality.name}: `;
@@ -112,14 +135,11 @@ export async function* generateGenieNPUStream(
     let resolveQueue: (() => void) | null = null;
     let fullGeneratedText = '';
 
-    const llmParams = personality.llmParams || {};
-    const maxTokens = llmParams.maxTokens ?? (maxResponseLength || 2048);
 
-    if (signal) {
-        signal.addEventListener('abort', () => {
-            Genie.abortGeneration().catch((e: any) => logger.log('warn', '[GenieProvider] Abort error', e));
-        });
-    }
+    const onAbort = () => {
+        Genie.abortGeneration().catch((e: any) => logger.log('warn', '[GenieProvider] Abort error', e));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
 
     try {
         await Genie.generateStream(
@@ -189,5 +209,7 @@ export async function* generateGenieNPUStream(
     } catch (e: any) {
         logger.log('error', '[GenieProvider] Stream generation failed', e);
         throw e;
+    } finally {
+        signal?.removeEventListener('abort', onAbort);
     }
 }

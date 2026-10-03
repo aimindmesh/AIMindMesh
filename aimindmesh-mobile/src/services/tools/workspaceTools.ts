@@ -99,6 +99,8 @@ export const workspaceTools: ToolDefinition[] = [
                 // 1. Ingest
                 const doc = await ingestionService.ingestDocument(params.document_path);
                 if (doc.status === 'failed') throw new Error(doc.error);
+                // Server-mode ingestion has no local document to link
+                if (doc.remote) return `Document sent to the AIMindMesh server for ingestion (job ${doc.jobId ?? 'unknown'}); server documents are not linked to local workspaces.`;
 
                 // 2. Find Workspace
                 let workspaceId: number;

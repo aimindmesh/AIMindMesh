@@ -6,6 +6,9 @@
 #include <fstream>
 #include <iostream>
 #include <array>
+#include <mutex>
+#include <sstream>
+#include <cstdlib>
 
 // ONNX Runtime headers
 // ONNX Runtime headers
@@ -56,6 +59,42 @@ extern "C" {
 // Global ONNX Runtime environment
 std::unique_ptr<Ort::Env> ortEnv;
 std::unique_ptr<Ort::Session> ortSession;
+// Guards the globals above (Java also serializes, this keeps the native side self-contained)
+static std::mutex ortMutex;
+
+// Per-voice settings from the .onnx.json config: "low"/"x_low" voices are 16 kHz, so a
+// hard-coded 22050 Hz header played them ~38% too fast.
+static int voiceSampleRate = 22050;
+static float voiceNoiseScale = 0.667f;
+static float voiceLengthScale = 1.0f;
+static float voiceNoiseW = 0.8f;
+
+// Reads the first number after "key": in a small JSON config (no JSON dependency needed).
+static double findJsonNumber(const std::string& json, const char* key, double fallback) {
+    std::string quoted = std::string("\"") + key + "\"";
+    size_t pos = json.find(quoted);
+    if (pos == std::string::npos) return fallback;
+    pos = json.find(':', pos + quoted.size());
+    if (pos == std::string::npos) return fallback;
+    const char* start = json.c_str() + pos + 1;
+    char* end = nullptr;
+    double value = std::strtod(start, &end);
+    return end == start ? fallback : value;
+}
+
+static void loadVoiceConfig(const char* configPath) {
+    std::ifstream file(configPath);
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    std::string json = buffer.str();
+    int rate = static_cast<int>(findJsonNumber(json, "sample_rate", 22050));
+    voiceSampleRate = (rate >= 8000 && rate <= 48000) ? rate : 22050;
+    voiceNoiseScale = static_cast<float>(findJsonNumber(json, "noise_scale", 0.667));
+    voiceLengthScale = static_cast<float>(findJsonNumber(json, "length_scale", 1.0));
+    voiceNoiseW = static_cast<float>(findJsonNumber(json, "noise_w", 0.8));
+    LOGI("Voice config: sample_rate=%d noise_scale=%.3f length_scale=%.3f noise_w=%.3f",
+         voiceSampleRate, voiceNoiseScale, voiceLengthScale, voiceNoiseW);
+}
 
 // WAV Header struct
 struct WavHeader {
@@ -74,11 +113,11 @@ struct WavHeader {
     uint32_t data_size;
 };
 
-void writeWav(const std::string& filename, const std::vector<float>& audioData, int sampleRate) {
+bool writeWav(const std::string& filename, const std::vector<float>& audioData, int sampleRate) {
     std::ofstream file(filename, std::ios::binary);
     if (!file.is_open()) {
         LOGE("Failed to open file for writing: %s", filename.c_str());
-        return;
+        return false;
     }
 
     WavHeader header;
@@ -100,6 +139,7 @@ void writeWav(const std::string& filename, const std::vector<float>& audioData, 
     
     file.close();
     LOGI("WAV file written: %s", filename.c_str());
+    return true;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -113,6 +153,7 @@ Java_com_aimindmesh_piper_PiperSynthesizer_nativeLoadVoice(
     const char* configPath = env->GetStringUTFChars(jConfigPath, 0);
 
     LOGI("Loading voice model from: %s", modelPath);
+    std::lock_guard<std::mutex> lock(ortMutex);
 
     try {
         if (!ortEnv) {
@@ -129,6 +170,7 @@ Java_com_aimindmesh_piper_PiperSynthesizer_nativeLoadVoice(
         LOGI("Creating Ort::Session with model: %s", modelPath);
         ortSession = std::make_unique<Ort::Session>(*ortEnv, modelPath, sessionOptions);
         LOGI("Ort::Session created successfully");
+        loadVoiceConfig(configPath);
 
         LOGI("ONNX model loaded successfully");
         
@@ -153,8 +195,10 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_com_aimindmesh_piper_PiperSynthesizer_nativeSynthesize(
         JNIEnv* env,
         jobject /* this */,
-        jlongArray jPhonemeIds) { // Changed input to long array
+        jlongArray jPhonemeIds,
+        jstring jOutputPath) {
     
+    std::lock_guard<std::mutex> lock(ortMutex);
     jsize numPhonemes = env->GetArrayLength(jPhonemeIds);
     jlong* phonemeIdsRaw = env->GetLongArrayElements(jPhonemeIds, 0);
     
@@ -170,7 +214,7 @@ Java_com_aimindmesh_piper_PiperSynthesizer_nativeSynthesize(
 
     try {
         std::vector<int64_t> inputLengths = {static_cast<int64_t>(phonemeIds.size())};
-        std::vector<float> scales = {0.667f, 1.0f, 0.8f}; // noise_scale, length_scale, noise_w
+        std::vector<float> scales = {voiceNoiseScale, voiceLengthScale, voiceNoiseW}; // noise_scale, length_scale, noise_w
 
         // Prepare inputs
         std::vector<const char*> inputNames = {"input", "input_lengths", "scales"};
@@ -228,11 +272,13 @@ Java_com_aimindmesh_piper_PiperSynthesizer_nativeSynthesize(
         
         std::vector<float> audioData(floatAudio, floatAudio + audioSize);
 
-        // Save to WAV file
-        // We need a path to save to. For simplicity, let's use a fixed path in app cache
-        // In a real app, we should pass the output path from Java
-        std::string outputPath = "/data/user/0/com.aimindmesh.mobile/cache/piper_output.wav";
-        writeWav(outputPath, audioData, 22050); // Assuming 22050Hz for now
+        // Path comes from Java (cache dir): /data/user/0/... is wrong for secondary users/profiles
+        const char* outputPathChars = env->GetStringUTFChars(jOutputPath, 0);
+        std::string outputPath(outputPathChars);
+        env->ReleaseStringUTFChars(jOutputPath, outputPathChars);
+        if (!writeWav(outputPath, audioData, voiceSampleRate)) {
+            return nullptr;
+        }
 
         return env->NewStringUTF(outputPath.c_str());
 
@@ -251,6 +297,7 @@ Java_com_aimindmesh_piper_PiperSynthesizer_nativeUnload(
         jobject /* this */) {
     
     LOGI("Unloading voice model");
+    std::lock_guard<std::mutex> lock(ortMutex);
     ortSession.reset();
     // Keep environment alive
 }

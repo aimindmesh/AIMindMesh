@@ -86,8 +86,8 @@ class PermissionManager {
         }
 
         // 7. Rate Limiting (Hourly)
-        const stats = await activityLogger.getStats(0.04); // Last 1 hour (1/24 days)
-        if (stats.total >= settings.limits.maxActionsPerHour) {
+        const deliveredLastHour = await activityLogger.countDelivered(1);
+        if (deliveredLastHour >= settings.limits.maxActionsPerHour) {
             // Allow critical actions to bypass rate limit
             if (estimatedPriority < 9) {
                 return { allowed: false, reason: 'Hourly rate limit reached' };

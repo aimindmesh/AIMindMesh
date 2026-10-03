@@ -3,6 +3,8 @@ import { CalendarPermissionScope } from '@ebarooni/capacitor-calendar/dist/esm/s
 import { logger } from './logger';
 
 export interface CalendarEvent {
+    /** System calendar id (listed events only): stable key for the server sync */
+    id?: string;
     title: string;
     location?: string;
     notes?: string;
@@ -141,6 +143,7 @@ export const listCalendarEvents = async (startDate: Date, endDate: Date): Promis
         // Note: The plugin returns objects that match our interface almost exactly, 
         // but we ensure type safety here
         return response.result.map((event: any) => ({
+            id: event.id != null ? String(event.id) : undefined,
             title: event.title,
             location: event.location,
             notes: event.description,
@@ -153,6 +156,13 @@ export const listCalendarEvents = async (startDate: Date, endDate: Date): Promis
         return [];
     }
 };
+
+/**
+ * Server sync id of a system calendar event: the calendar's own id, so two events with the
+ * same start (all-day events of one day, parallel meetings) never overwrite each other.
+ */
+export const calendarEventSyncId = (deviceId: string, event: CalendarEvent): string =>
+    event.id ? `${deviceId}_${event.id}` : `${deviceId}_${event.startDate.getTime()}_${event.title}`;
 
 /**
  * Parse natural language date expressions

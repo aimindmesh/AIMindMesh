@@ -2,6 +2,7 @@ import { Type } from '@google/genai';
 import { ToolDefinition, ToolResult } from './types';
 import { executeTermuxCommand } from '../termuxPlugin';
 import { Clipboard } from '@capacitor/clipboard';
+import { shellQuote, parsePackageNames, clampInt } from './shellArgs';
 
 // Re-export definitions
 export const systemTools: ToolDefinition[] = [
@@ -130,7 +131,7 @@ export const systemTools: ToolDefinition[] = [
             },
             required: ['package']
         },
-        requiresConfirmation: false,
+        requiresConfirmation: true, // Runs a shell command: always asked in 'dangerous' mode
         category: 'system'
     },
     {
@@ -300,8 +301,7 @@ export async function executeSetClipboard(args: { text: string }): Promise<ToolR
         return { success: true, message: "Clipboard set" };
     } catch (e: any) {
         // Fallback to Termux
-        const cleanText = args.text.replace(/'/g, "'\\''");
-        await executeTermuxCommand(`termux-clipboard-set '${cleanText}'`);
+        await executeTermuxCommand(`termux-clipboard-set ${shellQuote(args.text)}`);
         return { success: true, message: "Clipboard set (Termux)" };
     }
 }
@@ -321,8 +321,7 @@ export async function executeGetBatteryStatus(): Promise<ToolResult> {
 
 export async function executeTermuxSpeak(args: { text: string }): Promise<ToolResult> {
     try {
-        const cleanText = args.text.replace(/'/g, "'\\''");
-        await executeTermuxCommand(`termux-tts-speak '${cleanText}'`);
+        await executeTermuxCommand(`termux-tts-speak ${shellQuote(args.text)}`);
         return { success: true, message: "Spoken (Termux)" };
     } catch (e: any) {
         return { success: false, message: "Failed to speak: " + e.message };
@@ -330,19 +329,25 @@ export async function executeTermuxSpeak(args: { text: string }): Promise<ToolRe
 }
 
 export async function executeTermuxNotification(args: { title: string; content: string; id?: string }): Promise<ToolResult> {
-    const cmd = `termux-notification -t '${args.title}' -c '${args.content}' ${args.id ? `--id ${args.id}` : ''}`;
+    // Model-supplied text: quoted so quotes or ; in a title cannot run commands
+    const cmd = `termux-notification -t ${shellQuote(args.title)} -c ${shellQuote(args.content)}${args.id ? ` --id ${shellQuote(args.id)}` : ''}`;
     await executeTermuxCommand(cmd);
     return { success: true, message: "Notification shown" };
 }
 
 export async function executeTermuxVibrate(args: { duration?: number }): Promise<ToolResult> {
-    const duration = args.duration || 500;
+    const duration = clampInt(args.duration, 1, 5000, 500);
     await executeTermuxCommand(`termux-vibrate -d ${duration}`);
     return { success: true, message: "Vibrated" };
 }
 
 export async function installTermuxPackage(args: { package: string }): Promise<ToolResult> {
-    const cmd = `pkg install -y ${args.package}`;
+    // Only plain package names reach the shell (the argument comes from the model)
+    const names = parsePackageNames(args.package);
+    if (!names) {
+        return { success: false, message: `Invalid package name: ${String(args.package)}` };
+    }
+    const cmd = `pkg install -y ${names.join(' ')}`;
     const result = await executeTermuxCommand(cmd);
     return {
         success: result.success,

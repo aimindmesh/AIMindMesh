@@ -1,10 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import Performance from '../../../services/performancePlugin';
 import { triggerHaptic } from '../../../services/native';
+import { useKeepAlive } from '../../../services/performance/keepAliveSetting';
 
 const PerformanceSettings: React.FC = () => {
     const [isIgnoringBattery, setIsIgnoringBattery] = useState(false);
-    const [keepAliveEnabled, setKeepAliveEnabled] = useState(false);
+    // Shared flag: App starts/stops the native services and its background features from it
+    const [keepAliveEnabled, setKeepAliveEnabled] = useKeepAlive();
 
     useEffect(() => {
         checkStatus();
@@ -14,19 +16,6 @@ const PerformanceSettings: React.FC = () => {
         try {
             const { isIgnoring } = await Performance.isIgnoringBatteryOptimizations();
             setIsIgnoringBattery(isIgnoring);
-
-            // We don't have a way to check if service is running easily without more native code,
-            // but for now we can persist state or just rely on user toggle.
-            // For this iteration, let's just assume false on load or manage state locally/persisted.
-            // Ideally we'd save this preference in local storage.
-            const storedKeepAlive = localStorage.getItem('keep_alive_enabled');
-            const isEnabled = storedKeepAlive === 'true';
-            setKeepAliveEnabled(isEnabled);
-
-            // Re-sync with native layer on mount just in case
-            if (isEnabled) {
-                Performance.startKeepAlive().catch(e => console.error('Failed to sync KeepAlive on mount', e));
-            }
         } catch (e) {
             console.error('Failed to check performance status', e);
         }
@@ -44,23 +33,9 @@ const PerformanceSettings: React.FC = () => {
         }
     };
 
-    const handleKeepAliveToggle = async (enabled: boolean) => {
+    const handleKeepAliveToggle = (enabled: boolean) => {
         triggerHaptic();
         setKeepAliveEnabled(enabled);
-        localStorage.setItem('keep_alive_enabled', String(enabled));
-
-        try {
-            if (enabled) {
-                await Performance.startKeepAlive();
-            } else {
-                await Performance.stopKeepAlive();
-            }
-        } catch (e) {
-            console.error('Failed to toggle keep alive', e);
-            // Revert on error
-            setKeepAliveEnabled(!enabled);
-            localStorage.setItem('keep_alive_enabled', String(!enabled));
-        }
     };
 
     return (

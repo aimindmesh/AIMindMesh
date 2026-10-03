@@ -39,30 +39,36 @@ export const NoteEditor: React.FC<NoteEditorProps> = ({
     useEffect(() => {
         if (!editable || !onSave) return;
 
-        let timeoutId: NodeJS.Timeout;
+        let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+        const save = async () => {
+            timeoutId = undefined;
+            try {
+                const blocks = editor.document;
+                const jsonContent = JSON.stringify(blocks);
+                await onSave(jsonContent);
+                setIsSaving(false);
+            } catch (error) {
+                logger.log('error', '[NoteEditor] Failed to save note', error);
+                setIsSaving(false);
+            }
+        };
 
         const handleUpdate = () => {
             clearTimeout(timeoutId);
             setIsSaving(true);
-
-            timeoutId = setTimeout(async () => {
-                try {
-                    const blocks = editor.document;
-                    const jsonContent = JSON.stringify(blocks);
-                    await onSave(jsonContent);
-                    setIsSaving(false);
-                } catch (error) {
-                    logger.log('error', '[NoteEditor] Failed to save note', error);
-                    setIsSaving(false);
-                }
-            }, 1000); // 1 second debounce
+            timeoutId = setTimeout(save, 1000); // 1 second debounce
         };
 
         const cleanup = editor.onChange(handleUpdate);
 
         return () => {
-            clearTimeout(timeoutId);
             cleanup();
+            // Unmounting (another day picked, Agenda closed) must not drop the last edits
+            if (timeoutId !== undefined) {
+                clearTimeout(timeoutId);
+                void save();
+            }
         };
     }, [editor, editable, onSave]);
 

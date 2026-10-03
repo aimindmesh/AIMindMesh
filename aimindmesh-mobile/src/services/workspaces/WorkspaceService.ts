@@ -11,6 +11,26 @@ const emitEvent = (name: string, data?: any) => {
 // Context Mode for RAG
 export type ContextMode = 'GLOBAL' | 'WORKSPACE' | 'NONE';
 
+/** GLOBAL/NONE live here (WORKSPACE is the is_active row): "No workspace" survives restarts */
+const CONTEXT_MODE_KEY = 'workspace-context-mode';
+
+function readStoredMode(): ContextMode | null {
+    try {
+        const mode = localStorage.getItem(CONTEXT_MODE_KEY);
+        return mode === 'GLOBAL' || mode === 'NONE' || mode === 'WORKSPACE' ? mode : null;
+    } catch {
+        return null;
+    }
+}
+
+function storeMode(mode: ContextMode): void {
+    try {
+        localStorage.setItem(CONTEXT_MODE_KEY, mode);
+    } catch {
+        // Not persisted: the mode falls back to GLOBAL at the next start
+    }
+}
+
 export class WorkspaceService {
     private activeWorkspace: Workspace | null = null;
     private contextMode: ContextMode = 'GLOBAL'; // Default to Global
@@ -29,11 +49,14 @@ export class WorkspaceService {
         if (this.initializePromise) {
             return this.initializePromise;
         }
-        this.initializePromise = this.loadActiveWorkspace();
+        this.initializePromise = this.loadActiveWorkspace().then(loaded => {
+            // DB not ready yet: the next call tries again instead of keeping the fallback forever
+            if (!loaded) this.initializePromise = null;
+        });
         return this.initializePromise;
     }
 
-    async loadActiveWorkspace() {
+    async loadActiveWorkspace(): Promise<boolean> {
         try {
             const db = await getKnowledgeDatabase();
             const result = await db.query('SELECT * FROM workspaces WHERE is_active = 1 LIMIT 1');
@@ -41,14 +64,15 @@ export class WorkspaceService {
                 this.activeWorkspace = this.parseWorkspace(result.values[0]);
                 this.contextMode = 'WORKSPACE';
             } else {
-                // If no active workspace in DB, check if we should be GLOBAL or NONE
-                // For persistence we might want to store mode in DB or settings
-                // For now, default to GLOBAL if nothing active
+                // No active workspace: the saved choice between "Global" and "No workspace"
                 this.activeWorkspace = null;
-                this.contextMode = 'GLOBAL';
+                this.contextMode = readStoredMode() === 'NONE' ? 'NONE' : 'GLOBAL';
             }
+            return true;
         } catch (e) {
             logger.log('warn', '[Workspace] Failed to load active workspace', e);
+            this.contextMode = readStoredMode() === 'NONE' ? 'NONE' : 'GLOBAL';
+            return false;
         }
     }
 
@@ -121,6 +145,7 @@ export class WorkspaceService {
 
         this.activeWorkspace = await this.getWorkspaceById(workspaceId);
         this.contextMode = 'WORKSPACE';
+        storeMode('WORKSPACE');
 
         emitEvent('workspace:switched', { workspace: this.activeWorkspace, mode: this.contextMode });
     }
@@ -133,6 +158,7 @@ export class WorkspaceService {
         await db.execute('UPDATE workspaces SET is_active = 0');
         this.activeWorkspace = null;
         this.contextMode = 'GLOBAL';
+        storeMode('GLOBAL');
         emitEvent('workspace:switched', { workspace: null, mode: 'GLOBAL' });
     }
 
@@ -145,6 +171,7 @@ export class WorkspaceService {
         await db.execute('UPDATE workspaces SET is_active = 0');
         this.activeWorkspace = null;
         this.contextMode = 'NONE';
+        storeMode('NONE');
         emitEvent('workspace:switched', { workspace: null, mode: 'NONE' });
     }
 
@@ -165,6 +192,10 @@ export class WorkspaceService {
 
     // Document Management
     async addDocumentToWorkspace(workspaceId: number, documentId: number): Promise<void> {
+        // Server-ingested documents have no local row (id -1): there is nothing to link
+        if (!Number.isInteger(documentId) || documentId <= 0) {
+            throw new Error('This document is indexed on the AIMindMesh server, not locally: it cannot be added to a local workspace');
+        }
         const db = await getKnowledgeDatabase();
         await db.run(`
       INSERT OR IGNORE INTO workspace_documents (workspace_id, document_id, added_at)

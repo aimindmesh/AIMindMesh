@@ -3,6 +3,7 @@ package com.aimindmesh.mobile.tts.kokoro
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.os.SystemClock
 import android.util.Log
 import com.getcapacitor.JSObject
 import com.getcapacitor.Plugin
@@ -10,18 +11,27 @@ import com.getcapacitor.PluginCall
 import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.atomic.AtomicLong
 
 @CapacitorPlugin(name = "KokoroTTS")
 class KokoroTTSPlugin : Plugin() {
 
-    private var engine: KokoroTTSEngine? = null
+    @Volatile private var engine: KokoroTTSEngine? = null
+    // Track of the sentence currently playing, so stop() can cut it (guarded by trackLock)
     private var audioTrack: AudioTrack? = null
+    private val trackLock = Any()
+    // Serializes synthesis with engine init/release: freeing the model mid-generate would crash
+    private val engineMutex = Mutex()
+    // Each speak() owns a session; stop() or a newer speak() invalidates the older one, which
+    // previously kept reading its remaining sentences once the shared flag flipped back to true
+    private val speakSession = AtomicLong(0)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val SAMPLE_RATE = KokoroTTSEngine.SAMPLE_RATE
-    private var isLoaded = false
-    private var currentVoiceId = ""
+    @Volatile private var isLoaded = false
+    @Volatile private var currentVoiceId = ""
     private var currentLang = ""
-    private var isSpeaking = false
     
     private var currentOutput = "speaker"
 
@@ -117,12 +127,15 @@ class KokoroTTSPlugin : Plugin() {
         scope.launch {
             try {
                 val requestedLang = KokoroTTSEngine.getLanguageForVoice(voiceId)
-                if (engine == null || currentLang != requestedLang) {
-                    engine?.release()
-                    engine = KokoroTTSEngine(context)
-                    val modelDir = ModelDownloader.getModelDir(context)
-                    engine?.init(modelDir, requestedLang)
-                    currentLang = requestedLang
+                engineMutex.withLock {
+                    if (engine == null || currentLang != requestedLang) {
+                        engine?.release()
+                        engine = null
+                        val newEngine = KokoroTTSEngine(context)
+                        newEngine.init(ModelDownloader.getModelDir(context), requestedLang)
+                        engine = newEngine
+                        currentLang = requestedLang
+                    }
                 }
                 
                 isLoaded = true
@@ -138,8 +151,10 @@ class KokoroTTSPlugin : Plugin() {
     @PluginMethod
     fun unloadVoice(call: PluginCall) {
         scope.launch {
-            engine?.release()
-            engine = null
+            engineMutex.withLock {
+                engine?.release()
+                engine = null
+            }
             isLoaded = false
             currentVoiceId = ""
             currentLang = ""
@@ -161,20 +176,25 @@ class KokoroTTSPlugin : Plugin() {
         }
 
         val speakerId = KokoroTTSEngine.getSpeakerId(currentVoiceId)
+        val session = speakSession.incrementAndGet()
 
         scope.launch {
             try {
-                isSpeaking = true
                 val sentences = text.split(Regex("(?<=[.!?;])\\s+"))
                 for (sentence in sentences) {
-                    if (sentence.isBlank() || !isSpeaking) continue
-                    val audioData = engine!!.synthesize(sentence, speakerId, 1.0f)
-                    playAudio(audioData)
+                    if (speakSession.get() != session) break
+                    if (sentence.isBlank()) continue
+                    val audioData = engineMutex.withLock {
+                        if (speakSession.get() != session) null
+                        else (engine ?: throw IllegalStateException("Voice not loaded"))
+                            .synthesize(sentence, speakerId, 1.0f)
+                    } ?: break
+                    playAudio(audioData, session)
                 }
-                isSpeaking = false
                 call.resolve()
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                isSpeaking = false
                 Log.e("KokoroTTS", "Synthesis error", e)
                 call.reject("Synthesis error: ${e.message}")
             }
@@ -183,10 +203,23 @@ class KokoroTTSPlugin : Plugin() {
 
     @PluginMethod
     fun stop(call: PluginCall) {
-        audioTrack?.pause()
-        audioTrack?.flush()
-        isSpeaking = false
+        speakSession.incrementAndGet()
+        haltCurrentTrack()
         call.resolve()
+    }
+
+    /** Cuts the playing sentence; pause() also wakes a blocking write() so the speak loop can exit. */
+    private fun haltCurrentTrack() {
+        synchronized(trackLock) {
+            audioTrack?.let {
+                try {
+                    it.pause()
+                    it.flush()
+                } catch (e: IllegalStateException) {
+                    Log.w("KokoroTTS", "Failed to halt AudioTrack", e)
+                }
+            }
+        }
     }
 
     @PluginMethod
@@ -202,8 +235,8 @@ class KokoroTTSPlugin : Plugin() {
         call.resolve(ret)
     }
 
-    private fun playAudio(pcmData: FloatArray) {
-        if (!isSpeaking) return
+    private suspend fun playAudio(pcmData: FloatArray, session: Long) {
+        if (speakSession.get() != session || pcmData.isEmpty()) return
         
         val bufferSize = AudioTrack.getMinBufferSize(
             SAMPLE_RATE,
@@ -214,8 +247,7 @@ class KokoroTTSPlugin : Plugin() {
         val usage = if (currentOutput == "earpiece") AudioAttributes.USAGE_VOICE_COMMUNICATION else AudioAttributes.USAGE_ASSISTANT
         val contentType = AudioAttributes.CONTENT_TYPE_SPEECH
 
-        audioTrack?.release()
-        audioTrack = AudioTrack.Builder()
+        val track = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(usage)
@@ -233,17 +265,49 @@ class KokoroTTSPlugin : Plugin() {
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
 
-        audioTrack?.play()
-        audioTrack?.write(pcmData, 0, pcmData.size, AudioTrack.WRITE_BLOCKING)
-        audioTrack?.stop()
-        audioTrack?.release()
-        audioTrack = null
+        synchronized(trackLock) {
+            if (speakSession.get() != session) {
+                track.release()
+                return
+            }
+            audioTrack = track
+        }
+
+        try {
+            track.play()
+            track.write(pcmData, 0, pcmData.size, AudioTrack.WRITE_BLOCKING)
+            // write() returns once the samples are buffered, not played: releasing right away
+            // clipped the last few hundred ms of every sentence, so wait for the head to drain.
+            val maxWaitMs = pcmData.size * 1000L / SAMPLE_RATE + 1000L
+            val startedAt = SystemClock.elapsedRealtime()
+            while (speakSession.get() == session &&
+                track.playbackHeadPosition < pcmData.size &&
+                SystemClock.elapsedRealtime() - startedAt < maxWaitMs) {
+                delay(20)
+            }
+        } finally {
+            synchronized(trackLock) {
+                if (audioTrack === track) audioTrack = null
+            }
+            try {
+                track.stop()
+            } catch (e: IllegalStateException) {
+                // Already stopped or never started
+            }
+            track.release()
+        }
     }
 
     override fun handleOnDestroy() {
         super.handleOnDestroy()
+        speakSession.incrementAndGet()
+        haltCurrentTrack()
         scope.cancel()
-        engine?.release()
-        audioTrack?.release()
+        val oldEngine = engine
+        engine = null
+        // Free only after an in-flight synthesis has left the engine (it cannot be interrupted)
+        CoroutineScope(Dispatchers.IO).launch {
+            engineMutex.withLock { oldEngine?.release() }
+        }
     }
 }

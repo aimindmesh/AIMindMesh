@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { useLocalStorage } from './useLocalStorage';
 import { Message, Personality, LLMConfig, SpeechConfig, ResponseStyle, ImageAttachment, AudioAttachment, FileAttachment, AIMindMeshServerSettings } from '../types';
 import { FilePicker } from '@capawesome/capacitor-file-picker';
@@ -9,6 +9,9 @@ import { fileToBase64 } from '../utils/fileUtils';
 import { stopSpeaking } from '../services/tts/speech';
 import { getOrInitializeSemanticMemoryRetriever } from '../services/memory/semanticMemoryRetriever';
 import { imageGenService } from '../services/image/imageGenService';
+import { imageFromToolData, resolveToolSourceImage, rewriteImagePrompt } from '../services/image/imagePrompt';
+import { generateMemorySummary } from '../services/llm/llmService';
+import { apiKeyForProvider, effectiveProvider } from './chat/agentLoopHelpers';
 import { ChatContext, ApiKeys } from './chat/types';
 import { useAgenticLoop } from './chat/useAgenticLoop';
 
@@ -38,7 +41,8 @@ export const useChat = (
         setPendingToolCall,
         stopGeneration,
         runAgenticLoop,
-        handleConfirmTool
+        handleConfirmTool,
+        isBusy
     } = useAgenticLoop({
         llmConfig,
         personality,
@@ -197,9 +201,14 @@ export const useChat = (
         }
     };
 
+    // True from the moment a message is accepted until its run has started (the semantic memory
+    // save and image generation are awaited first): a second send meanwhile is ignored
+    const sendingRef = useRef(false);
+
     const triggerAIResponse = useCallback((history: Message[]) => {
+        if (isBusy()) return;
         runAgenticLoop(history);
-    }, [runAgenticLoop]);
+    }, [runAgenticLoop, isBusy]);
 
     const addPendingImage = useCallback((img: ImageAttachment) => {
         setPendingImages(prev => [...prev, img]);
@@ -208,6 +217,9 @@ export const useChat = (
 
     const sendMessage = useCallback(async (textToSend: string, options?: { hidden?: boolean, role?: 'user' | 'system' }) => {
         if (!textToSend && pendingImages.length === 0 && pendingAudio.length === 0 && pendingFiles.length === 0) return;
+        // One answer at a time (Enter while streaming, voice input, Gemini Live turns)
+        if (sendingRef.current || isBusy()) return;
+        sendingRef.current = true;
 
         triggerHaptic();
         stopSpeaking();
@@ -224,7 +236,6 @@ export const useChat = (
             hidden: options?.hidden
         };
 
-        const currentPendingImages = [...pendingImages];
 
         // Clear input state immediately
         setInput('');
@@ -234,71 +245,32 @@ export const useChat = (
 
         const trimmed = textToSend.trim();
 
-        // Handle /image or /draw command on NPU
-        if (trimmed.startsWith('/image ') || trimmed.startsWith('/draw ')) {
-            const prompt = trimmed.replace(/^\/(image|draw)\s+/, '').trim();
+        // /image (/draw) and /edit run on the NPU: the chat LLM, still in RAM, first turns the request
+        // into an English Stable Diffusion prompt; then it leaves the RAM to SD and comes back
+        const imageCommand = /^\/(image|draw|edit)\s+/.exec(trimmed);
+        if (imageCommand) {
+            const editing = imageCommand[1] === 'edit';
+            const request = trimmed.slice(imageCommand[0].length).trim();
             setMessages(prev => [...prev, userInput]);
             setIsLoading(true);
+            const reply = (text: string, images?: ImageAttachment[]) => setMessages(prev =>
+                [...prev, { id: (Date.now() + 1).toString(), role: 'model', text, timestamp: new Date(), images }]);
             try {
-                const genResult = await imageGenService.generateImage({ prompt });
-                const aiResponse: Message = {
-                    id: (Date.now() + 1).toString(),
-                    role: 'model',
-                    text: `Generated on Qualcomm Hexagon NPU (${genResult.generationTimeMs}ms): "${prompt}"`,
-                    timestamp: new Date(),
-                    images: [{
-                        name: 'generated.png',
-                        base64: genResult.base64Image.replace(/^data:image\/\w+;base64,/, ''),
-                        mimeType: 'image/png'
-                    }]
-                };
-                setMessages(prev => [...prev, aiResponse]);
+                // The attached image, else the newest one in the chat (e.g. the last generated)
+                const source = editing ? resolveToolSourceImage('last', [...messages, userInput]) : {};
+                if (source.error) throw new Error('attach the image to edit (or generate one first), then use /edit');
+                const apiKey = apiKeyForProvider(effectiveProvider(llmConfig, serverSettings), apiKeys, llmConfig);
+                const prompt = await rewriteImagePrompt(request, editing ? 'edit' : 'generate',
+                    instruction => generateMemorySummary(instruction, llmConfig, apiKey));
+                const genResult = await imageGenService.generateFromChat({ prompt, sourceImage: source.source });
+                const image = imageFromToolData(genResult);
+                reply(`${editing ? 'Modified' : 'Generated'} on the Hexagon NPU in ${(genResult.generationTimeMs / 1000).toFixed(1)}s` +
+                    `${genResult.seed !== undefined ? ` · seed ${genResult.seed}` : ''}\nPrompt: "${prompt}"`, image ? [image] : undefined);
             } catch (err: any) {
-                const errResponse: Message = {
-                    id: (Date.now() + 1).toString(),
-                    role: 'model',
-                    text: `⚠️ Image generation failed: ${err.message || 'Unknown error'}`,
-                    timestamp: new Date()
-                };
-                setMessages(prev => [...prev, errResponse]);
+                reply(`⚠️ Image ${editing ? 'modification' : 'generation'} failed: ${err.message || 'Unknown error'}`);
             } finally {
                 setIsLoading(false);
-            }
-            return;
-        }
-
-        // Handle /edit command on NPU
-        if (trimmed.startsWith('/edit ')) {
-            const prompt = trimmed.replace(/^\/edit\s+/, '').trim();
-            const sourceImg = currentPendingImages[0]?.base64
-                ? `data:${currentPendingImages[0].mimeType};base64,${currentPendingImages[0].base64}`
-                : (currentPendingImages[0]?.webPath || undefined);
-            setMessages(prev => [...prev, userInput]);
-            setIsLoading(true);
-            try {
-                const genResult = await imageGenService.generateImage({ prompt, sourceImage: sourceImg });
-                const aiResponse: Message = {
-                    id: (Date.now() + 1).toString(),
-                    role: 'model',
-                    text: `Modified on Qualcomm Hexagon NPU (${genResult.generationTimeMs}ms): "${prompt}"`,
-                    timestamp: new Date(),
-                    images: [{
-                        name: 'modified.png',
-                        base64: genResult.base64Image.replace(/^data:image\/\w+;base64,/, ''),
-                        mimeType: 'image/png'
-                    }]
-                };
-                setMessages(prev => [...prev, aiResponse]);
-            } catch (err: any) {
-                const errResponse: Message = {
-                    id: (Date.now() + 1).toString(),
-                    role: 'model',
-                    text: `⚠️ Image modification failed: ${err.message || 'Unknown error'}`,
-                    timestamp: new Date()
-                };
-                setMessages(prev => [...prev, errResponse]);
-            } finally {
-                setIsLoading(false);
+                sendingRef.current = false;
             }
             return;
         }
@@ -307,8 +279,9 @@ export const useChat = (
         // Save user message to semantic memory FIRST to prevent concurrent ONNX/LiteRT embedding calls
         await saveToSemanticMemory('user', textToSend);
 
-        triggerAIResponse(newHistory);
-    }, [pendingImages, pendingAudio, pendingFiles, messages, triggerAIResponse, setInput, llmConfig, activeThreadId, setMessages]);
+        sendingRef.current = false; // The run takes over (it marks itself busy before its first await)
+        runAgenticLoop(newHistory);
+    }, [pendingImages, pendingAudio, pendingFiles, messages, runAgenticLoop, isBusy, setInput, llmConfig, activeThreadId, setMessages, apiKeys, serverSettings]);
 
     const handleResend = useCallback((message: Message) => {
         sendMessage(message.text);

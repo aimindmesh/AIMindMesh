@@ -1,12 +1,15 @@
-import { SD, SDGenerateOptions, SDGenerateResult, SDProgressEvent, SDCapabilities } from 'sd-capacitor';
+import { SD, SDGenerateOptions, SDGenerateResult, SDProgressEvent, SDCapabilities, SDModelInfo, SDSampler } from 'sd-capacitor';
 import { logger } from '../logger';
 import { FileSystemAdapter as Filesystem, Directory } from '../../utils/fileSystemAdapter';
+import { readSetting } from '../security/secretStore';
+import { ensureResident, enterActivity, leaveActivity, markUnloaded } from '../model/modelOrchestrator';
+import { DEFAULT_NEGATIVE_PROMPT } from './imagePrompt';
 
 export interface ImageGenerationRequest {
     prompt: string;
     negativePrompt?: string;
-    sourceImage?: string; // Base64 or local file path for image-to-image editing
-    strength?: number;    // Denoising strength (0.1 - 0.9)
+    sourceImage?: string; // Data URL, base64 or file path of the image to edit (img2img)
+    strength?: number;    // Share of the steps re-run on the source (0.1 subtle - 0.95 drastic)
     steps?: number;
     cfgScale?: number;
     seed?: number;
@@ -14,6 +17,7 @@ export interface ImageGenerationRequest {
     height?: number;
     aspectRatio?: '1:1' | '16:9' | '9:16' | '4:3' | '3:4';
     upscale?: 1 | 2 | 4;
+    sampler?: SDSampler;
     onProgress?: (event: SDProgressEvent) => void;
 }
 
@@ -39,6 +43,25 @@ export class ImageGenService {
 
     public getCurrentModelPath(): string | null {
         return this.currentModelPath;
+    }
+
+    /** Native truth (the JS flag is lost when the WebView reloads) */
+    public async isModelLoaded(): Promise<boolean> {
+        try {
+            return (await SD.isLoaded()).loaded;
+        } catch {
+            return this.isLoaded;
+        }
+    }
+
+    /** What the loaded package supports (editing, AI upscaling), null when none is loaded */
+    public async getModelInfo(): Promise<SDModelInfo | null> {
+        try {
+            const state = await SD.isLoaded();
+            return state.loaded ? state : null;
+        } catch {
+            return null;
+        }
     }
 
     /**
@@ -76,6 +99,8 @@ export class ImageGenService {
                 return true;
             }
 
+            // Stable Diffusion never shares the RAM with an LLM or a large speech model
+            await ensureResident('sd');
             logger.log('info', `[ImageGenService] Loading SD model onto Qualcomm NPU: ${absolutePath}`);
             const result = await SD.loadModel({ modelPath: absolutePath, backend: 'npu' });
 
@@ -95,56 +120,45 @@ export class ImageGenService {
     }
 
     /**
+     * Loads the Stable Diffusion model chosen in Settings (or the first installed one) if no
+     * model is loaded yet. Image generation calls it; the image screen calls it when it opens.
+     */
+    public async ensureLoaded(): Promise<void> {
+        if (await this.isModelLoaded()) return;
+        const { listLocalSDModels, getSDModelPath } = await import('./sdModelDownloader');
+        const localModels = await listLocalSDModels();
+
+        // 1. The model chosen in Settings > Vision (stored in llm-config)
+        const llmConfig = readSetting<{ sdModelId?: string; sdModelPath?: string } | null>('llm-config', null);
+        let targetModelId: string | null = llmConfig?.sdModelId ?? null;
+        let targetPath: string | null = llmConfig?.sdModelPath ?? null;
+        if (targetModelId && !targetPath) {
+            targetPath = await getSDModelPath(targetModelId);
+        }
+
+        // 2. Fallback to the first installed model if the configured one is not found
+        if (!targetPath && localModels.length > 0) {
+            const fallbackId = (targetModelId && localModels.includes(targetModelId)) ? targetModelId : localModels[0];
+            targetPath = await getSDModelPath(fallbackId);
+            targetModelId = fallbackId;
+        }
+
+        if (targetPath) {
+            const loaded = await this.loadModel(targetPath);
+            if (!loaded) {
+                throw new Error(`Failed to load Stable Diffusion model (${targetModelId || targetPath}). Please check Settings > Vision & Image Creation.`);
+            }
+        } else {
+            throw new Error('No Stable Diffusion model installed. Please import a model (.zip) in Settings > Vision & Image Creation.');
+        }
+    }
+
+    /**
      * Generate or modify an image on-device using Qualcomm Hexagon NPU
      */
     public async generateImage(req: ImageGenerationRequest): Promise<SDGenerateResult> {
-        // Verify model is loaded or auto-load active local model
-        const status = await SD.isLoaded().catch(() => ({ loaded: false }));
-        if (!status.loaded) {
-            const { listLocalSDModels, getSDModelPath } = await import('./sdModelDownloader');
-            const localModels = await listLocalSDModels();
-
-            // 1. Try configured model from settings
-            let targetPath: string | null = null;
-            let targetModelId: string | null = null;
-
-            try {
-                const rawSettings = localStorage.getItem('settings');
-                if (rawSettings) {
-                    const parsed = JSON.parse(rawSettings);
-                    if (parsed?.llmConfig?.sdModelId) {
-                        targetModelId = parsed.llmConfig.sdModelId;
-                    }
-                    if (parsed?.llmConfig?.sdModelPath) {
-                        targetPath = parsed.llmConfig.sdModelPath;
-                    }
-                }
-            } catch (e) {
-                // ignore
-            }
-
-            if (targetModelId && !targetPath) {
-                targetPath = await getSDModelPath(targetModelId);
-            }
-
-            // 2. Fallback to first installed model if configured model not found
-            if (!targetPath && localModels.length > 0) {
-                const fallbackId = (targetModelId && localModels.includes(targetModelId)) ? targetModelId : localModels[0];
-                targetPath = await getSDModelPath(fallbackId);
-                targetModelId = fallbackId;
-            }
-
-            if (targetPath) {
-                const loaded = await this.loadModel(targetPath);
-                if (!loaded) {
-                    throw new Error(`Failed to load Stable Diffusion model (${targetModelId || targetPath}). Please check Settings > Vision & Image Creation.`);
-                }
-            } else if (localModels.length > 0) {
-                throw new Error('No Stable Diffusion model selected. Please select a model in Settings > Vision & Image Creation.');
-            } else {
-                throw new Error('No Stable Diffusion model installed. Please import a model (.zip) in Settings > Vision & Image Creation.');
-            }
-        }
+        // Verify model is loaded or auto-load the configured local model
+        await this.ensureLoaded();
 
         let listenerHandle: any = null;
         try {
@@ -166,6 +180,7 @@ export class ImageGenService {
                 height: req.height || 512,
                 aspectRatio: req.aspectRatio || '1:1',
                 upscale: req.upscale || 1,
+                sampler: req.sampler || 'euler',
             };
 
             const modeDesc = req.sourceImage ? 'Image-to-Image Edit' : 'Text-to-Image';
@@ -181,6 +196,32 @@ export class ImageGenService {
     }
 
     /**
+     * Settings: checks that a bundle loads on the NPU without leaving it in RAM (the image
+     * screen loads it when needed, and the chat LLM comes back right after the check).
+     */
+    public async verifyModel(modelPath: string): Promise<boolean> {
+        await enterActivity('image', ['sd']);
+        try {
+            return await this.loadModel(modelPath);
+        } finally {
+            await leaveActivity('image');
+        }
+    }
+
+    /**
+     * One-off generation from the chat (/image, /edit): the chat LLM leaves the RAM for the
+     * image model and comes back right after.
+     */
+    public async generateFromChat(req: ImageGenerationRequest): Promise<SDGenerateResult> {
+        await enterActivity('image', ['sd']);
+        try {
+            return await this.generateImage({ ...req, negativePrompt: req.negativePrompt?.trim() || DEFAULT_NEGATIVE_PROMPT });
+        } finally {
+            await leaveActivity('image');
+        }
+    }
+
+    /**
      * Unload SD model from NPU memory
      */
     public async unloadModel(): Promise<void> {
@@ -188,6 +229,7 @@ export class ImageGenService {
             await SD.unloadModel();
             this.isLoaded = false;
             this.currentModelPath = null;
+            markUnloaded('sd');
             logger.log('info', '[ImageGenService] SD NPU model unloaded');
         } catch (e) {
             logger.log('warn', '[ImageGenService] Error unloading SD model', e);

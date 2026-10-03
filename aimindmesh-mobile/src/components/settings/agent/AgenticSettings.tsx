@@ -6,6 +6,7 @@ import { initNativeModel, getSlotModelInfo, unloadNativeModelSlot } from '../../
 import { FilePicker } from '@capawesome/capacitor-file-picker';
 import { FileSystemAdapter as Filesystem, Directory } from '../../../utils/fileSystemAdapter';
 import { logger } from '../../../services/logger';
+import { useDownloadResume } from '../../../hooks/useDownloadResume';
 import { TOOL_DEFINITIONS } from '../../../services/toolDefinitions';
 
 interface AgenticSettingsProps {
@@ -96,22 +97,12 @@ const AgenticSettings: React.FC<AgenticSettingsProps> = ({
         try {
             console.log('[AgenticSettings] Loading tool model:', filename);
 
-            // Resolve absolute path for the native layer (required on Android/Linux)
-            const uriResult = await Filesystem.getUri({
-                path: filename,
-                directory: Directory.Data
-            });
-
-            // Strip file:// prefix if present
+            // The native layer needs the ABSOLUTE path (without the file:// prefix)
+            const uriResult = await Filesystem.getUri({ path: filename, directory: Directory.Data });
             const absolutePath = uriResult.uri.replace('file://', '');
             console.log('[AgenticSettings] Resolved absolute path:', absolutePath);
-
-            // Initialize with the ABSOLUTE path
-            await initNativeModel({
-                modelPath: absolutePath,
-                nCtx: 2048, // Explicitly set context for tool model
-                nGpuLayers: llmConfig.nGpuLayers, // Respect GPU setting
-            }, 'tool');
+            // nCtx set explicitly for the tool model; GPU layers follow the main setting
+            await initNativeModel({ modelPath: absolutePath, nCtx: 2048, nGpuLayers: llmConfig.nGpuLayers }, 'tool');
 
             // Save the RELATIVE filename to config (preserves restart behavior)
             onLlmConfigSave({ ...llmConfig, toolUseModelPath: filename });
@@ -132,6 +123,13 @@ const AgenticSettings: React.FC<AgenticSettingsProps> = ({
             console.error('Failed to unload tool model:', error);
         }
     };
+
+    // Downloads started before this screen was last closed keep running natively
+    useDownloadResume(
+        RECOMMENDED_MODELS.map(m => ({ id: m.id, url: m.url, filename: m.id + '.gguf' })),
+        setDownloadProgress,
+        () => { checkDownloadedModels(); }
+    );
 
     const handleDownloadModel = async (model: typeof RECOMMENDED_MODELS[0]) => {
         triggerHaptic();

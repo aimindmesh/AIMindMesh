@@ -19,7 +19,7 @@ export interface ModelInfo {
     loaded: boolean;
     /** Dimension of the embedding vectors produced */
     dimension: number;
-    /** Model ID (directory name) */
+    /** Directory of the loaded model as passed to loadModel ('' when none) */
     modelId: string;
 }
 
@@ -35,8 +35,10 @@ export interface ModelConfig {
 
 export interface TextEmbeddingPlugin {
     /**
-     * Load an ONNX embedding model from a directory.
-     * Directory must contain: model.onnx, tokenizer.json, tokenizer_config.json
+     * Load an ONNX embedding model from a directory, replacing (and closing) the loaded one.
+     * A no-op when this directory is already loaded; on failure the previous model stays.
+     * Directory must contain: model.onnx, tokenizer.json (WordPiece or Unigram);
+     * config.json and tokenizer_config.json are optional
      * @param options.modelDir Path to model directory (relative to app data)
      */
     loadModel(options: { modelDir: string }): Promise<{ dimension: number }>;

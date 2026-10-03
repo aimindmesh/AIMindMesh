@@ -3,11 +3,35 @@
  * Handles scheduling and managing local notifications for tasks
  */
 
+import { Capacitor } from '@capacitor/core';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import { logger } from '../logger';
 import { CalendarTask } from '../../types/calendar';
 
 const NOTIFICATION_CHANNEL = 'task-reminders';
+const REMINDER_LEAD_MS = 60 * 60 * 1000;
+
+/**
+ * Creates the reminder channel. Android 8+ silently drops notifications posted to a channel
+ * that does not exist, so this runs at startup (no permission prompt here).
+ */
+export async function ensureTaskNotificationChannel(): Promise<void> {
+    if (!Capacitor.isNativePlatform()) return;
+    try {
+        const globalVibration = localStorage.getItem('enable-notification-vibration') !== 'false';
+
+        await LocalNotifications.createChannel({
+            id: NOTIFICATION_CHANNEL,
+            name: 'Task Reminders',
+            description: 'Notifications for upcoming and overdue tasks',
+            importance: 3, // Default importance
+            sound: 'default',
+            vibration: globalVibration
+        });
+    } catch (error) {
+        logger.log('error', '[TaskNotifications] Failed to create the reminder channel', error);
+    }
+}
 
 /**
  * Initialize the notification service
@@ -21,18 +45,7 @@ export async function initTaskNotifications(): Promise<boolean> {
             return false;
         }
 
-        // Create notification channel (Android)
-        const globalVibration = localStorage.getItem('enable-notification-vibration') !== 'false';
-
-        await LocalNotifications.createChannel({
-            id: NOTIFICATION_CHANNEL,
-            name: 'Task Reminders',
-            description: 'Notifications for upcoming and overdue tasks',
-            importance: 3, // Default importance
-            sound: 'default',
-            vibration: globalVibration
-        });
-
+        await ensureTaskNotificationChannel();
         logger.log('info', '[TaskNotifications] Initialized successfully');
         return true;
     } catch (error) {
@@ -50,33 +63,30 @@ function getNotificationId(taskId: string): number {
         hash = ((hash << 5) - hash) + taskId.charCodeAt(i);
         hash = hash & hash; // Convert to 32bit integer
     }
-    return Math.abs(hash);
+    return Math.abs(hash) % 2147483647; // Math.abs(-2^31) does not fit a Java int
 }
 
 /**
- * Schedule a notification for a task
- * Schedules notification 1 hour before due date
+ * When the reminder of a task fires (1 hour before it is due), or null when it needs none:
+ * done, AI-run and subtasks (they share the parent's due date) get no reminder.
+ */
+export function getReminderTime(task: CalendarTask, now: number = Date.now()): number | null {
+    if (task.status === 'done' || task.assignee === 'ai' || task.parentTaskId) return null;
+    const at = task.dueDate - REMINDER_LEAD_MS;
+    return Number.isFinite(at) && at > now ? at : null;
+}
+
+/**
+ * Brings the reminder of a task in line with its current state: replaced when the due date
+ * changes, removed when the task is completed, handed to the AI or deleted.
  */
 export async function scheduleTaskNotification(task: CalendarTask): Promise<void> {
     try {
         // Cancel existing notification for this task first
         await cancelTaskNotification(task.id);
 
-        const dueDate = new Date(task.dueDate);
-        const now = new Date();
-
-        if (dueDate <= now) {
-            logger.log('info', '[TaskNotifications] Task already due, skipping notification');
-            return;
-        }
-
-        // Schedule reminder 1 hour before due date
-        const reminderTime = new Date(dueDate.getTime() - (60 * 60 * 1000));
-
-        if (reminderTime <= now) {
-            logger.log('info', '[TaskNotifications] Reminder time in past, skipping');
-            return;
-        }
+        const reminderTime = getReminderTime(task);
+        if (reminderTime === null) return;
 
         await LocalNotifications.schedule({
             notifications: [{
@@ -84,7 +94,7 @@ export async function scheduleTaskNotification(task: CalendarTask): Promise<void
                 title: '📋 Task Reminder',
                 body: `"${task.title}" is due in 1 hour`,
                 schedule: {
-                    at: reminderTime
+                    at: new Date(reminderTime)
                 },
                 channelId: NOTIFICATION_CHANNEL,
                 extra: {
@@ -149,9 +159,7 @@ export async function notifyOverdueTasks(tasks: CalendarTask[]): Promise<void> {
  */
 export async function scheduleAllTaskNotifications(tasks: CalendarTask[]): Promise<void> {
     for (const task of tasks) {
-        if (task.status !== 'done' && task.dueDate > Date.now()) {
-            await scheduleTaskNotification(task);
-        }
+        await scheduleTaskNotification(task);
     }
 }
 

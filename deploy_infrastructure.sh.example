@@ -50,14 +50,10 @@ else
     echo "ℹ️  Kasm not found in /opt/kasm. Skipping Kasm startup."
 fi
 
-# 7. Launch Core AIMindMesh Stack (Server + OpenClaw + Neo4j)
-echo "🧠 Launching Core AIMindMesh Stack..."
-# Note: The core stack is usually deployed via aimindmesh-server/deploy_to_cloud.sh
-# but this section ensures the docker-compose in infrastructure/docker/core is up.
-CORE_DIR="$INFRA_DIR/docker/core"
-
-if [ -f "$CORE_DIR/docker-compose.yml" ]; then
-    cd "$CORE_DIR" && GITEA_TOKEN="$GITEA_TOKEN" GOOGLE_API_KEY="$GOOGLE_API_KEY" docker-compose up -d --build
-fi
+# 7. Core AIMindMesh Stack (Server + OpenClaw + Neo4j + FreeLLMAPI + Hermes)
+# Deployed from aimindmesh-server (its docker-compose.yml is the only definition of these containers):
+#   cd aimindmesh-server && ./deploy_to_cloud.sh --full     (from your workstation)
+#   or, on the VPS: cd aimindmesh-server && docker compose up -d --build
+echo "🧠 Core stack: deploy it with aimindmesh-server/deploy_to_cloud.sh (see DEVELOPMENT_GUIDE.md)."
 
 echo "✅ Infrastructure Deployment Complete!"

@@ -5,4 +5,7 @@
         <package android:name="com.termux" />
         <package android:name="com.termux.api" />
     </queries>
+
+    <!-- Run commands through Termux's RunCommandService (dangerous: requested at runtime) -->
+    <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
 </manifest>

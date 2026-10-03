@@ -15,6 +15,7 @@ import androidx.annotation.NonNull;
 public class MainScreen extends Screen {
         public MainScreen(CarContext carContext) {
                 super(carContext);
+                AutoDataStore.register(this);
         }
 
         @NonNull
@@ -23,7 +24,7 @@ public class MainScreen extends Screen {
                 ItemList.Builder listBuilder = new ItemList.Builder();
 
                 // Call Mode Item
-                if (AndroidAutoPlugin.isCallModeEnabled()) {
+                if (AutoDataStore.isEnabled(getCarContext(), AutoDataStore.SHOW_CALL_MODE)) {
                         listBuilder.addItem(
                                         new GridItem.Builder()
                                                         .setTitle("Assistant Call")
@@ -48,7 +49,7 @@ public class MainScreen extends Screen {
                 }
 
                 // Calendar Item
-                if (AndroidAutoPlugin.isCalendarEnabled()) {
+                if (AutoDataStore.isEnabled(getCarContext(), AutoDataStore.SHOW_CALENDAR)) {
                         listBuilder.addItem(
                                         new GridItem.Builder()
                                                         .setTitle("Calendar")
@@ -62,7 +63,7 @@ public class MainScreen extends Screen {
                 }
 
                 // To-Do Item
-                if (AndroidAutoPlugin.isToDoEnabled()) {
+                if (AutoDataStore.isEnabled(getCarContext(), AutoDataStore.SHOW_TODO)) {
                         listBuilder.addItem(
                                         new GridItem.Builder()
                                                         .setTitle("Agenda")
@@ -76,7 +77,7 @@ public class MainScreen extends Screen {
                 }
 
                 // Kanban Item
-                if (AndroidAutoPlugin.isKanbanEnabled()) {
+                if (AutoDataStore.isEnabled(getCarContext(), AutoDataStore.SHOW_KANBAN)) {
                         listBuilder.addItem(
                                         new GridItem.Builder()
                                                         .setTitle("Kanban Board")

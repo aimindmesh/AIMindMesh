@@ -3,7 +3,7 @@
 > **Version:** 0.1.0
 > **Server Version:** 0.1.0
 > **Repository:** https://github.com/aimindmesh/AIMindMesh
-> **Last Updated:** May 17, 2026
+> **Last Updated:** October 3, 2026
 > **Architecture:** Local-First Hybrid Agent + Distributed Ecosystem
 
 ## 1. Executive Summary & Philosophy
@@ -25,8 +25,8 @@ The application uses a **React Native-like** architecture but with a custom, hig
 
 ### 2.1 Technology Stack
 *   **Frontend**: React 18, TypeScript, Vite, TailwindCSS (Utility-first styling).
-*   **Container**: Capacitor 5 (Native Bridge).
-*   **Vector Database**: SQLite (via `sqlite-vec` compatible logic) + `all-MiniLM-L6-v2` embeddings (ONNX).
+*   **Container**: Capacitor 7 (`@capacitor/core` 7.x, `@capacitor/android` 7.x; CLI 8.x) as Native Bridge.
+*   **Vector Database**: SQLite (`@capacitor-community/sqlite`) storing 384-dim `all-MiniLM-L6-v2` embeddings (ONNX) as BLOBs. Similarity search is a brute-force cosine scan in TypeScript (`DocumentRetriever.ts`, `semanticMemoryRetriever.ts`); `sqlite-vec` is **not** used.
 *   **Native Layer**: Android (Java/Kotlin/C++).
 *   **Inference Engines**:
     *   **LLM**: `llama.cpp` (GGUF format) & `LiteRT` (Gemini Nano/Gemma format).
@@ -44,20 +44,21 @@ The application uses a **React Native-like** architecture but with a custom, hig
         *   `layout/`: Extracted layout components like `AppNavbar` to ensure maintainability.
         *   `onboarding/`: First-run onboarding wizard. Includes optional server configuration step.
     *   `types/`: Centralized TypeScript definitions.
-*   `android/`: Native Android project.
-    *   `plugins/`: 17 Custom Capacitor plugins.
+*   `plugins/`: 16 custom Capacitor plugin packages (`*-capacitor`, TypeScript definitions + Android library module), resolved by the TypeScript `paths` and Vite aliases to their `src/index.ts`.
+*   `android/`: Native Android project. Further in-app plugins (Voxtral, KokoroTTS, AudioPlayback, MeetingExport, Performance, SystemMonitor, Proactive, SecureStorage) live directly in `android/app/src/main/java/com/aimindmesh/mobile/`.
     *   `utils/`: Native audio processing utilities (`AudioEncoder`, `AudioDecoder`, `WavHelper`).
 
 ### 2.3 Data Persistence & Resilience
 *   **Database**: SQLite is the primary storage engine for all persistent data (Memories, Calendar, Settings).
     *   **Architecture**: Multi-database isolation (separate files for memories, meeting history, and global settings).
-    *   **Concurrency**: **Write-Ahead Logging (WAL)** mode enabled across all databases to permit concurrent reads while a write operation is in progress (bypassing `SQLITE_BUSY` contention).
-    *   **Performance Tuning**:
-        *   `journal_mode = WAL`: Optimized for concurrent access.
-        *   `synchronous = NORMAL`: Balanced safety/speed; protects database integrity while doubling write throughput vs `FULL`.
+    *   **Journal mode**: `journal_mode = DELETE` (rollback journal). WAL is **not** enabled: `DatabaseManager.ts` sets DELETE because `@capacitor-community/sqlite` wraps statements in transactions. Write contention is handled by serialized writes and `busy_timeout`.
+    *   **Performance Tuning** (`DatabaseManager.ts`):
+        *   `synchronous = NORMAL`: Balanced safety/speed.
         *   `cache_size = -8000`: 8MB page cache per database connection.
-        *   `wal_autocheckpoint = 1000`: Automated checkpointing every 1000 pages to keep `.wal` file sizes manageable.
-        *   **Background Maintenance**: Periodic `PRAGMA wal_checkpoint(PASSIVE)` triggered via `DatabaseManager.walCheckpoint()` during app idle states.
+        *   `busy_timeout = 5000`: Waits up to 5s on `SQLITE_BUSY` instead of failing.
+        *   `foreign_keys = ON`.
+        *   `wal_autocheckpoint` / `walCheckpoint()` are still issued but have no effect in DELETE mode.
+*   **Not in SQLite**: chat threads (`threadManager.ts`) and most settings are stored in WebView `localStorage`; API keys live in the Keystore-backed secret store when encryption is available (see §9).
 *   **Connection Management**: Uses a custom **Robust Proxy Pattern** to automatically handle Android lifecycle events.
 *   **Auto-Recovery**: Automatically detects and recovers from OS-initiated connection closures (e.g., when app is backgrounded/killed) without data loss or user interruption.
 
@@ -74,7 +75,7 @@ The unique power of AI Mind Mesh comes from its extensive suite of custom native
 | **MeetingExport** | `meeting-export-capacitor` | **Export & Share**. Renders HTML to PDF and handles Android Share Intents. |
 | **LiteRT** | `litert-capacitor` | **Google Edge AI Engine**. Runs `.litertlm` models (Gemma 4 QAT, Gemma 4 E2B/E4B) via LiteRT 0.11.0 runtime. Optimized per hardware (NPU/GPU), Multi-Token Prediction (MTP), and memory-mapped embeddings. |
 | **Vosk** | `vosk-capacitor` | **Offline Speech-to-Text**. Continuous large-vocabulary speech recognition. Fast, lightweight. Used for Meeting Mode and Voice Mode. |
-| **Voxtral** | `voxtral-capacitor` | **Real-time STT**. Mistral Voxtral Mini 4B Realtime via `mtmd` multimodal API (PCM→mel→CLIP→llama). Greedy token sampling (temperature=0). Auto-unloads main LLM for memory coordination. |
+| **Voxtral** | `voxtral-capacitor` | **Real-time STT**. Mistral Voxtral Mini 4B Realtime via `mtmd` multimodal API (PCM→mel→CLIP→llama). Greedy token sampling (temperature=0). Heavy model: the model orchestrator frees the LLM before it loads (§4.1.5). |
 | **Whisper** | `whisper-capacitor` | **High-Fidelity STT**. Runs OpenAI Whisper models (cpp port). Supports multilingual transcription and diarization preprocessing. |
 | **Piper** | `piper-capacitor` | **Neural TTS**. Synthesizes speech locally. Supports ONNX voice models with variable speech/pitch. |
 | **KokoroTTS** | `KokoroTTS` | **State-of-the-Art Neural TTS**. Offline multi-lingual speech synthesis powered by Sherpa-ONNX (`OfflineTts` / Kokoro-82M). Features in-JVM streaming archive decompression (Apache Commons Compress) supporting `.tar.bz2`, `.tar.gz`, `.zip`, `.tar` bundles with `content://` URI resolution and path normalization. Supports Italian (`if_sara`, `im_nicola`), English US (`af_sky`, `am_michael`), and English UK (`bf_emma`, `bm_george`). |
@@ -83,17 +84,17 @@ The unique power of AI Mind Mesh comes from its extensive suite of custom native
 | **AudioOutput** | `audio-output-capacitor` | **Audio Routing**. Switches output between Earpiece (privacy) and Speakerphone. |
 | **AudioPlayback** | `AudioPlaybackPlugin` | **Segment Playback**. Leverages AndroidX Media3 ExoPlayer for precise Tap-to-Play segment replay without degrading live mic recording quality (bypasses AEC ducking). |
 | **AudioConverter** | `n/a` (Java Utility) | **Media Processing**. Uses specialized `AudioEncoder`, `AudioDecoder`, and `WavHelper` utilities to process PCM to AAC/M4A/WAV. |
-| **Termux** | `termux-capacitor` | **Shell Execution**. Bridges app to Termux environment. Executes `bash` commands, installs packages (`pkg`), manages files. |
-| **BackgroundService** | `background-service-capacitor` | **Process Management**. Manages service lifecycle. The Proactive service has been transitioned to a standard background service to eliminate persistent notifications while maintaining periodic execution. |
-| **Proactive** | `ProactivePlugin` | **Proactive Engine**. Dynamically controls the `ProactiveBackgroundService` loop, ensuring reliable on-device monitoring for suggestions. |
-| **KeepAlive** | `KeepAliveService` | **Persistence**. Special use foreground service to guarantee "Always Loaded" model availability. |
+| **Termux** | `termux-capacitor` | **Shell Execution**. Runs commands through Termux's `RUN_COMMAND` intent (needs Termux with `allow-external-apps=true` and the RUN_COMMAND permission, asked at runtime). Model-supplied arguments are always shell-quoted; installing packages asks for confirmation. |
+| **BackgroundService** | `background-service-capacitor` | **Process Management**. Foreground service (type `microphone` when the mic permission is granted, otherwise `specialUse`): keeps a meeting recording with the screen off and backs the keep-alive option. |
+| **Proactive** | `ProactivePlugin` | **Proactive Engine**. Schedules/cancels the periodic WorkManager job (`ProactiveWorker`) and gives it the server settings for contextual delivery. |
+| **KeepAlive** | `KeepAliveService` | **Persistence**. Special use foreground service to guarantee "Always Loaded" model availability. One setting (`keep_alive_enabled`) drives it, the background service and the JS background features. |
 | **AndroidAuto** | `android-auto-capacitor` | **Car Integration**. Projects a simplified UI (GridTemplate) to car dashboard via IOT category. Screens: Main, Call Mode, Calendar, To-Do, Kanban. |
 | **Performance** | `performance-capacitor` | **Battery Opt**. Requests "Ignore Battery Optimizations" to allow heavy compute. Checks thermal state. |
 | **SystemMonitor** | `system-monitor-cap` | **Diagnostics**. Real-time CPU/RAM usage tracking with granular visibility controls (RAM, CPU, GPU, App Mem). Floating overlay capability. |
 | **SpeakerEmbedding** | `speaker-embedding-capacitor` | **Biometrics**. Generates vector embeddings from voice audio for Speaker Diarization (Guest vs User 1 vs User 2). |
 | **TextEmbedding** | `text-embedding-capacitor` | **RAG Core**. Runs `all-MiniLM-L6-v2` to vectorize text for Semantic Memory storage and retrieval. |
 | **Genie** | `genie-capacitor` | **Qualcomm NPU LLM Runtime**. Executes Qwen 3.5, Qwen 2.5, and Gemma models directly on Hexagon NPU (HTP v79/v75) via Qualcomm AI Engine Direct (QNN) & GenieX SDK. 50+ tok/s at 2W power draw. |
-| **SD** | `sd-capacitor` | **Qualcomm NPU Image Generation**. Executes Stable Diffusion (v2.1 / v1.5) pipelines (`unet.bin`, `vae.bin`, `text_encoder.bin`) on Hexagon NPU in 2–4s per image. |
+| **SD** | `sd-capacitor` | **Qualcomm NPU Image Generation**. Runs Stable Diffusion packages (`text_encoder.bin`, `unet.bin`, `vae.bin`, optional `vae_encoder.bin` / `realesrgan_x4plus.bin`, quantized or float) on the Hexagon NPU, ~1 s per step. |
 
 ### 3.1 Vulkan Acceleration & Architecture Constraints
 The `llama-cpp-capacitor` plugin utilizes Vulkan for hardware-accelerated LLM inference. Due to Android NDK constraints and upstream `llama.cpp` divergence, the integration adheres to strict architectural patches:
@@ -192,45 +193,49 @@ The `whisper-capacitor` plugin features automated hardware detection, versatile 
 
 ### 3.6 Stable Diffusion Qualcomm NPU Subsystem (`sd-capacitor`)
 The `sd-capacitor` plugin implements the high-performance on-device Stable Diffusion synthesis pipeline on Qualcomm Hexagon NPU:
-*   **Pre-compiled Graphs**: Loads `unet.bin`, `vae.bin`, `text_encoder.bin`, `vae_encoder.bin`, and `realesrgan_x4plus.bin` quantized/compiled for Hexagon HTP (`w8a16` / float32) using Qualcomm AI Engine Direct (QNN / QAIRT).
+*   **Pre-compiled Graphs**: Loads `text_encoder.bin`, `unet.bin`, `vae.bin` (required), `vae_encoder.bin` (image editing) and `realesrgan_x4plus.bin` (AI upscaling): QNN context binaries for the Hexagon HTP, either quantized (Qualcomm AI Hub `w8a16`, uint16 tensors) or float exports (float32 tensors, e.g. the UberRealistic package).
+*   **Tensors read from each binary**: `qnn_graph_io.cpp` reads graph name, tensor ids, data types, quantization (`scale`/`offset`) and shapes through the QNN System API (`libQnnSystem.so`), so any package runs without per-model constants (the Qualcomm SD 2.1 layout is kept only as a fallback when the System API is unavailable). The engine checks that the graphs fit together (text embedding size, latent shape, image size) and refuses an inconsistent package. Binaries are memory-mapped while their NPU context is created (no heap copy of a 1.7 GB UNet). `qnn_types.h` mirrors the QNN ABI with `static_assert`ed offsets; unloading frees every context and the backend.
 *   **Subsystem Components**:
-    *   `ClipTokenizer.kt`: High-precision 77-token OpenCLIP BPE tokenizer loading official `vocab.json` (49,408 tokens) and `merges.txt` (48,888 rules) with `<|endoftext|>` (`49407`) sequence padding matching OpenCLIP ViT-H/14.
-    *   `EulerAncestralScheduler.kt`: Exact $v$-prediction and $\epsilon$-prediction Euler discrete scheduler with continuous $\sigma$ schedule, model input scaling ($z_t / \sqrt{\sigma^2 + 1}$), and configurable Classifier-Free Guidance (CFG).
-    *   `QnnNativeBridge.kt`: Manages QNN native libraries (`libQnnHtp.so`, `libQnnSystem.so`), exact 144-byte ABI tensor descriptors, quantization parameters (`scale`, `zero_point`), and zero-overhead native memory mapping for text encoder, UNet, VAE decoder, VAE encoder, and Real-ESRGAN super-resolution.
-    *   `SDEngine.kt`: Orchestrates the complete pipeline (Text-to-Image and Image-to-Image), executing TextEncoder, UNet denoising loop, VAE decoding, Aspect Ratio framing, and Real-ESRGAN 4x super-resolution on Hexagon HTP NPU, converting decoded RGB byte tensors directly into full ARGB Android Bitmaps and PNG base64 strings.
-*   **Super-Resolution & Multi-Resolution Support**:
-    *   **Real-ESRGAN General x4plus**: Deep neural super-resolution network executed directly on Hexagon NPU (`realesrgan_x4plus.bin`). Upscales 512×512 base generations to 2048×2048 (4x Ultra HD) in ~250ms or downsamples to 1024×1024 (2x HD) with crystal clear textures and edge sharpness.
-    *   **Aspect Ratio Framing**: Dynamic framing support for `1:1` (512×512 / 1024×1024 / 2048×2048), `16:9` (512×288 / 1024×576 / 2048×1152), `9:16` (288×512 / 576×1024 / 1152×2048), `4:3` (512×384 / 1024×768 / 2048×1536), and `3:4` (384×512 / 768×1024 / 1536×2048).
+    *   `ClipTokenizer.kt`: 77-token CLIP BPE tokenizer (`vocab.json`, `merges.txt`); pads with `!` (id 0) for SD 2.x and with `<|endoftext|>` for SD 1.x (768-dim text encoders); prompt weights `(text:1.3)`, `(text)` ×1.1, `[text]` ÷1.1; reports prompts cut at 75 tokens.
+    *   `PromptTools.kt`: weights move a token's embedding relative to the empty prompt's; `PredictionTypeProbe` (epsilon vs v-prediction, see below); `SDGeometry` (aspect crops, fitting a source into the square, mirrored margins).
+    *   `DiffusionScheduler.kt`: scaled-linear schedule in the sigma formulation, "trailing" timestep spacing capped at the UNet's calibrated maximum (951 for the quantized Qualcomm package, whose timestep input cannot carry more), samplers **Euler** (default) and **DPM++ 2M** working on the denoised estimate for both epsilon and v-prediction models, CFG, img2img start step = `steps × strength` as in diffusers.
+    *   `SDImageOps.kt`: decodes data URLs, base64, file paths, `content://` and Capacitor web paths with EXIF orientation and high-quality downscaling; fits the image to edit into the square without distortion (mirrored margins, cropped away after decoding); upscales the whole square with Real-ESRGAN and only then crops; returns PNG up to 1024 px and JPEG (q95) above.
+    *   `SDEngine.kt`: text conditioning (the negative prompt is the unconditional CFG branch; CFG ≤ 1 runs one UNet pass per step), denoising loop, decoding, cropping and upscaling; returns the seed actually used (random seeds included), sampler, prediction type and whether the prompt was truncated.
+*   **Prediction type**: `metadata.json` `"prediction_type"` when present; otherwise one UNet call on a blank latent at t=900 at load time decides it (an epsilon model returns the input noise, a v model a nearly uncorrelated output) and the result is cached per `unet.bin`; undetermined → v-prediction for SD 2.x (768-v), epsilon for SD 1.x. The Qualcomm AI Hub SD 2.1 package derives from SD 2.1 768-v and runs at 512×512 (`v_prediction`).
+*   **Editing (img2img)**: needs `vae_encoder.bin`; without it, or when the source cannot be read, the request fails with an explicit error (no black canvas, no zero latents). The result keeps the source's proportions. SD 2.1 cannot follow instructions: the prompt must describe the final picture.
+*   **Super-Resolution & Aspect Ratio**:
+    *   **Real-ESRGAN x4plus** on the NPU (`realesrgan_x4plus.bin`): the full 512×512 image becomes 2048×2048, then the aspect crop is taken; 2x halves it with high-quality filtering. Without the model, bilinear scaling (the image screen says so).
+    *   **Aspect ratios** are centered crops of the square (the graphs are fixed at 512×512): `16:9` → 512×288 / 1024×576 / 2048×1152, `9:16`, `4:3`, `3:4` likewise.
 *   **Model Bundle Management**:
     *   `sdModelDownloader.ts` and `SDFileUtils.kt` provide complete model package import, streaming ZIP extraction, macOS metadata filtering (`__MACOSX`, `.DS_Store`), and automatic directory flattening into `sd-models/<modelName>/`.
     *   Full model manager in **Settings > Vision & Image Creation** (`StableDiffusionSection.tsx`) with active model selection, model directory listing, and recursive deletion.
 *   **Path Resolution & Multi-Stage Auto-Load**:
     *   `imageGenService.ts` automatically strips URI scheme prefixes (`file://`) and normalizes paths before communicating with the native layer, preventing path duplication bugs across Capacitor Filesystem bridges.
     *   `SDEngine.kt` implements a robust multi-stage fallback lookup (direct path, `filesDir`, `sd-models/`, and recursive `findSDModelDirectory` up to depth 3) to seamlessly locate model binaries even in nested archive structures.
-    *   `imageGenService.generateImage()` verifies native engine status (`isLoaded`) and prioritizes the user-selected active model from settings before falling back to local installed models.
-*   **Safe Generation & Model Validation**:
-    *   Enforces explicit model loading verification prior to generation in both `SDEngine.kt`, `SDPlugin.kt`, and `imageGenService.ts`, preventing empty black image generation when no model is active.
-    *   `ImageGenModal` provides visual warning banners and shortcuts when no model is configured.
+    *   `imageGenService.ensureLoaded()` verifies native engine status (`isLoaded`) and loads the model chosen in Settings (`llm-config.sdModelId/sdModelPath`) before falling back to local installed models; selecting a model in Settings only verifies it (loads and frees it again). `isLoaded`/`loadModel` also report what the package supports (`hasVaeEncoder`, `hasSuperResolution`, `predictionType`).
 *   **Performance & Flexibility**:
-    *   Executes full 512x512 diffusion on Hexagon NPU on Snapdragon 8 Elite (SM8750 / HTP v79) in ~1.0s/step, plus ~250ms for 4x Real-ESRGAN super-resolution.
-    *   Configurable inference steps (5–50 steps, default 25), CFG scale (1.0–25.0, default 7.5), Aspect Ratio (`1:1`, `16:9`, `9:16`, `4:3`), and Resolution (`512px`, `1024px`, `2048px`).
+    *   ~1.0 s per step on Snapdragon 8 Elite (two UNet passes with CFG) for the quantized package; float packages are slower.
+    *   Steps 5–50 (default 25), CFG 1–25 (default 7.5), sampler, seed (empty = random), aspect ratio, resolution 512/1024/2048.
 *   **Modal Studio & GUI**:
-    *   Dedicated `ImageGenModal` accessible via the 🎨 action button in the chat input bar, supporting Text-to-Image synthesis, Image-to-Image (img2img) restyling, Aspect Ratio selection, and AI Super-Resolution with real-time progress bars.
-    *   **Native Storage & Sharing**: One-tap **Save Image** to device storage (`AIMindMesh_SD_{timestamp}.png`) and **Share** via Android native Share Sheet (WhatsApp, Telegram, Gallery, etc.).
-*   **Conversational Chat Integration**: Supports instant slash commands (`/image <prompt>`, `/draw <prompt>`, `/edit <prompt>`) and autonomous tool calling via `generate_image(prompt, negative_prompt?, source_image?, strength?, aspect_ratio?, upscale?)`.
+    *   `ImageGenModal` (🎨 in the chat input bar): text-to-image, image editing, style presets (prompt suffix + negative prompt), aspect ratio (txt2img only: edits keep the source shape), AI upscaling, advanced controls (negative prompt, steps, CFG, sampler, seed), progress bar; the result card shows the seed with a "reuse" button and warns about truncated prompts. Editing from a chat image starts with an empty prompt (a description of the result, not an instruction).
+    *   **Save / Share**: `AIMindMesh_SD_{timestamp}.png|jpg` in Documents, or the Android share sheet.
+*   **Conversational Chat Integration**:
+    *   `/image <text>` (`/draw`) and `/edit <text>`: the chat LLM, still in RAM, rewrites the request as an English Stable Diffusion prompt (for `/edit`, a description of the edited picture; 20 s timeout, original text on failure), then SD takes its place; a default negative prompt is applied. `/edit` uses the attached image, else the newest image in the chat. The reply shows the prompt used and the seed.
+    *   Tool `generate_image(prompt, negative_prompt?, source_image?, strength?)`: the model writes the English prompt itself; `source_image: "last"` means the newest image of the run or the chat (the model cannot copy pixels into arguments). The picture is attached to the answer bubble and never sent back to the model.
 *   **Data Flow**:
 ```
-Chat Input (🎨) / Slash Command (/image) / Tool Call (generate_image)
-  └─> imageGenService.generateImage({ prompt, sourceImage?, strength?, steps, cfgScale, aspectRatio, upscale }) (TS)
-        └─> SD.generateImage(...) (sd-capacitor)
-              └─> SDPlugin.kt → SDEngine.kt
-                    ├─> ClipTokenizer.kt (OpenCLIP BPE, 77 tokens)
-                    ├─> QnnNativeBridge.kt (text_encoder.bin on Hexagon HTP)
-                    ├─> EulerAncestralScheduler.kt (Denoising loop: unet.bin)
-                    ├─> QnnNativeBridge.kt (vae.bin on Hexagon HTP)
-                    ├─> Aspect Ratio Framing (1:1, 16:9, 9:16, 4:3, 3:4)
-                    ├─> QnnNativeBridge.kt (realesrgan_x4plus.bin on Hexagon HTP)
-                    └─> RGB Float Array -> Bitmap (PNG base64: up to 2048x2048)
+Chat Input (🎨) / Slash Command (/image, /edit) / Tool Call (generate_image)
+  └─> [chat] rewriteImagePrompt (chat LLM → English SD prompt) → imageGenService.generateFromChat
+  └─> imageGenService.generateImage({ prompt, negativePrompt, sourceImage?, strength?, steps, cfgScale, seed, sampler, aspectRatio, upscale }) (TS)
+        └─> SD.generateImage(...) (sd-capacitor) → SDPlugin.kt → SDEngine.kt
+              ├─> ClipTokenizer.kt + PromptWeighting (77 tokens, weights vs empty prompt)
+              ├─> text_encoder.bin ─┐
+              ├─> [img2img] SDImageOps (EXIF, fit + mirrored margins) → vae_encoder.bin → noise at steps×strength
+              ├─> DiffusionScheduler.kt (Euler / DPM++ 2M, epsilon / v) ⇄ unet.bin (cond + uncond per step)
+              ├─> vae.bin → 512×512 RGB
+              ├─> realesrgan_x4plus.bin (whole square) → crop (aspect ratio or source shape) → resize
+              └─> PNG (≤1024 px) / JPEG data URL + seed, sampler, predictionType, promptTruncated
+        (all graphs go through qnn_graph_io: tensor specs read from each context binary)
 ```
 
 ---
@@ -275,7 +280,7 @@ When enabled, displays internal reasoning process before final answer:
 *   **Performance**: Adds latency but improves answer quality for complex queries
 
 #### 4.1.4 Message Persistence & Context
-*   **Auto-Save**: All messages persisted to SQLite immediately
+*   **Auto-Save**: New messages are persisted immediately to WebView `localStorage` (`threadManager.ts`); a streamed answer is saved once its text stops changing (no write per token). A full storage shows a warning, and threads that cannot be parsed are copied to `conversation-threads-unreadable` instead of being overwritten.
 *   **Context Window**: Configurable via `nCtx` (default: 2048 tokens). In Dual-Model Tool Calling (GGUF), `nCtx` is automatically synchronized across both Chat and Extraction models. **Update**: Introduced Intelligent Context Summarization for extraction. If the extraction prompt exceeds the tool model's limit (e.g., 2048 tokens), the main model automatically generates a concise summary of the relevant history to ensure accurate tool selection without context overflow.
 *   **Native Statefulness**:
     *   **GGUF (PocketPal Engine)**: Uses native C++ Jinja2 templates (via `llama.rn` matching) instead of manual TypeScript formatters. Resolves formatting errors by passing OpenAI-compatible `messages` arrays directly to the C++ backend. Employs a Mutex locked `initContext` pattern with Memory-Pressure batch constraints to prevent initialisation race conditions. Uses KV Cache reuse (~95% hit rate via System Prompt Optimization) and token diffing to avoid re-processing the entire prompt history on every turn. Only new tokens are computed.
@@ -286,6 +291,16 @@ When enabled, displays internal reasoning process before final answer:
     *   **Drift Detection**: Automatically resets native context if frontend history diverges from native state (e.g., deleted messages).
 *   **Context Management**: Automatically truncates oldest messages when limit reached
 *   **Memory Integration**: Semantic memories injected into context based on relevance
+
+#### 4.1.5 Context Management & VRAM Optimization
+To prevent OOM (Out Of Memory) kills on Android and Adreno GPU crashes, the system implements a multi-layered context protection strategy:
+*   **Real Tokenization (BPE)**: Uses `js-tiktoken` (`cl100k_base`) for accurate token estimation. Replaces character-based heuristics to ensure the LLM never receives a prompt exceeding its hardware-allocated context window.
+*   **Model Residency (`modelOrchestrator.ts`)**: RAM holds one heavy model at a time: an LLM engine (GGUF chat+tool, LiteRT or Genie), Stable Diffusion, Voxtral or a medium/large Whisper (a tiny/base/small Whisper may stay next to the LLM). At startup only the configured LLM loads (`useModelLoader`); STT loads with a call or a meeting, TTS with the first spoken reply. Opening the image screen (or `/image`, `/edit`, `generate_image`) unloads the LLM and loads Stable Diffusion; closing it frees SD and reloads the LLM. Meetings and calls free their speech models on exit. A recording pins its speech model; a voice call refuses a heavy STT with an on-device LLM. Android memory pressure unloads the heavy models the current feature does not need (critical, foreground) or every unpinned one (app about to be killed).
+*   **Tool Output Pruning**: Large tool results (e.g., web searches > 800 tokens) are automatically summarized by a fast cloud or local model before being injected into the conversation, preserving reasoning space.
+*   **GGUF Context Sync (Append Mode)**: Synchronizes the UI message count with the native `llama.cpp` KV cache. 
+    *   **Append Mode**: If counts match, only the newest message is sent, enabling incremental KV cache reuse (~90% speedup).
+    *   **Hard Reset**: If history diverges, the native context is explicitly reset to prevent "inconsistent sequence position" errors.
+*   **Template De-Duplication**: Strips outer chat wrappers from formatted prompts when passing to native engines (GGUF/LiteRT) to prevent "Double-Wrapping" (e.g., nested `<|user|>` tags), which otherwise causes infinite loops or truncated responses.
 
 #### 4.1.6 Persistent KV Cache
 To eliminate redundant "Prefill" times (the time taken to process the conversation history) during app restarts or context switching, the system implements a disk-based KV cache persistence layer for native providers:
@@ -298,24 +313,14 @@ To eliminate redundant "Prefill" times (the time taken to process the conversati
     *   **Server-Side State**: If running `llama-server`, binary KV state is flushed to disk (e.g., in the `--slot-save-path` directory) ensuring instant resumption after app backgrounding or server restart.
 *   **Lifecycle Synchronization**: Integrated with the Android application lifecycle. The `NodeWorker` and native plugins automatically flush the active KV state to disk when the application transitions to the background (`appStateChange: inactive`).
 
-### 4.1.5 Context Management & VRAM Optimization
-To prevent OOM (Out Of Memory) kills on Android and Adreno GPU crashes, the system implements a multi-layered context protection strategy:
-*   **Real Tokenization (BPE)**: Uses `js-tiktoken` (`cl100k_base`) for accurate token estimation. Replaces character-based heuristics to ensure the LLM never receives a prompt exceeding its hardware-allocated context window.
-*   **Dynamic RAM-Pressure Scaling**: A native observer listens to Android `onTrimMemory` and `onLowMemory` signals. If the OS reports high memory pressure, the app dynamically reduces the `maxTokens` budget (by up to 60%), forcing earlier history summarization to free VRAM *before* a system kill occurs.
-*   **Tool Output Pruning**: Large tool results (e.g., web searches > 800 tokens) are automatically summarized by a fast cloud or local model before being injected into the conversation, preserving reasoning space.
-*   **GGUF Context Sync (Append Mode)**: Synchronizes the UI message count with the native `llama.cpp` KV cache. 
-    *   **Append Mode**: If counts match, only the newest message is sent, enabling incremental KV cache reuse (~90% speedup).
-    *   **Hard Reset**: If history diverges, the native context is explicitly reset to prevent "inconsistent sequence position" errors.
-*   **Template De-Duplication**: Strips outer chat wrappers from formatted prompts when passing to native engines (GGUF/LiteRT) to prevent "Double-Wrapping" (e.g., nested `<|user|>` tags), which otherwise causes infinite loops or truncated responses.
-
 ### 4.2 Semantic Memory (Long-Term RAG)
 Vector-based memory system that enables the AI to recall relevant context from past conversations.
 
 #### 4.2.1 Ingestion Pipeline
 *   **Auto-Capture**: Messages exceeding 20 characters automatically saved
-*   **Embedding Model**: `all-MiniLM-L6-v2` (384-dimensional vectors via ONNX)
-*   **Storage**: SQLite with `sqlite-vec` extension for efficient vector search
-*   **Metadata**: Each memory stores timestamp, category, embedding, and original text
+*   **Embedding Model**: `all-MiniLM-L6-v2` by default (384-dim, ONNX, up to 512 tokens); E5 models get their `query:`/`passage:` prefixes and `multilingual-e5-small` uses a SentencePiece (Unigram) tokenizer. Every vector records the model that produced it: rows of another model are ignored by search and re-embedded in the background after a model change.
+*   **Storage**: SQLite (`memories` database) with embeddings stored as BLOBs; retrieval is a brute-force cosine scan over every memory of the age window (ids and embeddings only, read in pages), then the text of the top K is loaded (`semanticMemoryRetriever.ts`)
+*   **Metadata**: Each memory stores timestamp, category, embedding (with its model), and original text. Extracted facts and summaries never age out of retrieval; plain chat turns are searched for 30 days and deleted after 90.
 
 #### 4.2.2 Categorization System
 **Auto-Categorization** (optional):
@@ -355,7 +360,7 @@ Vector-based memory system that enables the AI to recall relevant context from p
     *   **Audio Storage Architecture**: Live PCM buffers are continuously encoded and appended to a native `.m4a` file in the device `Data` directory, eliminating `localStorage` RAM exhaustion and OOM crashes during long (>2hr) recordings.
     *   **Segment Replay**: Custom `AudioPlaybackPlugin` loops targeted sub-segments and respects the active microphone's AEC state to prevent echo or degradation of ongoing live recordings.
     *   **Transcript Editing & Metadata**: Long-pressing a paragraph enables inline text editing. Both the revised and original texts are persistently managed in the SQLite `meetingDatabase`.
-    *   **Export**: Full transcripts can be exported to Markdown, PDF (via WebView Print Adapter), SRT, and VTT with accurate timestamping.
+    *   **Export**: Full transcripts can be exported to Markdown, PDF (via WebView Print Adapter), SRT, and VTT with accurate timestamping, and the audio recording can be shared. **Safe recording**: each recording is a new meeting with its own id; edits autosave (one SQLite transaction per save), Back/X ask before stopping and save first, Pause really cuts the audio and text, and a foreground service keeps the microphone alive with the screen off. Meetings are never deleted automatically; a recording interrupted by the app being killed is recovered (audio + last checkpoint) the next time Meeting mode opens.
 *   **Speaker Separation**:
     *   **Real-time**: ECAPA-TDNN embedding-based identification with **Periodic Mini-Clustering** — every 30s (or 10 segments), `IncrementalStrategy` re-clusters all session embeddings to refine speaker centroids and correct prior greedy assignments, bringing post-processing quality to live transcription.
     *   **Post-Process (Reprocessing)**: Robust **3-Pass Diarization**:
@@ -365,7 +370,7 @@ Vector-based memory system that enables the AI to recall relevant context from p
             *   **HMM Viterbi Decoder** (Recommended): Eliminates rapid speaker changes using hidden Markov model transition probabilities.
             *   **Median Filter**: Simple 5-segment sliding window to eliminate spurious single-segment oscillations (e.g., `[0,1,0,0,0]` → `[0,0,0,0,0]`).
 *   **ONNX Runtime Safety**: VAD and ECAPA plugins share a single process-global `OrtEnvironment` singleton. VAD's `release()` only closes its `OrtSession`, not the shared environment.
-*   **Memory Optimization**: Dynamic resource management automatically unloads heavy LLM models (GGUF/LiteRT) when Voxtral is active to prevent Out-Of-Memory (OOM) errors, reloading them on demand. The Voxtral STT service calls `releaseAllSmolLM()` before model initialization.
+*   **Memory Optimization**: Voxtral and medium/large Whisper models go through the model orchestrator (§4.1.5): loading them unloads any LLM engine (GGUF, LiteRT, Genie); leaving the meeting frees them and reloads the configured LLM.
 *   **Post-Process**: Can use Whisper for high-quality final transcript cleanup.
 
 ### 4.4 Agenda & Kanban
@@ -414,12 +419,12 @@ Comprehensive productivity system combining calendar events, tasks, and notes.
 *   **Distributed Ingestion & Sync**: The system supports two primary ingestion workflows based on server connectivity:
     *   **Standard Mode (Server-First)**: When `aimindmeshServer.enabled` is true, ingestion is delegated to the server API (`/api/documents/ingest/file`). To save local resources (RAM/VRAM), the local indexing is **skipped**. The file is processed and searchable via the server.
     *   **Distributed Ingestion & Sync**: The system features a robust bidirectional synchronization infrastructure between mobile nodes (ZFOLD5, ZFOLD7) and the VPS server:
-        1.  **Manual Sync Trigger**: Users can initiate an atomic sync from Settings -> Server, forcing an immediate exchange of SQLite (mobile) and Neo4j (server) knowledge deltas.
-        2.  **Bidirectional Knowledge Exchange**: Local memories, meeting transcripts, and calendar events are pushed to the server for global KG integration, while server-side insights and Neural Wiki updates are pulled to the device.
+        1.  **Manual Sync Trigger**: Settings -> Server -> Sync Now (`GlobalSyncService.performSync`, which returns `{ ok, error }`; the outcome is shown under the button).
+        2.  **Push / Pull**: meetings, edited segments, memories (with their embedding), calendar events and chat threads are pushed (`POST /api/sync/push`, one server transaction; memories the KG could not store stay unsynced). The pull (`GET /api/sync/pull`) uses the server clock as cursor and merges messages of other devices into their threads, without duplicates. Deleted meetings and segments travel as tombstones (`sync_deletions` on the phone, `sync_tombstones` on the server) and are never brought back by a device that synced late. Documents are not synced.
         3.  **FCM Sync Triggers**: The server can broadcast `SYNC_REQUEST` push notifications via Firebase to all registered mobile nodes, triggering background "Silent Syncs" to ensure ecosystem-wide eventual consistency.
         4.  **Local Fallback**: If the server is disabled or unreachable, the system automatically falls back to the strictly local pipeline.
 *   **Workspaces**: Logical grouping of documents (e.g., "Personal", "Work", "Project X"). Search is scoped to the active workspace.
-*   **Hybrid Search**: Combines FTS5 (Keyword) and Vector (Semantic) search using Reciprocal Rank Fusion (RRF).
+*   **Hybrid Search**: Combines FTS5 (Keyword: query words joined with OR, ranked by bm25) and Vector (Semantic: embeddings scanned in pages, text loaded for the best chunks only) search using Reciprocal Rank Fusion (RRF).
 *   **Context Injection**: Automatically retrieves relevant chunks from the active workspace and injects them into the prompt.
 *   **UI Performance & Client-Side Pagination**: To prevent rendering lag when displaying large indexes (e.g., 24,000+ files synced from Gitea), the client-side Knowledge Base explorer utilizes strict page-based chunking (`pageSize` selector of 20, 50, 100, or 200 rows) using a reactive windowing slice (`paginatedDocs = filteredDocs.slice(...)`). This reduces the active DOM size from thousands of simultaneous table rows down to a negligible count, maintaining high UI responsiveness.
 
@@ -439,7 +444,7 @@ When `aimindmeshServer.enabled = true`, the `ProactiveService` enters **Server M
 *   **Intelligence Source Selection**: Users can choose in Settings → Proactive between **"Hybrid/Server Data"** (Auto) and **"Strictly Local"** (Privacy-focused).
     *   **Auto**: Default. Uses server-side insights (FCM) when online, fallback to local when offline.
     *   **Strictly Local**: Explicitly disables server-side proactive push reception even if the server is online, ensuring the background engine only uses on-device context.
-*   **Local Suspension**: If source is "Auto" and server is online, the native `BackgroundServicePlugin` check listener is detached.
+*   **Local Checks in Server Mode**: Local checks (battery, agenda, overdue tasks, briefings) keep running when the server is online, because server insights only cover the knowledge graph; the check listener is registered once.
 *   **Server Delegation**: The AIMindMesh Server generates insights and sends `NEW_INSIGHT` push notifications.
 *   **Automatic Fallback**: The `useServerMode` hook pings `/api/health` every 60 seconds. After 3 consecutive failures, `ProactiveService.disableServerMode()` is called, restoring local proactive behavior.
 *   **State Events**: `onServerModeChange(cb)` notifies UI consumers of online/offline transitions for banner display.
@@ -521,7 +526,7 @@ The system continuously evaluates **context** to determine when and what actions
 *   **Local Processing**: All context analysis happens strictly on-device. No sensor data is sent to the cloud.
 *   **Action Engine**: Executes Silent, Informative, Suggestive, Interactive, and Autonomous actions based on a priority queue.
 *   **Permission System**: Granular controls per action category and rate limiting ensure the assistant remains helpful, not intrusive.
-*   **Background Service**: A lightweight background service (`ProactiveBackgroundService`) enables periodic checks (default: 15min). To ensure a premium user experience with zero UI clutter, it operates as a standard background service (non-foreground), relying on AlarmManager `setAndAllowWhileIdle` for persistence. Its lifecycle is strictly controlled via `ProactivePlugin`, ensuring perfect synchronization with user preferences (dynamically starts/stops when toggled).
+*   **Background Checks**: A periodic WorkManager job (`ProactiveWorker`, every 15 min, Doze-aware) runs contextual delivery and sends a `proactiveCheck` event to the app when it is alive. `ProactivePlugin` schedules/cancels it with the user's preference; `syncServerConfig` gives it the server settings (the API key comes from the Keystore). Real intervals depend on Doze and standby buckets.
 *   **Persistence**: Automatically starts `KeepAliveService` on app mount and synchronizes settings with native layer to prevent OS from unloading the mission-critical LLM state.
 *   **Activity Logging**: All actions logged locally for transparency and learning (dismiss rates, interaction patterns).
 
@@ -555,12 +560,12 @@ The system continuously evaluates **context** to determine when and what actions
         *   Older messages (calculated based on threshold) → Summarized.
         *   Recent messages (60-80%) → Kept verbatim for continuity.
     3.  **Summarize**: Uses active provider (Cloud, GGUF, or LiteRT) to generate concise summary. Supports local models like Gemma 4 QAT per estrazione e offline summarization a basso consumo.
-    4.  **Replace**: Creates special `[Context Summary]` system message containing summary.
-    5.  **Save**: Updates chat history in localStorage: `[Summary Message] + Recent Messages`.
+    4.  **Store**: Saves the summary per thread (`context-summaries`, `contextSummaryStore.ts`) with the id of the last message it covers; a later summary folds the earlier one in.
+    5.  **Apply**: Only the history sent to the model is `[Context Summary] + messages after it`; the chat and the saved thread keep every original message.
 *   **Context Safety Fallback (Rolling Context)**: If summarization is disabled or reaches its limits, the system employs **Anchor Protection** during history pruning:
     *   **Always Protected**: System prompts, tool rules, and the most recent `[Context Summary]` message.
     *   **Rolling Window**: Oldest conversational turns are gradually discarded to stay within the model's `nCtx`, while keeping the "anchors" to preserve high-level coherence.
-*   **Cross-Context Synchronization**: Active chat instances automatically detect background history updates (e.g., from `ActionExecutor`) via storage event listeners, ensuring the UI remains perfectly synced without manual refresh.
+*   **Cross-Context Synchronization**: Active chat instances detect background history updates via storage event listeners; context summarization never rewrites the chat, so it cannot drop messages written meanwhile.
 *   **Context Estimation**: Uses same logic as GGUF context manager:
     *   Counts system prompt tokens, message text, and attachment overhead
     *   Reserves space for response generation
@@ -581,7 +586,7 @@ The system continuously evaluates **context** to determine when and what actions
 #### 4.7.6 Background Robustness & ANR Prevention
 *   **Purpose**: Ensures the proactive system remains stable even during heavy computations of memory maintenance or context summarization without causing Application Not Responding (ANR) errors or OS-initiated process kills.
 *   **Implementation**:
-    *   **WakeLock Management**: Android layer (`ProactiveBackgroundService`) utilizes a persistent `PARTIAL_WAKE_LOCK` for up to 60 seconds to guarantee background execution time for LLM-based autonomous tasks.
+    *   **Background Execution**: The native `ProactiveWorker` runs under WorkManager, which holds the wake lock for the job; it never retries with backoff (the next periodic run is the retry).
     *   **Main Thread Yielding**: Heavy $O(N^2)$ computations in the JS layer (e.g., vector similarity clustering) include intentional yield points to the event loop (`setTimeout(0)`) to remain responsive to system signals.
     *   **Concurrency Guards**: `ActionExecutor` implements an execution lock to prevent multiple autonomous heavy tasks from running simultaneously, avoiding CPU and RAM thrashing.
     *   **Resource Throttling**: Automatically skips non-critical maintenance if the user is currently "active" in the app, prioritizing foreground interface smoothness.
@@ -753,6 +758,114 @@ A client-side pipeline routes physical meeting discussions to organizational act
 *   **Action Candidate Extraction**: Scans meeting transcripts for intent indicators (verbs, goals).
 *   **Selective Submission**: Provides interactive UI selectors to submit approved candidates to the server as Directives or Ideas.
 
+### 4.12 Neural Wiki
+The Neural Wiki is a structured, collaborative-style knowledge base automatically compiled from the Knowledge Graph on the AIMindMesh Server.
+*   **Two Modes**:
+    *   **List Mode**: Searchable and paginated catalog of all compiled wiki pages.
+    *   **Detail Mode**: Full-screen Markdown viewer with [[Wikilink]] support for seamless navigation between related entities and concepts.
+*   **Navigation**: Maintains a historical back-stack for deep-diving into complex knowledge clusters.
+*   **Export to Markdown**: Individual pages can be exported as `.md` files. On Desktop, this invokes a native save dialog via `@tauri-apps/plugin-dialog`. On Mobile, it triggers the native share intent via `@capacitor/share` to allow saving to the filesystem or sharing with external productivity apps.
+*   **Sync & Regeneration**: Support for manual triggering of synthesis cycles and per-page regeneration via the AIMindMesh Server API to ensure knowledge remains current.
+
+### 4.13 AIMindMesh Server Integration
+AI Mind Mesh introduces optional integration with the **AIMindMesh Server** — a Cloud VPS accessible over a WireGuard VPN. The integration is strictly additive; no existing local features are altered.
+
+#### 4.13.1 System Architecture
+
+```
+┌──────────────────────────────┐        WireGuard VPN (10.2.0.1:3030)        ┌─────────────────────────────────────────┐
+│  AIMindMesh App (Android)    │ ─────────────────────────────────────────── │  AIMindMesh Server (VPS, Fastify)       │
+│                              │  REST  x-api-key: <apiKey>                  │                                         │
+│  FeedView / ThreadView ──────┼──────► /api/feed, /api/kg/*, /api/documents │  authHook (API key, every route)        │
+│  ImportSheet                 │                                             │  InferenceRouter                        │
+│  ServerLLM Provider ─────────┼──────► /ws/chat?mode=completion (stream)    │   ├─ Gemini / OpenRouter / FreeLLMAPI   │
+│                              │        POST /api/chat           (fallback)  │   ├─ Ollama (SERVER_LOCAL, PC client)   │
+│  NodeWorker ◄────────────────┼─────── /ws/nodes?id=&name=&token= (tasks)   │   └─ mobile worker nodes (/ws/nodes)    │
+│  FCMService ◄────────────────┼─────── Firebase Cloud Messaging (push)      │  Knowledge Graph (Neo4j), SQLite        │
+└──────────────────────────────┘                                             └─────────────────────────────────────────┘
+```
+
+#### 4.13.2 Feed Screen
+*   **Purpose**: Displays AI-generated insights, connection summaries, and document ingestion results from the server KG.
+*   **Architecture**: Bottom-nav tab (💬 Chat | ✨ Feed). Uses `IntersectionObserver` for infinite scroll.
+*   **Live Updates**: FCM `NEW_INSIGHT` messages dispatch to `onFCMFeedEvent` event bus → `FeedView` re-fetches top of list without full reload.
+*   **Thread View**: Each insight opens a `FeedThreadView` with a chat-bubble reply interface, streaming server responses via WebSocket.
+*   **Unread Badge**: Bottom nav badge count reflects unread insights; resets on feed tab open.
+#### 4.13.3 AIMindMesh Server LLM Provider
+*   **Provider ID**: `'aimindmesh-server'` in `LLMConfig.provider`.
+*   **Primary Transport**: one WebSocket per request, `ws://<serverUrl>/ws/chat?mode=completion&token=<apiKey>`, stateless: `{ type: 'completion', requestId, messages, options }` → `ack`, then `delta` / `thought`, then `done` (node used) or `error`. Timeouts: 10s for the ack, 90s for the first event, 60s of inactivity.
+*   **Fallback**: `POST /api/chat` (120s) only when the WebSocket is unusable (no connection, or no ack from an older server). If part of the answer was already shown, an error is shown instead of falling back (no duplicated answers); before any text, `fallbackProvider` answers locally.
+*   **Health Tracking**: `server:unreachable` is emitted for connection failures only (not for inference errors reported by the server).
+*   **Authentication**: REST requests carry the `x-api-key: <apiKey>` header. Browser WebSockets cannot set headers, so WebSocket URLs carry the same key as the `token` query parameter; the server rejects the handshake (HTTP 401) without it.
+
+#### 4.13.4 Knowledge Import Sheet
+*   **Triggers**: FAB button on FeedView, or paperclip attachment in chat.
+*   **Tabs**: Document (file picker: PDF/DOCX/TXT/MD), URL (HTTP), Clipboard (auto-detects URL).
+*   **Server Pipeline**: `POST /api/documents/ingest/file` or `/url` → receives `{jobId}` → polls `GET /api/documents/jobs/<jobId>` every 5s for up to 2 minutes.
+*   **Local Fallback**: When server not configured, files are queued to local `DocumentIngestionService`.
+
+#### 4.13.5 Memory KG Sync
+*   **Auto-Sync**: When `autoSyncNewMemories = true`, each `addMemory()` call fires a fire-and-forget `POST /api/kg/memories`.
+*   **Bulk Sync**: `bulkSyncMemoriesToServer()` in `memorySyncService.ts` iterates all local memories with `setTimeout(0)` yield points between each POST (ANR prevention).
+*   **Payload**: `{content, category, source: 'aimindmesh_android', createdAt}` (the server currently ignores `createdAt` and timestamps on arrival).
+
+#### 4.13.6 FCM Push Notification Architecture
+*   **Plugin**: `fcm-capacitor` (Kotlin). Registers `FCMCapacitorPlugin` with Capacitor bridge.
+*   **Services**: `FCMMessagingService` (extends `FirebaseMessagingService`), `FCMActionReceiver` (handles inline actions).
+*   **Token Lifecycle**: On init → request permission → `getFCMToken()` → `POST /api/nodes/register`. On rotate → re-register via `tokenRefresh` listener.
+*   **Message Types**: `NEW_INSIGHT`, `INGESTION_COMPLETE`, `NODE_STATUS`, `SYSTEM_ALERT`, `MARK_READ_ACTION`.
+*   **Data Flow**:
+```
+Firebase Cloud Messaging
+  └─> FCMMessagingService.onMessageReceived()
+        └─> capacitorPlugin.notifyListeners("fcm:message", payload)
+              └─> fcmService.ts dispatchMessage()
+                    └─> emitFeedEvent() → onFCMFeedEvent listeners
+                          └─> FeedView.tsx → prepend new insight card
+```
+
+#### 4.13.7 Mobile Worker Node
+*   **Purpose**: Allows the mobile device to act as an active inference worker for the entire mesh cluster.
+*   **Mechanism**: The app establishes a dedicated bidirectional WebSocket neural link to `/ws/nodes?id=<deviceId>&name=<deviceName>&token=<apiKey>` on the server. The device ID (`Device.getId()`) identifies the node.
+*   **Task Ownership**: The server accepts `token`, `thinking` and `result` messages for a task only from the node it was dispatched to; messages for other nodes' tasks are discarded.
+*   **Configuration Injection**: Unlike standard chat sessions, the `NodeWorker` dynamically inherits the active `LLMConfig` (model paths, thread counts) and `Personality` (traits, instructions) from the app's local state. This ensures that tasks dispatched from the mesh are executed with the exact same persona and hardware optimizations configured by the user.
+*   **Execution Flow**:
+    1.  Server dispatches task via WebSocket.
+    2.  `NodeWorker.ts` receives payload (prompt + task ID).
+    3.  Worker retrieves active configuration and triggers `generateTextResponseStream`.
+    4.  Response is streamed back to the server in real-time.
+*   **Robust Error Reporting**: Any exception during local inference (e.g., model not found, OOM) is caught and reported back to the server as a `WORKER_EXECUTION_FAILED` result. This prevents tasks from hanging in `PROCESSING` state and allows for automatic server-side retries or routing fallback.
+*   **Wakeup Layer**: If the WebSocket is closed, the server dispatches a `WAKE_FOR_INFERENCE` FCM message. The mobile app's background service intercepts this and automatically re-activates the `NodeWorker` connection to receive the task.
+*   **Lifecycle & UI Sync**: The worker's status is synchronized with the "AIMindMesh Server" settings panel. A dedicated listener pattern ensures the "READY FOR TASKS" badge reflects the real-time connectivity of the WebSocket link.
+*   **Controls**: Users can enable/disable this feature via "Participate as Worker Node" in AIMindMesh Server settings.
+
+### 4.14 Auto-Evolution Engine (Server)
+The Auto-Evolution Engine is a server-side pipeline that lets the ecosystem propose changes to its own codebase. It never merges nor deploys by itself: every change is a Gitea Pull Request that a human reviews.
+
+*   **Improvement Detection**: Monitors the Knowledge Graph for high-severity `open_question` / `observation` insights, `DebateEngine` conclusions and wiki "Open Questions", and asks an LLM to map them to a target file.
+*   **Contextual Code Generation**: `MultiFileContextBuilder` assembles the target plus related files (imports, callers, shared types, DB schema, `ServerConfig` interface) and routes an `EVOLUTION` task to Gemini, then OpenRouter. Chat requests classified as development intents (`injectUserRequest`) follow the same pipeline.
+*   **Path Policy** (`services/evolution/EvolutionPathPolicy.ts`), enforced at every entry point and again right before each Gitea commit:
+    *   **Secrets** are never read, sent to an LLM, nor committed: `config.json`, `.env*`, Firebase service accounts, `openclaw-config/`, `openclaw-workspace/`, `hermes-data/`, server `data/` and `backups/`, databases and keys, the deployment `src/config.ts`.
+    *   **Protected paths** are never written: a built-in baseline that cannot be disabled (the evolution services themselves, auth middleware, `index.ts`, DB layer, Dockerfile/compose, every `package.json`/`package-lock.json`/`tsconfig*.json`/`vite.config.*`, CI workflows, shell scripts, the server test suite, the mobile `MainActivity`/manifest and the Tauri backend), plus `.noautoedit` and the `protected_paths` registry.
+    *   Paths are normalized (no absolute paths, no `..`, no URL-breaking characters) and repository names validated before reaching the Gitea API.
+*   **Validation** (`ValidationLayer` + `PatchTypeChecker`): the patched files (target, additional files and generated tests) are laid over a temporary copy of the server sources and checked with a real `tsc --noEmit`; errors already present without the patch are not counted. A change that cannot be type-checked for a server TypeScript file is rejected.
+*   **Rate Limits**: `autoEvolution.maxProposalsPerDay` covers proposals created today plus candidates in flight, and applies to chat requests as well as the cron cycle.
+*   **Human-in-the-loop (Gitea Integration)**:
+    *   Automated creation of `feature/auto-*` branches and Pull Requests in the local Gitea instance.
+    *   PR comments (Gitea webhook, HMAC-signed — see §9.6) feed an iterative regeneration loop; the bot's own comments are ignored to prevent loops.
+    *   Requires manual review and approval via the Evolution API or Admin Cockpit before merging.
+*   **Autonomous Organization**: the AI council may approve ideas on its own, but repository creation and development agents start only after a human confirmation (`/ideas/:id/approve`) unless `organization.allowAutoRepoCreation` is explicitly `true`.
+*   **Developer Controls**: The Admin Panel (PC/Mobile) provides full visibility into proposals, allowing for approval, rejection, and manual triggering of evolution cycles.
+
+### 4.15 Server-Side Knowledge Import
+See §4.13.4 for the import sheet UI. The server-side pipeline (`DocumentIngester`):
+1.  **File ingest**: `POST /api/documents/ingest/file` (multipart). Text is extracted (`pdf-parse-fork` for PDF, `mammoth` for DOCX, plain text otherwise), chunked, embedded and stored in the Neo4j KG.
+2.  **URL ingest**: `POST /api/documents/ingest/url`. The server fetches the page, extracts the readable text with `cheerio`, then processes it like a file.
+3.  **Job Status**: `GET /api/documents/jobs/<jobId>` returns an `IngestionJob` with `status` ∈ `PENDING | EXTRACTING | CHUNKING | VECTORIZING | INDEXING | DONE | ERROR | SKIPPED | CANCELLED` and `progress` (0-100).
+4.  **Completion**: the client polls the job status; the server does not currently send an ingestion-complete FCM message.
+
+## 5. Agent Tool Catalog
+
 ### Category: System & Device
 | Tool Name | Parameters | Description |
 | :--- | :--- | :--- |
@@ -923,118 +1036,6 @@ Located in **Settings -> Knowledge**.
 | **Hybrid Search** | `Info` | Active by default. Combines Vector (Semantic) + FTS5 (Keyword). |
 | **Connectivity Check** | `Toggle` | **Disable Connectivity Check**. Disables frequent DB pings. Default: `Off` (Ping Disabled). |
 
-### 4.11 Neural Wiki
-The Neural Wiki is a structured, collaborative-style knowledge base automatically compiled from the Knowledge Graph on the AIMindMesh Server.
-*   **Two Modes**:
-    *   **List Mode**: Searchable and paginated catalog of all compiled wiki pages.
-    *   **Detail Mode**: Full-screen Markdown viewer with [[Wikilink]] support for seamless navigation between related entities and concepts.
-*   **Navigation**: Maintains a historical back-stack for deep-diving into complex knowledge clusters.
-*   **Export to Markdown**: Individual pages can be exported as `.md` files. On Desktop, this invokes a native save dialog via `@tauri-apps/plugin-dialog`. On Mobile, it triggers the native share intent via `@capacitor/share` to allow saving to the filesystem or sharing with external productivity apps.
-*   **Sync & Regeneration**: Support for manual triggering of synthesis cycles and per-page regeneration via the AIMindMesh Server API to ensure knowledge remains current.
-
-### 4.13 Auto-Evolution Engine
-The Auto-Evolution Engine is an autonomous software improvement pipeline that allows the AIMindMesh ecosystem to suggest, validate, and propose architectural changes to its own codebase.
-
-*   **Improvement Detection**: Monitor the Knowledge Graph for high-severity `open_question` nodes and `developerConclusion` nodes from debates that suggest actionable code changes.
-*   **Contextual Code Generation**: Resolves local file context and dependencies using `InferenceRouter` (routed to `COMPLEX` tier nodes) to generate targeted improvements.
-*   **Multi-Layered Validation**:
-    *   **Syntax Check**: Uses `tsc --noEmit` and `eslint` in a secure sandbox to ensure code quality.
-    *   **Protected Paths**: Respects `.noautoedit` and a dynamic `protected_paths` registry to avoid critical system corruption.
-*   **Human-in-the-loop (Gitea Integration)**:
-    *   Automated creation of `feature/auto-*` branches and Pull Requests in the local Gitea instance.
-    *   **AI Identity Isolation**: Uses a dedicated `AIMindMesh` Gitea user for PR comments to prevent feedback loops and distinguish AI actions from human reviews.
-    *   Requires manual review and approval via the EvolutionRouter API or Admin Cockpit before merging.
-*   **Developer Controls**: The Admin Panel (PC/Mobile) provides full visibility into proposals, allowing for approval, rejection, and manual triggering of evolution cycles.
-
-AI Mind Mesh introduces optional integration with the **AIMindMesh Server** — a Cloud VPS accessible over a WireGuard VPN. The integration is strictly additive; no existing local features are altered.
-
-#### 4.12.1 System Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                  AntiGravity Ecosystem                  │
-├───────────────────┬────────────────────┬────────────────┤
-│  AIMindMesh App  │  AIMindMesh       │  AGServer      │
-│  (Android)        │  Server (VPS)      │  (Auth/Router) │
-│                   │                   │                │
-│  ┌─────────────┐  │  ┌─────────────┐  │  ┌──────────┐  │
-│  │  FeedView   │◄─┼──│ Feed API    │  │  │ Gateway  │  │
-│  │  ThreadView │  │  │ /api/feed   │  │  │ JWT Auth │  │
-│  │  ImportSheet│  │  │ /api/kg/*   │  │  └──────────┘  │
-│  └─────────────┘  │  └─────────────┘  │                │
-│  ┌─────────────┐  │  ┌─────────────┐  │                │
-│  │ ServerLLM   │◄─┼──│ LLM Proxy   │  │                │
-│  │ Provider    │  │  │ (Ollama)    │  │                │
-│  └─────────────┘  │  └─────────────┘  │                │
-│  ┌─────────────┐  │  ┌─────────────┐  │                │
-│  │ FCMService  │◄─┼──│ Firebase    │  │                │
-│  └─────────────┘  │  │ (Push)      │  │                │
-│                   │  └─────────────┘  │                │
-│  ProactiveService │  KnowledgeGraph   │                │
-│  (Server Mode)    │  (Neo4j)          │                │
-└───────────────────┴────────────────────┴────────────────┘
-```
-
-#### 4.12.2 Feed Screen
-*   **Purpose**: Displays AI-generated insights, connection summaries, and document ingestion results from the server KG.
-*   **Architecture**: Bottom-nav tab (💬 Chat | ✨ Feed). Uses `IntersectionObserver` for infinite scroll.
-*   **Live Updates**: FCM `NEW_INSIGHT` messages dispatch to `onFCMFeedEvent` event bus → `FeedView` re-fetches top of list without full reload.
-*   **Thread View**: Each insight opens a `FeedThreadView` with a chat-bubble reply interface, streaming server responses via WebSocket.
-*   **Unread Badge**: Bottom nav badge count reflects unread insights; resets on feed tab open.
-#### 4.12.7 Mobile Worker Node
-*   **Purpose**: Allows the mobile device to act as an active inference worker for the entire mesh cluster.
-*   **Mechanism**: The app establishes a dedicated bidirectional WebSocket neural link to `/ws/nodes` on the server.
-*   **Configuration Injection**: Unlike standard chat sessions, the `NodeWorker` dynamically inherits the active `LLMConfig` (model paths, thread counts) and `Personality` (traits, instructions) from the app's local state. This ensures that tasks dispatched from the mesh are executed with the exact same persona and hardware optimizations configured by the user.
-*   **Execution Flow**:
-    1.  Server dispatches task via WebSocket.
-    2.  `NodeWorker.ts` receives payload (prompt + task ID).
-    3.  Worker retrieves active configuration and triggers `generateTextResponseStream`.
-    4.  Response is streamed back to the server in real-time.
-*   **Robust Error Reporting**: Any exception during local inference (e.g., model not found, OOM) is caught and reported back to the server as a `WORKER_EXECUTION_FAILED` result. This prevents tasks from hanging in `PROCESSING` state and allows for automatic server-side retries or routing fallback.
-*   **Wakeup Layer**: If the WebSocket is closed, the server dispatches a `WAKE_FOR_INFERENCE` FCM message. The mobile app's background service intercepts this and automatically re-activates the `NodeWorker` connection to receive the task.
-*   **Lifecycle & UI Sync**: The worker's status is synchronized with the "AIMindMesh Server" settings panel. A dedicated listener pattern ensures the "READY FOR TASKS" badge reflects the real-time connectivity of the WebSocket link.
-*   **Controls**: Users can enable/disable this feature via "Participate as Worker Node" in AIMindMesh Server settings.
-
-#### 4.12.3 AIMindMesh Server LLM Provider
-*   **Provider ID**: `'aimindmesh-server'` in `LLMConfig.provider`.
-*   **Primary Transport**: WebSocket streaming at `ws://<serverUrl>/api/llm/stream`.
-*   **Fallback**: REST POST at `/api/llm/generate` when WebSocket unavailable.
-*   **Health Tracking**: `serverProvider.ts` maintains a `consecutiveFailures` counter; fires `server:unreachable` custom event after 3 failures.
-*   **Authentication**: All requests carry `x-api-key: <apiKey>` header.
-
-#### 4.12.4 Knowledge Import Sheet
-*   **Triggers**: FAB button on FeedView, or paperclip attachment in chat.
-*   **Tabs**: Document (file picker: PDF/DOCX/TXT/MD), URL (HTTP), Clipboard (auto-detects URL).
-*   **Server Pipeline**: `POST /api/documents/ingest/file` or `/url` → receives `{jobId}` → polls `GET /api/documents/jobs/<jobId>` every 5s for up to 2 minutes.
-*   **Local Fallback**: When server not configured, files are queued to local `DocumentIngestionService`.
-
-#### 4.12.5 Memory KG Sync
-*   **Auto-Sync**: When `autoSyncNewMemories = true`, each `addMemory()` call fires a fire-and-forget `POST /api/kg/memories`.
-*   **Bulk Sync**: `bulkSyncMemoriesToServer()` in `memorySyncService.ts` iterates all local memories with `setTimeout(0)` yield points between each POST (ANR prevention).
-*   **Payload**: `{content, category, source: 'aimindmesh_android', createdAt}`.
-
-#### 4.12.6 FCM Push Notification Architecture
-*   **Plugin**: `fcm-capacitor` (Kotlin). Registers `FCMCapacitorPlugin` with Capacitor bridge.
-*   **Services**: `FCMMessagingService` (extends `FirebaseMessagingService`), `FCMActionReceiver` (handles inline actions).
-*   **Token Lifecycle**: On init → request permission → `getFCMToken()` → `POST /api/nodes/register`. On rotate → re-register via `tokenRefresh` listener.
-*   **Message Types**: `NEW_INSIGHT`, `INGESTION_COMPLETE`, `NODE_STATUS`, `SYSTEM_ALERT`, `MARK_READ_ACTION`.
-*   **Data Flow**:
-```
-Firebase Cloud Messaging
-  └─> FCMMessagingService.onMessageReceived()
-        └─> capacitorPlugin.notifyListeners("fcm:message", payload)
-              └─> fcmService.ts dispatchMessage()
-                    └─> emitFeedEvent() → onFCMFeedEvent listeners
-                          └─> FeedView.tsx → prepend new insight card
-```
-
-### 4.13 Server-Side Knowledge Import
-See §4.12.4 for the import sheet UI. The server-side pipeline:
-1.  **File ingest**: Server extracts text (Apache Tika), chunks, embeds, and stores in Neo4j KG.
-2.  **URL ingest**: Server fetches URL, runs Readability extraction, then processes identically to file.
-3.  **Job Status**: Polling endpoint returns `{status: 'pending'|'processing'|'completed'|'failed', progress}`.
-4.  **FCM Completion**: On completion, server dispatches `INGESTION_COMPLETE` FCM message; `ImportSheet` receives it via `onFCMFeedEvent` listener.
-
 ### 6.7 App & Utils Settings
 Located in **Settings -> App & Utils**.
 
@@ -1120,9 +1121,9 @@ This feature delegates heavy data extraction (like web search scraping) to an ex
 | Option | Type | Description |
 | :--- | :--- | :--- |
 | **Enable Support Server** | `Toggle` | Master switch for the support server capabilities. |
-| **Server URL** | `Text` | The endpoint of the AIMindMesh Server (e.g. `http://192.168.1.100:3000`). |
+| **Server URL** | `Text` | The endpoint of the AIMindMesh Server over the VPN (e.g. `http://10.2.0.1:3030`). |
 | **Delegate Web Search** | `Toggle` | Offloads DuckDuckGo web scraping. Calls `POST /api/web/search` with `{query, num_results}`. |
-| **Delegate Web Scraping** | `Toggle` | Offloads full web page parsing. Calls `POST /api/web/read` with `{url}`. |
+| **Delegate Web Scraping** | `Toggle` | Offloads full web page parsing. Calls `POST /api/web/read` with `{url, query?, method?, headers?, body?}` (`headers` as a JSON object). |
 | **Delegate Web Analysis** | `Toggle` | Offloads Search + AI Synth loop to containerized Ollama. Calls `POST /api/web/analyze` with `{query}`. |
 
 ### 6.13 AIMindMesh Server Settings
@@ -1131,8 +1132,8 @@ Located **Settings → AIMindMesh Server**.
 | Option | Type | Description |
 | :--- | :--- | :--- |
 | **Enable** | `Toggle` | Master switch. Activates Feed tab, Server LLM provider, FCM token registration, and server-mode proactive suspension. |
-| **Server URL** | `Text` | VPN endpoint of AIMindMesh Server. |
-| **API Key** | `Password` | `x-api-key` header value for all server requests. |
+| **Server URL** | `Text` | VPN endpoint of AIMindMesh Server (default `http://10.2.0.1:3030`). The server port is bound only to the VPN address and localhost. |
+| **API Key** | `Password` | Sent as the `x-api-key` header on REST requests and as the `token` query parameter on WebSockets (`/ws/chat`, `/ws/nodes`). Stored in the Keystore-backed secret store (see §9.1). |
 | **Fallback Provider** | `Select` | LLM provider to use if server is unreachable (default: `gemini`). |
 | **Participate as Worker** | `Toggle` | Allows the server to route inference tasks to this device. Activates the `NodeWorker` WebSocket. |
 | **Mesh Activity** | `Indicator` | Real-time status card showing if the device is currently executing a distributed task. |
@@ -1196,14 +1197,17 @@ All components must use theme-aware CSS variables defined in `src/index.css`. Ad
 
 ## 9. Security & Privacy
 
+This section describes the **current** state. Items marked *(planned)* are known gaps tracked in the security roadmap, not implemented behaviour.
+
 ### 9.1 Threat Model
 
 #### Assets
 | Asset | Sensitivity | Storage Location |
 |---|---|---|
-| Cloud API Keys (Gemini, Claude, Perplexity) | HIGH | Android Keystore (`EncryptedSharedPreferences`) |
-| Chat History | MEDIUM | SQLite (app private storage) |
-| Long-Term Memories | HIGH | SQLite (app private storage) |
+| Cloud API Keys (Gemini, Claude, Perplexity, OpenRouter, HF) | HIGH | Android: EncryptedSharedPreferences (Keystore) via `secretStore.ts`; `localStorage` only if encryption is unavailable. Desktop: `secrets.json` |
+| AIMindMesh Server API Key | HIGH | Same secret store (`aimindmesh-server-settings.apiKey`) |
+| Chat History | MEDIUM | WebView `localStorage` (`threadManager.ts`) |
+| Long-Term Memories | HIGH | SQLite (app private storage, unencrypted) |
 | Voice Recordings (.m4a) | HIGH | App private files directory |
 | Speaker Embeddings (biometric) | HIGH | SQLite (app private storage) |
 | Calendar Events | MEDIUM | SQLite (app private storage) |
@@ -1212,11 +1216,12 @@ All components must use theme-aware CSS variables defined in `src/index.css`. Ad
 #### Threat Actors
 | Actor | Capability | Mitigated By |
 |---|---|---|
-| Malicious app on same device | Read SharedPreferences | Android Keystore for secrets |
+| Malicious app on same device | Send intents to the exported `MainActivity` | Intent extras (`route`, widget host) are JSON-escaped before reaching `evaluateJavascript`; WebView permission requests are granted only to the app origin (`localhost`) |
 | Physical device theft | Filesystem access | Android FDE (File-Based Encryption, default API 24+) |
 | ADB backup exfiltration | Backup file read | `android:allowBackup="false"` in Manifest |
+| Debugger attached to a release build | Inspect WebView, read `localStorage` | `webContentsDebuggingEnabled` left to Capacitor's default: enabled on debug builds only |
 | Rooted device | Root file access | Defense-in-depth; user is aware of device state |
-| Network MITM | API key interception | HTTPS enforced; keys never in URL params |
+| Network MITM | API key interception | Server traffic runs inside the WireGuard VPN; cleartext HTTP is permitted app-wide (`usesCleartextTraffic="true"`) for VPN and LAN endpoints |
 | Prompt injection via tools | LLM manipulation | Tool confirmation system; dangerous tool whitelist |
 
 #### Out of Scope Threats
@@ -1230,45 +1235,40 @@ All components must use theme-aware CSS variables defined in `src/index.css`. Ad
 
 | Category | Examples | Retention | Cloud Transmission |
 |---|---|---|---|
-| CRITICAL | API Keys | App lifetime | Never |
-| SENSITIVE | Voice recordings, Speaker embeddings, Memories | Configurable (default: 30d for audio) | Never (local-first) |
-| PERSONAL | Calendar, Tasks, Chat history | App lifetime | Only if cloud LLM selected |
+| CRITICAL | API Keys | App lifetime | Only to the provider they belong to; the server key goes to the AIMindMesh Server (header on REST, `token` query parameter on WebSockets) |
+| SENSITIVE | Voice recordings, Speaker embeddings, Memories | Configurable (default: 30d for audio) | Memories only when KG sync is enabled (§4.13.5) |
+| PERSONAL | Calendar, Tasks, Chat history | App lifetime | Only if a cloud LLM or the AIMindMesh Server is selected |
 | OPERATIONAL | Settings, Model paths, Logs | App lifetime | Never |
 
-**Cloud Transmission Policy**: Data is sent to cloud providers (Gemini, Claude, Perplexity) ONLY when the user explicitly selects a cloud LLM provider. When using local GGUF/LiteRT, zero data leaves the device.
+**Cloud Transmission Policy**: Data is sent to cloud providers (Gemini, Claude, Perplexity, OpenRouter) ONLY when the user explicitly selects a cloud LLM provider. When using local GGUF/LiteRT/Genie, zero data leaves the device. When the AIMindMesh Server is enabled, data goes to the user's own VPS over the VPN, which may in turn route tasks to cloud providers according to its routing configuration.
 
 ---
 
 ### 9.3 Android Security Hardening
 
-#### Manifest Configuration
+#### Manifest Configuration (current)
 ```xml
 <application
     android:allowBackup="false"
-    android:fullBackupContent="false"
-    android:networkSecurityConfig="@xml/network_security_config"
+    android:usesCleartextTraffic="true"
     ... >
 ```
-
-#### Network Security Config (`res/xml/network_security_config.xml`)
-```xml
-<network-security-config>
-    <base-config cleartextTrafficPermitted="false">
-        <trust-anchors>
-            <certificates src="system"/>
-        </trust-anchors>
-    </base-config>
-</network-security-config>
-```
+*   There is no `network_security_config.xml`: cleartext is allowed for all hosts *(planned: restrict cleartext to the VPN/LAN ranges)*.
+*   Capacitor serves the app from `http://localhost` (`androidScheme: 'http'`, `allowNavigation: ['*']`, `allowMixedContent: true`).
 
 #### Permissions Rationale
-| Permission | Reason | When Requested |
-|---|---|---|
-| `RECORD_AUDIO` | STT, Meeting Mode, Voice Mode | First use of voice feature |
-| `READ_EXTERNAL_STORAGE` | Loading GGUF model files | Model selection in Settings |
-| `FOREGROUND_SERVICE` | Background STT, KeepAlive, Proactive | App first launch |
-| `RECEIVE_BOOT_COMPLETED` | Restart ProactiveService after reboot | Automatic |
-| `INTERNET` | Cloud provider API calls (optional) | When cloud provider selected |
+| Permission | Reason |
+|---|---|
+| `INTERNET` | Cloud providers, AIMindMesh Server |
+| `RECORD_AUDIO`, `MODIFY_AUDIO_SETTINGS` | STT, Meeting Mode, Voice/Call Mode, wake word |
+| `READ_EXTERNAL_STORAGE`, `WRITE_EXTERNAL_STORAGE`, `READ_MEDIA_IMAGES/VIDEO/AUDIO` | Model files, document import, media for vision features |
+| `POST_NOTIFICATIONS` | FCM insights, proactive suggestions |
+| `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MICROPHONE`, `FOREGROUND_SERVICE_MEDIA_PLAYBACK`, `FOREGROUND_SERVICE_SPECIAL_USE` | Wake word service, KeepAlive (always-loaded model) |
+| `WAKE_LOCK` | Long inference and recordings |
+| `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` | Heavy on-device compute (Performance plugin) |
+| `READ_CALENDAR`, `WRITE_CALENDAR` | Agenda integration |
+
+`RECEIVE_BOOT_COMPLETED` is **not** declared: the Proactive service does not restart after a reboot until the app is opened.
 
 ---
 
@@ -1295,16 +1295,38 @@ Voice recordings and speaker embeddings may constitute **biometric data** under 
 #### Data Minimization (Art. 5(1)(c))
 - Voice recordings auto-delete after configurable retention period (default: 30 days)
 - Speaker embeddings not linked to real identity unless user assigns name
-- No device identifiers or analytics transmitted
+- No analytics are collected. When the AIMindMesh Server is enabled, the device ID (`Device.getId()`) is sent to the user's own server to identify the node (`/ws/nodes`, `x-device-id`, FCM registration, sync); it is never sent to third parties.
 
 ---
 
 ### 9.5 Security Checklist (Pre-Release)
-- [ ] `android:allowBackup="false"` in AndroidManifest.xml
-- [ ] `cleartextTrafficPermitted="false"` in network security config
-- [ ] All API keys stored via EncryptedSharedPreferences (Android Keystore)
+- [x] `android:allowBackup="false"` in AndroidManifest.xml
+- [ ] Cleartext restricted via a network security config *(planned)*
+- [x] API keys stored via the Keystore-backed `SecureStorage` plugin (migrated from `localStorage` at startup; the plain copy is removed only after a verified encrypted write)
+- [x] WebView debugging disabled in release builds (Capacitor default)
+- [x] Intent data JSON-escaped before `evaluateJavascript`; WebView permissions granted only to the app origin
+- [x] `localStorage` values are never logged (`useLocalStorage.ts`)
 - [ ] No sensitive data in Android logs (logcat) in release builds
-- [ ] ProGuard/R8 minification enabled for release builds
-- [ ] No hardcoded secrets in source code
+- [x] ProGuard/R8 minification enabled for release builds
+- [x] No hardcoded secrets in source code
 - [ ] `run_termux_command` tool disabled by default; requires explicit user enable
 - [ ] Voice recordings stored in `filesDir` (not `externalFilesDir`)
+
+---
+
+### 9.6 AIMindMesh Server Security
+
+| Control | Implementation |
+|---|---|
+| **Authentication** | Every route goes through `authHook` (`middleware/auth.ts`): the `x-api-key` header must match `server.apiKey` or one of `auth.keys` (constant-time comparison). WebSocket upgrades use the `token` query parameter; without a valid key the handshake is rejected with HTTP 401. Tokens are masked (`token=***`) in logs. |
+| **Exempt routes** | `POST /api/freellmapi-proxy/v1/chat/completions` (requires the caller's own `Authorization: Bearer` FreeLLMAPI key, the server key is never injected); Gitea webhooks `POST /api/evolution/gitea/webhook` and `POST /api/organization/webhooks/gitea` (HMAC-SHA256 `X-Gitea-Signature` with `autoEvolution.giteaWebhookSecret`, rejected with 401 when the secret is missing or the signature is wrong); `GET /dl/*` installers (VPN IP filter). |
+| **Network exposure** | Docker publishes the server (3030) and Neo4j (7474/7687) only on `127.0.0.1` and the VPN address `10.2.0.1`, never on public interfaces. |
+| **Secrets in the API** | `GET /api/admin/config` returns credentials masked as `********`; masked values sent back by `PATCH` are ignored, so they never overwrite real secrets. The Docker image does not contain `config.json`, `.env` or the Firebase key (mounted at runtime). |
+| **Command execution** | No user- or LLM-controlled string reaches a shell: external tools (`whisper`, `tar`, `git`, `grep`, `docker exec`) run via `execFile` with argument arrays; backup names are validated against path traversal. |
+| **Mesh integrity** | A worker node can stream or resolve only the tasks dispatched to it (§4.13.7). |
+| **Auto-evolution** | Path policy, real type-check, rate limits and human approval (§4.14). |
+
+### 9.7 Testing & Continuous Integration
+*   **Server tests**: Vitest suite in `aimindmesh-server/test/` (`npm test`), covering authentication and WebSockets, webhook signatures, config redaction, command-injection and path-traversal regressions, the auto-evolution path policy and real patch type-checking, and the API contract fixes. Tests run against an in-memory SQLite database and a test configuration, with outgoing network calls disabled.
+*   **Shared API contract**: `aimindmesh-server/src/types/api.ts` (types only) is imported by the desktop, admin and mobile apps through the `@aimindmesh/api-types` path alias; a type-level test keeps the server's internal types compatible with it.
+*   **CI**: `.gitea/workflows/ci.yml` type-checks the four projects and runs the server tests on every push to `master` and on pull requests (Gitea Actions). Branches written by the auto-evolution engine (`feature/auto-*`, `fail/*`) are skipped so that LLM-written code never runs on the runner.

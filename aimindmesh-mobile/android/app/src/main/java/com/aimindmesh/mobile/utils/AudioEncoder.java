@@ -41,6 +41,9 @@ public class AudioEncoder {
             byte[] buffer = new byte[16384]; // Buffer for reading PCM
             boolean inputDone = false;
             boolean outputDone = false;
+            long bytesQueued = 0;
+            boolean wroteSample = false;
+            final long bytesPerSecond = (long) sampleRate * channels * 2;
 
             while (!outputDone) {
                 if (!inputDone) {
@@ -48,13 +51,18 @@ public class AudioEncoder {
                     if (inputBufferIndex >= 0) {
                         int read = fis.read(buffer);
                         if (read == -1) {
-                            encoder.queueInputBuffer(inputBufferIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                            encoder.queueInputBuffer(inputBufferIndex, 0, 0, bytesQueued * 1_000_000L / bytesPerSecond,
+                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM);
                             inputDone = true;
                         } else {
                             ByteBuffer inputBuffer = encoder.getInputBuffer(inputBufferIndex);
                             inputBuffer.clear();
                             inputBuffer.put(buffer, 0, read);
-                            encoder.queueInputBuffer(inputBufferIndex, 0, read, System.nanoTime() / 1000, 0);
+                            // Timestamp = position in the audio. The wall clock (encoding runs much faster
+                            // than real time) gave the file a wrong duration and broke seeking.
+                            long presentationTimeUs = bytesQueued * 1_000_000L / bytesPerSecond;
+                            encoder.queueInputBuffer(inputBufferIndex, 0, read, presentationTimeUs, 0);
+                            bytesQueued += read;
                         }
                     }
                 }
@@ -75,6 +83,7 @@ public class AudioEncoder {
                         encodedData.position(bufferInfo.offset);
                         encodedData.limit(bufferInfo.offset + bufferInfo.size);
                         muxer.writeSampleData(trackIndex, encodedData, bufferInfo);
+                        wroteSample = true;
                     }
 
                     encoder.releaseOutputBuffer(outputBufferIndex, false);
@@ -84,7 +93,8 @@ public class AudioEncoder {
                     }
                 }
             }
-            return true;
+            // A file without samples is not playable: let the caller fall back
+            return wroteSample;
         } catch (Exception e) {
             Log.e(TAG, "PCM to AAC encoding error", e);
             return false;

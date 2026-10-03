@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 
 // Regex to detect ISO 8601 date strings
 const isoDateRegex = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z$/;
@@ -12,22 +12,29 @@ function jsonReviver(_key: string, value: any) {
   return value;
 }
 
-import { PersistenceService } from '../services/config/persistenceService';
+import { getSecret, storeSetting } from '../services/security/secretStore';
+import { mergeSecrets } from '../services/security/secretFields';
+import { createWriteThrottle } from './writeThrottle';
 
+/** Minimum time between two writes of the same key (later changes are coalesced) */
+const WRITE_INTERVAL_MS = 1000;
+
+/**
+ * State persisted in localStorage (and app-settings.json on desktop). API keys inside the
+ * value are kept in the secret store instead (see secretStore.ts): merged in when reading,
+ * stripped when writing, so callers always see the full value.
+ */
 export function useLocalStorage<T>(key: string, initialValue: T): [T, React.Dispatch<React.SetStateAction<T>>] {
-  console.log(`[AI Mind Mesh] useLocalStorage hook initializing for key: "${key}"`);
+  const [value, setValue] = useState<T>(() => mergeSecrets(key, readStored(), getSecret));
 
-  const [value, setValue] = useState<T>(() => {
+  function readStored(): T {
     try {
       if (typeof window !== 'undefined' && window.localStorage) {
-        console.log(`[AI Mind Mesh] Reading localStorage for key: "${key}"`);
         const item = window.localStorage.getItem(key);
-        console.log(`[AI Mind Mesh] Raw item for "${key}":`, item);
+        // Values are never logged: several keys hold API keys and credentials
 
         if (item) {
-          console.log(`[AI Mind Mesh] Parsing item for "${key}"...`);
           const parsed = JSON.parse(item, jsonReviver);
-          console.log(`[AI Mind Mesh] Parsed item for "${key}":`, parsed);
 
           // If the initial value is an object (but not an array), merge it with the parsed value.
           // This ensures that if the app is updated with new properties in the default state,
@@ -36,7 +43,6 @@ export function useLocalStorage<T>(key: string, initialValue: T): [T, React.Disp
             typeof initialValue === 'object' && initialValue !== null && !Array.isArray(initialValue) &&
             typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
           ) {
-            console.log(`[AI Mind Mesh] Merging parsed object with initial value for key: "${key}"`);
             return { ...initialValue, ...parsed };
           }
 
@@ -50,20 +56,19 @@ export function useLocalStorage<T>(key: string, initialValue: T): [T, React.Disp
           return parsed ?? initialValue;
         }
       }
-      console.log(`[AI Mind Mesh] No item found for "${key}", using initial value.`);
       return initialValue;
     } catch (error) {
       console.error(`[AI Mind Mesh] CRITICAL ERROR reading/parsing localStorage key "${key}". Falling back to initial value.`, error);
       return initialValue;
     }
-  });
+  }
 
   useEffect(() => {
     const handleStorageChange = (e: StorageEvent) => {
       if (e.key === key && e.newValue) {
         try {
           const parsed = JSON.parse(e.newValue, jsonReviver);
-          setValue(parsed);
+          setValue(mergeSecrets(key, parsed, getSecret));
           console.log(`[AI Mind Mesh] useLocalStorage updated state from storage event for key: "${key}"`);
         } catch (error) {
           console.error(`[AI Mind Mesh] Error parsing storage event value for key "${key}"`, error);
@@ -75,31 +80,40 @@ export function useLocalStorage<T>(key: string, initialValue: T): [T, React.Disp
     return () => window.removeEventListener('storage', handleStorageChange);
   }, [key]);
 
-  useEffect(() => {
-    try {
-      if (typeof window !== 'undefined' && window.localStorage) {
-        // Storing 'undefined' results in the string "undefined", which is not ideal.
-        // It's better to remove the key if the value is undefined.
-        // import { PersistenceService } from '../services/config/persistenceService';
-
-        // ... (inside useEffect)
-
-        if (value === undefined) {
-          console.log(`[AI Mind Mesh] Value for key "${key}" is undefined, removing from localStorage.`);
-          window.localStorage.removeItem(key);
-          PersistenceService.removeItem(key).catch((e: unknown) => console.error('Failed to persist removal', e));
-        } else {
-          console.log(`[AI Mind Mesh] Writing to localStorage for key: "${key}"`);
-          const serialized = JSON.stringify(value);
-          window.localStorage.setItem(key, serialized);
-          // Persist to disk on Desktop
-          PersistenceService.saveItem(key, value).catch((e: unknown) => console.error('Failed to persist item', e));
+  // Writes are throttled per key: a streaming chat would otherwise serialize the whole
+  // history to storage on every update
+  const keyRef = useRef(key);
+  keyRef.current = key;
+  const writerRef = useRef<ReturnType<typeof createWriteThrottle<T>> | null>(null);
+  if (!writerRef.current) {
+    writerRef.current = createWriteThrottle<T>(next => {
+      try {
+        if (typeof window !== 'undefined' && window.localStorage) {
+          // undefined removes the key; secrets go to the secret store; desktop also mirrors to disk
+          storeSetting(keyRef.current, next);
         }
+      } catch (error) {
+        console.error(`[AI Mind Mesh] Error writing to localStorage key "${keyRef.current}".`, error);
       }
-    } catch (error) {
-      console.error(`[AI Mind Mesh] Error writing to localStorage key "${key}".`, error);
-    }
+    }, WRITE_INTERVAL_MS);
+  }
+
+  useEffect(() => {
+    writerRef.current!.push(value);
   }, [key, value]);
+
+  // A coalesced write is not left pending when the app goes to background or the owner unmounts
+  useEffect(() => {
+    const writer = writerRef.current!;
+    const flushWhenHidden = () => { if (document.visibilityState === 'hidden') writer.flush(); };
+    document.addEventListener('visibilitychange', flushWhenHidden);
+    window.addEventListener('pagehide', writer.flush);
+    return () => {
+      document.removeEventListener('visibilitychange', flushWhenHidden);
+      window.removeEventListener('pagehide', writer.flush);
+      writer.flush();
+    };
+  }, []);
 
   return [value, setValue];
 }

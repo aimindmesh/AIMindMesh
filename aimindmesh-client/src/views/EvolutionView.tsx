@@ -4,43 +4,12 @@ import { serverApi } from '../services/serverApi';
 import { Dropdown } from '../components/ui/Dropdown';
 import { Logger } from '../utils/logger';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import type { EvolutionProposalRow, ProtectedPathRow, EvolutionCandidateRow } from '@aimindmesh/api-types';
 
-interface EvolutionProposal {
-  id: string;
-  candidate_id: string;
-  candidate_title: string;
-  candidate_description: string;
-  explanation: string;
-  branch_name: string;
-  pr_url: string;
-  pr_number: number;
-  target_component: string;
-  impact: string;
-  breaking_change: boolean;
-  status: 'proposed' | 'merged' | 'rejected' | 'failed';
-  created_at: number;
-}
-
-interface ProtectedPath {
-  path: string;
-  reason: string;
-  created_at: number;
-}
-
-interface EvolutionCandidate {
-  id: string;
-  title: string;
-  description: string;
-  severity: number;
-  confidence: number;
-  status: string;
-  source: string;
-  proposed_approach?: string;
-  target_component?: string;
-  target_language?: string;
-  tags?: string;
-  created_at: number;
-}
+// Raw rows from /api/evolution (server contract)
+type EvolutionProposal = EvolutionProposalRow;
+type ProtectedPath = ProtectedPathRow;
+type EvolutionCandidate = EvolutionCandidateRow;
 
 export default function EvolutionView() {
   const [proposals, setProposals] = useState<EvolutionProposal[]>([]);

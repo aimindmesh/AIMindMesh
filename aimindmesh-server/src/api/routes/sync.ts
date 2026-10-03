@@ -15,8 +15,9 @@ export default async function (fastify: FastifyInstance) {
         return reply.code(400).send({ error: 'Missing deviceId' });
       }
 
-      await SyncManager.handlePush(payload);
-      return { ok: true, timestamp: Date.now() };
+      // failedMemoryIds: memories not stored in the graph, the device keeps them for the next push
+      const { failedMemoryIds } = await SyncManager.handlePush(payload);
+      return { ok: true, timestamp: Date.now(), failedMemoryIds };
     } catch (e: any) {
       Logger.error('SyncRoute', `Push failed: ${e.message}`);
       return reply.code(500).send({ error: e.message });
@@ -32,7 +33,8 @@ export default async function (fastify: FastifyInstance) {
         return reply.code(400).send({ error: 'Missing deviceId' });
       }
 
-      const sinceTs = parseInt(since || '0', 10);
+      const parsed = parseInt(since || '0', 10);
+      const sinceTs = Number.isFinite(parsed) ? parsed : 0;
       const data = await SyncManager.handlePull(deviceId, sinceTs);
       return data;
     } catch (e: any) {

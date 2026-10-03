@@ -14,6 +14,9 @@ import java.util.Collections;
 /**
  * ECAPA-TDNN speaker embedding extraction using ONNX Runtime.
  * Designed for speaker diarization with high accuracy.
+ * Load, unload and extraction are synchronized: the plugin runs each call on its own thread, and a
+ * load (which closes the session) racing an extraction crashed natively. isModelLoaded() stays
+ * unsynchronized so a status check on the shared plugin thread never waits for a model load.
  */
 public class EcapaEmbedding {
     private static final String TAG = "EcapaEmbedding";
@@ -21,9 +24,9 @@ public class EcapaEmbedding {
 
     private Context context;
     private OrtEnvironment env; // Lazy initialized
-    private OrtSession session;
+    private volatile OrtSession session;
     private int embeddingDimension = 192; // Default for ECAPA-TDNN
-    private boolean isLoaded = false;
+    private volatile boolean isLoaded = false;
     private FeatureExtractor featureExtractor;
 
     public EcapaEmbedding(Context context) {
@@ -39,7 +42,7 @@ public class EcapaEmbedding {
      * @param modelPath Relative path to model file (e.g., "models/ecapa_tdnn.onnx")
      * @return true if successful
      */
-    public boolean loadModel(String modelPath) {
+    public synchronized boolean loadModel(String modelPath) {
         try {
             File modelFile = new File(context.getFilesDir(), modelPath);
 
@@ -103,7 +106,7 @@ public class EcapaEmbedding {
     /**
      * Unload the model and release resources.
      */
-    public void unloadModel() {
+    public synchronized void unloadModel() {
         if (session != null) {
             try {
                 session.close();
@@ -136,7 +139,7 @@ public class EcapaEmbedding {
      *                     to 1)
      * @return Float array embedding vector, or null on failure
      */
-    public float[] extractEmbedding(float[] audioSamples) {
+    public synchronized float[] extractEmbedding(float[] audioSamples) {
         if (!isModelLoaded()) {
             Log.e(TAG, "Model not loaded");
             return null;
@@ -209,7 +212,7 @@ public class EcapaEmbedding {
     /**
      * Cleanup resources.
      */
-    public void cleanup() {
+    public synchronized void cleanup() {
         unloadModel();
         if (env != null) {
             try {

@@ -1,10 +1,17 @@
 import { ValidationResult } from './types';
 import { KasmService } from '../KasmService';
 import { config } from '../../config';
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { shQuote } from '../../utils/shell';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+/** Hides the Gitea token embedded in clone URLs from stored logs and summaries. */
+function maskToken(text: string): string {
+  const token = process.env.GITEA_TOKEN;
+  return token ? text.split(token).join('***') : text;
+}
 
 // Timeout for individual exec commands (ms)
 const EXEC_TIMEOUT_MS = 5 * 60 * 1000;
@@ -43,6 +50,10 @@ export class KasmValidationService {
     // Container name = adminkasm.lo_<first 8 chars of kasm_id> (before first hyphen)
     const shortId = kasmId.split('-')[0];
     const containerName = `adminkasm.lo_${shortId}`;
+    if (!/^[\w.-]+$/.test(containerName)) {
+      await KasmService.destroySession(kasmId).catch(() => {});
+      throw new Error(`Unexpected Kasm container name: ${containerName}`);
+    }
     console.log(`[KasmValidationService] Session ${kasmId} -> container: ${containerName}`);
 
     // Resolve Gitea hostname and inject auth token
@@ -68,12 +79,14 @@ export class KasmValidationService {
     const execInWorkspace = async (shellCmd: string, label: string): Promise<string> => {
       console.log(`[KasmValidationService] [${label}] Running command...`);
       // docker exec kasm docker exec -u root <containerName> sh -c '<cmd>'
-      const { stdout, stderr } = await execAsync(
-        `docker exec -u root kasm docker exec -u root ${containerName} sh -c ${JSON.stringify(shellCmd)}`,
+      // execFile: no local shell, shellCmd is only interpreted by sh inside the workspace
+      const { stdout, stderr } = await execFileAsync(
+        'docker',
+        ['exec', '-u', 'root', 'kasm', 'docker', 'exec', '-u', 'root', containerName, 'sh', '-c', shellCmd],
         { timeout: EXEC_TIMEOUT_MS }
       );
       const output = [stdout, stderr].filter(Boolean).join('\n');
-      logs.push(`[${label}] ${output}`);
+      logs.push(`[${label}] ${maskToken(output)}`);
       return output;
     };
 
@@ -90,7 +103,7 @@ export class KasmValidationService {
 
       // 2. Clone the repository
       await execInWorkspace(
-        `rm -rf /tmp/val-repo && git clone ${resolvedUrl} /tmp/val-repo 2>&1`,
+        `rm -rf /tmp/val-repo && git clone ${shQuote(resolvedUrl)} /tmp/val-repo 2>&1`,
         'git-clone'
       );
 
@@ -113,10 +126,10 @@ export class KasmValidationService {
         logs,
       };
     } catch (e: any) {
-      const errLogs = [e.message, e.stdout, e.stderr].filter(Boolean);
+      const errLogs = [e.message, e.stdout, e.stderr].filter(Boolean).map((l: string) => maskToken(String(l)));
       return {
         status: 'failed',
-        summary: `Validation failed: ${e.message}`,
+        summary: `Validation failed: ${maskToken(String(e.message))}`,
         logs: [...logs, ...errLogs],
       };
     } finally {

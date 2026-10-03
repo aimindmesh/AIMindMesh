@@ -6,6 +6,7 @@ import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { AiTaskScheduler } from '../../services/AiTaskScheduler';
 import { AiModel, AiProvider, StoragePolicy, AiTaskDefinition } from '../../types/aiTask';
 import { Logger } from '../../utils/Logger';
+import type { ApiAiTask } from '../../types/api';
 
 export default async function aiTasksRouter(fastify: FastifyInstance) {
   
@@ -21,7 +22,7 @@ export default async function aiTasksRouter(fastify: FastifyInstance) {
         return {
           ...task,
           lastExecution: executions.length > 0 ? executions[0] : undefined
-        };
+        } satisfies ApiAiTask;
       });
       return tasksWithExec;
     } catch (err: any) {
@@ -80,7 +81,9 @@ export default async function aiTasksRouter(fastify: FastifyInstance) {
       const task = AiTaskScheduler.getTask(id);
       if (!task) return reply.code(404).send({ error: 'Task not found' });
 
-      return task;
+      // Same shape as the list route: clients read lastExecution from here too
+      const executions = AiTaskScheduler.getExecutions(task.id);
+      return { ...task, lastExecution: executions.length > 0 ? executions[0] : undefined } satisfies ApiAiTask;
     } catch (err: any) {
       return reply.code(500).send({ error: err.message });
     }

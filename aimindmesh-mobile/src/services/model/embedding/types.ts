@@ -19,8 +19,24 @@ export interface EmbeddingDownloadProgress {
 
 export const EMBEDDING_MODELS_DIR = 'embedding_models';
 
+export interface EmbeddingModelDefinition {
+    id: string;
+    name: string;
+    description: string;
+    dimension: number;
+    size: number;
+    sizeBytes: number;
+    modelUrl: string;
+    tokenizerUrl: string;
+    /** Prepended to search queries (E5 models are trained with it) */
+    queryPrefix?: string;
+    /** Prepended to stored texts: memories and document chunks */
+    passagePrefix?: string;
+    recommended: boolean;
+}
+
 // Predefined embedding models with direct download URLs
-export const EMBEDDING_MODELS = [
+export const EMBEDDING_MODELS: EmbeddingModelDefinition[] = [
     // Legacy model (keep for backwards compatibility)
     {
         id: 'all-MiniLM-L6-v2',

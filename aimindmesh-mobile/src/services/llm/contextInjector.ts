@@ -1,6 +1,18 @@
 import { DocumentRetriever } from '../documents/DocumentRetriever';
 import { workspaceService } from '../workspaces/WorkspaceService';
+import { getKnowledgeDatabase } from '../database/knowledgeDatabase';
 import { logger } from '../logger';
+
+/** Whether any document is indexed: global mode would otherwise embed every query for nothing */
+async function hasIndexedDocuments(): Promise<boolean> {
+    try {
+        const db = await getKnowledgeDatabase();
+        const res = await db.query('SELECT 1 FROM documents LIMIT 1');
+        return (res.values?.length ?? 0) > 0;
+    } catch {
+        return false;
+    }
+}
 
 export class ContextInjector {
     private retriever: DocumentRetriever;
@@ -16,14 +28,23 @@ export class ContextInjector {
         userQuery: string,
         baseSystemPrompt: string
     ): Promise<string> {
-        const activeWorkspace = workspaceService.getActiveWorkspace();
-
-        // Check if auto-inject is enabled for the active workspace
-        if (!activeWorkspace || !activeWorkspace.settings.auto_inject) {
-            return baseSystemPrompt;
-        }
+        if (!userQuery?.trim()) return baseSystemPrompt;
 
         try {
+            // The mode (all documents / one workspace / none) is loaded lazily from the database
+            await workspaceService.ensureInitialized();
+            const mode = workspaceService.getContextMode();
+            const activeWorkspace = workspaceService.getActiveWorkspace();
+
+            if (mode === 'NONE') return baseSystemPrompt;
+            if (mode === 'WORKSPACE' && activeWorkspace) {
+                // A workspace injects only when its auto-inject setting is on
+                if (!activeWorkspace.settings.auto_inject) return baseSystemPrompt;
+            } else if (!(await hasIndexedDocuments())) {
+                // GLOBAL (or a workspace that is gone): search all documents, if there are any
+                return baseSystemPrompt;
+            }
+
             // Retrieve relevant chunks
             const chunks = await this.retriever.autoRetrieve(userQuery);
 
@@ -40,7 +61,8 @@ export class ContextInjector {
             });
 
             // Build Context Block
-            let contextBlock = `\n\n## 📚 WORKSPACE CONTEXT (${activeWorkspace.name})\n`;
+            const scope = mode === 'WORKSPACE' && activeWorkspace ? activeWorkspace.name : 'All documents';
+            let contextBlock = `\n\n## 📚 WORKSPACE CONTEXT (${scope})\n`;
             contextBlock += `Use the following document excerpts to answer the user's question. If the answer is found in the context, cite the document title. If not, rely on your general knowledge but mention that the documents didn't contain the answer.\n\n`;
 
             Object.entries(grouped).forEach(([title, docChunks]) => {

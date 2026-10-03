@@ -6,6 +6,7 @@
 
 import { logger } from '../logger';
 import { initMemoryDatabase, getMemoryDatabase } from '../memory/memoryDatabase';
+import { blobToFloat32Array, cosineSimilarity } from './embeddingCodec';
 
 /**
  * Memory relation type
@@ -339,13 +340,16 @@ export class MemoryGraphService {
     }
 
     /**
-     * Auto-detect relations between memories based on content analysis
+     * Auto-detect relations of a newly saved memory (called by SemanticMemoryRetriever.saveMessage):
+     * the previous memory of the same conversation (follows), recent memories embedded by the
+     * same model with similar vectors (similar_to), shared keywords (mentioned_with).
      */
     public async detectRelations(
         memoryId: string,
         content: string,
-        embedding: number[],
-        recentMemoryIds: string[]
+        embedding: ArrayLike<number>,
+        sessionId: string,
+        modelKey: string | null
     ): Promise<MemoryRelation[]> {
         await this.initialize();
         const db = await getMemoryDatabase();
@@ -353,91 +357,52 @@ export class MemoryGraphService {
         if (!db) throw new Error('Database not connected');
 
         const relations: MemoryRelation[] = [];
+        const link = async (sourceId: string, targetId: string, type: RelationType, weight: number, metadata?: Record<string, unknown>) => {
+            try {
+                const id = await this.addRelation(sourceId, targetId, type, weight, metadata);
+                relations.push({ id, sourceMemoryId: sourceId, targetMemoryId: targetId, relationType: type, weight, createdAt: Date.now(), metadata });
+            } catch (e) {
+                // e.g. the other memory was deleted meanwhile (foreign key)
+                logger.log('debug', `Relation ${type} ${sourceId} -> ${targetId} skipped`, e);
+            }
+        };
+
+        // Earlier memories of the same conversation, newest first
+        const sessionResult = await db.query(
+            `SELECT id, content FROM memories WHERE session_id = ? AND id != ? ORDER BY timestamp DESC LIMIT 5`,
+            [sessionId, memoryId]
+        );
+        const sessionRecent = sessionResult.values ?? [];
 
         // 1. Temporal relation with previous message (follows)
-        if (recentMemoryIds.length > 0) {
-            const prevId = recentMemoryIds[recentMemoryIds.length - 1];
-            const relId = await this.addRelation(prevId, memoryId, 'follows', 0.8);
-            relations.push({
-                id: relId,
-                sourceMemoryId: prevId,
-                targetMemoryId: memoryId,
-                relationType: 'follows',
-                weight: 0.8,
-                createdAt: Date.now()
-            });
+        if (sessionRecent.length > 0) {
+            await link(sessionRecent[0].id, memoryId, 'follows', 0.8);
         }
 
-        // 2. Similar content (using embedding similarity)
-        // Query recent memories for similarity
-        const recentResult = await db.query(
-            `SELECT id, embedding FROM memories 
-             WHERE id != ? 
-             ORDER BY timestamp DESC 
-             LIMIT 20`,
-            [memoryId]
-        );
-
-        if (recentResult.values) {
-            for (const row of recentResult.values) {
-                if (!row.embedding) continue;
-
-                // Parse embedding from blob
-                let otherEmbedding: number[];
-                try {
-                    if (typeof row.embedding === 'string') {
-                        otherEmbedding = JSON.parse(row.embedding);
-                    } else {
-                        otherEmbedding = Array.from(new Float32Array(row.embedding));
-                    }
-                } catch {
-                    continue;
-                }
-
-                const similarity = this.cosineSimilarity(embedding, otherEmbedding);
-
+        // 2. Similar content: vectors of other models are not comparable
+        if (modelKey) {
+            const recentResult = await db.query(
+                `SELECT id, hex(embedding) AS embedding FROM memories
+                 WHERE id != ? AND embedding_model = ?
+                 ORDER BY timestamp DESC
+                 LIMIT 20`,
+                [memoryId, modelKey]
+            );
+            for (const row of recentResult.values ?? []) {
+                const similarity = cosineSimilarity(embedding, blobToFloat32Array(row.embedding));
                 if (similarity >= 0.75) {
-                    const relId = await this.addRelation(memoryId, row.id, 'similar_to', similarity);
-                    relations.push({
-                        id: relId,
-                        sourceMemoryId: memoryId,
-                        targetMemoryId: row.id,
-                        relationType: 'similar_to',
-                        weight: similarity,
-                        createdAt: Date.now()
-                    });
+                    await link(memoryId, row.id, 'similar_to', similarity);
                 }
             }
         }
 
         // 3. Topic co-occurrence (mentioned_with) - simple keyword detection
         const keywords = this.extractKeywords(content);
-
-        for (const otherId of recentMemoryIds.slice(-5)) {
-            const otherResult = await db.query(
-                `SELECT content FROM memories WHERE id = ?`,
-                [otherId]
-            );
-
-            if (otherResult.values?.[0]?.content) {
-                const otherKeywords = this.extractKeywords(otherResult.values[0].content);
-                const overlap = keywords.filter(k => otherKeywords.includes(k));
-
-                if (overlap.length >= 2) {
-                    const weight = Math.min(overlap.length / 5, 1.0);
-                    const relId = await this.addRelation(memoryId, otherId, 'mentioned_with', weight, {
-                        sharedKeywords: overlap
-                    });
-                    relations.push({
-                        id: relId,
-                        sourceMemoryId: memoryId,
-                        targetMemoryId: otherId,
-                        relationType: 'mentioned_with',
-                        weight,
-                        createdAt: Date.now(),
-                        metadata: { sharedKeywords: overlap }
-                    });
-                }
+        for (const other of sessionRecent) {
+            const otherKeywords = this.extractKeywords(String(other.content ?? ''));
+            const overlap = keywords.filter(k => otherKeywords.includes(k));
+            if (overlap.length >= 2) {
+                await link(memoryId, other.id, 'mentioned_with', Math.min(overlap.length / 5, 1.0), { sharedKeywords: overlap });
             }
         }
 
@@ -471,25 +436,6 @@ export class MemoryGraphService {
             .split(/\s+/)
             .filter(word => word.length > 3 && !stopwords.has(word))
             .slice(0, 20);
-    }
-
-    /**
-     * Cosine similarity
-     */
-    private cosineSimilarity(a: number[], b: number[]): number {
-        if (a.length !== b.length) return 0;
-
-        let dot = 0, normA = 0, normB = 0;
-        for (let i = 0; i < a.length; i++) {
-            dot += a[i] * b[i];
-            normA += a[i] * a[i];
-            normB += b[i] * b[i];
-        }
-
-        if (normA > 0 && normB > 0) {
-            return dot / (Math.sqrt(normA) * Math.sqrt(normB));
-        }
-        return 0;
     }
 
     /**

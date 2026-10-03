@@ -180,6 +180,8 @@ public class VoskRecognizer {
                 Log.i(TAG, "Creating recognizer WITHOUT speaker model");
                 recognizer = new Recognizer(model, SAMPLE_RATE);
             }
+            // Word times give each utterance its start/end (without them every segment was 0-0)
+            recognizer.setWords(true);
 
             android.media.AudioRecord audioRecord;
             int bufferSize = Math.max(
@@ -210,6 +212,8 @@ public class VoskRecognizer {
 
             if (audioRecord.getState() != android.media.AudioRecord.STATE_INITIALIZED) {
                 Log.e(TAG, "AudioRecord failed to initialize - state: " + audioRecord.getState());
+                audioRecord.release();
+                recognizer.close();
                 throw new IOException("AudioRecord failed to initialize");
             }
 
@@ -224,6 +228,7 @@ public class VoskRecognizer {
                 Log.d(TAG, "Recognition thread started");
                 short[] buffer = new short[bufferSize / 2];
                 int loopCount = 0;
+                try {
                 while (isRecording) {
                     int read = finalRecord.read(buffer, 0, buffer.length);
                     if (read > 0) {
@@ -286,10 +291,30 @@ public class VoskRecognizer {
                         Log.w(TAG, "AudioRecord.read returned: " + read);
                     }
                 }
-                Log.d(TAG, "Recognition thread stopping");
-                finalRecord.stop();
-                finalRecord.release();
-                Log.d(TAG, "Recognition thread stopped");
+                } finally {
+                    Log.d(TAG, "Recognition thread stopping");
+                    try {
+                        finalRecord.stop();
+                    } catch (IllegalStateException e) {
+                        Log.w(TAG, "AudioRecord stop failed: " + e.getMessage());
+                    }
+                    finalRecord.release();
+                    // Flush the utterance in progress: the last words before Stop were dropped
+                    try {
+                        String finalResult = recognizer.getFinalResult();
+                        String text = parseHypothesis(finalResult);
+                        if (onFinal != null && !text.isEmpty()) {
+                            long[] boundaries = parseBoundaries(finalResult);
+                            onFinal.onResult(text, parseSpeakerVector(finalResult), boundaries[0], boundaries[1]);
+                        }
+                    } catch (Exception e) {
+                        Log.w(TAG, "Final result flush failed: " + e.getMessage());
+                    } finally {
+                        // Native recognizer state leaked at every recording otherwise
+                        recognizer.close();
+                    }
+                    Log.d(TAG, "Recognition thread stopped");
+                }
             });
             recordingThread.start();
 
@@ -315,6 +340,7 @@ public class VoskRecognizer {
         } else {
             processingRecognizer = new Recognizer(model, SAMPLE_RATE);
         }
+        processingRecognizer.setWords(true);
     }
 
     public boolean processData(byte[] data, int len, OnPartialResultListener onPartial, OnFinalResultListener onFinal) {
@@ -360,7 +386,8 @@ public class VoskRecognizer {
         isRecording = false;
         if (recordingThread != null) {
             try {
-                recordingThread.join(1000);
+                // The thread flushes the last utterance before ending: wait for it
+                recordingThread.join(3000);
             } catch (InterruptedException e) {
                 Log.e(TAG, "Interrupted while waiting for recording thread to stop");
             }

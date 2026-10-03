@@ -39,7 +39,8 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ llmConfig }) =
             await workspaceService.ensureInitialized();
             const db = await getKnowledgeDatabase();
             // Show all docs, but mark if they are in active workspace
-            const res = await db.query('SELECT * FROM documents ORDER BY created_at DESC');
+            // (total_chunks < 0: still being ingested)
+            const res = await db.query('SELECT * FROM documents WHERE total_chunks >= 0 ORDER BY created_at DESC');
 
             // Also get docs in active workspace
             let workspaceDocIds = new Set<number>();
@@ -113,18 +114,23 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ llmConfig }) =
                     });
 
                 if (ingestRes.status === 'indexed') {
-                    // If workspace active, add it
-                    if (activeWorkspace) {
+                    // A local document joins the active workspace; a server-ingested one has
+                    // no local row to link (and does not appear in this list)
+                    if (activeWorkspace && !ingestRes.remote && ingestRes.id > 0) {
                         await workspaceService.addDocumentToWorkspace(activeWorkspace.id, ingestRes.id);
                     }
                     await loadDocuments();
+                    if (ingestRes.remote) {
+                        alert(`Document sent to the AIMindMesh server for indexing${ingestRes.jobId ? ` (job ${ingestRes.jobId})` : ''}.`);
+                    }
                 } else {
                     alert('Upload failed: ' + ingestRes.error);
                 }
             }
         } catch (e: any) {
             logger.log('error', 'Pick files failed', e);
-            // alert('Pick files failed: ' + e.message);
+            // A cancelled picker is not an error worth a dialog
+            if (!/cancel/i.test(e?.message || '')) alert('Upload failed: ' + (e?.message || e));
         } finally {
             setLoading(false);
         }
@@ -155,8 +161,9 @@ export const DocumentManager: React.FC<DocumentManagerProps> = ({ llmConfig }) =
             // Delete document
             await db.run('DELETE FROM documents WHERE id = ?', [docId]);
             await loadDocuments();
-        } catch (e) {
+        } catch (e: any) {
             console.error('Failed to delete document', e);
+            alert('Failed to delete document: ' + (e?.message || e));
         }
     };
 

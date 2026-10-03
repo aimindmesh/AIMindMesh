@@ -5,53 +5,9 @@ import { logger } from '../logger';
 import { getPiperTtsService } from '../tts/piperTTS';
 import { getKokoroTtsService } from '../tts/kokoroTTS';
 import { requestMicrophonePermission } from '../../utils/permissions';
-
-// Fix for SpeechRecognition API not being in standard TS DOM library
-// This adds the necessary types to the global scope to resolve compilation errors.
-// See: https://developer.mozilla.org/en-US/docs/Web/API/SpeechRecognition
-interface SpeechRecognitionAlternative {
-  readonly transcript: string;
-  readonly confidence: number;
-}
-
-interface SpeechRecognitionResult {
-  readonly isFinal: boolean;
-  readonly length: number;
-  item(index: number): SpeechRecognitionAlternative;
-  [index: number]: SpeechRecognitionAlternative;
-}
-
-interface SpeechRecognitionResultList {
-  readonly length: number;
-  item(index: number): SpeechRecognitionResult;
-  [index: number]: SpeechRecognitionResult;
-}
-
-interface SpeechRecognitionEvent extends Event {
-  readonly resultIndex: number;
-  readonly results: SpeechRecognitionResultList;
-}
-
-interface SpeechRecognition extends EventTarget {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  onresult: ((this: SpeechRecognition, ev: SpeechRecognitionEvent) => any) | null;
-  onend: (() => void) | null;
-  start(): void;
-  stop(): void;
-}
-
-declare global {
-  interface Window {
-    SpeechRecognition: {
-      new(): SpeechRecognition;
-    };
-    webkitSpeechRecognition: {
-      new(): SpeechRecognition;
-    };
-  }
-}
+import { normalizeTtsProvider } from './providerIds';
+import { beginSpeak, endPendingSpeak } from './speakSession';
+import type { SpeechRecognition } from './speechRecognitionTypes';
 
 // --- Text-to-Speech (TTS) ---
 
@@ -111,20 +67,25 @@ export const unlockTtsAudioContextSync = () => {
 /**
  * Speaks a given text string using the browser's speech synthesis engine.
  * @param text The text to speak.
- * @param onEnd Optional callback function to execute when speaking finishes.
+ * @param onEnd Optional callback function to execute when speaking finishes (or is stopped).
  */
 export const speak = async (text: string, provider: TtsProvider, llmConfig: LLMConfig, speechConfig?: SpeechConfig, apiKey?: string, onEnd?: () => void) => {
-  stopSpeaking();
+  stopEngines(); // replaced, not stopped: the previous reply's onEnd must not fire now
+  return speakWith(text, provider, llmConfig, speechConfig, apiKey, beginSpeak(onEnd));
+};
 
-  // Normalize legacy provider IDs stored in old localStorage versions
-  if ((provider as string) === 'gemini') provider = 'online';
-  if ((provider as string) === 'system') provider = 'offline';
+/** speak() body; fallbacks recurse here so the end callback is registered once. */
+const speakWith = async (text: string, provider: TtsProvider, llmConfig: LLMConfig, speechConfig?: SpeechConfig, apiKey?: string, onEnd?: () => void): Promise<void> => {
+  // Legacy ('gemini'/'system') and capitalized ('Piper') ids from older settings
+  provider = normalizeTtsProvider(provider);
 
   logger.log('info', `Speaking text (provider: ${provider}, length: ${text.length})`);
 
   if (provider === 'offline') {
     if (!window.speechSynthesis) {
       logger.log('error', "Browser does not support speech synthesis.");
+      // Callers flip isSpeaking back in onEnd; without it a voice call stays on "Speaking..."
+      onEnd?.();
       return;
     }
     const utterance = new SpeechSynthesisUtterance(text);
@@ -144,7 +105,7 @@ export const speak = async (text: string, provider: TtsProvider, llmConfig: LLMC
     if (!ai) {
       logger.log('warn', "Online TTS skipped: client failed to initialize. Falling back to offline provider.");
       // Fallback to offline TTS
-      speak(text, 'offline', llmConfig, speechConfig, apiKey, onEnd);
+      speakWith(text, 'offline', llmConfig, speechConfig, apiKey, onEnd);
       return;
     }
     // IMPORTANT: Only TTS-specific models support Modality.AUDIO via generateContent.
@@ -190,7 +151,7 @@ export const speak = async (text: string, provider: TtsProvider, llmConfig: LLMC
     } catch (error) {
       logger.log('error', "Error during online TTS generation, falling back to offline.", error);
       // Fallback to offline TTS to avoid freezing UI in 'Speaking...' state
-      speak(text, 'offline', llmConfig, speechConfig, apiKey, onEnd);
+      speakWith(text, 'offline', llmConfig, speechConfig, apiKey, onEnd);
     }
   } else if (provider === 'piper') {
     const piperService = getPiperTtsService();
@@ -213,7 +174,7 @@ export const speak = async (text: string, provider: TtsProvider, llmConfig: LLMC
     if (!piperService.isSupported() || !isLoaded) {
       logger.log('warn', `Piper TTS not available or no voice loaded (voice: ${currentVoice}). Falling back to offline provider.`);
       // Fallback to offline TTS
-      speak(text, 'offline', llmConfig, speechConfig, apiKey, onEnd);
+      speakWith(text, 'offline', llmConfig, speechConfig, apiKey, onEnd);
       return;
     }
     try {
@@ -222,7 +183,7 @@ export const speak = async (text: string, provider: TtsProvider, llmConfig: LLMC
     } catch (error) {
       logger.log('error', "Error during Piper TTS", error);
       // Fallback to offline on error
-      speak(text, 'offline', llmConfig, speechConfig, apiKey, onEnd);
+      speakWith(text, 'offline', llmConfig, speechConfig, apiKey, onEnd);
     }
   } else if (provider === 'kokoro') {
     const kokoroService = getKokoroTtsService();
@@ -245,7 +206,7 @@ export const speak = async (text: string, provider: TtsProvider, llmConfig: LLMC
     if (!kokoroService.isSupported() || !isLoaded) {
       logger.log('warn', `Kokoro TTS not available or no voice loaded (voice: ${currentVoice}). Falling back to offline provider.`);
       // Fallback to offline TTS
-      speak(text, 'offline', llmConfig, speechConfig, apiKey, onEnd);
+      speakWith(text, 'offline', llmConfig, speechConfig, apiKey, onEnd);
       return;
     }
     try {
@@ -253,8 +214,11 @@ export const speak = async (text: string, provider: TtsProvider, llmConfig: LLMC
     } catch (error) {
       logger.log('error', "Error during Kokoro TTS", error);
       // Fallback to offline on error
-      speak(text, 'offline', llmConfig, speechConfig, apiKey, onEnd);
+      speakWith(text, 'offline', llmConfig, speechConfig, apiKey, onEnd);
     }
+  } else {
+    logger.log('warn', `Unknown TTS provider "${provider}", nothing to speak.`);
+    onEnd?.();
   }
 };
 
@@ -262,6 +226,11 @@ export const speak = async (text: string, provider: TtsProvider, llmConfig: LLMC
  * Immediately stops any ongoing speech synthesis from all known sources.
  */
 export const stopSpeaking = () => {
+  stopEngines();
+  endPendingSpeak(); // a stopped reply never reaches its own end: report it so isSpeaking resets
+};
+
+const stopEngines = () => {
   // Stop browser-native speech
   if (window.speechSynthesis && window.speechSynthesis.speaking) {
     logger.log('debug', 'Stopping browser-native speech synthesis.');
@@ -274,16 +243,10 @@ export const stopSpeaking = () => {
     currentTtsSource.stop();
     currentTtsSource = null;
   }
-  // Stop Piper TTS
-  try {
-    const { getPiperTtsService } = require('./piperTTS');
-    getPiperTtsService().stop();
-  } catch (e) { /* Piper not loaded, ignore */ }
-  // Stop Kokoro TTS
-  try {
-    const { getKokoroTtsService } = require('./kokoroTTS');
-    getKokoroTtsService().stop();
-  } catch (e) { /* Kokoro not loaded, ignore */ }
+  // Static imports: require() does not exist in the Vite/WebView bundle, so the previous
+  // lazy require threw (silently) and Piper/Kokoro were never stopped.
+  getPiperTtsService().stop().catch(e => logger.log('warn', 'Failed to stop Piper TTS', e));
+  getKokoroTtsService().stop().catch(e => logger.log('warn', 'Failed to stop Kokoro TTS', e));
 };
 
 

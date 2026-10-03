@@ -9,46 +9,16 @@ import { Browser } from '@capacitor/browser';
 import { evolutionApi, adminApi } from '../services/api';
 import { useAdminStore } from '../store/adminStore';
 import { CategorizedSelector, SelectorGroup } from '../components/ui/CategorizedSelector';
+import type { EvolutionCandidateRow, EvolutionProposalRow, ProtectedPathRow } from '@aimindmesh/api-types';
 
 
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-interface EvolutionCandidate {
-  id: string;
-  title: string;
-  description: string;
-  severity: number;
-  confidence: number;
-  status: string;
-  source: string;
-  proposed_approach?: string;
-  target_component?: string;
-  target_language?: string;
-  tags?: string;
-  created_at: number;
-}
-
-interface EvolutionProposal {
-  id: string;
-  candidate_id: string;
-  candidate_title: string;
-  explanation: string;
-  branch_name: string;
-  pr_url: string;
-  pr_number: number;
-  target_component: string;
-  impact: string;
-  breaking_change: boolean;
-  status: 'proposed' | 'merged' | 'rejected' | 'failed';
-  created_at: number;
-}
-
-interface ProtectedPath {
-  path: string;
-  reason: string;
-  created_at: number;
-}
+// Raw rows from /api/evolution (server contract)
+type EvolutionCandidate = EvolutionCandidateRow;
+type EvolutionProposal = EvolutionProposalRow;
+type ProtectedPath = ProtectedPathRow;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -181,8 +151,8 @@ export default function EvolutionView() {
       await evolutionApi.deleteCandidate(id);
       setSelectedCandidate(null);
       fetchAll();
-    } catch (e) {
-      console.error('[EvolutionView] delete candidate failed:', e);
+    } catch (e: any) {
+      alert(e.response?.data?.error || 'Delete failed'); // e.g. 409: the candidate has proposals
     }
   };
 

@@ -6,61 +6,33 @@
  */
 
 // ── Tipi base ──────────────────────────────────────────────────────────────
+// The wire format comes from the server contract (aimindmesh-server/src/types/api.ts)
 
-export type AiModel         = 'auto' | 'ollama' | 'gemini' | 'openclaw';
-export type AiStoragePolicy = 'server_disk' | 'server_disk_gitea';
-export type AiTaskStatus    = 'active' | 'paused';
-export type AiExecutionStatus =
-  | 'scheduled'
-  | 'queued'
-  | 'running'
-  | 'completed'
-  | 'failed'
-  | 'needs_review';
-export type AiOutputFormat  = 'markdown' | 'plain' | 'json' | 'pdf';
+import type {
+  AiStoragePolicy, AiExecutionStatus, AiOutputFormat, AiTaskExecution,
+  AiTaskState, ApiAiTask, AiTaskCreatePayload as ApiAiTaskCreatePayload,
+} from '@aimindmesh/api-types';
+
+export type { AiStoragePolicy, AiExecutionStatus, AiOutputFormat, AiTaskExecution };
+
+/** Provider chosen in the UI (stored in `model` by older clients, now also sent as `provider`) */
+export type AiModel       = 'auto' | 'ollama' | 'gemini' | 'openclaw';
+export type AiTaskStatus  = AiTaskState;
 
 // ── Entità ─────────────────────────────────────────────────────────────────
 
-export interface AiTaskExecution {
-  executionId:     string;
-  taskId:          string;
-  status:          AiExecutionStatus;
-  startedAt?:      number;
-  completedAt?:    number;
-  errorMessage?:   string;
-  artifactPath?:   string;
-  giteaCommitUrl?: string;
-  outputSummary?:  string;
-  updatedAt:       number;
-}
-
-export interface ServerAiTask {
-  id:              string;
-  title:           string;
-  promptTemplate:  string;
-  model:           AiModel;
-  outputFormat:    AiOutputFormat;
-  storagePolicy:   AiStoragePolicy;
-  requiresReview:  boolean;
-  cronExpression?: string;
-  scheduledAt?:    number;
-  status:          AiTaskStatus;
-  createdAt:       number;
-  updatedAt:       number;
-  lastExecution?:  AiTaskExecution;
+export interface ServerAiTask extends Omit<ApiAiTask, 'model' | 'outputFormat'> {
+  model:        AiModel;
+  outputFormat: AiOutputFormat;
 }
 
 // ── Payloads ───────────────────────────────────────────────────────────────
 
-export interface AiTaskCreatePayload {
-  title:           string;
-  promptTemplate:  string;
+export interface AiTaskCreatePayload extends Omit<ApiAiTaskCreatePayload, 'model' | 'outputFormat' | 'storagePolicy' | 'requiresReview'> {
   model:           AiModel;
   outputFormat:    AiOutputFormat;
   storagePolicy:   AiStoragePolicy;
   requiresReview:  boolean;
-  cronExpression?: string;
-  scheduledAt?:    number;
 }
 
 export type AiTaskUpdatePayload = Partial<AiTaskCreatePayload>;

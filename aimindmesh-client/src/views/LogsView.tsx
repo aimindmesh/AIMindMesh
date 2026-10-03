@@ -103,7 +103,7 @@ export default function LogsView() {
 
   useEffect(() => {
     fetchLogs();
-    let interval: NodeJS.Timeout;
+    let interval: ReturnType<typeof setInterval>;
     if (autoRefresh && isDocumentVisible) {
       // Dynamic polling based on performance mode (20s vs 10s)
       const intervalMs = performanceMode ? 20000 : 10000;

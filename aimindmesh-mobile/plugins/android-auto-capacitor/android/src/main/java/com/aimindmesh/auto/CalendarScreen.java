@@ -15,6 +15,7 @@ import java.util.Map;
 public class CalendarScreen extends Screen {
     public CalendarScreen(CarContext carContext) {
         super(carContext);
+        AutoDataStore.register(this);
     }
 
     @NonNull
@@ -22,20 +23,24 @@ public class CalendarScreen extends Screen {
     public Template onGetTemplate() {
         ItemList.Builder listBuilder = new ItemList.Builder();
 
-        String json = AndroidAutoPlugin.getCalendarData();
+        String json = AutoDataStore.getCalendarData(getCarContext());
         List<Map<String, String>> events = AutoUtils.parseCalendarEvents(json);
 
         if (events.isEmpty()) {
             listBuilder.addItem(new Row.Builder().setTitle("No upcoming events").build());
         } else {
             for (Map<String, String> event : events) {
-                String timeRange = event.get("startTime") + " - " + event.get("endTime");
-                listBuilder.addItem(
-                        new Row.Builder()
-                                .setTitle(event.get("title"))
-                                .addText(timeRange)
-                                .addText(event.get("description"))
-                                .build());
+                // All-day events come without an end time
+                String end = event.get("endTime");
+                String timeRange = end == null || end.isEmpty()
+                        ? event.get("startTime")
+                        : event.get("startTime") + " - " + end;
+                Row.Builder row = new Row.Builder()
+                        .setTitle(AutoUtils.nonEmpty(event.get("title"), "Untitled event"));
+                if (timeRange != null && !timeRange.isEmpty()) row.addText(timeRange);
+                String description = event.get("description");
+                if (description != null && !description.isEmpty()) row.addText(description);
+                listBuilder.addItem(row.build());
             }
         }
 

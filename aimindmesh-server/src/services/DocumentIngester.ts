@@ -16,6 +16,7 @@ import { Logger } from '../utils/Logger';
 import { NodeRegistry } from './NodeRegistry';
 import { DeliveryScheduler } from './DeliveryScheduler';
 import { KnowledgeService } from './KnowledgeService';
+import type { IngestionJob } from '../types/api';
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -29,18 +30,8 @@ interface IngestJob {
   contentHash?: string;
 }
 
-export interface JobStatus {
-  id: string;
-  status: 'PENDING' | 'EXTRACTING' | 'CHUNKING' | 'VECTORIZING' | 'INDEXING' | 'DONE' | 'ERROR' | 'SKIPPED' | 'CANCELLED';
-  docId?: string;
-  source: string;
-  totalChunks: number;
-  doneChunks: number;
-  progress: number; // For compatibility with existing UI (0-100)
-  error?: string;
-  createdAt: number;
-  updatedAt: number;
-}
+/** Ingestion job as returned by /api/documents/jobs (contract in types/api.ts). */
+export type JobStatus = IngestionJob;
 
 // ─── Main Service ───────────────────────────────────────────────────────────
 

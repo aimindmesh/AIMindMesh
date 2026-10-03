@@ -1,6 +1,7 @@
 import { Message, Personality, LLMConfig, Memory } from "../../../types";
 import { logger } from "../../logger";
 import { buildSystemPrompt } from "../promptBuilder";
+import { toChatRole, lastUserText } from "../roles";
 
 /**
  * Provider for local LLM servers (like Ollama or local web servers)
@@ -18,14 +19,14 @@ export async function* generateLocalStream(
     // Inject Workspace Documents Context
     try {
         const { contextInjector } = await import('../contextInjector');
-        const userMessage = history[history.length - 1];
-        systemPrompt = await contextInjector.buildSystemPromptWithContext(userMessage.text, systemPrompt);
+        systemPrompt = await contextInjector.buildSystemPromptWithContext(lastUserText(history), systemPrompt);
     } catch (e) {
         logger.log('warn', 'Failed to inject workspace context', e);
     }
     const messagesPayload = [
         { role: 'system', content: systemPrompt },
-        ...history.map(m => ({ role: m.role, content: m.text }))
+        // OpenAI-compatible servers know 'assistant', not 'model'
+        ...history.map(m => ({ role: toChatRole(m.role), content: m.text }))
     ];
 
     logger.log('info', 'Connecting to local stream', { endpoint: llmConfig.localEndpoint, model: llmConfig.localModel });

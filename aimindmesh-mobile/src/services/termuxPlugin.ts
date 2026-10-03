@@ -1,8 +1,9 @@
 /**
  * Termux Plugin Service for AI Mind Mesh
- * 
- * Provides shell command execution via Termux:API.
- * Requires the Termux and Termux:API apps to be installed on the device.
+ *
+ * Runs shell commands through Termux's RUN_COMMAND intent. Device setup: Termux installed and
+ * opened once, the "Run commands in Termux environment" permission granted to this app (asked on
+ * first use) and allow-external-apps=true in ~/.termux/termux.properties.
  */
 
 import { Capacitor, registerPlugin } from '@capacitor/core';
@@ -17,8 +18,9 @@ export interface TermuxCommandResult {
 }
 
 interface TermuxPlugin {
-    executeCommand(options: { command: string; background?: boolean }): Promise<TermuxCommandResult>;
-    isAvailable(): Promise<{ available: boolean }>;
+    /** Commands always run as Termux background commands so their output can be returned */
+    executeCommand(options: { command: string; background?: boolean; timeoutMs?: number }): Promise<TermuxCommandResult>;
+    isAvailable(): Promise<{ available: boolean; permissionGranted?: boolean }>;
     openUrl(options: { url: string }): Promise<void>;
     showToast(options: { message: string; short?: boolean }): Promise<void>;
     vibrate(options: { duration?: number }): Promise<void>;

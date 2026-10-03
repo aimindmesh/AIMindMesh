@@ -96,8 +96,16 @@ class ProactiveNotificationHelper(private val context: Context) {
         val builder = NotificationCompat.Builder(context, CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(message)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(message))
             .setSmallIcon(R.mipmap.ic_launcher)
             .setAutoCancel(true)
+
+        // Tapping the notification opens the app
+        context.packageManager.getLaunchIntentForPackage(context.packageName)?.let { launch ->
+            builder.setContentIntent(
+                android.app.PendingIntent.getActivity(context, 0, launch, android.app.PendingIntent.FLAG_IMMUTABLE)
+            )
+        }
         
         // Apply priority
         val priority = when (notifSettings?.optString("priority", "default")) {

@@ -6,6 +6,8 @@ import { RecognitionMode, TranscriptionMode } from '../../types/meeting';
 interface MeetingHeaderProps {
     onClose: () => void;
     onOpenHistory: () => void;
+    /** Modes are locked while recording: switching mid-recording left engines running or stopped */
+    isRecording?: boolean;
     // Recognition settings
     recognitionMode: RecognitionMode;
     setRecognitionMode: (mode: RecognitionMode) => void;
@@ -52,6 +54,7 @@ interface MeetingHeaderProps {
 const MeetingHeader: React.FC<MeetingHeaderProps> = ({
     onClose,
     onOpenHistory,
+    isRecording = false,
     recognitionMode,
     setRecognitionMode,
     speechConfig,
@@ -170,7 +173,7 @@ const MeetingHeader: React.FC<MeetingHeaderProps> = ({
                         <span className="text-xs font-medium text-text-secondary uppercase tracking-wider">
                             Real-time Transcription
                         </span>
-                        <div className="flex bg-surface rounded-lg p-1 border border-white/5">
+                        <div className={`flex bg-surface rounded-lg p-1 border border-white/5 ${isRecording ? 'pointer-events-none opacity-50' : ''}`}>
                             <button
                                 onClick={() => setTranscriptionMode('off')}
                                 className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all flex items-center gap-2 ${transcriptionMode === 'off'
@@ -291,7 +294,7 @@ const MeetingHeader: React.FC<MeetingHeaderProps> = ({
                         <span className="text-xs font-medium text-text-secondary uppercase tracking-wider">
                             Speaker Recognition
                         </span>
-                        <div className="flex bg-surface rounded-lg p-1 border border-white/5">
+                        <div className={`flex bg-surface rounded-lg p-1 border border-white/5 ${isRecording ? 'pointer-events-none opacity-50' : ''}`}>
                             <button
                                 onClick={() => setRecognitionMode('off')}
                                 className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all flex items-center gap-2 ${recognitionMode === 'off'

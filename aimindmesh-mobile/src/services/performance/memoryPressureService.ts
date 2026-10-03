@@ -1,19 +1,22 @@
 /**
  * Memory Pressure Service
- * 
- * Listens for native trim events broadcast by MemoryPressureManager
- * and dispatches unload calls to the appropriate services.
- * 
- * Respects the `alwaysKeepLoaded` setting for GGUF models.
+ *
+ * Listens for the trim requests MemoryPressureManager sends on onTrimMemory (forwarded by
+ * the Performance plugin) and dispatches unload calls to the appropriate services.
+ *
+ * Only components that reload by themselves on next use get a handler: an unload must
+ * never break a feature that is still running.
  */
 
-import { Capacitor } from '@capacitor/core';
+import { Capacitor, PluginListenerHandle } from '@capacitor/core';
+import Performance from '../performancePlugin';
 import { logger } from '../logger';
 
 type TrimHandler = (component: string) => Promise<void>;
 
 class MemoryPressureService {
     private handlers: Map<string, TrimHandler> = new Map();
+    private listener: Promise<PluginListenerHandle> | null = null;
 
     /**
      * Register a component handler for trim events
@@ -23,34 +26,56 @@ class MemoryPressureService {
         logger.log('info', `[MemoryPressure] Registered handler for: ${component}`);
     }
 
+    /** Runs the handler of one trim request (exposed for tests) */
+    async handleTrim(component: string | undefined): Promise<void> {
+        if (!component) return;
+
+        logger.log('warn', `[MemoryPressure] Trim request received: ${component}`);
+
+        const handler = this.handlers.get(component);
+        if (handler) {
+            try {
+                await handler(component);
+                logger.log('info', `[MemoryPressure] Successfully unloaded: ${component}`);
+            } catch (err) {
+                logger.log('error', `[MemoryPressure] Failed to unload: ${component}`, err);
+            }
+        } else {
+            logger.log('debug', `[MemoryPressure] No handler for: ${component}`);
+        }
+    }
+
     /**
-     * Initialize the service by listening for native broadcast events.
+     * Initialize the service by listening for native trim requests (once).
      * Components register their own unload handlers.
      */
     initialize(): void {
-        if (!Capacitor.isNativePlatform()) return;
+        if (!Capacitor.isNativePlatform() || this.listener) return;
 
-        // Listen for trim broadcasts from native layer
-        // These arrive via window custom events dispatched by the BroadcastReceiver
-        window.addEventListener('trimComponent', async (event: Event) => {
-            const detail = (event as CustomEvent).detail;
-            const component = detail?.component as string;
+        this.listener = Performance.addListener('trimComponent', event => {
+            void this.handleTrim(event?.component);
+        });
+        this.listener.catch(err => {
+            this.listener = null;
+            logger.log('warn', '[MemoryPressure] Trim events unavailable', err);
+        });
 
-            if (!component) return;
+        // Heavy models (LLM, Stable Diffusion, large speech models) through the orchestrator:
+        // they reload when their feature needs them, pinned ones (a recording) stay
+        this.registerHandler('heavy_idle', async () => {
+            const { releaseForMemoryPressure } = await import('../model/modelOrchestrator');
+            await releaseForMemoryPressure('idle');
+        });
+        this.registerHandler('heavy_all', async () => {
+            const { releaseForMemoryPressure } = await import('../model/modelOrchestrator');
+            await releaseForMemoryPressure('all');
+        });
 
-            logger.log('warn', `[MemoryPressure] Trim request received: ${component}`);
-
-            const handler = this.handlers.get(component);
-            if (handler) {
-                try {
-                    await handler(component);
-                    logger.log('info', `[MemoryPressure] Successfully unloaded: ${component}`);
-                } catch (err) {
-                    logger.log('error', `[MemoryPressure] Failed to unload: ${component}`, err);
-                }
-            } else {
-                logger.log('warn', `[MemoryPressure] No handler for: ${component}`);
-            }
+        // Piper reloads its voice on the next speak (speech.ts)
+        this.registerHandler('tts_piper', async () => {
+            const { getPiperTtsService } = await import('../tts/piperTTS');
+            const piper = getPiperTtsService();
+            if (!piper.isBusy()) await piper.unloadVoice(); // never cut a reply mid-speech
         });
 
         logger.log('info', '[MemoryPressure] Service initialized');

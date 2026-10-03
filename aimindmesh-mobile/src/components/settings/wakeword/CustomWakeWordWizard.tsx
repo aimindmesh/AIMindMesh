@@ -141,11 +141,12 @@ export const CustomWakeWordWizard: React.FC<CustomWakeWordWizardProps> = ({
             // Check with VAD if available
             let isValid = true;
             const vadService = getVADService();
-            if (vadService.isAvailable()) {
+            if (await vadService.ensureModelLoaded()) {
                 logger.log('info', 'Verifying recording with VAD...');
                 try {
-                    const base64 = int16ToBase64(fullPcm);
-                    const vadResult = await vadService.processSamples(base64);
+                    // VAD expects Float32 samples, not the Int16 bytes stored for training
+                    await vadService.reset();
+                    const vadResult = await vadService.processInt16Samples(fullPcm);
                     logger.log('info', `VAD Result: Speech=${vadResult.isSpeech}, Conf=${vadResult.confidence}`);
 
                     isValid = vadResult.isSpeech && vadResult.confidence > 0.6;
@@ -158,7 +159,7 @@ export const CustomWakeWordWizard: React.FC<CustomWakeWordWizardProps> = ({
                     logger.log('warn', 'VAD check failed, using RMS only', vadError);
                 }
             } else {
-                logger.log('warn', 'VAD service not available, skipping VAD check');
+                logger.log('warn', 'VAD not available or no model downloaded, skipping VAD check');
             }
 
             // Save sample

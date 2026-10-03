@@ -4,6 +4,7 @@ import { logger } from "../../logger";
 import { buildSystemPrompt } from "../promptBuilder";
 import { getGeminiFunctionDeclarations } from "../../toolDefinitions";
 import { StreamChunk } from "../llmService";
+import { toGeminiRole } from "../roles";
 
 // Fallback list of known stable Gemini models (May 2026)
 export const GEMINI_FALLBACK_MODELS = [
@@ -75,8 +76,8 @@ import { FileSystemAdapter as Filesystem } from '../../../utils/fileSystemAdapte
 export async function buildMessageParts(message: Message): Promise<Array<{ text: string } | { inlineData: { data: string; mimeType: string } }>> {
     const parts: Array<{ text: string } | { inlineData: { data: string; mimeType: string } }> = [];
 
-    // Add text part
-    parts.push({ text: message.text });
+    // Add text part (an empty text part is rejected: image-only messages send just the image)
+    if (message.text?.trim()) parts.push({ text: message.text });
 
     // Add image parts if present
     if (message.images && message.images.length > 0) {
@@ -139,6 +140,7 @@ export async function buildMessageParts(message: Message): Promise<Array<{ text:
         }
     }
 
+    if (parts.length === 0) parts.push({ text: ' ' });
     return parts;
 }
 
@@ -156,7 +158,8 @@ export async function* generateGeminiStreamWithTools(
     maxResponseLength?: number
 ): AsyncGenerator<StreamChunk> {
     const userMessage = history[history.length - 1];
-    if (userMessage.role !== 'user') throw new Error("Last message must be from user.");
+    // A hidden 'system' trigger (autonomous call greeting) is sent as a user turn
+    if (!userMessage || userMessage.role === 'model') throw new Error("Last message must be from user.");
 
     const aiClient = getAiClient(apiKey);
     const llmParams = personality.llmParams || {};
@@ -188,7 +191,7 @@ export async function* generateGeminiStreamWithTools(
 
     // Build history for the API with potential image support
     const historyForApi = await Promise.all(history.slice(0, -1).map(async m => ({
-        role: m.role,
+        role: toGeminiRole(m.role),
         parts: await buildMessageParts(m)
     })));
 
@@ -246,6 +249,7 @@ export async function* generateGeminiStreamWithTools(
             { role: 'user', parts: userParts }
         ],
         config: {
+            abortSignal: signal, // Stop cancels the request instead of waiting for the full answer
             systemInstruction: systemPrompt,
             temperature: llmParams.temperature ?? 0.7,
             topP: llmParams.topP ?? 0.9,

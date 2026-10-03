@@ -7,8 +7,19 @@
 import { SQLiteDBConnection } from '@capacitor-community/sqlite';
 import { logger } from '../logger';
 import { DatabaseManager } from '../database/DatabaseManager';
+import { blobToFloat32Array, cosineSimilarity, float32ToHex } from './embeddingCodec';
 
-// Schema with category support
+export { blobToFloat32Array };
+
+/**
+ * Extracted facts and summaries never age out of retrieval; chat turns (user/model) do,
+ * and are pruned after RAW_RETENTION_DAYS.
+ */
+const LONG_LIVED_ROLES_SQL = `role IN ('extracted', 'system')`;
+export const RAW_RETENTION_DAYS = 90;
+const SUMMARY_PREFIX = '[MEMORY SUMMARY]';
+
+// Schema with category support. embedding_model: key of the model that produced the vector
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY,
@@ -19,7 +30,8 @@ CREATE TABLE IF NOT EXISTS memories (
   embedding BLOB NOT NULL,
   category TEXT DEFAULT 'semantic',
   is_synced INTEGER DEFAULT 0,
-  server_id TEXT
+  server_id TEXT,
+  embedding_model TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_session_time ON memories(session_id, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_timestamp ON memories(timestamp DESC);
@@ -70,11 +82,12 @@ export async function initMemoryDatabase(): Promise<SQLiteDBConnection> {
             logger.log('warn', 'Migration v2 check failed', e);
         }
 
-        // Apply migration v3 - add sync columns
+        // Migrations v3 (sync columns) and v4 (embedding model tag): rows of older installs
+        // have a NULL model and are re-embedded by embeddingReindexer
         try {
             const tableInfo = await db.query("PRAGMA table_info(memories);");
             const columns = tableInfo.values?.map((col: any) => col.name) || [];
-            
+
             if (!columns.includes('is_synced')) {
                 logger.log('info', '[MemoryDB] Adding is_synced column to memories');
                 await db.execute("ALTER TABLE memories ADD COLUMN is_synced INTEGER DEFAULT 0;");
@@ -83,8 +96,13 @@ export async function initMemoryDatabase(): Promise<SQLiteDBConnection> {
                 logger.log('info', '[MemoryDB] Adding server_id column to memories');
                 await db.execute("ALTER TABLE memories ADD COLUMN server_id TEXT;");
             }
+            if (!columns.includes('embedding_model')) {
+                logger.log('info', '[MemoryDB] Adding embedding_model column to memories');
+                await db.execute("ALTER TABLE memories ADD COLUMN embedding_model TEXT;");
+            }
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_memories_model ON memories(embedding_model, timestamp DESC);");
         } catch (e) {
-            logger.log('warn', 'Migration v3 (sync) failed', e);
+            logger.log('warn', 'Migrations v3/v4 failed', e);
         }
 
         isSchemaApplied = true;
@@ -130,35 +148,34 @@ export async function closeMemoryDatabase(): Promise<void> {
     logger.log('info', '[MemoryDB] Close request ignored (managed centrally)');
 }
 
+const QUERY_TIMEOUT_MS = 5000;
+const withTimeout = <T,>(promise: Promise<T>, label: string, ms: number = QUERY_TIMEOUT_MS) => Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} TIMEOUT`)), ms)),
+]);
+
 /**
- * Save a memory with its embedding to the database
+ * Save a memory with its embedding (tagged with the producing model's key).
+ * The timeout only unblocks the caller: the native insert may still complete afterwards,
+ * so callers that must replace rows use replaceMemoriesAtomically instead.
  */
 export async function saveMemoryToDb(
     id: string,
     sessionId: string,
     role: string,
     content: string,
-    embedding: Float32Array
+    embedding: Float32Array,
+    modelKey: string | null = null
 ): Promise<void> {
     const database = await getMemoryDatabase();
-
-    // Convert Float32Array to Uint8Array (BLOB)
-    const embeddingBlob = new Uint8Array(embedding.buffer);
-    const embeddingHex = Array.from(embeddingBlob)
-        .map(b => b.toString(16).padStart(2, '0'))
-        .join('');
-
     const timestamp = Date.now();
 
     try {
-        await Promise.race([
-            database.run(
-                `INSERT OR IGNORE INTO memories (id, session_id, timestamp, role, content, embedding)
-                 VALUES (?, ?, ?, ?, ?, X'${embeddingHex}')`,
-                [id, sessionId, timestamp, role, content]
-            ),
-            new Promise<any>((_, reject) => setTimeout(() => reject(new Error("database.run TIMEOUT")), 5000))
-        ]);
+        await withTimeout(database.run(
+            `INSERT OR IGNORE INTO memories (id, session_id, timestamp, role, content, embedding, embedding_model)
+             VALUES (?, ?, ?, ?, ?, X'${float32ToHex(embedding)}', ?)`,
+            [id, sessionId, timestamp, role, content, modelKey]
+        ), 'database.run');
     } catch (error) {
         logger.log('error', 'Failed to save memory to database', error);
         throw error;
@@ -166,12 +183,33 @@ export async function saveMemoryToDb(
 }
 
 /**
- * Retrieve memories from database within time range
+ * Insert a memory and delete the ones it replaces (summary/consolidation) in one transaction:
+ * either both happen or neither, even if the caller gives up waiting.
+ */
+export async function replaceMemoriesAtomically(
+    row: { id: string; sessionId: string; role: string; content: string; embedding: Float32Array; modelKey: string },
+    replacedIds: string[]
+): Promise<void> {
+    const database = await getMemoryDatabase();
+    const set = [{
+        statement: `INSERT INTO memories (id, session_id, timestamp, role, content, embedding, embedding_model)
+                    VALUES (?, ?, ?, ?, ?, X'${float32ToHex(row.embedding)}', ?)`,
+        values: [row.id, row.sessionId, Date.now(), row.role, row.content, row.modelKey],
+    }];
+    if (replacedIds.length > 0) {
+        set.push({ statement: `DELETE FROM memories WHERE id IN (${replacedIds.map(() => '?').join(',')})`, values: replacedIds });
+    }
+    await withTimeout(database.executeSet(set, true), 'replaceMemoriesAtomically', 15000);
+}
+
+/**
+ * Retrieve memories from database within time range (optionally of one embedding model only)
  */
 export async function getRecentMemories(
     limit: number = 50,
     sessionId?: string,
-    maxAgeDays: number = 30
+    maxAgeDays: number = 30,
+    modelKey?: string
 ): Promise<Array<{
     id: string;
     sessionId: string;
@@ -185,7 +223,7 @@ export async function getRecentMemories(
     const minTimestamp = Date.now() - (maxAgeDays * 24 * 60 * 60 * 1000);
 
     let query = `
-        SELECT id, session_id, timestamp, role, content, embedding
+        SELECT id, session_id, timestamp, role, content, hex(embedding) AS embedding
         FROM memories
         WHERE timestamp > ?
     `;
@@ -195,12 +233,16 @@ export async function getRecentMemories(
         query += ` AND session_id = ?`;
         params.push(sessionId);
     }
+    if (modelKey) {
+        query += ` AND embedding_model = ?`;
+        params.push(modelKey);
+    }
 
     query += ` ORDER BY timestamp DESC LIMIT ?`;
     params.push(limit);
 
     try {
-        const result = await Promise.race([database.query(query, params), new Promise<any>((_, reject) => setTimeout(() => reject(new Error("database.query TIMEOUT")), 5000))]);
+        const result = await withTimeout(database.query(query, params), 'database.query');
 
         if (!result.values) {
             return [];
@@ -221,6 +263,54 @@ export async function getRecentMemories(
 }
 
 /**
+ * id, session and embedding (no text) of every memory of `modelKey` that retrieval may use:
+ * chat turns of the last `maxAgeDays`, extracted facts and summaries of any age. Read in
+ * pages so a single bridge call never carries thousands of vectors.
+ */
+export async function getMemoryEmbeddings(
+    maxAgeDays: number,
+    modelKey: string,
+    pageSize: number = 250
+): Promise<Array<{ id: string; sessionId: string; embedding: Float32Array }>> {
+    const database = await getMemoryDatabase();
+    const minTimestamp = Date.now() - (maxAgeDays * 24 * 60 * 60 * 1000);
+    const rows: Array<{ id: string; sessionId: string; embedding: Float32Array }> = [];
+
+    for (let offset = 0; ; offset += pageSize) {
+        const result = await withTimeout(database.query(
+            `SELECT id, session_id, hex(embedding) AS embedding FROM memories
+             WHERE embedding_model = ? AND (timestamp > ? OR ${LONG_LIVED_ROLES_SQL})
+             ORDER BY timestamp DESC, id LIMIT ? OFFSET ?`,
+            [modelKey, minTimestamp, pageSize, offset]
+        ), 'getMemoryEmbeddings');
+        const page = result.values || [];
+        for (const row of page) {
+            rows.push({ id: row.id, sessionId: row.session_id, embedding: blobToFloat32Array(row.embedding) });
+        }
+        if (page.length < pageSize) return rows;
+    }
+}
+
+/** Text and metadata of the given memories (no embeddings). */
+export async function getMemoriesByIds(
+    ids: string[]
+): Promise<Array<{ id: string; sessionId: string; timestamp: number; role: string; content: string }>> {
+    if (ids.length === 0) return [];
+    const database = await getMemoryDatabase();
+    const result = await withTimeout(database.query(
+        `SELECT id, session_id, timestamp, role, content FROM memories WHERE id IN (${ids.map(() => '?').join(',')})`,
+        ids
+    ), 'getMemoriesByIds');
+    return (result.values || []).map((row: any) => ({
+        id: row.id,
+        sessionId: row.session_id,
+        timestamp: row.timestamp,
+        role: row.role,
+        content: row.content,
+    }));
+}
+
+/**
  * Delete a memory by ID
  */
 export async function deleteMemoryFromDb(id: string): Promise<void> {
@@ -235,16 +325,17 @@ export async function deleteMemoryFromDb(id: string): Promise<void> {
 }
 
 /**
- * Delete old memories beyond retention period
+ * Delete chat turns (user/model) older than the retention period. They are already outside
+ * the retrieval window; extracted facts and summaries are kept.
  */
-export async function pruneOldMemories(maxAgeDays: number = 30): Promise<number> {
+export async function pruneOldMemories(maxAgeDays: number = RAW_RETENTION_DAYS): Promise<number> {
     const database = await getMemoryDatabase();
 
     const minTimestamp = Date.now() - (maxAgeDays * 24 * 60 * 60 * 1000);
 
     try {
         const result = await database.run(
-            'DELETE FROM memories WHERE timestamp < ?',
+            `DELETE FROM memories WHERE timestamp < ? AND role IN ('user', 'model')`,
             [minTimestamp]
         );
         logger.log('info', `Pruned ${result.changes?.changes || 0} old memories`);
@@ -278,7 +369,7 @@ export async function updateSemanticMemoryCategory(id: string, category: string)
 
     try {
         await database.run(
-            'UPDATE memories SET category = ? WHERE id = ?',
+            'UPDATE memories SET category = ?, is_synced = 0 WHERE id = ?', // pushed again at the next sync
             [category, id]
         );
         logger.log('info', `Updated memory ${id} category to: ${category}`);
@@ -289,9 +380,10 @@ export async function updateSemanticMemoryCategory(id: string, category: string)
 }
 
 /**
- * Get all semantic memories with embeddings for clustering/deduplication
+ * The most recent `maxRows` memories of one embedding model, with embeddings, oldest first,
+ * for clustering. Bounded and paged: consolidation is O(n²) and the table keeps growing.
  */
-export async function getAllSemanticMemoriesWithEmbeddings(): Promise<Array<{
+export async function getAllSemanticMemoriesWithEmbeddings(modelKey: string, maxRows: number = 500): Promise<Array<{
     id: string;
     sessionId: string;
     timestamp: number;
@@ -301,17 +393,23 @@ export async function getAllSemanticMemoriesWithEmbeddings(): Promise<Array<{
     category: string;
 }>> {
     const database = await getMemoryDatabase();
+    const rows: any[] = [];
+    const pageSize = 125;
 
     try {
-        const result = await database.query(
-            `SELECT id, session_id, timestamp, role, content, embedding, category 
-             FROM memories 
-             ORDER BY timestamp ASC` // Oldest first
-        );
+        while (rows.length < maxRows) {
+            const result = await withTimeout(database.query(
+                `SELECT id, session_id, timestamp, role, content, hex(embedding) AS embedding, category
+                 FROM memories WHERE embedding_model = ?
+                 ORDER BY timestamp DESC, id LIMIT ? OFFSET ?`,
+                [modelKey, Math.min(pageSize, maxRows - rows.length), rows.length]
+            ), 'getAllSemanticMemoriesWithEmbeddings');
+            const page = result.values || [];
+            rows.push(...page);
+            if (page.length < pageSize) break;
+        }
 
-        if (!result.values) return [];
-
-        return result.values.map((row: any) => ({
+        return rows.reverse().map((row: any) => ({ // Oldest first
             id: row.id,
             sessionId: row.session_id,
             timestamp: row.timestamp,
@@ -324,6 +422,20 @@ export async function getAllSemanticMemoriesWithEmbeddings(): Promise<Array<{
         logger.log('error', 'Failed to get all semantic memories with embeddings', error);
         return [];
     }
+}
+
+/** The oldest memories that are not summaries already: the next ones to compress. */
+export async function getOldestMemoriesForSummary(count: number): Promise<Array<{
+    id: string; timestamp: number; role: string; content: string;
+}>> {
+    const database = await getMemoryDatabase();
+    const result = await withTimeout(database.query(
+        `SELECT id, timestamp, role, content FROM memories
+         WHERE content NOT LIKE '${SUMMARY_PREFIX}%'
+         ORDER BY timestamp ASC, id LIMIT ?`,
+        [count]
+    ), 'getOldestMemoriesForSummary');
+    return (result.values || []).map((row: any) => ({ id: row.id, timestamp: row.timestamp, role: row.role, content: row.content }));
 }
 
 /**
@@ -341,9 +453,9 @@ export async function getAllSemanticMemories(limit: number = 100): Promise<Array
 
     try {
         const result = await database.query(
-            `SELECT id, session_id, timestamp, role, content, category 
-             FROM memories 
-             ORDER BY timestamp DESC 
+            `SELECT id, session_id, timestamp, role, content, category
+             FROM memories
+             ORDER BY timestamp DESC
              LIMIT ?`,
             [limit]
         );
@@ -393,37 +505,9 @@ export async function clearAllSemanticMemories(): Promise<number> {
 }
 
 /**
- * Convert SQLite BLOB to Float32Array
- */
-function blobToFloat32Array(blob: any): Float32Array {
-    if (!blob) {
-        return new Float32Array(384); // Default dimension
-    }
-
-    // Handle different blob representations
-    if (blob instanceof Uint8Array) {
-        return new Float32Array(blob.buffer);
-    }
-
-    if (typeof blob === 'string') {
-        // Hex string
-        const bytes = new Uint8Array(blob.length / 2);
-        for (let i = 0; i < blob.length; i += 2) {
-            bytes[i / 2] = parseInt(blob.substr(i, 2), 16);
-        }
-        return new Float32Array(bytes.buffer);
-    }
-
-    if (Array.isArray(blob)) {
-        return new Float32Array(new Uint8Array(blob).buffer);
-    }
-
-    return new Float32Array(384);
-}
-
-/**
  * Cleanup function to remove semantically duplicate memories.
  * Call at app startup or periodically to reduce DB bloat.
+ * Only vectors of the same embedding model are compared (others are not comparable).
  * @param similarityThreshold Similarity above which to consider duplicates (default 0.90)
  * @returns Number of duplicates removed
  */
@@ -434,7 +518,8 @@ export async function deduplicateExistingMemories(similarityThreshold: number = 
     try {
         // Get recent memories ordered by timestamp DESC (newer first)
         const result = await database.query(
-            `SELECT id, content, embedding, timestamp FROM memories ORDER BY timestamp DESC LIMIT 200`
+            `SELECT id, hex(embedding) AS embedding, embedding_model FROM memories
+             WHERE embedding_model IS NOT NULL ORDER BY timestamp DESC LIMIT 200`
         );
 
         if (!result.values || result.values.length < 2) {
@@ -444,9 +529,8 @@ export async function deduplicateExistingMemories(similarityThreshold: number = 
 
         const memories = result.values.map((row: any) => ({
             id: row.id,
-            content: row.content,
+            model: row.embedding_model,
             embedding: blobToFloat32Array(row.embedding),
-            timestamp: row.timestamp
         }));
 
         const toDelete: string[] = [];
@@ -457,9 +541,9 @@ export async function deduplicateExistingMemories(similarityThreshold: number = 
             if (seen.has(i)) continue;
 
             for (let j = i + 1; j < memories.length; j++) {
-                if (seen.has(j)) continue;
+                if (seen.has(j) || memories[j].model !== memories[i].model) continue;
 
-                const similarity = computeCosineSimilarity(memories[i].embedding, memories[j].embedding);
+                const similarity = cosineSimilarity(memories[i].embedding, memories[j].embedding);
                 if (similarity >= similarityThreshold) {
                     toDelete.push(memories[j].id);
                     seen.add(j);
@@ -479,18 +563,3 @@ export async function deduplicateExistingMemories(similarityThreshold: number = 
         return 0;
     }
 }
-
-/**
- * Cosine similarity for deduplication
- */
-function computeCosineSimilarity(a: Float32Array, b: Float32Array): number {
-    if (a.length !== b.length) return 0;
-    let dot = 0, normA = 0, normB = 0;
-    for (let i = 0; i < a.length; i++) {
-        dot += a[i] * b[i];
-        normA += a[i] * a[i];
-        normB += b[i] * b[i];
-    }
-    return (normA === 0 || normB === 0) ? 0 : dot / (Math.sqrt(normA) * Math.sqrt(normB));
-}
-

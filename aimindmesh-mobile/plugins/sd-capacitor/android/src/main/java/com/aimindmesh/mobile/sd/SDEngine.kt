@@ -1,394 +1,279 @@
 package com.aimindmesh.mobile.sd
 
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.os.Build
-import android.util.Base64
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import java.io.ByteArrayOutputStream
+import org.json.JSONObject
 import java.io.File
+import java.util.Random
+
+data class SDRequest(
+    val prompt: String,
+    val negativePrompt: String = "",
+    /** Image to edit (img2img): data URL, base64, file path or content:// URI */
+    val sourceImage: String? = null,
+    val strength: Float = 0.65f,
+    val steps: Int = 25,
+    val cfgScale: Float = 7.5f,
+    /** -1: random (the seed actually used is returned) */
+    val seed: Long = -1,
+    val aspectRatio: String = "1:1",
+    val upscale: Int = 1,
+    val sampler: SamplerKind = SamplerKind.EULER
+)
 
 /**
- * High-performance Qualcomm QNN on-device Stable Diffusion synthesis engine.
- * Executes CLIP Text Encoder, UNet diffusion loops, and VAE decoding on Hexagon HTP.
+ * Stable Diffusion on the Qualcomm Hexagon NPU: CLIP text encoder, UNet denoising loop and VAE
+ * decoding, plus img2img (VAE encoder) and Real-ESRGAN upscaling when the package has them.
  */
 class SDEngine(private val context: Context) {
     companion object {
         private const val TAG = "SDEngine"
+        private const val PREFS = "sd_engine"
+        // The QNN pipeline is a native singleton: its state is process-wide like the engine
         private var isInitialized = false
         private var activeModelDir: String? = null
+        private var modelInfo = SDModelInfo()
+        private var predictionType = PredictionType.V_PREDICTION
+        /** Embedding of the empty prompt: the reference for prompt weights */
+        private var emptyEmbedding: FloatArray? = null
+        // load/unload/generate must not overlap
+        private val pipelineMutex = Mutex()
     }
 
-    private val clipTokenizer = ClipTokenizer(context)
-    private val scheduler = EulerAncestralScheduler()
+    private val clipTokenizer by lazy { ClipTokenizer.fromAssets(context) }
+    private val scheduler = DiffusionScheduler()
     private val qnnBridge = QnnNativeBridge(context)
 
-    /**
-     * Inspect Qualcomm NPU / Hexagon hardware capabilities
-     */
+    /** SD 1.x (768-dim CLIP) pads prompts with the end token, SD 2.x (OpenCLIP) with "!" */
+    private val padToken get() = if (modelInfo.embedDim == 768) ClipTokenizer.END_TOKEN_ID else ClipTokenizer.SD2_PAD_TOKEN_ID
+
     fun detectCapabilities(): Map<String, Any> {
         val hardware = Build.HARDWARE.lowercase()
         val board = Build.BOARD.lowercase()
-        val soc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            Build.SOC_MODEL.lowercase()
-        } else {
-            ""
-        }
-
-        val isSnapdragon8Elite = hardware.contains("qcom") && (
-            board.contains("sun") || soc.contains("sm8750") || hardware.contains("sm8750")
-        )
-        val isSnapdragon8Gen3 = hardware.contains("qcom") && (
-            board.contains("pineapple") || soc.contains("sm8650") || hardware.contains("sm8650")
-        )
+        val soc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Build.SOC_MODEL.lowercase() else ""
+        val isSnapdragon8Elite = hardware.contains("qcom") && (board.contains("sun") || soc.contains("sm8750") || hardware.contains("sm8750"))
+        val isSnapdragon8Gen3 = hardware.contains("qcom") && (board.contains("pineapple") || soc.contains("sm8650") || hardware.contains("sm8650"))
         val hasNpu = isSnapdragon8Elite || isSnapdragon8Gen3 || hardware.contains("qcom")
-
         val npuArch = when {
             isSnapdragon8Elite -> "v79"
             isSnapdragon8Gen3 -> "v75"
             hardware.contains("qcom") -> "v73"
             else -> "none"
         }
-
-        val backends = mutableListOf<String>("cpu")
-        if (hasNpu) {
-            backends.add("gpu")
-            backends.add("npu")
-        }
-
         return mapOf(
             "hasNpu" to hasNpu,
             "npuArch" to npuArch,
-            "supportedBackends" to backends,
-            "socModel" to if (soc.isNotEmpty()) soc else Build.HARDWARE
+            "supportedBackends" to if (hasNpu) listOf("cpu", "gpu", "npu") else listOf("cpu"),
+            "socModel" to soc.ifEmpty { Build.HARDWARE }
         )
     }
 
-    /**
-     * Load Qualcomm QNN Stable Diffusion model bundle (unet.bin, vae.bin, text_encoder.bin)
-     */
+    /** Loads a package directory (text_encoder.bin, unet.bin, vae.bin, optional vae_encoder.bin / realesrgan_x4plus.bin). */
     suspend fun loadModel(modelPath: String, backend: String = "npu"): Boolean = withContext(Dispatchers.IO) {
-        try {
-            val cleanPath = modelPath.removePrefix("file://").trim()
-            var dir = File(cleanPath)
-            if (!dir.exists()) {
-                dir = File(context.filesDir, cleanPath)
-            }
-            if (!dir.exists()) {
-                val sdDir = File(context.filesDir, "sd-models")
-                val candidate = File(sdDir, cleanPath)
-                if (candidate.exists()) {
-                    dir = candidate
-                }
-            }
-            if (!dir.exists()) {
-                val modelName = File(cleanPath).name
-                val candidate = File(File(context.filesDir, "sd-models"), modelName)
-                if (candidate.exists()) {
-                    dir = candidate
-                }
-            }
-            if (!dir.exists()) {
-                Log.e(TAG, "SD Model path does not exist: $modelPath (tried: $cleanPath)")
-                return@withContext false
-            }
+        pipelineMutex.withLock { loadModelLocked(modelPath, backend) }
+    }
 
-            val resolvedDir = SDFileUtils.findSDModelDirectory(dir) ?: dir
-            Log.i(TAG, "Loading Stable Diffusion QNN pipeline on $backend from ${resolvedDir.absolutePath}")
+    private fun resolveModelDir(modelPath: String): File? {
+        val cleanPath = modelPath.removePrefix("file://").trim()
+        val sdDir = File(context.filesDir, "sd-models")
+        val dir = listOf(File(cleanPath), File(context.filesDir, cleanPath), File(sdDir, cleanPath), File(sdDir, File(cleanPath).name))
+            .firstOrNull { it.exists() } ?: return null
+        return SDFileUtils.findSDModelDirectory(dir) ?: dir
+    }
 
-            qnnBridge.initializeFromDirectory(resolvedDir)
-            activeModelDir = resolvedDir.absolutePath
-            isInitialized = true
+    private fun loadModelLocked(modelPath: String, backend: String): Boolean {
+        return try {
+            val dir = resolveModelDir(modelPath)
+            if (dir == null) {
+                Log.e(TAG, "SD model path does not exist: $modelPath")
+                return false
+            }
+            Log.i(TAG, "Loading Stable Diffusion QNN pipeline on $backend from ${dir.absolutePath}")
+            emptyEmbedding = null
+            // nativeInit releases any previous pipeline first; report its real outcome
+            val ready = qnnBridge.initializeFromDirectory(dir)
+            isInitialized = ready
+            activeModelDir = if (ready) dir.absolutePath else null
+            if (!ready) {
+                Log.e(TAG, "QNN pipeline init failed (text_encoder/unet/vae .bin missing, inconsistent or unsupported NPU)")
+                return false
+            }
+            modelInfo = qnnBridge.modelInfo()
+            predictionType = resolvePredictionType(dir)
+            Log.i(TAG, "Model ready: $modelInfo, prediction=${predictionType.id}")
             true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load SD model", e)
+            isInitialized = false
+            activeModelDir = null
             false
         }
     }
 
-    fun isLoaded(): Boolean = isInitialized && activeModelDir != null
+    /** metadata.json "prediction_type", else a cached or fresh probe, else the SD 2.x 768-v default. */
+    private fun resolvePredictionType(dir: File): PredictionType {
+        val meta = File(dir, "metadata.json")
+        if (meta.isFile) {
+            try {
+                PredictionType.parse(JSONObject(meta.readText()).optString("prediction_type", ""))?.let {
+                    Log.i(TAG, "Prediction type from metadata.json: ${it.id}")
+                    return it
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Unreadable metadata.json", e)
+            }
+        }
+        val unet = File(dir, "unet.bin")
+        val key = "prediction:${dir.absolutePath}:${unet.length()}:${unet.lastModified()}"
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        PredictionType.parse(prefs.getString(key, null))?.let { return it }
+
+        val fallback = if (modelInfo.embedDim == 768) PredictionType.EPSILON else PredictionType.V_PREDICTION
+        val probed = try {
+            val t = minOf(PredictionTypeProbe.PROBE_TIMESTEP, modelInfo.timestepMax)
+            val noise = scheduler.noise(modelInfo.latentSize, Random(1234))
+            val input = PredictionTypeProbe.probeInput(noise, scheduler.alphaCumprod(t))
+            val output = qnnBridge.runUnet(input, t.toFloat(), emptyPromptEmbedding())
+            val corr = PredictionTypeProbe.correlation(output, noise)
+            PredictionTypeProbe.decide(output, noise).also {
+                Log.i(TAG, "Prediction probe at t=$t: correlation=${"%.3f".format(corr)} -> ${it?.id ?: "undetermined"}")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Prediction probe failed", e)
+            null
+        }
+        if (probed != null) prefs.edit().putString(key, probed.id).apply()
+        return probed ?: fallback
+    }
+
+    private fun emptyPromptEmbedding(): FloatArray =
+        emptyEmbedding ?: qnnBridge.runTextEncoder(clipTokenizer.encode("", padToken)).also { emptyEmbedding = it }
+
+    fun isLoaded(): Boolean = isInitialized && activeModelDir != null && qnnBridge.isReady()
 
     fun getActiveModelPath(): String? = activeModelDir
 
+    fun getModelInfo(): SDModelInfo = modelInfo
+
+    fun getPredictionType(): PredictionType = predictionType
+
     suspend fun unloadModel(): Boolean = withContext(Dispatchers.IO) {
-        try {
-            activeModelDir = null
-            isInitialized = false
-            Log.i(TAG, "SD QNN engine unloaded")
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to unload SD model", e)
-            false
+        pipelineMutex.withLock {
+            try {
+                // Frees the QNN contexts (GBs of NPU/native memory), not just the flags
+                qnnBridge.release()
+                activeModelDir = null
+                isInitialized = false
+                emptyEmbedding = null
+                Log.i(TAG, "SD QNN engine unloaded")
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to unload SD model", e)
+                false
+            }
         }
     }
 
-    /**
-     * Generate or restyle an image on Qualcomm Hexagon NPU.
-     */
+    private fun encodePrompt(text: String): Pair<FloatArray, Boolean> {
+        val tokenized = clipTokenizer.encodeWithWeights(text, padToken)
+        val embedding = qnnBridge.runTextEncoder(tokenized.tokens)
+        if (PromptWeighting.needsWeighting(tokenized.weights)) {
+            PromptWeighting.apply(embedding, tokenized.weights, emptyPromptEmbedding(), modelInfo.embedDim)
+        }
+        return embedding to tokenized.truncated
+    }
+
+    /** Generates (or, with a source image, edits) an image on the Hexagon NPU. */
     suspend fun generateImage(
-        prompt: String,
-        negativePrompt: String = "",
-        sourceImage: String? = null,
-        strength: Float = 0.65f,
-        steps: Int = 20,
-        cfgScale: Float = 7.5f,
-        seed: Long = -1,
-        width: Int = 512,
-        height: Int = 512,
-        aspectRatio: String = "1:1",
-        upscale: Int = 1,
+        request: SDRequest,
         progressCallback: ((step: Int, totalSteps: Int, timePerStep: Float) -> Unit)? = null
-    ): Map<String, Any> = withContext(Dispatchers.IO) {
+    ): Map<String, Any> = withContext(Dispatchers.IO) { pipelineMutex.withLock {
         if (!isLoaded() || activeModelDir == null) {
             throw IllegalStateException("No Stable Diffusion model loaded. Please import and select a model in Settings > Vision & Image Creation.")
         }
-
         val startTime = System.currentTimeMillis()
-        val numSteps = steps.coerceIn(1, 100)
-        val modeStr = if (sourceImage != null) "Image-to-Image (strength: $strength)" else "Text-to-Image"
-        Log.i(TAG, "Starting on-device Qualcomm NPU synthesis [$modeStr]: '$prompt' | Neg: '$negativePrompt' (ratio: $aspectRatio, upscale: ${upscale}x, steps: $numSteps, cfg: $cfgScale)")
+        val info = modelInfo
+        val numSteps = request.steps.coerceIn(1, 100)
+        val seed = if (request.seed >= 0) request.seed else Random().nextInt(Int.MAX_VALUE).toLong()
+        val random = Random(seed)
+        val editing = !request.sourceImage.isNullOrBlank()
+        Log.i(TAG, "SD ${if (editing) "img2img (strength ${request.strength})" else "txt2img"}: '${request.prompt}' | neg '${request.negativePrompt}' " +
+            "| steps $numSteps, cfg ${request.cfgScale}, seed $seed, ${request.sampler.id}, ${predictionType.id}, ratio ${request.aspectRatio}, upscale ${request.upscale}x")
 
-        // 1. CLIP Text Encoding with Attention Weights
-        val posTokenized = clipTokenizer.encodeWithWeights(prompt)
-        val negTokenized = clipTokenizer.encodeWithWeights(negativePrompt)
+        // 1. Text conditioning (the negative prompt is the unconditional branch of CFG)
+        val (condEmbedding, truncated) = encodePrompt(request.prompt)
+        val useCfg = request.cfgScale > 1.0f
+        val uncondEmbedding = if (useCfg) encodePrompt(request.negativePrompt).first else null
 
-        val posEmbeddings = qnnBridge.runTextEncoder(posTokenized.tokens)
-        val negEmbeddings = qnnBridge.runTextEncoder(negTokenized.tokens)
+        // 2. Schedule within the timestep range the UNet was calibrated for
+        val timesteps = scheduler.timesteps(numSteps, info.timestepMax)
+        val sigmas = scheduler.sigmas(timesteps)
 
-        // 1.1 Apply Attention Weights: e_i = neg_e_i + weight * (pos_e_i - neg_e_i)
-        for (i in 0 until 77) {
-            val weight = posTokenized.weights[i]
-            if (weight != 1.0f) {
-                val offset = i * 1024
-                for (d in 0 until 1024) {
-                    val pos = posEmbeddings[offset + d]
-                    val neg = negEmbeddings[offset + d]
-                    posEmbeddings[offset + d] = neg + weight * (pos - neg)
-                }
-            }
-        }
-
-        // 2. Scheduler & Timesteps setup
-        val (timesteps, stepSigmas) = scheduler.setTimesteps(numSteps)
-
-        // 3. Initial Latents setup (txt2img vs img2img)
+        // 3. Starting latent: pure noise, or the source image noised to the strength's level
         var latents: FloatArray
-        val startStep: Int
-
-        if (!sourceImage.isNullOrBlank()) {
-            val sourceBitmap = decodeSourceImage(sourceImage)
-            val sourceLatents = bitmapToLatents(sourceBitmap)
-            val initNoise = scheduler.generateInitialLatents(seed)
-
-            startStep = ((1.0f - strength.coerceIn(0.05f, 0.95f)) * numSteps).toInt().coerceIn(0, numSteps - 1)
-            val startTimestep = timesteps[startStep]
-            val startSigma = stepSigmas[startStep]
-            latents = scheduler.addNoise(sourceLatents, initNoise, startSigma)
-            Log.i(TAG, "img2img initialized at step $startStep/$numSteps (t=$startTimestep, sigma=$startSigma)")
+        var startIndex = 0
+        var outputRect = SDGeometry.aspectCrop(info.imageWidth, request.aspectRatio)
+        if (editing) {
+            if (!qnnBridge.hasVaeEncoder()) {
+                throw IllegalStateException("This Stable Diffusion package has no vae_encoder.bin, so it cannot edit images")
+            }
+            val source = SDImageOps.decodeSource(context, request.sourceImage!!)
+            val (rgb, placement) = SDImageOps.prepareForEditing(source, info.imageWidth)
+            outputRect = placement // the result keeps the source's proportions
+            val sourceLatents = qnnBridge.runVaeEncoder(rgb)
+            startIndex = scheduler.img2imgStartIndex(numSteps, request.strength)
+            latents = scheduler.addNoise(sourceLatents, scheduler.noise(info.latentSize, random), sigmas[startIndex])
         } else {
-            startStep = 0
-            latents = scheduler.generateInitialLatents(seed, stepSigmas[0])
+            val scale = scheduler.initNoiseScale(sigmas[0])
+            latents = scheduler.noise(info.latentSize, random).let { n -> FloatArray(n.size) { i -> (n[i] * scale).toFloat() } }
         }
 
-        // 4. UNet Denoising Loop on Hexagon NPU
+        // 4. Denoising loop on the NPU
+        val sampler = scheduler.sampler(request.sampler)
+        val totalSteps = numSteps - startIndex
         var lastStepTime = System.currentTimeMillis()
-        for (step in startStep until numSteps) {
-            val t = timesteps[step].toFloat()
-            val scaledLatents = scheduler.scaleModelInput(latents, step, stepSigmas)
-
-            // Conditional & Unconditional forward passes on scaled latents
-            val noiseUncond = qnnBridge.runUnet(scaledLatents, t, negEmbeddings)
-            val noiseCond = qnnBridge.runUnet(scaledLatents, t, posEmbeddings)
-
-            // Classifier-Free Guidance (CFG)
-            val noisePred = scheduler.applyClassifierFreeGuidance(noiseUncond, noiseCond, cfgScale)
-
-            // Scheduler step: z_t -> z_{t-1}
-            latents = scheduler.step(noisePred, step, stepSigmas, latents, seed)
+        for (i in startIndex until numSteps) {
+            val sigma = sigmas[i]
+            val input = scheduler.scaleModelInput(latents, sigma)
+            val t = timesteps[i].toFloat()
+            val cond = qnnBridge.runUnet(input, t, condEmbedding)
+            val output = if (uncondEmbedding != null) {
+                scheduler.guidance(qnnBridge.runUnet(input, t, uncondEmbedding), cond, request.cfgScale)
+            } else cond
+            val denoised = scheduler.denoised(latents, output, sigma, predictionType)
+            latents = sampler.step(latents, denoised, sigma, sigmas[i + 1])
 
             val now = System.currentTimeMillis()
-            val stepTime = (now - lastStepTime) / 1000.0f
+            progressCallback?.invoke(i - startIndex + 1, totalSteps, (now - lastStepTime) / 1000.0f)
             lastStepTime = now
-
-            progressCallback?.invoke(step + 1, numSteps, stepTime)
         }
 
-        // 5. VAE Latent Decoding to RGB Tensor
-        Log.i(TAG, "Decoding final latents through VAE on Qualcomm NPU...")
-        val rgbBytes = qnnBridge.runVaeDecoder(latents)
-
-        // 6. Convert RGB byte tensor to Android Bitmap (512x512)
-        var outputBitmap = rgbBytesToBitmap(rgbBytes, 512, 512)
-
-        // 7. Apply Aspect Ratio Framing (1:1, 16:9, 9:16, 4:3, 3:4)
-        if (aspectRatio != "1:1") {
-            outputBitmap = applyAspectRatioFraming(outputBitmap, aspectRatio)
-        }
-
-        // 8. Apply AI Super-Resolution (Real-ESRGAN x4plus on Hexagon NPU)
-        if (upscale > 1) {
-            val srStart = System.currentTimeMillis()
-            outputBitmap = applySuperResolution(outputBitmap, upscale)
-            Log.i(TAG, "Super-Resolution ${upscale}x complete in ${System.currentTimeMillis() - srStart}ms -> ${outputBitmap.width}x${outputBitmap.height}")
-        }
-
-        // 9. Compress to PNG Base64
-        val outputStream = ByteArrayOutputStream()
-        outputBitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
-        val base64 = Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
+        // 5. Decode, upscale the whole square, then crop to the requested (or source) shape
+        val square = SDImageOps.rgbToBitmap(qnnBridge.runVaeDecoder(latents), info.imageWidth, info.imageHeight)
+        val upscale = request.upscale.coerceIn(1, 4)
+        val output = SDImageOps.upscaleAndCrop(square, outputRect, upscale, qnnBridge::runSuperResolution,
+            info.superResolutionWidth, info.superResolutionHeight)
+        val dataUrl = SDImageOps.toDataUrl(output)
 
         val totalTime = System.currentTimeMillis() - startTime
-        Log.i(TAG, "Stable Diffusion synthesis complete on Qualcomm NPU in ${totalTime}ms (final size: ${outputBitmap.width}x${outputBitmap.height})")
-
+        Log.i(TAG, "Stable Diffusion done in ${totalTime}ms (${output.width}x${output.height})")
         mapOf(
-            "base64Image" to "data:image/png;base64,$base64",
+            "base64Image" to dataUrl,
             "generationTimeMs" to totalTime,
-            "width" to outputBitmap.width,
-            "height" to outputBitmap.height,
+            "width" to output.width,
+            "height" to output.height,
             "steps" to numSteps,
             "seed" to seed,
-            "aspectRatio" to aspectRatio,
-            "upscale" to upscale
+            "aspectRatio" to if (editing) "source" else request.aspectRatio,
+            "upscale" to upscale,
+            "sampler" to request.sampler.id,
+            "predictionType" to predictionType.id,
+            "promptTruncated" to truncated
         )
-    }
-
-    private fun decodeSourceImage(source: String): Bitmap {
-        return try {
-            val rawBitmap = if (source.startsWith("data:image") || source.contains(";base64,")) {
-                val clean = source.substringAfter("base64,")
-                val bytes = Base64.decode(clean, Base64.DEFAULT)
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-            } else if (source.startsWith("/")) {
-                BitmapFactory.decodeFile(source)
-            } else {
-                val clean = source.removePrefix("file://")
-                BitmapFactory.decodeFile(clean)
-            }
-            Bitmap.createScaledBitmap(rawBitmap, 512, 512, true)
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to decode source image for img2img, creating default canvas", e)
-            Bitmap.createBitmap(512, 512, Bitmap.Config.ARGB_8888)
-        }
-    }
-
-    /**
-     * Encode a 512x512 Bitmap into SD latent space using the VAE Encoder NPU model.
-     * Output: FloatArray of shape [1, 64, 64, 4] (NHWC), values in latent space.
-     */
-    private fun bitmapToLatents(bitmap: Bitmap): FloatArray {
-        // Use the compiled VAE encoder on the Hexagon NPU
-        if (qnnBridge.hasVaeEncoder()) {
-            return try {
-                val bmp512 = if (bitmap.width != 512 || bitmap.height != 512) {
-                    Bitmap.createScaledBitmap(bitmap, 512, 512, true)
-                } else {
-                    bitmap
-                }
-
-                // Extract raw RGB bytes [512 * 512 * 3]
-                val rgbBytes = ByteArray(512 * 512 * 3)
-                val pixels = IntArray(512 * 512)
-                bmp512.getPixels(pixels, 0, 512, 0, 0, 512, 512)
-                for (i in pixels.indices) {
-                    val px = pixels[i]
-                    rgbBytes[i * 3]     = ((px shr 16) and 0xFF).toByte()
-                    rgbBytes[i * 3 + 1] = ((px shr 8)  and 0xFF).toByte()
-                    rgbBytes[i * 3 + 2] = (px           and 0xFF).toByte()
-                }
-
-                val latent = qnnBridge.runVaeEncoder(rgbBytes)
-                if (latent != null && latent.size == 64 * 64 * 4) {
-                    Log.i(TAG, "VAE Encoder succeeded: latent shape [1,64,64,4], sample[0]=${latent[0]}")
-                    latent
-                } else {
-                    Log.e(TAG, "VAE Encoder returned null or wrong size (${latent?.size}), falling back to zeros")
-                    FloatArray(64 * 64 * 4)
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Exception in VAE Encoder, falling back to zeros", e)
-                FloatArray(64 * 64 * 4)
-            }
-        } else {
-            // VAE encoder not available - return zero latents (img2img won't work correctly)
-            Log.w(TAG, "VAE encoder not loaded, using zero latents for img2img")
-            return FloatArray(64 * 64 * 4)
-        }
-    }
-
-    private fun rgbBytesToBitmap(rgb: ByteArray, width: Int, height: Int): Bitmap {
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val pixels = IntArray(width * height)
-
-        for (i in pixels.indices) {
-            val r = rgb[i * 3].toInt() and 0xFF
-            val g = rgb[i * 3 + 1].toInt() and 0xFF
-            val b = rgb[i * 3 + 2].toInt() and 0xFF
-            pixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-        }
-
-        bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
-        return bitmap
-    }
-
-    private fun applyAspectRatioFraming(src: Bitmap, aspectRatio: String): Bitmap {
-        val srcW = src.width
-        val srcH = src.height
-
-        val (targetW, targetH) = when (aspectRatio) {
-            "16:9" -> Pair(srcW, (srcW * 9) / 16)       // 512 x 288
-            "9:16" -> Pair((srcH * 9) / 16, srcH)       // 288 x 512
-            "4:3"  -> Pair(srcW, (srcW * 3) / 4)        // 512 x 384
-            "3:4"  -> Pair((srcH * 3) / 4, srcH)        // 384 x 512
-            else   -> Pair(srcW, srcH)
-        }
-
-        val cropX = ((srcW - targetW) / 2).coerceAtLeast(0)
-        val cropY = ((srcH - targetH) / 2).coerceAtLeast(0)
-        return Bitmap.createBitmap(src, cropX, cropY, targetW, targetH)
-    }
-
-    private fun applySuperResolution(src: Bitmap, scaleFactor: Int): Bitmap {
-        if (qnnBridge.hasSuperResolution()) {
-            try {
-                val inputSquare = if (src.width != 512 || src.height != 512) {
-                    Bitmap.createScaledBitmap(src, 512, 512, true)
-                } else {
-                    src
-                }
-
-                val rgbBytes = ByteArray(512 * 512 * 3)
-                val pixels = IntArray(512 * 512)
-                inputSquare.getPixels(pixels, 0, 512, 0, 0, 512, 512)
-                for (i in pixels.indices) {
-                    val px = pixels[i]
-                    rgbBytes[i * 3]     = ((px shr 16) and 0xFF).toByte()
-                    rgbBytes[i * 3 + 1] = ((px shr 8)  and 0xFF).toByte()
-                    rgbBytes[i * 3 + 2] = (px           and 0xFF).toByte()
-                }
-
-                val outRgb = qnnBridge.runSuperResolution(rgbBytes)
-                if (outRgb != null && outRgb.size == 2048 * 2048 * 3) {
-                    val out2048 = rgbBytesToBitmap(outRgb, 2048, 2048)
-                    val finalW = src.width * scaleFactor
-                    val finalH = src.height * scaleFactor
-                    return if (finalW == 2048 && finalH == 2048) {
-                        out2048
-                    } else {
-                        Bitmap.createScaledBitmap(out2048, finalW, finalH, true)
-                    }
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "NPU Real-ESRGAN super-resolution exception, falling back to bicubic scaling", e)
-            }
-        }
-
-        // Fallback high-quality bilinear/bicubic scaling
-        val targetW = src.width * scaleFactor
-        val targetH = src.height * scaleFactor
-        return Bitmap.createScaledBitmap(src, targetW, targetH, true)
-    }
+    } }
 }
-

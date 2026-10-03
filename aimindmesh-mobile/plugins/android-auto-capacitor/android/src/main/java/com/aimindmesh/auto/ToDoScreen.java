@@ -17,6 +17,7 @@ import java.util.Map;
 public class ToDoScreen extends Screen {
     public ToDoScreen(CarContext carContext) {
         super(carContext);
+        AutoDataStore.register(this);
     }
 
     @NonNull
@@ -24,7 +25,7 @@ public class ToDoScreen extends Screen {
     public Template onGetTemplate() {
         ItemList.Builder listBuilder = new ItemList.Builder();
 
-        String json = AndroidAutoPlugin.getTasksData();
+        String json = AutoDataStore.getTasksData(getCarContext());
         List<Map<String, String>> tasks = AutoUtils.parseTasks(json);
 
         if (tasks.isEmpty()) {
@@ -38,7 +39,7 @@ public class ToDoScreen extends Screen {
 
                 listBuilder.addItem(
                         new Row.Builder()
-                                .setTitle(task.get("text"))
+                                .setTitle(AutoUtils.nonEmpty(task.get("text"), "Untitled task"))
                                 .setImage(new CarIcon.Builder(IconCompat.createWithResource(getCarContext(), iconResId))
                                         .build())
                                 .build());

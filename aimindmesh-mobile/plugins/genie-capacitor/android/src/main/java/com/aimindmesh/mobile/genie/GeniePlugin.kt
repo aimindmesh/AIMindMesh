@@ -152,16 +152,29 @@ class GeniePlugin : Plugin() {
         generationJob?.cancel()
         generationJob = scope.launch {
             try {
-                engine?.generateStream(prompt, maxTokens, temperature, topP, stopSeqs)?.collect { (token, isDone) ->
+                val stream = engine?.generateStream(prompt, maxTokens, temperature, topP, stopSeqs)
+                    ?: throw IllegalStateException("Genie engine not available")
+                var finished = false
+                stream.collect { (token, isDone) ->
                     val data = JSObject().apply {
                         put("text", token)
                         put("done", isDone)
                     }
                     call.resolve(data)
                     if (isDone) {
+                        finished = true
                         call.setKeepAlive(false)
-                        activeStreamingCall = null
+                        if (activeStreamingCall === call) activeStreamingCall = null
                     }
+                }
+                if (!finished) {
+                    // Aborted streams end without a Completed event: close the JS callback anyway
+                    call.resolve(JSObject().apply {
+                        put("text", "")
+                        put("done", true)
+                    })
+                    call.setKeepAlive(false)
+                    if (activeStreamingCall === call) activeStreamingCall = null
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Streaming generation failed", e)
@@ -171,7 +184,7 @@ class GeniePlugin : Plugin() {
                 }
                 call.resolve(errData)
                 call.setKeepAlive(false)
-                activeStreamingCall = null
+                if (activeStreamingCall === call) activeStreamingCall = null
             }
         }
     }

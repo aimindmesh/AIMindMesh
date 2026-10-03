@@ -51,6 +51,29 @@ import {
     executeGetTaskStats
 } from './taskTools';
 
+/** A tool the user set to 'deny': never executed, the model gets a refusal instead */
+export function isToolDenied(toolName: string, toolRules: Record<string, 'allow' | 'confirm' | 'deny'> = {}): boolean {
+    return toolRules[toolName] === 'deny';
+}
+
+/**
+ * Result of a tool implemented by its definition's `handler` (document and workspace tools).
+ * Handlers return a message, starting with "Error"/"Failed" when they fail.
+ */
+async function runDefinitionHandler(call: ToolCall): Promise<ToolResult | null> {
+    const handler = getToolByName(call.name)?.handler;
+    if (!handler) return null;
+    const output = await handler(call.args || {});
+    if (typeof output === 'string') {
+        return { success: !/^(error|failed)\b/i.test(output.trim()), message: output };
+    }
+    return {
+        success: output?.success ?? true,
+        message: output?.message ?? JSON.stringify(output),
+        data: output
+    };
+}
+
 /**
  * Check if a tool requires user confirmation
  */
@@ -236,7 +259,7 @@ export async function executeTool(
                 return await executeGetTaskStats();
 
             default:
-                return {
+                return await runDefinitionHandler(call) ?? {
                     success: false,
                     message: `Unknown tool: ${call.name}`
                 };

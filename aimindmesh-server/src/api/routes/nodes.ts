@@ -1,6 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { NodeRegistry } from '../../services/NodeRegistry';
 import { Logger } from '../../utils/Logger';
+import db from '../../db/sqlite';
 
 export default async function (fastify: FastifyInstance) {
   fastify.post('/register', async (request, reply) => {
@@ -39,7 +40,6 @@ export default async function (fastify: FastifyInstance) {
 
   fastify.delete('/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const db = require('../../db/sqlite').default;
     db.prepare('DELETE FROM nodes WHERE id = ?').run(id);
     return { ok: true };
   });

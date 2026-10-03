@@ -1,8 +1,7 @@
 import { registerPlugin, Capacitor } from '@capacitor/core';
 import { FileSystemAdapter as Filesystem, Directory } from '../../utils/fileSystemAdapter';
 
-// Register plugin without strict typing since exports are incomplete  
-// Register plugin without strict typing since exports are incomplete  
+// Register plugin without strict typing since exports are incomplete
 const LlamaCpp = registerPlugin('LlamaCpp') as any;
 
 import { isDesktop } from '../../utils/platform';
@@ -150,8 +149,14 @@ async function requestStoragePermission(): Promise<boolean> {
     }
 }
 
+// Download tracking lives in downloadTracking.ts; re-exported for existing importers
+export { normalizeDownloadUrl, checkDownloadedSize, isTrackedStatus, toDownloadProgress, getDownloadStatus, trackDownload } from './downloadTracking';
+import { normalizeDownloadUrl, trackDownload } from './downloadTracking';
+
 /**
- * Download a GGUF model from URL
+ * Download a GGUF model from URL.
+ * With onProgress the promise waits for the end of the download and checks the file;
+ * without it, it resolves as soon as the download has started.
  */
 export async function downloadModel(
     url: string,
@@ -161,12 +166,7 @@ export async function downloadModel(
 ): Promise<string> {
     console.log('[ModelDownloader] Starting download:', filename);
 
-    // Sanitize URL for HuggingFace (blob -> resolve)
-    let finalUrl = url;
-    if (finalUrl.includes('huggingface.co') && finalUrl.includes('/blob/')) {
-        console.log('[ModelDownloader] Fixing HuggingFace URL (blob -> resolve)');
-        finalUrl = finalUrl.replace('/blob/', '/resolve/');
-    }
+    const finalUrl = normalizeDownloadUrl(url);
 
     // Request storage permissions first
     const hasPermission = await requestStoragePermission();
@@ -174,7 +174,7 @@ export async function downloadModel(
         throw new Error('Storage permission denied. Please enable storage access in app settings.');
     }
 
-    // Use the plugin's download functionality
+    // Use the plugin's download functionality (resolves with { localPath } once started)
     const result = await LlamaCpp.downloadModel({
         url: finalUrl,
         filename,
@@ -184,58 +184,12 @@ export async function downloadModel(
     // If no progress callback, return immediately
     if (!onProgress) {
         console.log('[ModelDownloader] Download started (background):', result);
-        return result;
+        return result?.localPath || filename;
     }
 
-    // Wait for completion if tracking progress
-    return new Promise<string>((resolve, reject) => {
-        const progressInterval = setInterval(async () => {
-            try {
-                const progress = await LlamaCpp.getDownloadProgress({ url: finalUrl });
-
-                onProgress({
-                    bytesDownloaded: progress.bytesDownloaded || 0,
-                    totalBytes: progress.totalBytes || 0,
-                    percentage: progress.totalBytes > 0 ? (progress.bytesDownloaded / progress.totalBytes) * 100 : 0,
-                    completed: progress.completed,
-                    failed: progress.failed,
-                    errorMessage: progress.error,
-                });
-
-                if (progress.completed) {
-                    clearInterval(progressInterval);
-
-                    // Verify file size locally to ensure it's not a 404 page
-                    // This adds safety even if native plugin isn't rebuilt immediately
-                    Filesystem.stat({
-                        path: filename,
-                        directory: Directory.Data
-                    }).then(stat => {
-                        if (stat.size < 1024) {
-                            console.error('[ModelDownloader] Downloaded file is too small (' + stat.size + ' bytes). Deleting...');
-                            Filesystem.deleteFile({ path: filename, directory: Directory.Data }).catch(() => { });
-                            reject(new Error('Download failed: File too small (likely 404 error)'));
-                        } else {
-                            console.log('[ModelDownloader] Download completed successfully:', result);
-                            resolve(result); // Return the local path
-                        }
-                    }).catch(e => {
-                        // Stat failed? ensure we don't hang
-                        console.warn('Failed to verify file size', e);
-                        resolve(result);
-                    });
-                } else if (progress.failed || progress.cancelled) {
-                    clearInterval(progressInterval);
-                    console.error('[ModelDownloader] Download failed or cancelled:', progress.error);
-                    reject(new Error(progress.error || 'Download cancelled'));
-                }
-            } catch (error) {
-                // Ignore errors during polling (might be temporary)
-                // or handle max retries?
-                console.warn('[ModelDownloader] Error polling progress:', error);
-            }
-        }, 500); // Update every 500ms
-    });
+    await trackDownload(finalUrl, filename, onProgress);
+    console.log('[ModelDownloader] Download completed successfully:', filename);
+    return result?.localPath || filename;
 }
 
 /**
@@ -243,7 +197,7 @@ export async function downloadModel(
  */
 export async function cancelDownload(url: string): Promise<boolean> {
     console.log('[ModelDownloader] Cancelling download:', url);
-    return LlamaCpp.cancelDownload({ url });
+    return LlamaCpp.cancelDownload({ url: normalizeDownloadUrl(url) });
 }
 
 /**

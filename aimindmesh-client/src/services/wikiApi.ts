@@ -6,19 +6,8 @@
 
 import { serverApi } from './serverApi';
 
-export interface WikiPageSummary {
-  slug: string;
-  folder?: string;
-  title: string;
-  tags: string[];
-  updatedAt: string;
-  neo4jId?: string;
-}
-
-export interface WikiPage extends WikiPageSummary {
-  body: string;
-  sources?: { type: string; id: string }[];
-}
+export type { WikiPageSummary, WikiPage } from '@aimindmesh/api-types';
+import type { WikiPageSummary, WikiPage } from '@aimindmesh/api-types';
 
 export const wikiApi = {
   /** List all wiki pages */

@@ -5,11 +5,12 @@ import { Share } from '@capacitor/share';
 import { FilePicker } from '@capawesome/capacitor-file-picker';
 import { imageGenService } from '../../services/image/imageGenService';
 import { triggerHaptic } from '../../services/native';
-import { SDProgressEvent, SDGenerateResult } from 'sd-capacitor';
+import { SDProgressEvent, SDGenerateResult, SDSampler } from 'sd-capacitor';
 import { logger } from '../../services/logger';
 import { StylePreset, STYLE_PRESETS } from './imageGenPresets';
 import { ImageGenResultCard } from './ImageGenResultCard';
 import { ImageGenAdvancedControls } from './ImageGenAdvancedControls';
+import { useImageModelSession } from '../../hooks/useImageModelSession';
 
 interface ImageGenModalProps {
     isOpen: boolean;
@@ -36,6 +37,8 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
     const [strength, setStrength] = useState(0.65);
     const [aspectRatio, setAspectRatio] = useState<'1:1' | '16:9' | '9:16' | '4:3'>('1:1');
     const [upscale, setUpscale] = useState<1 | 2 | 4>(1);
+    const [sampler, setSampler] = useState<SDSampler>('euler');
+    const [seed, setSeed] = useState<number | null>(null); // null: random every time
     const [sourceImage, setSourceImage] = useState<string | null>(initialImage || null);
     const [isGenerating, setIsGenerating] = useState(false);
     const [progress, setProgress] = useState<{ step: number; total: number; percent: number } | null>(null);
@@ -48,6 +51,10 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
     const [isSharing, setIsSharing] = useState(false);
 
     const fileInputRef = useRef<HTMLInputElement>(null);
+    // Only Stable Diffusion in RAM while this screen is open (the LLM comes back on close)
+    const { modelStatus, modelError, modelInfo } = useImageModelSession(isOpen);
+    const imageExt = (img: string) => img.startsWith('data:image/jpeg') ? 'jpg' : 'png';
+    const isModelSwitching = modelStatus === 'freeing' || modelStatus === 'loading';
 
     useEffect(() => {
         if (initialImage) {
@@ -149,6 +156,8 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                 cfgScale,
                 aspectRatio,
                 upscale,
+                sampler,
+                seed: seed ?? -1,
                 onProgress: (ev: SDProgressEvent) => {
                     const percent = Math.round((ev.step / ev.totalSteps) * 100);
                     setProgress({ step: ev.step, total: ev.totalSteps, percent });
@@ -174,7 +183,7 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
             const rawBase64 = result.base64Image.replace(/^data:image\/\w+;base64,/, '');
             const timestamp = new Date().toISOString().replace(/\D/g, '').slice(0, 14);
             await Filesystem.writeFile({
-                path: `AIMindMesh_SD_${timestamp}.png`,
+                path: `AIMindMesh_SD_${timestamp}.${imageExt(result.base64Image)}`,
                 data: rawBase64,
                 directory: Directory.Documents,
                 recursive: true,
@@ -185,7 +194,7 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
             try {
                 const link = document.createElement('a');
                 link.href = result.base64Image;
-                link.download = `AIMindMesh_SD_${Date.now()}.png`;
+                link.download = `AIMindMesh_SD_${Date.now()}.${imageExt(result.base64Image)}`;
                 document.body.appendChild(link);
                 link.click();
                 document.body.removeChild(link);
@@ -206,7 +215,7 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
         try {
             const rawBase64 = result.base64Image.replace(/^data:image\/\w+;base64,/, '');
             const fileRes = await Filesystem.writeFile({
-                path: `AIMindMesh_SD_share_${Date.now()}.png`,
+                path: `AIMindMesh_SD_share_${Date.now()}.${imageExt(result.base64Image)}`,
                 data: rawBase64,
                 directory: Directory.Cache,
                 recursive: true,
@@ -307,12 +316,15 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                                 <span className="text-[10px] text-text-tertiary">To modify or restyle</span>
                             </div>
 
+                            {modelInfo?.hasVaeEncoder === false && (
+                                <p className="text-[11px] text-red-300">This model package has no vae_encoder.bin: it cannot edit images.</p>
+                            )}
                             {sourceImage ? (
                                 <div className="flex items-center gap-3 bg-surface/60 p-2 rounded-lg border border-white/5">
                                     <img src={sourceImage} alt="Source preview" className="w-16 h-16 object-cover rounded-md border border-white/10 bg-black" />
                                     <div className="flex-1 min-w-0">
                                         <p className="text-xs font-medium text-text-primary truncate">Source Image Loaded</p>
-                                        <p className="text-[10px] text-text-tertiary">512x512 normalized</p>
+                                        <p className="text-[10px] text-text-tertiary">The result keeps its proportions</p>
                                         <div className="mt-1 flex items-center gap-2">
                                             <button type="button" onClick={handlePickImage} className="text-[11px] text-amber-300 hover:underline">Change</button>
                                             <span className="text-text-tertiary">•</span>
@@ -341,7 +353,7 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                                         <span className="text-amber-300 font-mono">{Math.round(strength * 100)}%</span>
                                     </div>
                                     <input type="range" min="0.1" max="0.95" step="0.05" value={strength} onChange={(e) => setStrength(parseFloat(e.target.value))} className="w-full accent-amber-400" />
-                                    <p className="text-[10px] text-text-tertiary">Lower preserves original shape; higher invents new details.</p>
+                                    <p className="text-[10px] text-text-tertiary">30-50% recolors/restyles keeping the layout; 70%+ reinvents it.</p>
                                 </div>
                             )}
                         </div>
@@ -354,7 +366,7 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                                 <label className="text-[11px] font-semibold text-text-primary flex items-center gap-1">
                                     📐 Aspect Ratio
                                 </label>
-                                <span className="text-[10px] text-amber-300 font-mono">{aspectRatio}</span>
+                                <span className="text-[10px] text-amber-300 font-mono">{mode === 'img2img' ? 'source' : aspectRatio}</span>
                             </div>
                             <div className="grid grid-cols-4 gap-1">
                                 {(['1:1', '16:9', '9:16', '4:3'] as const).map((ratio) => (
@@ -362,6 +374,7 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                                         key={ratio}
                                         type="button"
                                         onClick={() => { setAspectRatio(ratio); triggerHaptic(); }}
+                                        disabled={mode === 'img2img'}
                                         className={`py-1.5 rounded-lg text-[10px] font-semibold transition-all border ${
                                             aspectRatio === ratio
                                                 ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 shadow-sm'
@@ -379,7 +392,7 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                                 <label className="text-[11px] font-semibold text-text-primary flex items-center gap-1">
                                     ⚡ AI Super-Res
                                 </label>
-                                <span className="text-[10px] text-amber-300 font-mono">{upscale === 1 ? '512px' : upscale === 2 ? '1024px' : '2048px'}</span>
+                                <span className="text-[10px] text-amber-300 font-mono">{upscale === 1 ? '512px' : upscale === 2 ? '1024px' : '2048px'}{upscale > 1 && modelInfo?.hasSuperResolution === false ? ' (bilinear)' : ''}</span>
                             </div>
                             <div className="grid grid-cols-3 gap-1">
                                 {([
@@ -444,11 +457,12 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                         <textarea
                             value={prompt}
                             onChange={(e) => setPrompt(e.target.value)}
-                            placeholder={mode === 'img2img' ? "Describe modifications (e.g. 'Turn into a watercolor oil painting')..." : "A cute cat sitting near the window, cinematic lighting, photorealistic 8k..."}
+                            placeholder={mode === 'img2img' ? "Describe the whole result, e.g. 'a watercolor painting of a house by a lake'..." : "A cute cat sitting near the window, cinematic lighting, photorealistic 8k..."}
                             rows={3}
                             maxLength={500}
                             className="w-full bg-input text-text-primary rounded-xl p-3 text-xs border border-white/10 focus:border-amber-400 focus:outline-none resize-none transition-colors"
                         />
+                        <p className="text-[10px] text-text-tertiary">Write in English and describe the picture you want, not the change: Stable Diffusion does not follow instructions.</p>
                     </div>
 
                     {/* Advanced Settings Accordion */}
@@ -461,6 +475,10 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                         setSteps={setSteps}
                         cfgScale={cfgScale}
                         setCfgScale={setCfgScale}
+                        sampler={sampler}
+                        setSampler={setSampler}
+                        seed={seed}
+                        setSeed={setSeed}
                     />
 
                     {/* Error display */}
@@ -469,6 +487,17 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                             <span>⚠️</span>
                             <span className="flex-1">{error}</span>
                         </div>
+                    )}
+
+                    {/* Model swap: the LLM leaves the RAM, Stable Diffusion is loaded */}
+                    {isModelSwitching && !isGenerating && (
+                        <div className="p-3 bg-white/5 border border-white/10 rounded-xl text-xs text-text-secondary flex items-center gap-2">
+                            <span className="animate-spin inline-block">⚙️</span>
+                            {modelStatus === 'freeing' ? 'Freeing memory (unloading the chat model)…' : 'Loading the image model…'}
+                        </div>
+                    )}
+                    {modelStatus === 'error' && modelError && installedModels.length > 0 && !error && (
+                        <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-xl text-xs text-red-300">{modelError}</div>
                     )}
 
                     {/* Progress Bar */}
@@ -500,6 +529,7 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                             isSharing={isSharing}
                             onSave={handleSaveImage}
                             onShare={handleShareImage}
+                            onReuseSeed={(s) => { setSeed(s); setShowAdvanced(true); triggerHaptic(); }}
                         />
                     )}
                 </div>
@@ -527,7 +557,7 @@ export const ImageGenModal: React.FC<ImageGenModalProps> = ({
                         <button
                             type="button"
                             onClick={handleGenerate}
-                            disabled={isGenerating || !prompt.trim()}
+                            disabled={isGenerating || isModelSwitching || !prompt.trim()}
                             className="w-full py-3 px-4 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 disabled:opacity-50 disabled:cursor-not-allowed text-xs font-bold text-black transition-all shadow-lg flex items-center justify-center gap-2"
                         >
                             {isGenerating ? (

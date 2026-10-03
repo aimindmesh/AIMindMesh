@@ -3,6 +3,7 @@ import { LLMConfig } from '../../../types';
 import { triggerHaptic } from '../../../services/native';
 import { RECOMMENDED_PROJECTORS, downloadModel, cancelDownload, ModelDownloadProgress } from '../../../services/model/modelDownloader';
 import { logger } from '../../../services/logger';
+import { useDownloadResume } from '../../../hooks/useDownloadResume';
 import { fileImportService } from '../../../services/file/fileImportService';
 
 import { StableDiffusionSection } from './StableDiffusionSection';
@@ -28,6 +29,13 @@ const VisionSettings: React.FC<VisionSettingsProps> = ({
             getLocalProjectorFiles().then(setProjectors);
         });
     }, [isImporting, downloadProgress]);
+
+    // Projector downloads started before this screen was last closed keep running natively
+    useDownloadResume(
+        RECOMMENDED_PROJECTORS.map(p => ({ id: p.id, url: p.url, filename: p.id + '.mmproj' })),
+        setDownloadProgress,
+        () => setIsImporting(prev => !prev)
+    );
 
     const handleDownloadProjector = async (proj: typeof RECOMMENDED_PROJECTORS[0]) => {
         triggerHaptic();
@@ -65,6 +73,11 @@ const VisionSettings: React.FC<VisionSettingsProps> = ({
 
         } catch (e) {
             logger.log('error', 'Projector download failed', e);
+            setDownloadProgress(prev => {
+                const newState = { ...prev };
+                delete newState[proj.id];
+                return newState;
+            });
             alert('Download failed: ' + (e as any).message);
         }
     };

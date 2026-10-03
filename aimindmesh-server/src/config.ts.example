@@ -38,7 +38,15 @@ export interface ServerConfig {
     defaultSessionKey: string;
     taskTimeoutMs: number;
   };
+  hermes?: {
+    enabled: boolean;
+    gatewayUrl: string;
+    apiServerKey: string;
+    defaultSessionKey: string;
+    taskTimeoutMs: number;
+  };
   ingestion: { chunkSize: number; chunkOverlap: number };
+
   routing: { 
     preferredNode: 'AUTO' | 'LAPTOP' | 'SERVER_LOCAL' | 'GEMINI' | 'OPENROUTER';
     taskPriorities?: Record<string, string[]>;
@@ -67,10 +75,10 @@ export interface ServerConfig {
   };
   wiki?: {
     enabled: boolean;
-    storagePath: string;
-    syncIntervalHours: number;
-    gitEnabled: boolean;
-    maxConceptsPerCycle: number;
+    storagePath: string;         // default: './data/wiki'
+    syncIntervalHours: number;   // default: 24
+    gitEnabled: boolean;         // default: false
+    maxConceptsPerCycle: number; // default: 20
   };
   autoEvolution?: {
     enabled: boolean;
@@ -87,8 +95,8 @@ export interface ServerConfig {
     autoMerge: boolean;
     shadowMode?: boolean;
     preferredNode?: string;
-    maxFeedbackIterations?: number;
-    feedbackAutoTrigger?: boolean;
+    maxFeedbackIterations?: number;     // default: 5
+    feedbackAutoTrigger?: boolean;      // default: true
     giteaWebhookSecret?: string;
   };
   kasm?: {
@@ -106,23 +114,31 @@ export interface ServerConfig {
     timeoutMs: number;
     model: string;
   };
+  organization?: {
+    enabled: boolean;
+    defaultApprovalMode: 'human' | 'auto';
+    allowAutoRoleMaterialization: boolean;
+    allowAutoRepoCreation: boolean;
+    allowAutoKasmValidation: boolean;
+    defaultGiteaNamespace: string;
+    defaultRepoVisibility: 'public' | 'private' | 'internal';
+    searxngBaseUrl: string;
+    kasmValidationWorkspaceId: string;
+  };
 }
 
 
 const configPath = path.join(__dirname, '../config.json');
 
 export function loadConfig(): ServerConfig {
-  if (!fs.existsSync(configPath)) {
-    throw new Error(`Configuration file not found at ${configPath}. Please copy config.json.example to config.json and fill in your details.`);
-  }
-
   const content = fs.readFileSync(configPath, 'utf-8');
   const parsed = JSON.parse(content) as ServerConfig;
-  
-  // Set defaults for missing values
-  if (parsed.infrastructureBrake === undefined) parsed.infrastructureBrake = false;
-  if (!parsed.logging) parsed.logging = { level: 'INFO' };
-  
+  if (parsed.infrastructureBrake === undefined) {
+    parsed.infrastructureBrake = false;
+  }
+  if (!parsed.logging) {
+    parsed.logging = { level: 'INFO' };
+  }
   if (!parsed.delivery) {
     parsed.delivery = { 
       quietHours: false, 
@@ -131,7 +147,6 @@ export function loadConfig(): ServerConfig {
       fallbackAfterHours: 6 
     };
   }
-  
   if (!parsed.search) {
     parsed.search = {
       enabled: false,
@@ -139,14 +154,17 @@ export function loadConfig(): ServerConfig {
       maxResults: 5
     };
   }
-
+  if (!parsed.tasks) {
+    parsed.tasks = {
+      retentionLimit: 1000
+    };
+  }
   if (parsed.ollama) {
     if (parsed.ollama.timeoutMs === undefined) parsed.ollama.timeoutMs = 86400000;
     if (parsed.ollama.numThread === undefined) parsed.ollama.numThread = 6;
     if (parsed.ollama.numCtx === undefined) parsed.ollama.numCtx = 8192;
     if (parsed.ollama.keepAlive === undefined) parsed.ollama.keepAlive = "5m";
   }
-
   if (!parsed.wiki) {
     parsed.wiki = {
       enabled: true,
@@ -156,15 +174,25 @@ export function loadConfig(): ServerConfig {
       maxConceptsPerCycle: 20
     };
   }
-
   if (!parsed.openrouter) {
     parsed.openrouter = {
       apiKey: '',
       model: 'anthropic/claude-3.5-sonnet',
       dailyQuotaCap: 100
     };
+  } else {
+    if (parsed.openrouter.dailyQuotaCap === undefined) parsed.openrouter.dailyQuotaCap = 100;
+    if (!parsed.openrouter.model) parsed.openrouter.model = 'anthropic/claude-3.5-sonnet';
+    if (!parsed.openrouter.apiKey) parsed.openrouter.apiKey = '';
   }
-
+  if (!parsed.debate) {
+    parsed.debate = {
+      enabled: true,
+      mergeEnabled: true,
+      mergeIntervalHours: 12,
+      participants: []
+    };
+  }
   if (!parsed.autoEvolution) {
     parsed.autoEvolution = {
       enabled: false,
@@ -180,7 +208,9 @@ export function loadConfig(): ServerConfig {
       repoLocalPath: path.join(__dirname, '../../'),
       autoMerge: false,
       shadowMode: false,
-      preferredNode: 'AUTO'
+      preferredNode: 'AUTO',
+      maxFeedbackIterations: 5,
+      feedbackAutoTrigger: true
     };
   }
 
@@ -194,7 +224,7 @@ export function loadConfig(): ServerConfig {
       userId: ''
     };
   }
-
+  
   if (!parsed.freellmapi) {
     parsed.freellmapi = {
       enabled: false,
@@ -203,6 +233,98 @@ export function loadConfig(): ServerConfig {
       timeoutMs: 120000,
       model: 'auto'
     };
+  }
+
+  if (!parsed.hermes) {
+    parsed.hermes = {
+      enabled: false,
+      gatewayUrl: 'http://your-hermes-ip:8642',
+      apiServerKey: process.env.HERMES_API_KEY || '',
+      defaultSessionKey: 'system',
+      taskTimeoutMs: 300000
+    };
+  }
+
+  if (!parsed.organization) {
+    parsed.organization = {
+      enabled: true,
+      defaultApprovalMode: 'human',
+      allowAutoRoleMaterialization: false,
+      allowAutoRepoCreation: false,
+      allowAutoKasmValidation: true,
+      defaultGiteaNamespace: 'aimindmesh-labs',
+      defaultRepoVisibility: 'private',
+      searxngBaseUrl: 'http://searxng:8080',
+      kasmValidationWorkspaceId: 'workspace-template-id'
+    };
+  } else {
+    if (parsed.organization.enabled === undefined) parsed.organization.enabled = true;
+    if (parsed.organization.defaultApprovalMode === undefined) parsed.organization.defaultApprovalMode = 'human';
+    if (parsed.organization.allowAutoRoleMaterialization === undefined) parsed.organization.allowAutoRoleMaterialization = false;
+    if (parsed.organization.allowAutoRepoCreation === undefined) parsed.organization.allowAutoRepoCreation = false;
+    if (parsed.organization.allowAutoKasmValidation === undefined) parsed.organization.allowAutoKasmValidation = true;
+    if (parsed.organization.defaultGiteaNamespace === undefined) parsed.organization.defaultGiteaNamespace = 'aimindmesh-labs';
+    if (parsed.organization.defaultRepoVisibility === undefined) parsed.organization.defaultRepoVisibility = 'private';
+    if (parsed.organization.searxngBaseUrl === undefined) parsed.organization.searxngBaseUrl = 'http://searxng:8080';
+    if (parsed.organization.kasmValidationWorkspaceId === undefined) parsed.organization.kasmValidationWorkspaceId = 'workspace-template-id';
+  }
+
+  
+  if (parsed.autoEvolution) {
+    if (parsed.autoEvolution.maxFeedbackIterations === undefined) parsed.autoEvolution.maxFeedbackIterations = 5;
+    if (parsed.autoEvolution.feedbackAutoTrigger === undefined) parsed.autoEvolution.feedbackAutoTrigger = true;
+  }
+
+  if (!parsed.routing.taskPriorities) {
+    const defaultCloudFirst = ['GEMINI', 'OPENROUTER', 'SERVER_LOCAL'];
+    const localFirst = ['SERVER_LOCAL', 'GEMINI', 'OPENROUTER'];
+    parsed.routing.taskPriorities = {
+      'EVOLUTION': defaultCloudFirst,
+      'INTENT_CLASSIFICATION': localFirst,
+      'QUERY_EXPANSION': localFirst,
+      'CONCEPT_EXTRACTION': localFirst,
+      'CONCEPT_ENRICHMENT': localFirst,
+      'IMPROVEMENT_DETECTION': localFirst,
+      'PROACTIVE_INSIGHT': defaultCloudFirst,
+      'DEBATE_PARTICIPATION': defaultCloudFirst,
+      'DEBATE_SUMMARY': defaultCloudFirst,
+      'INSIGHT_DEDUP': defaultCloudFirst,
+      'WIKI_SYNTHESIS': defaultCloudFirst,
+      'WIKI_TOPIC_MAP': defaultCloudFirst,
+      'CODE_EVOLUTION': defaultCloudFirst,
+      'EVOLUTION_VALIDATION': defaultCloudFirst,
+      'EMBEDDING_GENERATION': ['SERVER_LOCAL', 'GEMINI', 'OPENROUTER'],
+      'GENERAL_CHAT': defaultCloudFirst,
+      'WEB_RESEARCH': defaultCloudFirst,
+      'AGENTIC_TASK': defaultCloudFirst
+    };
+  } else {
+    // Migration logic for existing configs
+    const defaultCloudFirst = ['GEMINI', 'OPENROUTER', 'SERVER_LOCAL'];
+    const p = parsed.routing.taskPriorities;
+    const migrationMap: Record<string, string[]> = {
+      'INTENT_CLASSIFICATION': p['LIGHTWEIGHT'] || defaultCloudFirst,
+      'QUERY_EXPANSION': p['LIGHTWEIGHT'] || defaultCloudFirst,
+      'CONCEPT_EXTRACTION': p['LIGHTWEIGHT'] || defaultCloudFirst,
+      'CONCEPT_ENRICHMENT': p['LIGHTWEIGHT'] || defaultCloudFirst,
+      'IMPROVEMENT_DETECTION': p['LIGHTWEIGHT'] || defaultCloudFirst,
+      'PROACTIVE_INSIGHT': p['STANDARD'] || defaultCloudFirst,
+      'DEBATE_PARTICIPATION': p['STANDARD'] || defaultCloudFirst,
+      'DEBATE_SUMMARY': p['STANDARD'] || defaultCloudFirst,
+      'INSIGHT_DEDUP': p['STANDARD'] || defaultCloudFirst,
+      'WIKI_SYNTHESIS': p['COMPLEX'] || defaultCloudFirst,
+      'WIKI_TOPIC_MAP': p['COMPLEX'] || defaultCloudFirst,
+      'CODE_EVOLUTION': p['EVOLUTION'] || defaultCloudFirst,
+      'EVOLUTION_VALIDATION': p['STANDARD'] || defaultCloudFirst,
+      'EMBEDDING_GENERATION': p['EMBEDDING'] || ['SERVER_LOCAL', 'GEMINI', 'OPENROUTER'],
+      'GENERAL_CHAT': p['STANDARD'] || defaultCloudFirst,
+      'WEB_RESEARCH': p['RESEARCH'] || defaultCloudFirst,
+      'AGENTIC_TASK': p['AGENTIC'] || defaultCloudFirst
+    };
+
+    for (const [key, value] of Object.entries(migrationMap)) {
+      if (!p[key]) p[key] = value;
+    }
   }
   
   return parsed;

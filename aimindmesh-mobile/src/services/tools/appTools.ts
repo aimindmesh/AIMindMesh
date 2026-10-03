@@ -4,6 +4,7 @@
 
 import { executeTermuxCommand } from '../termuxPlugin';
 import { ToolResult } from './types';
+import { shellQuote, clampInt } from './shellArgs';
 
 // Common app package names for quick lookup
 export const APP_PACKAGES: Record<string, string> = {
@@ -51,13 +52,14 @@ export async function executeLaunchApp(args: Record<string, unknown>): Promise<T
         packageName = APP_PACKAGES[appName] || '';
     }
 
+    // Names come from the model and reach sh -c: quoted
     let cmd: string;
     if (packageName) {
         // Launch by package name
-        cmd = `am start -n ${packageName}/.MainActivity 2>/dev/null || am start -a android.intent.action.MAIN -p ${packageName}`;
+        cmd = `am start -n ${shellQuote(`${packageName}/.MainActivity`)} 2>/dev/null || am start -a android.intent.action.MAIN -p ${shellQuote(packageName)}`;
     } else {
         // Try to launch by app name using monkey
-        cmd = `monkey -p ${appName} -c android.intent.category.LAUNCHER 1 2>/dev/null || echo "App not found"`;
+        cmd = `monkey -p ${shellQuote(appName)} -c android.intent.category.LAUNCHER 1 2>/dev/null || echo "App not found"`;
     }
 
     const result = await executeTermuxCommand(cmd);
@@ -84,10 +86,7 @@ export async function executeCreateKeepNote(args: Record<string, unknown>): Prom
         return { success: false, message: 'Note content is required' };
     }
 
-    const safeContent = content.replace(/'/g, "'\\''");
-    const safeTitle = title.replace(/'/g, "'\\''");
-
-    const cmd = `am start -a android.intent.action.SEND -t "text/plain" -p com.google.android.keep -e "android.intent.extra.TEXT" '${safeContent}' -e "android.intent.extra.SUBJECT" '${safeTitle}'`;
+    const cmd = `am start -a android.intent.action.SEND -t "text/plain" -p com.google.android.keep -e "android.intent.extra.TEXT" ${shellQuote(content)} -e "android.intent.extra.SUBJECT" ${shellQuote(title)}`;
 
     const result = await executeTermuxCommand(cmd);
 
@@ -106,18 +105,16 @@ export async function executeCreateKeepNote(args: Record<string, unknown>): Prom
 }
 
 export async function executeSetAlarm(args: Record<string, unknown>): Promise<ToolResult> {
-    const hour = args.hour as number;
-    const minute = args.minute as number;
+    const hour = clampInt(args.hour, 0, 23, NaN);
+    const minute = clampInt(args.minute, 0, 59, NaN);
     const message = (args.message as string) || 'AI Alarm';
 
-    if (hour === undefined || minute === undefined) {
+    if (Number.isNaN(hour) || Number.isNaN(minute)) {
         return { success: false, message: 'Hour and minute are required' };
     }
 
-    const safeMessage = message.replace(/'/g, "'\\''");
-
     // --ei for integer extras
-    const cmd = `am start -a android.intent.action.SET_ALARM --ei "android.intent.extra.alarm.HOUR" ${hour} --ei "android.intent.extra.alarm.MINUTES" ${minute} -e "android.intent.extra.alarm.MESSAGE" '${safeMessage}'`;
+    const cmd = `am start -a android.intent.action.SET_ALARM --ei "android.intent.extra.alarm.HOUR" ${hour} --ei "android.intent.extra.alarm.MINUTES" ${minute} -e "android.intent.extra.alarm.MESSAGE" ${shellQuote(message)}`;
 
     const result = await executeTermuxCommand(cmd);
 

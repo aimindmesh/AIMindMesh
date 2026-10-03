@@ -7,7 +7,9 @@ services:
     cap_add:
       - NET_ADMIN
     ports:
-      - "3030:3030"
+      # VPN + localhost only: reach the server through WireGuard, never from the public interface
+      - "127.0.0.1:3030:3030"
+      - "10.2.0.1:3030:3030"
     environment:
       - OPENCLAW_URL=http://openclaw-gateway:18789
       - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
@@ -19,6 +21,9 @@ services:
         ipv4_address: 10.2.0.50
     volumes:
       - ./config.json:/app/config.json
+      # Must exist on the host before `up`, otherwise Docker creates a directory in its place.
+      # Not read-only: backup restore writes it back like config.json
+      - ./firebase-service-account.json:/app/firebase-service-account.json
       - ./data:/app/data
       - ./backups:/app/backups
       - ./openclaw-config:/app/openclaw-config
@@ -34,8 +39,10 @@ services:
     container_name: aimindmesh-neo4j
     restart: unless-stopped
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "127.0.0.1:7474:7474"
+      - "10.2.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+      - "10.2.0.1:7687:7687"
     environment:
       - NEO4J_AUTH=neo4j/aimindmesh
       - TZ=Europe/Rome

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <fstream>
 #include <thread>
+#include <cstdio>
 #include "whisper.h"
 
 // Log tag
@@ -97,6 +98,40 @@ bool read_wav(const std::string & fname, std::vector<float> & pcmf32, std::vecto
     return true;
 }
 
+// Whisper tokens are byte-level BPE, so a segment can end in the middle of a UTF-8 sequence,
+// which NewStringUTF rejects (CheckJNI aborts the app). java.lang.String(byte[], "UTF-8")
+// replaces malformed bytes instead.
+static jstring utf8_to_jstring(JNIEnv *env, const std::string &s) {
+    jbyteArray bytes = env->NewByteArray((jsize) s.size());
+    if (!bytes) return nullptr;
+    env->SetByteArrayRegion(bytes, 0, (jsize) s.size(), reinterpret_cast<const jbyte *>(s.data()));
+    jclass stringClass = env->FindClass("java/lang/String");
+    jmethodID ctor = env->GetMethodID(stringClass, "<init>", "([BLjava/lang/String;)V");
+    jstring charset = env->NewStringUTF("UTF-8");
+    jstring result = (jstring) env->NewObject(stringClass, ctor, bytes, charset);
+    env->DeleteLocalRef(charset);
+    env->DeleteLocalRef(stringClass);
+    env->DeleteLocalRef(bytes);
+    return result;
+}
+
+// JSON string escaping, including the remaining control characters
+static void append_json_escaped(std::stringstream &ss, const char *text) {
+    for (const char *p = text; p && *p; ++p) {
+        unsigned char c = (unsigned char) *p;
+        if (c == '"') ss << "\\\"";
+        else if (c == '\\') ss << "\\\\";
+        else if (c == '\n') ss << "\\n";
+        else if (c == '\r') ss << "\\r";
+        else if (c == '\t') ss << "\\t";
+        else if (c < 0x20) {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "\\u%04x", c);
+            ss << buf;
+        } else ss << (char) c;
+    }
+}
+
 // Helper to format result as JSON
 std::string format_result(struct whisper_context * ctx) {
     std::stringstream ss;
@@ -105,17 +140,7 @@ std::string format_result(struct whisper_context * ctx) {
     
     int n_segments = whisper_full_n_segments(ctx);
     for (int i = 0; i < n_segments; ++i) {
-        const char * text = whisper_full_get_segment_text(ctx, i);
-        // Basic escaping
-        std::string s(text);
-        for (char c : s) {
-            if (c == '"') ss << "\\\"";
-            else if (c == '\\') ss << "\\\\";
-            else if (c == '\n') ss << "\\n";
-            else if (c == '\r') ss << "\\r";
-            else if (c == '\t') ss << "\\t";
-            else ss << c;
-        }
+        append_json_escaped(ss, whisper_full_get_segment_text(ctx, i));
     }
     ss << "\",";
     
@@ -127,17 +152,7 @@ std::string format_result(struct whisper_context * ctx) {
         
         if (i > 0) ss << ",";
         ss << "{\"text\":\"";
-        
-        std::string s(text);
-         for (char c : s) {
-            if (c == '"') ss << "\\\"";
-            else if (c == '\\') ss << "\\\\";
-            else if (c == '\n') ss << "\\n";
-            else if (c == '\r') ss << "\\r";
-            else if (c == '\t') ss << "\\t";
-            else ss << c;
-        }
-        
+        append_json_escaped(ss, text);
         ss << "\",";
         ss << "\"start\":" << (t0 * 10) << ","; // whisper time is 10ms units
         ss << "\"end\":" << (t1 * 10) << "}";
@@ -217,7 +232,7 @@ Java_com_aimindmesh_whisper_WhisperContext_nativeTranscribeFile(
     }
 
     std::string json = format_result(ctx);
-    return env->NewStringUTF(json.c_str());
+    return utf8_to_jstring(env, json);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -248,7 +263,7 @@ Java_com_aimindmesh_whisper_WhisperContext_nativeTranscribeAudio(
     }
 
     std::string json = format_result(ctx);
-    return env->NewStringUTF(json.c_str());
+    return utf8_to_jstring(env, json);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -329,7 +344,7 @@ Java_com_aimindmesh_whisper_WhisperContext_nativeTranscribeAudioOptimized(
     }
 
     std::string json = format_result(ctx);
-    return env->NewStringUTF(json.c_str());
+    return utf8_to_jstring(env, json);
 }
 
 // ============================================================================
@@ -380,7 +395,7 @@ static void streaming_segment_callback(
         int64_t t1 = whisper_full_get_segment_t1(ctx, i) * 10;
         
         if (text && strlen(text) > 0) {
-            jstring jText = env->NewStringUTF(text);
+            jstring jText = utf8_to_jstring(env, text);
             
             // Call Java callback: onSegment(String text, long startMs, long endMs, int segmentIndex)
             env->CallVoidMethod(
@@ -513,5 +528,5 @@ Java_com_aimindmesh_whisper_WhisperContext_nativeTranscribeAudioStreaming(
     }
 
     std::string json = format_result(ctx);
-    return env->NewStringUTF(json.c_str());
+    return utf8_to_jstring(env, json);
 }

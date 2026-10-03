@@ -1,3 +1,4 @@
+import type { PluginListenerHandle } from '@capacitor/core';
 import { logger } from '../logger';
 import { Vosk } from 'vosk-capacitor';
 
@@ -8,8 +9,8 @@ import { Vosk } from 'vosk-capacitor';
 export class VoskSpeechToTextService {
     private currentModelId: string | null = null;
     private isRecognizing: boolean = false;
-    private listenerHandles: any[] = [];
-    private accumulatedTranscript: string = '';
+    private listenerHandles: PluginListenerHandle[] = [];
+    private startToken = 0;
     private context: string = 'unknown'; // Tracks which feature is using Vosk (meeting|voicechat)
 
     public isRecognitionActive(): boolean { return this.isRecognizing; }
@@ -90,6 +91,19 @@ export class VoskSpeechToTextService {
     }
 
     /**
+     * Native Vosk records with its own AudioRecord, which fails without RECORD_AUDIO and
+     * nothing else asks for it before a voice call.
+     */
+    private async ensureMicrophonePermission(): Promise<void> {
+        const status = await Vosk.checkPermissions();
+        if (status.microphone === 'granted') return;
+        const requested = await Vosk.requestPermissions();
+        if (requested.microphone !== 'granted') {
+            throw new Error('Microphone permission denied. Please grant microphone access to use voice input.');
+        }
+    }
+
+    /**
      * Start speech recognition
      * @param onUpdate Callback that receives the full transcript
      * @param _apiKey Optional API key (ignored)
@@ -110,52 +124,74 @@ export class VoskSpeechToTextService {
 
         logger.log('info', 'Starting Vosk recognition');
         this.isRecognizing = true;
+        // stop() bumps the token: a start still awaiting the bridge must then undo itself,
+        // otherwise the mic kept recording (and listeners kept firing) after hang-up
+        const token = ++this.startToken;
+        const handles: PluginListenerHandle[] = [];
+        const isCurrent = () => token === this.startToken;
+        const abandon = async () => {
+            for (const handle of handles) {
+                await handle.remove().catch(() => { /* already removed */ });
+            }
+        };
+        // Per-session transcript: a late event from the previous session cannot leak in
+        let accumulated = '';
 
         try {
+            await this.ensureMicrophonePermission();
+            if (!isCurrent()) return abandon();
+
             logger.log('info', '[VoskSTT] Setting up event listeners...');
 
             // Setup event listeners
-            const partialHandle = await Vosk.addListener('partialResult', (result: { text: string }) => {
-                if (result.text) {
+            handles.push(await Vosk.addListener('partialResult', (result: { text: string }) => {
+                if (result.text && isCurrent()) {
                     logger.log('info', `[VoskSTT] Partial result: ${result.text}`);
-                    onUpdate((this.accumulatedTranscript + ' ' + result.text).trim());
+                    onUpdate((accumulated + ' ' + result.text).trim());
                 }
-            });
+            }));
 
-            const finalHandle = await Vosk.addListener('finalResult', (result: { text: string }) => {
-                if (result.text) {
+            handles.push(await Vosk.addListener('finalResult', (result: { text: string }) => {
+                if (result.text && isCurrent()) {
                     logger.log('info', `[VoskSTT] Final result: ${result.text}`);
-                    this.accumulatedTranscript = (this.accumulatedTranscript + ' ' + result.text).trim();
-                    onUpdate(this.accumulatedTranscript);
+                    accumulated = (accumulated + ' ' + result.text).trim();
+                    onUpdate(accumulated);
                 }
-            });
+            }));
 
             // Listen for audio level (if implemented in plugin)
-            let audioLevelHandle: any = null;
             if (onAudioLevel) {
                 logger.log('info', '[VoskSTT] Setting up audio level listener');
-                audioLevelHandle = await Vosk.addListener('audioLevel' as any, ((result: { level: number }) => {
-                    onAudioLevel(result.level);
-                }) as any);
+                handles.push(await Vosk.addListener('audioLevel', (result: { level: number }) => {
+                    if (isCurrent()) onAudioLevel(result.level);
+                }));
             }
 
-            const errorHandle = await Vosk.addListener('error', (error: { message: string }) => {
+            handles.push(await Vosk.addListener('error', (error: { message: string }) => {
                 logger.log('error', 'Vosk recognition error: ' + error.message);
-            });
+            }));
 
-            this.listenerHandles = [partialHandle, finalHandle, errorHandle];
-            if (audioLevelHandle) {
-                this.listenerHandles.push(audioLevelHandle);
-            }
+            if (!isCurrent()) return abandon();
+            this.listenerHandles = handles;
 
             logger.log('info', '[VoskSTT] Event listeners set up, calling Vosk.startRecognition()...');
 
             // Start recognition
             await Vosk.startRecognition();
 
+            if (!isCurrent()) {
+                // stop() ran before the native recorder existed, so its stopRecognition was a no-op
+                await Vosk.stopRecognition().catch(() => { /* nothing to stop */ });
+                return abandon();
+            }
+
             logger.log('info', 'Vosk recognition started');
         } catch (error) {
-            this.isRecognizing = false;
+            await abandon();
+            if (isCurrent()) {
+                this.isRecognizing = false;
+                this.listenerHandles = [];
+            }
             logger.log('error', 'Failed to start Vosk recognition', error);
             throw error;
         }
@@ -170,25 +206,22 @@ export class VoskSpeechToTextService {
         }
 
         logger.log('info', 'Stopping Vosk recognition');
+        // Synchronously detach: a start() racing with this stop sees the new token and undoes
+        // itself, and a new start() can begin without these handles being removed under it
+        this.startToken++;
+        this.isRecognizing = false;
+        const handles = this.listenerHandles;
+        this.listenerHandles = [];
 
         try {
             await Vosk.stopRecognition();
-
-            // Remove event listeners
-            for (const handle of this.listenerHandles) {
-                await handle.remove();
-            }
-            this.listenerHandles = [];
-
-            this.isRecognizing = false;
-
-            // CRITICAL: Clear accumulated transcript to prevent contamination
-            this.accumulatedTranscript = '';
-
-            logger.log('info', 'Vosk recognition stopped');
         } catch (error) {
             logger.log('error', 'Failed to stop Vosk recognition', error);
         }
+        for (const handle of handles) {
+            await handle.remove().catch(() => { /* already removed */ });
+        }
+        logger.log('info', 'Vosk recognition stopped');
     }
 
     /**

@@ -3,6 +3,7 @@ import { RECOMMENDED_MODELS, downloadModel, deleteLocalModel, cancelDownload, Mo
 import { fileImportService } from '../services/file/fileImportService';
 import { logger } from '../services/logger';
 import { LLMConfig } from '../types';
+import { useDownloadResume } from './useDownloadResume';
 import type { GenieModelInfo } from 'genie-capacitor';
 
 export const useNativeModels = (
@@ -79,6 +80,13 @@ export const useNativeModels = (
         checkModels();
     }, [externalLiteRTModels]);
 
+    // Downloads started before this screen was last closed keep running natively
+    useDownloadResume(
+        RECOMMENDED_MODELS.map(m => ({ id: m.id, url: m.url, filename: m.id + '.gguf' })),
+        setDownloadProgress,
+        (id, ok) => { if (ok) setDownloadedModels(prev => prev.includes(id) ? prev : [...prev, id]); }
+    );
+
     const handleDownloadModel = async (model: typeof RECOMMENDED_MODELS[0]) => {
         triggerHaptic();
         const filename = model.id + '.gguf';
@@ -104,7 +112,7 @@ export const useNativeModels = (
 
             const { modelExists } = await import('../services/model/modelDownloader');
             if (await modelExists(filename)) {
-                setDownloadedModels(prev => [...prev, model.id]);
+                setDownloadedModels(prev => prev.includes(model.id) ? prev : [...prev, model.id]);
             }
 
             setTimeout(() => {
@@ -117,6 +125,11 @@ export const useNativeModels = (
 
         } catch (e) {
             logger.log('error', 'Download failed', e);
+            setDownloadProgress(prev => {
+                const newState = { ...prev };
+                delete newState[model.id];
+                return newState;
+            });
             alert('Download failed: ' + (e as any).message);
         }
     };

@@ -1,6 +1,7 @@
 import { RepoProvisionRequest } from './types';
 import axios from 'axios';
 import { GiteaService } from '../GiteaService';
+import { config } from '../../config';
 
 export class GiteaOrganizationService {
   private get baseUrl(): string {
@@ -91,25 +92,36 @@ export class GiteaOrganizationService {
     const serverWebhookUrl = process.env.SERVER_WEBHOOK_URL
       || 'http://aimindmesh-server:3030/api/organization/webhooks/gitea';
 
+    const headers = { 'Authorization': `token ${this.token}`, 'Content-Type': 'application/json' };
+    const hooksUrl = `${this.baseUrl}/api/v1/repos/${namespace}/${repoName}/hooks`;
+    // The server verifies X-Gitea-Signature with this secret (see api/routes/giteaWebhook.ts)
+    const hook = {
+      type: 'gitea',
+      config: {
+        url: serverWebhookUrl,
+        content_type: 'json',
+        secret: config.autoEvolution?.giteaWebhookSecret ?? '',
+      },
+      events: ['push', 'workflow_run', 'check_run'],
+      active: true,
+    };
+
+    // Update an existing hook (e.g. registered before signatures were required) instead of duplicating it
+    let existingId: number | undefined;
     try {
-      await axios.post(
-        `${this.baseUrl}/api/v1/repos/${namespace}/${repoName}/hooks`,
-        {
-          type: 'gitea',
-          config: {
-            url: serverWebhookUrl,
-            content_type: 'json',
-          },
-          events: ['push', 'workflow_run', 'check_run'],
-          active: true,
-        },
-        {
-          headers: {
-            'Authorization': `token ${this.token}`,
-            'Content-Type': 'application/json',
-          },
-        }
-      );
+      const res: any = await axios.get(hooksUrl, { headers });
+      existingId = (res.data as any[]).find(h => h?.config?.url === serverWebhookUrl)?.id;
+    } catch {
+      existingId = undefined; // listing failed: fall back to creating the hook
+    }
+
+    try {
+      if (existingId) {
+        const { type, ...patch } = hook;
+        await axios.patch(`${hooksUrl}/${existingId}`, patch, { headers });
+      } else {
+        await axios.post(hooksUrl, hook, { headers });
+      }
     } catch (e: any) {
       // 422 means webhook already exists — not an error
       if (e.response?.status !== 422) throw e;

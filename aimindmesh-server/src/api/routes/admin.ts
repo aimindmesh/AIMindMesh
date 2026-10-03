@@ -1,6 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import fs from 'fs';
 import { AdminService } from '../../services/AdminService';
+import { BackupService } from '../../services/BackupService';
 import { ProactiveEngine } from '../../services/ProactiveEngine';
 import * as FCMDispatcher from '../../services/FCMDispatcher';
 import { GiteaService } from '../../services/GiteaService';
@@ -8,12 +9,19 @@ import db from '../../db/sqlite';
 import { Logger } from '../../utils/Logger';
 import { InferenceRouter } from '../../services/InferenceRouter';
 import { OpenRouterService } from '../../services/OpenRouterService';
+import { redactConfig, stripRedacted } from '../../utils/configRedaction';
+import { DebateEngine, DEFAULT_PARTICIPANTS } from '../../services/DebateEngine';
+import { InferenceRegistry } from '../../services/InferenceRegistry';
+import { WikiSynthesisService } from '../../services/WikiSynthesisService';
+import { WikiManager } from '../../services/WikiManager';
+import { config } from '../../config';
+import { NodeRegistry } from '../../services/NodeRegistry';
+import { InferenceProviders } from '../../services/InferenceProviders';
 
 export default async function (fastify: FastifyInstance) {
   fastify.get('/config', async (request, reply) => {
-    const { DEFAULT_PARTICIPANTS } = require('../../services/DebateEngine');
     return { 
-      config: AdminService.getConfig(),
+      config: redactConfig(AdminService.getConfig()),
       defaults: {
         debate: { participants: DEFAULT_PARTICIPANTS }
       }
@@ -22,8 +30,9 @@ export default async function (fastify: FastifyInstance) {
 
   fastify.patch('/config', async (request, reply) => {
     try {
-      const partialConfig = request.body as any;
-      return { config: AdminService.updateConfig(partialConfig) };
+      // Masked secrets sent back by clients must not overwrite the real values
+      const partialConfig = stripRedacted(request.body);
+      return { config: redactConfig(AdminService.updateConfig(partialConfig)) };
     } catch (err: any) {
       reply.code(500).send({ error: err.message || 'Internal Server Error' });
       return reply;
@@ -36,7 +45,6 @@ export default async function (fastify: FastifyInstance) {
   });
 
   fastify.get('/activity', async (request, reply) => {
-    const { InferenceRegistry } = require('../../services/InferenceRegistry');
     return { activeInferences: InferenceRegistry.getActive() };
   });
 
@@ -80,7 +88,6 @@ export default async function (fastify: FastifyInstance) {
   });
 
   fastify.post('/debate/merge', async (request, reply) => {
-    const { DebateEngine } = require('../../services/DebateEngine');
     const result = await DebateEngine.runMergeCycle().catch((e: any) => {
       request.log.error('Manual merge cycle failed: ' + e.message);
       return { started: false, message: e.message };
@@ -89,7 +96,6 @@ export default async function (fastify: FastifyInstance) {
   });
 
   fastify.post('/debate/reprocess', async (request, reply) => {
-    const { DebateEngine } = require('../../services/DebateEngine');
     const { limit } = request.body as any;
     DebateEngine.reprocessRecentThreads(limit || 20).catch((e: any) => {
       Logger.error('AdminRouter', 'Manual reprocess failed: ' + e.message);
@@ -114,20 +120,18 @@ export default async function (fastify: FastifyInstance) {
   });
 
   fastify.post('/wiki/trigger', async (request, reply) => {
-    const { WikiSynthesisService } = require('../../services/WikiSynthesisService');
     const result = await WikiSynthesisService.runCycle().catch((e: any) => {
       Logger.error('AdminRouter', 'Manual Wiki synthesis failed: ' + e.message);
       return { error: e.message };
     });
     
-    if (result.queued) {
+    if ('queued' in result && result.queued) {
       return { ok: true, message: 'Wiki synthesis cycle queued (another one is running)' };
     }
     return { ok: true, message: 'Wiki synthesis cycle triggered successfully' };
   });
   
   fastify.post('/wiki/force-save', async (request, reply) => {
-    const { WikiManager } = require('../../services/WikiManager');
     const { title, body, tags, neo4jId } = request.body as any;
     
     if (!title || !body) {
@@ -155,8 +159,6 @@ export default async function (fastify: FastifyInstance) {
   });
 
   fastify.post('/nodes/refresh', async (request, reply) => {
-    const { config } = require('../../config');
-    const { NodeRegistry } = require('../../services/NodeRegistry');
     await NodeRegistry.discoverAndRegisterLocalModels(config.ollama.baseUrl, config.ollama.defaultModel);
     return { ok: true, nodes: NodeRegistry.getNodes() };
   });
@@ -171,7 +173,6 @@ export default async function (fastify: FastifyInstance) {
   });
 
   fastify.get('/openrouter/models', async (request, reply) => {
-    const { InferenceProviders } = require('../../services/InferenceProviders');
     try {
       const models = await InferenceProviders.fetchOpenRouterModels();
       return { models };
@@ -329,13 +330,17 @@ export default async function (fastify: FastifyInstance) {
       return reply;
     }
     try {
-      await AdminService.restoreBackup(filename);
-      return { ok: true, message: 'Restore initiated. Server state updated.' };
+      const result = await AdminService.restoreBackup(filename);
+      // The staged restore is applied at boot: exit only after the response reached the client
+      if (result.restarting) reply.raw.once('finish', () => BackupService.exitForRestore());
+      return { ok: true, ...result };
     } catch (err: any) {
-      reply.code(500).send({ error: err.message });
+      reply.code(err.statusCode || 500).send({ error: err.message });
       return reply;
     }
   });
+
+  fastify.get('/backups/restore-status', async () => BackupService.getRestoreStatus());
 
   fastify.delete('/backups/:filename', async (request, reply) => {
     const { filename } = request.params as any;

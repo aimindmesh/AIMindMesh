@@ -6,6 +6,8 @@
 import { logger } from '../logger';
 import Voxtral from './voxtralPlugin';
 import type { PluginListenerHandle } from '@capacitor/core';
+import { requestMicrophonePermission } from '../../utils/permissions';
+import { ensureResident, markUnloaded } from '../model/modelOrchestrator';
 
 export interface VoxtralToken {
     text: string;
@@ -35,6 +37,23 @@ export interface VoxtralTranscriptResult {
 }
 
 /**
+ * The native plugin emits `start_ms`/`end_ms` while callers read `startMs`/`endMs`, so meeting
+ * segments fell back to the absolute `timestampMs` (epoch) as their offsets. Normalize to the
+ * camelCase fields; the snake_case ones stay on the object for compatibility.
+ */
+export function normalizeVoxtralTokens(tokens: unknown): VoxtralToken[] {
+    if (!Array.isArray(tokens)) return [];
+    return tokens.map((raw: any) => ({
+        ...raw,
+        text: typeof raw?.text === 'string' ? raw.text : '',
+        timestampMs: raw?.timestampMs ?? Date.now(),
+        confidence: raw?.confidence ?? 1,
+        startMs: raw?.startMs ?? raw?.start_ms,
+        endMs: raw?.endMs ?? raw?.end_ms,
+    }));
+}
+
+/**
  * Voxtral STT Service
  * Provides streaming and batch transcription using Mistral Voxtral Mini 4B Realtime
  */
@@ -42,6 +61,7 @@ export class VoxtralSTTService {
     private isModelLoaded = false;
     private currentModelPath: string | null = null;
     private isStreaming = false;
+    private startToken = 0;
     private tokenListener: PluginListenerHandle | null = null;
     private errorListener: PluginListenerHandle | null = null;
     private accumulatedTranscript: string = '';
@@ -109,18 +129,8 @@ export class VoxtralSTTService {
                 await this.unloadModel();
             }
 
-            // Memory coordination: try to unload main LLM to free RAM
-            try {
-                const { releaseAllSmolLM, isSmolLMLoaded } = await import('../llm/smolLM');
-                if (isSmolLMLoaded('chat') || isSmolLMLoaded('tool')) {
-                    logger.log('info', '[VoxtralSTT] Unloading main LLM to free memory for Voxtral...');
-                    await releaseAllSmolLM();
-                    logger.log('info', '[VoxtralSTT] Main LLM unloaded successfully');
-                }
-            } catch (e) {
-                // Not critical — LLM might not be loaded
-                logger.log('debug', '[VoxtralSTT] LLM unload skipped (not loaded or unavailable)');
-            }
+            // Memory coordination: Voxtral is heavy, the LLM (any engine) and other heavy models go first
+            await ensureResident('voxtral');
 
             // Find mmproj file (multimodal projector)
             // It should be in the same directory (voxtral-models)
@@ -206,6 +216,7 @@ export class VoxtralSTTService {
             await Voxtral.unloadModel();
             this.isModelLoaded = false;
             this.currentModelPath = null;
+            markUnloaded('voxtral');
             logger.log('info', 'Voxtral model unloaded');
         } catch (error) {
             logger.log('error', 'Failed to unload Voxtral model', error);
@@ -257,39 +268,73 @@ export class VoxtralSTTService {
         logger.log('info', 'Starting Voxtral streaming');
         this.isStreaming = true;
         this.currentCallback = onUpdate;
+        this.accumulatedTranscript = '';
+        // stop() bumps the token; a start still in flight then tears itself down instead of
+        // leaving native capture running after the caller stopped
+        const token = ++this.startToken;
+        const isCurrent = () => token === this.startToken;
+        let tokenListener: PluginListenerHandle | null = null;
+        let errorListener: PluginListenerHandle | null = null;
+        const abandon = async () => {
+            await tokenListener?.remove().catch(() => { /* already removed */ });
+            await errorListener?.remove().catch(() => { /* already removed */ });
+        };
 
         try {
+            // Native capture uses its own AudioRecord: make sure RECORD_AUDIO is granted first
+            // (getUserMedia triggers the Android permission prompt through the WebView)
+            const hasPermission = await requestMicrophonePermission();
+            if (!hasPermission) {
+                throw new Error('Microphone permission denied. Please grant microphone access to use voice input.');
+            }
+            if (!isCurrent()) return abandon();
+
             // Setup token listener
-            this.tokenListener = await Voxtral.addListener('voxtralTokens', (data: { tokens: VoxtralToken[] }) => {
-                if (data.tokens && data.tokens.length > 0) {
-                    // Accumulate tokens
-                    const newText = data.tokens.map(t => t.text).join('');
+            tokenListener = await Voxtral.addListener('voxtralTokens', (data: { tokens: unknown }) => {
+                const tokens = normalizeVoxtralTokens(data?.tokens);
+                if (tokens.length > 0 && isCurrent()) {
+                    // Accumulate tokens; callers get the accumulated text plus this delta's tokens
+                    const newText = tokens.map(t => t.text).join('');
                     this.accumulatedTranscript += newText;
 
-                    logger.log('info', `[VoxtralSTT] Received ${data.tokens.length} tokens: ${newText}`);
+                    logger.log('info', `[VoxtralSTT] Received ${tokens.length} tokens: ${newText}`);
 
                     // Send update
                     if (this.currentCallback) {
-                        this.currentCallback(this.accumulatedTranscript, data.tokens);
+                        this.currentCallback(this.accumulatedTranscript, tokens);
                     }
                 }
             });
 
             // Setup error listener
-            this.errorListener = await Voxtral.addListener('voxtralError', (data) => {
+            errorListener = await Voxtral.addListener('voxtralError', (data) => {
                 logger.log('error', `[VoxtralSTT] Native error: code=${data.code} message=${data.message}`);
                 if (this.onErrorCallback) {
                     this.onErrorCallback(data);
                 }
             });
 
+            if (!isCurrent()) return abandon();
+            this.tokenListener = tokenListener;
+            this.errorListener = errorListener;
+
             // Start streaming
             await Voxtral.startRealtimeTranscription();
 
+            if (!isCurrent()) {
+                await Voxtral.stopRealtimeTranscription().catch(() => { /* nothing to stop */ });
+                return abandon();
+            }
+
             logger.log('info', 'Voxtral streaming started');
         } catch (error) {
-            this.isStreaming = false;
-            this.currentCallback = null;
+            await abandon();
+            if (isCurrent()) {
+                this.isStreaming = false;
+                this.currentCallback = null;
+                this.tokenListener = null;
+                this.errorListener = null;
+            }
             logger.log('error', 'Failed to start Voxtral streaming', error);
             throw error;
         }
@@ -304,30 +349,25 @@ export class VoxtralSTTService {
         }
 
         logger.log('info', 'Stopping Voxtral streaming');
+        // Detach synchronously so a racing start() undoes itself and a new start() is not
+        // affected by this stop's awaits
+        this.startToken++;
+        this.isStreaming = false;
+        this.currentCallback = null;
+        this.onErrorCallback = null;
+        this.accumulatedTranscript = '';
+        const listeners = [this.tokenListener, this.errorListener];
+        this.tokenListener = null;
+        this.errorListener = null;
 
         try {
             await Voxtral.stopRealtimeTranscription();
-
-            // Remove listeners
-            if (this.tokenListener) {
-                await this.tokenListener.remove();
-                this.tokenListener = null;
-            }
-            if (this.errorListener) {
-                await this.errorListener.remove();
-                this.errorListener = null;
-            }
-
-            this.isStreaming = false;
-            this.currentCallback = null;
-            this.onErrorCallback = null;
-
-            // Clear accumulated transcript
-            this.accumulatedTranscript = '';
-
             logger.log('info', 'Voxtral streaming stopped');
         } catch (error) {
             logger.log('error', 'Failed to stop Voxtral streaming', error);
+        }
+        for (const listener of listeners) {
+            await listener?.remove().catch(() => { /* already removed */ });
         }
     }
 

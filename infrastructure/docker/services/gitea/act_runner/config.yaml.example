@@ -1,0 +1,27 @@
+# act_runner configuration (hardened). Copy to config.yaml next to docker-compose.yml.
+log:
+  level: info
+
+runner:
+  file: .runner
+  # One job at a time: the VPS also runs the AIMindMesh services
+  capacity: 1
+  timeout: 1h
+  labels:
+    - "ubuntu-latest:docker://node:22-bookworm"
+
+cache:
+  enabled: false
+
+container:
+  # Dedicated bridge network, isolated from wirehole_private_network (10.2.0.0/24)
+  network: "ci_jobs"
+  privileged: false
+  # "-" = do NOT mount the Docker socket into job containers
+  docker_host: "-"
+  # No host paths can be mounted by workflows
+  valid_volumes: []
+  force_pull: false
+
+host:
+  workdir_parent:

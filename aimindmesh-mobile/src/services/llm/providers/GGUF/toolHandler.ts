@@ -4,6 +4,7 @@ import { getFormattedToolDefinitions } from '../../../toolDefinitions';
 import { ToolCall, parseReActToolCalls } from '../../../tools';
 import * as nativeLLM from '../../nativeLLM';
 import { estimateTokens } from '../../context/unifiedContextManager';
+import { toChatRole } from '../../roles';
 
 export const isToolCallingEnabled = (llmConfig: LLMConfig): boolean => {
     return llmConfig.enableToolCalling === true;
@@ -34,10 +35,11 @@ async function getRelevantContextSummary(
     try {
         let summary = '';
         // We use the 'chat' slot because it already has the KV cache warm.
-        // We pass it as a messages array with a final system/user turn.
+        // Chat-template messages ({role, content}): app Messages carry `text` and role 'model'.
+        // The instruction is the final user turn (templates reject a system role after the start).
         const messages = [
-            ...history.slice(-10), // Take the last 10 messages for safety if sync is needed
-            { role: 'system' as any, content: summaryInstruction }
+            ...history.slice(-10).map(m => ({ role: toChatRole(m.role), content: m.text })),
+            { role: 'user', content: summaryInstruction }
         ];
 
         for await (const chunk of nativeLLM.generateNativeStream({

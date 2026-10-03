@@ -5,16 +5,11 @@ import android.util.Log;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
 
 import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
-import java.nio.FloatBuffer;
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import ai.onnxruntime.NodeInfo;
@@ -26,18 +21,21 @@ import ai.onnxruntime.OrtEnvironment;
 import ai.onnxruntime.OrtSession;
 
 /**
- * Text embedder using ONNX Runtime with HuggingFace tokenizer.
- * Supports models like all-MiniLM-L6-v2.
+ * Text embedder using ONNX Runtime with a HuggingFace tokenizer (WordPiece or Unigram).
+ * Supports models like all-MiniLM-L6-v2, E5, BGE and multilingual-e5.
  */
 public class TextEmbedder {
     private static final String TAG = "TextEmbedder";
+    /** Input cap when the model files do not declare one (BERT-family position limit) */
+    private static final int DEFAULT_MAX_SEQUENCE_LENGTH = 512;
 
     private final Context context;
     private OrtEnvironment env;
     private OrtSession session;
-    private BertTokenizer tokenizer;
+    private EmbeddingTokenizer tokenizer;
     private int embeddingDimension = 384; // Default for MiniLM
-    private int maxSequenceLength = 128;
+    private int maxSequenceLength = DEFAULT_MAX_SEQUENCE_LENGTH;
+    private String loadedModelDir;
     private boolean isLoaded = false;
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
@@ -47,48 +45,50 @@ public class TextEmbedder {
     }
 
     /**
-     * Load model from directory containing model.onnx, tokenizer.json, config.json
-     * 
+     * Load model from directory containing model.onnx, tokenizer.json, config.json.
+     * The new model is built completely before it replaces the current one, so a failed load
+     * leaves the previous model usable, and the replaced session is closed (no native leak).
+     *
      * @param modelDir Directory path relative to app data
-     * @return Embedding dimension on success, -1 on failure
+     * @return Embedding dimension on success
      */
     public int loadModel(String modelDir) throws Exception {
         lock.writeLock().lock();
         try {
-            // Resolve full model directory path
-            File baseDir = context.getFilesDir();
-            File modelDirectory = new File(baseDir, modelDir);
+            if (isLoaded && session != null && modelDir.equals(loadedModelDir)) {
+                Log.i(TAG, "Model already loaded: " + modelDir);
+                return embeddingDimension;
+            }
 
+            File modelDirectory = new File(context.getFilesDir(), modelDir);
             if (!modelDirectory.exists()) {
                 throw new IOException("Model directory not found: " + modelDirectory.getAbsolutePath());
             }
 
-            // Load config.json to get model parameters
+            // config.json: dimension and position limit (downloaded models may only declare hidden_size)
+            int dimension = -1;
+            int maxLength = DEFAULT_MAX_SEQUENCE_LENGTH;
             File configFile = new File(modelDirectory, "config.json");
             if (configFile.exists()) {
                 try (FileReader reader = new FileReader(configFile)) {
-                    Gson gson = new Gson();
-                    JsonObject config = gson.fromJson(reader, JsonObject.class);
-                    if (config.has("hidden_size")) {
-                        embeddingDimension = config.get("hidden_size").getAsInt();
+                    JsonObject config = new Gson().fromJson(reader, JsonObject.class);
+                    if (config != null && config.has("hidden_size")) {
+                        dimension = config.get("hidden_size").getAsInt();
                     }
-                    if (config.has("max_position_embeddings")) {
-                        maxSequenceLength = Math.min(config.get("max_position_embeddings").getAsInt(), 512);
+                    if (config != null && config.has("max_position_embeddings")) {
+                        maxLength = Math.min(config.get("max_position_embeddings").getAsInt(), DEFAULT_MAX_SEQUENCE_LENGTH);
                     }
                 }
             }
-            Log.i(TAG, "Config loaded: dim=" + embeddingDimension + ", maxLen=" + maxSequenceLength);
 
-            // Load tokenizer
             File tokenizerFile = new File(modelDirectory, "tokenizer.json");
-            File tokenizerConfigFile = new File(modelDirectory, "tokenizer_config.json");
             if (!tokenizerFile.exists()) {
                 throw new IOException("tokenizer.json not found in model directory");
             }
-            tokenizer = new BertTokenizer(tokenizerFile, tokenizerConfigFile);
-            Log.i(TAG, "Tokenizer loaded");
+            TokenizerJson.Loaded loadedTokenizer = TokenizerJson.load(tokenizerFile, new File(modelDirectory, "tokenizer_config.json"));
+            if (loadedTokenizer.maxLength > 0) maxLength = Math.min(maxLength, loadedTokenizer.maxLength);
+            Log.i(TAG, "Tokenizer loaded (" + loadedTokenizer.tokenizer.getClass().getSimpleName() + "), maxLen=" + maxLength);
 
-            // Load ONNX model
             File modelFile = new File(modelDirectory, "model.onnx");
             if (!modelFile.exists()) {
                 throw new IOException("model.onnx not found in model directory");
@@ -99,45 +99,64 @@ public class TextEmbedder {
             // Use 1 thread for inference to prevent deadlocks with LlamaCpp/LiteRT thread pools
             sessionOptions.setIntraOpNumThreads(1);
             sessionOptions.setInterOpNumThreads(1);
+            OrtSession newSession = env.createSession(modelFile.getAbsolutePath(), sessionOptions);
+            if (dimension <= 0) dimension = outputDimension(newSession);
+            if (dimension <= 0) dimension = 384;
 
-            session = env.createSession(modelFile.getAbsolutePath(), sessionOptions);
-            Log.i(TAG, "ONNX session created");
-
+            OrtSession previous = session;
+            session = newSession;
+            tokenizer = loadedTokenizer.tokenizer;
+            embeddingDimension = dimension;
+            maxSequenceLength = maxLength;
+            loadedModelDir = modelDir;
             isLoaded = true;
+            if (previous != null) {
+                try {
+                    previous.close();
+                } catch (Exception e) {
+                    Log.e(TAG, "Error closing previous session", e);
+                }
+            }
+            Log.i(TAG, "ONNX session created: dim=" + dimension + ", maxLen=" + maxLength);
             return embeddingDimension;
         } finally {
             lock.writeLock().unlock();
         }
     }
 
+    /** Last dimension of the first output with a known shape, -1 when not declared. */
+    private static int outputDimension(OrtSession newSession) {
+        try {
+            for (NodeInfo info : newSession.getOutputInfo().values()) {
+                if (info.getInfo() instanceof TensorInfo) {
+                    long[] shape = ((TensorInfo) info.getInfo()).getShape();
+                    if (shape.length >= 2 && shape[shape.length - 1] > 0) return (int) shape[shape.length - 1];
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Could not read output shape", e);
+        }
+        return -1;
+    }
+
     /**
      * Generate embedding for a single text
      */
     public float[] generateEmbedding(String text) throws Exception {
-        Log.i(TAG, "generateEmbedding: acquiring readLock");
         lock.readLock().lock();
         try {
-            Log.i(TAG, "generateEmbedding: readLock acquired, checking state");
             if (!isLoaded || session == null || tokenizer == null) {
                 throw new IllegalStateException("Model not loaded");
             }
 
-            Log.i(TAG, "generateEmbedding: Tokenizing text");
-            // Tokenize text
             TokenizerOutput tokens = tokenizer.encode(text, maxSequenceLength);
 
-            Log.i(TAG, "generateEmbedding: Creating input tensors");
-            // Create input tensors
             long[] inputIds = tokens.inputIds;
             long[] attentionMask = tokens.attentionMask;
             long[] tokenTypeIds = tokens.tokenTypeIds;
 
             Map<String, OnnxTensor> inputs = new HashMap<>();
-
-            Log.i(TAG, "generateEmbedding: Analyzing model inputs");
-            // Analyze model inputs
             Map<String, NodeInfo> inputInfo = session.getInputInfo();
-            Log.i(TAG, "generateEmbedding: Preparing data arrays");
 
             // Helper to create tensor with correct type
             for (String inputName : inputInfo.keySet()) {
@@ -171,10 +190,7 @@ public class TextEmbedder {
                 }
             }
 
-            // Run inference
-            Log.i(TAG, "Calling ONNX session.run()");
             OrtSession.Result result = session.run(inputs);
-            Log.i(TAG, "ONNX session.run() completed");
 
             // Get output - different models have different output names
             // Try common names: last_hidden_state, sentence_embedding, embeddings
@@ -275,6 +291,7 @@ public class TextEmbedder {
                 session = null;
             }
             tokenizer = null;
+            loadedModelDir = null;
             isLoaded = false;
         } finally {
             lock.writeLock().unlock();
@@ -300,6 +317,11 @@ public class TextEmbedder {
         return embeddingDimension;
     }
 
+    /** Directory of the loaded model (null when none): JS compares it with the selected model. */
+    public String getLoadedModelDir() {
+        return loadedModelDir;
+    }
+
     /**
      * Helper class to hold tokenizer output
      */
@@ -307,5 +329,15 @@ public class TextEmbedder {
         public long[] inputIds;
         public long[] attentionMask;
         public long[] tokenTypeIds;
+
+        /** Single unpadded sequence: every position attended, one segment. */
+        static TokenizerOutput of(long[] inputIds) {
+            TokenizerOutput output = new TokenizerOutput();
+            output.inputIds = inputIds;
+            output.attentionMask = new long[inputIds.length];
+            java.util.Arrays.fill(output.attentionMask, 1L);
+            output.tokenTypeIds = new long[inputIds.length];
+            return output;
+        }
     }
 }

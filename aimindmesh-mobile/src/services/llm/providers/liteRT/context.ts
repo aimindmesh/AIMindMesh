@@ -1,8 +1,9 @@
 import { Capacitor } from '@capacitor/core';
 import { logger } from '../../../logger';
 import { Message, LLMConfig } from '../../../../types';
-import { LiteRT, state, stopLiteRTGeneration, releaseLiteRTSession } from './plugin';
+import { LiteRT, state, stopLiteRTGeneration, releaseLiteRTSession, syncLiteRTTools } from './plugin';
 import { refineContext } from '../../context/unifiedContextManager';
+import { canAppendToSession, snapshotOf } from './sessionTracking';
 
 // Safeguard limit for context window
 export const SAFEGUARD_CONTEXT_SIZE = 2048;
@@ -32,6 +33,13 @@ export async function syncNativeContext(
         }
     }
 
+    // Tool calling off: the native side must stop appending tool definitions
+    try {
+        await syncLiteRTTools(llmConfig.enableToolCalling);
+    } catch (e) {
+        logger.log('warn', '[LiteRT] Failed to sync native tool registration', e);
+    }
+
     let messagesToFormat: Message[] = history;
     let systemPromptToUse = systemPrompt;
     let appendMode = false;
@@ -47,7 +55,8 @@ export async function syncNativeContext(
             const { count } = await LiteRT.getMessageCount();
             const expectedCount = Math.max(0, history.length - 1);
 
-            if (history.length > 1 && count > 0 && count <= expectedCount) {
+            // Append only to the session built from this same thread, exactly one exchange later
+            if (history.length > 1 && canAppendToSession(state.sessionSnapshot, history, count)) {
                 logger.log('info', `[LiteRT] 🔗 Context sync valid (Native: ${count}, Expected: ${expectedCount}). Appending new message.`);
                 messagesToFormat = [history[history.length - 1]];
                 systemPromptToUse = '';
@@ -110,6 +119,8 @@ export async function syncNativeContext(
     }
 
     state.lastRunWasBackground = isBackground;
+    // The session about to be used now corresponds to this history (full transcript or appended turn)
+    state.sessionSnapshot = usePersistentContext ? snapshotOf(history) : null;
 
     return { messagesToFormat, systemPromptToUse, appendMode };
 }

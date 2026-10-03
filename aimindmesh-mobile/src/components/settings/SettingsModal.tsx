@@ -308,6 +308,11 @@ const SettingsModal: React.FC<SettingsModalProps> = (props) => {
                   isSyncing={s.isSyncingState}
                   onSync={s.handleSync}
                 />
+                {s.syncResultState && (
+                  <div className={`mt-3 text-xs font-medium ${s.syncResultState.ok ? 'text-green-500' : 'text-red-400'}`}>
+                    {s.syncResultState.ok ? 'Sync completed' : `Sync failed: ${s.syncResultState.error}`}
+                  </div>
+                )}
                 {/* Auto-sync toggle */}
                 <div className="flex items-center justify-between mt-6 pt-5 border-t border-white/5">
                   <div>

@@ -3,17 +3,31 @@ import { CloseIcon, SaveIcon } from '../../constants';
 import { TranscriptSegment } from '../../types/meeting';
 import { exportMeetingAs } from '../../services/meeting/meetingExportService';
 import { meetingExportPlugin } from '../../services/meeting/meetingExportPlugin';
+import { prepareMeetingAudioExport } from '../../services/meeting/meetingStorage';
 import { logger } from '../../services/logger';
 import { useLocalStorage } from '../../hooks/useLocalStorage';
 import { AIMindMeshServerSettings, DEFAULT_AIMINDMESH_SERVER_SETTINGS } from '../../types';
 import { extractMeetingCandidates, MeetingActionCandidate } from '../../services/meetingOrganizationBridge';
 import { organizationApi } from '../../services/organizationApi';
 
+/** The saved meeting being exported (its real date and duration, and whether it has audio) */
+export interface ExportMeetingInfo {
+    id: string;
+    timestamp: number;
+    /** Seconds */
+    duration: number;
+    hasAudio?: boolean;
+    audioMimeType?: string;
+}
+
 interface ExportBottomSheetProps {
     isOpen: boolean;
     onClose: () => void;
     transcript: TranscriptSegment[];
     speakerNames: Record<number, string>;
+    meeting?: ExportMeetingInfo;
+    /** Format selected when the sheet opens (e.g. 'audio' from the history's audio button) */
+    initialFormat?: string;
     onExportComplete?: (filePath: string) => void;
 }
 
@@ -22,6 +36,8 @@ const ExportBottomSheet: React.FC<ExportBottomSheetProps> = ({
     onClose,
     transcript,
     speakerNames,
+    meeting,
+    initialFormat,
     onExportComplete
 }) => {
     const [aimindmeshServer] = useLocalStorage<AIMindMeshServerSettings>(
@@ -29,7 +45,7 @@ const ExportBottomSheet: React.FC<ExportBottomSheetProps> = ({
         DEFAULT_AIMINDMESH_SERVER_SETTINGS
     );
 
-    const [format, setFormat] = useState<string>('markdown');
+    const [format, setFormat] = useState<string>(initialFormat ?? (transcript.length === 0 && meeting?.hasAudio ? 'audio' : 'markdown'));
     const [includeTimestamps, setIncludeTimestamps] = useState(true);
     const [includeSpeakers, setIncludeSpeakers] = useState(true);
     const [isExporting, setIsExporting] = useState(false);
@@ -44,15 +60,28 @@ const ExportBottomSheet: React.FC<ExportBottomSheetProps> = ({
     if (!isOpen) return null;
 
     const handleExport = async () => {
+        if (format !== 'audio' && transcript.length === 0) {
+            alert('No transcript to export');
+            return;
+        }
         setIsExporting(true);
         try {
-            const mockMeeting = {
-                id: Date.now().toString(),
-                timestamp: Date.now(),
+            if (format === 'audio' && meeting) {
+                const audio = await prepareMeetingAudioExport(meeting.id, meeting.audioMimeType);
+                await meetingExportPlugin.shareFile(audio.filePath, audio.mimeType, 'Share Meeting Audio');
+                if (onExportComplete) onExportComplete(audio.filePath);
+                onClose();
+                return;
+            }
+
+            // The real meeting: a placeholder made exports carry the export time and no duration
+            const exportedMeeting = {
+                id: meeting?.id ?? Date.now().toString(),
+                timestamp: meeting?.timestamp || Date.now(),
                 transcript,
                 speakerNames,
-                duration: 0,
-                hasAudio: false
+                duration: meeting?.duration ?? 0,
+                hasAudio: !!meeting?.hasAudio
             };
 
             const options = {
@@ -61,15 +90,15 @@ const ExportBottomSheet: React.FC<ExportBottomSheetProps> = ({
             };
 
             if (format === 'pdf') {
-                const { content } = await exportMeetingAs(mockMeeting, 'pdf', options);
-                await meetingExportPlugin.exportToPDF(content, `Meeting_Export_${mockMeeting.id}`);
+                const { content } = await exportMeetingAs(exportedMeeting, 'pdf', options);
+                await meetingExportPlugin.exportToPDF(content, `Meeting_Export_${exportedMeeting.id}`);
                 onClose();
             } else {
-                const { content, extension } = await exportMeetingAs(mockMeeting, format as any, options);
-                const filename = `meeting_${mockMeeting.id}.${extension}`;
+                const { content, extension, mimeType } = await exportMeetingAs(exportedMeeting, format as any, options);
+                const filename = `meeting_${exportedMeeting.id}.${extension}`;
                 const filePath = await meetingExportPlugin.saveTextFile(content, filename);
 
-                await meetingExportPlugin.shareFile(filePath, undefined, 'Share Meeting Export');
+                await meetingExportPlugin.shareFile(filePath, mimeType, 'Share Meeting Export');
 
                 if (onExportComplete) onExportComplete(filePath);
                 onClose();
@@ -164,6 +193,7 @@ const ExportBottomSheet: React.FC<ExportBottomSheetProps> = ({
         { id: 'pdf', label: 'PDF Document (.pdf)', desc: 'Professional printable report' },
         { id: 'srt', label: 'Subtitles (.srt)', desc: 'Standard video subtitle format' },
         { id: 'vtt', label: 'Web Video Subtitles (.vtt)', desc: 'For web video players' },
+        ...(meeting?.hasAudio ? [{ id: 'audio', label: 'Audio Recording', desc: 'The original meeting audio' }] : []),
     ];
 
     return (

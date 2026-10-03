@@ -12,12 +12,12 @@ export async function extractConceptsLocally(text: string): Promise<string[]> {
   Text: ${text.slice(0, 2000)}`;
 
   try {
-    const res = await serverApi.post('/api/inference/chat', {
+    const res = await serverApi.post<{ content?: string; response?: string }>('/api/chat', {
       messages: [{ role: 'user', content: prompt }],
-      personality: { name: 'Extractor', systemPrompt: 'Return JSON' }
+      taskType: 'CONCEPT_EXTRACTION'
     });
     
-    const fullResponse = res.data.response || '';
+    const fullResponse = res.data.content || res.data.response || '';
     const match = fullResponse.match(/\[.*\]/s);
     if (match) {
       const concepts = JSON.parse(match[0]);

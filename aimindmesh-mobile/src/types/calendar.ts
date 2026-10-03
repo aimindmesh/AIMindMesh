@@ -1,3 +1,4 @@
+import type { AiStoragePolicy, AiExecutionStatus, AiTaskExecution } from '@aimindmesh/api-types';
 /**
  * Calendar Types
  * Type definitions for the Agenda/Calendar module including Tasks
@@ -139,31 +140,8 @@ export type TaskAssignee = 'user' | 'ai';
 /** Modello AI da usare sul server */
 export type AiModel = 'auto' | 'ollama' | 'gemini' | 'openclaw';
 
-/** Policy di salvataggio output sul server */
-export type AiStoragePolicy = 'server_disk' | 'server_disk_gitea';
-
-/** Stato dell'ultima (o corrente) esecuzione AI */
-export type AiExecutionStatus =
-  | 'scheduled'     // in attesa del trigger
-  | 'queued'        // nella coda del server
-  | 'running'       // il modello sta generating
-  | 'completed'     // esecuzione riuscita
-  | 'failed'        // errore
-  | 'needs_review'; // output pronto, l'utente deve approvare
-
-/** Dati dell'ultima esecuzione — popolati dal server */
-export interface AiTaskExecution {
-  executionId: string;
-  taskId: string;
-  status: AiExecutionStatus;
-  startedAt?: number;
-  completedAt?: number;
-  errorMessage?: string;
-  artifactPath?: string;
-  giteaCommitUrl?: string;
-  outputSummary?: string;
-  updatedAt: number;
-}
+// Wire formats shared with the server (aimindmesh-server/src/types/api.ts)
+export type { AiStoragePolicy, AiExecutionStatus, AiTaskExecution };
 
 /** Configurazione delegazione AI — presente su CalendarTask solo se assignee === 'ai' */
 export interface AiTaskConfig {

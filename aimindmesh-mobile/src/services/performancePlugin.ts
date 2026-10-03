@@ -1,4 +1,4 @@
-import { registerPlugin } from '@capacitor/core';
+import { registerPlugin, PluginListenerHandle } from '@capacitor/core';
 
 export type ThermalTier = 'UNKNOWN' | 'NORMAL' | 'WARM' | 'HOT' | 'VERY_HOT' | 'CRITICAL';
 
@@ -14,6 +14,10 @@ export interface PerformancePlugin {
     startKeepAlive(): Promise<void>;
     stopKeepAlive(): Promise<void>;
     getThermalStatus(): Promise<ThermalStatus>;
+    /** Action requested by the launch intent (assistant gesture, wake word): read once */
+    consumeLaunchAction(): Promise<{ action: string | null }>;
+    /** Model unload requests from MemoryPressureManager (onTrimMemory) */
+    addListener(eventName: 'trimComponent', listener: (event: { component: string }) => void): Promise<PluginListenerHandle>;
 }
 
 const Performance = registerPlugin<PerformancePlugin>('Performance');

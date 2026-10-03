@@ -1,6 +1,5 @@
 import { ProactiveSettings, DEFAULT_PROACTIVE_SETTINGS } from '../../types/index';
-import ProactivePlugin from './ProactivePlugin';
-import { Capacitor } from '@capacitor/core';
+import { syncNativeProactiveSettings } from './nativeProactiveSync';
 
 class ProactiveSettingsStorage {
     private STORAGE_KEY = 'proactive-settings';
@@ -36,16 +35,13 @@ class ProactiveSettingsStorage {
 
     async save(settings: ProactiveSettings): Promise<void> {
         try {
-            const previousSettings = this.cachedSettings;
             const value = JSON.stringify(settings);
 
             // Save to standard localStorage for web/PWA
             localStorage.setItem(this.STORAGE_KEY, value);
 
-            // Save to Custom Plugin for Native Android (MainActivity.java reads this)
-            if (Capacitor.isNativePlatform()) {
-                await ProactivePlugin.updateSettings({ settings: value });
-            }
+            // Native side (MainActivity, the periodic job): settings plus start/stop on `enabled`
+            await syncNativeProactiveSettings(settings);
 
             this.cachedSettings = settings;
             this.notifyListeners(settings);
@@ -54,17 +50,6 @@ class ProactiveSettingsStorage {
             window.dispatchEvent(new CustomEvent('proactive-settings-changed', {
                 detail: settings,
             }));
-
-            // Handle native service toggle if we are on Native
-            if (previousSettings && previousSettings.enabled !== settings.enabled) {
-                if (Capacitor.isNativePlatform()) {
-                    if (settings.enabled) {
-                        await ProactivePlugin.startService();
-                    } else {
-                        await ProactivePlugin.stopService();
-                    }
-                }
-            }
         } catch (error) {
             console.error('Failed to save proactive settings:', error);
             throw error;

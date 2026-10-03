@@ -1,0 +1,75 @@
+# CI for the AIMindMesh monorepo (Gitea Actions).
+# Runner setup: infrastructure/docker/services/gitea/act_runner/ and DEVELOPMENT_GUIDE.md.
+#
+# Branches written by the auto-evolution engine (feature/auto-*, fail/*) are skipped on purpose:
+# running their code here would execute LLM-written code on the runner. Those patches are
+# already type-checked by the server (PatchTypeChecker) before the PR is opened.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  server:
+    if: ${{ !startsWith(github.head_ref, 'feature/auto-') && !startsWith(github.head_ref, 'fail/') }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aimindmesh-server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # src/config.ts is not versioned (deployment-specific): the example has the same interface
+      - run: cp src/config.ts.example src/config.ts
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run typecheck:test
+      - run: npm test
+
+  client:
+    if: ${{ !startsWith(github.head_ref, 'feature/auto-') && !startsWith(github.head_ref, 'fail/') }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aimindmesh-client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npx tsc --noEmit
+
+  admin-mobile:
+    if: ${{ !startsWith(github.head_ref, 'feature/auto-') && !startsWith(github.head_ref, 'fail/') }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aimindmesh-admin-mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --legacy-peer-deps
+      - run: npx tsc -p tsconfig.app.json --noEmit
+
+  mobile:
+    if: ${{ !startsWith(github.head_ref, 'feature/auto-') && !startsWith(github.head_ref, 'fail/') }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aimindmesh-mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm test

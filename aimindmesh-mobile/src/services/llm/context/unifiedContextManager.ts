@@ -44,22 +44,46 @@ export function estimateTokens(text: string): number {
 }
 
 /**
+ * Tokens kept free for the answer. Never more than half the window: a response style
+ * larger than the context (e.g. 4000 on a 2048 model) would otherwise leave no room for input.
+ */
+export function getResponseReserve(contextSize: number, maxResponseTokens: number): number {
+    return Math.max(64, Math.min(maxResponseTokens, Math.floor(contextSize / 2)));
+}
+
+/** Input windows of the remote providers (tokens). nCtx/contextSize describe on-device models only. */
+const PROVIDER_CONTEXT_WINDOWS: Record<string, number> = {
+    gemini: 1_000_000,
+    claude: 200_000,
+    perplexity: 127_000,
+    openrouter: 32_000,
+    'aimindmesh-server': 32_000,
+    local: 8_192,
+};
+
+export function getProviderContextWindow(provider: string): number | undefined {
+    return PROVIDER_CONTEXT_WINDOWS[provider];
+}
+
+/**
  * Tiered Context Refinement
  * 1. Prunes older conversational history.
  * 2. Prunes non-essential sections of the system prompt (RAG context).
  * 3. Keeps core personality and instructions intact as much as possible.
+ * The last message is always kept (truncated if needed): an empty history breaks every provider.
  */
 export function refineContext(
     history: Message[],
     systemPrompt: string,
     config: LLMConfig,
-    maxResponseTokens: number = 512
+    maxResponseTokens: number = 512,
+    contextWindow?: number
 ): TruncationResult {
-    const contextSize = config.nCtx || config.contextSize || 2048;
+    const contextSize = contextWindow || config.nCtx || config.contextSize || 2048;
     const SAFETY_BUFFER = 100;
 
     // Calculate total allowed tokens for input
-    const allowedInputTokens = contextSize - maxResponseTokens - SAFETY_BUFFER;
+    const allowedInputTokens = contextSize - getResponseReserve(contextSize, maxResponseTokens) - SAFETY_BUFFER;
 
     let currentSystemPrompt = systemPrompt;
     let systemTokens = estimateTokens(currentSystemPrompt);
@@ -122,15 +146,13 @@ export function refineContext(
             messageTokens += msgLen;
         } else if (keptMessages.length === 0 && i === history.length - 1) {
             // Always keep at least the last message, even if we have to truncate it
-            const allowedMsgChars = Math.floor(messageBudget * CHARS_PER_TOKEN);
-            if (allowedMsgChars > 20) {
-                keptMessages.unshift({
-                    ...msg,
-                    text: msg.text.substring(0, allowedMsgChars) + "...[Truncated]"
-                });
-                messageTokens += messageBudget;
-                truncated = true;
-            }
+            const allowedMsgChars = Math.max(200, Math.floor(messageBudget * CHARS_PER_TOKEN));
+            keptMessages.unshift({
+                ...msg,
+                text: msg.text.substring(0, allowedMsgChars) + "...[Truncated]"
+            });
+            messageTokens += Math.max(0, messageBudget);
+            truncated = true;
             break;
         } else {
             truncated = true;

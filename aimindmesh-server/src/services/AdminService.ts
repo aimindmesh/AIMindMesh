@@ -6,7 +6,6 @@ import { NodeRegistry } from './NodeRegistry';
 import crypto from 'crypto';
 import db from '../db/sqlite';
 import { Logger } from '../utils/Logger';
-import { driver } from '../db/neo4j';
 import * as FCMDispatcher from './FCMDispatcher';
 import { ProactiveEngine } from './ProactiveEngine';
 import { DebateEngine } from './DebateEngine';
@@ -56,11 +55,6 @@ export class AdminService {
     Logger.info('Admin', 'Server configuration persistently updated using Deep Merge and Hot-Reloaded');
     
     return merged as ServerConfig;
-  }
-
-  public static async deleteDocument(docId: string): Promise<void> {
-    Logger.info('KG', `Deleting document and all associated chunks: ${docId}`);
-    const session = driver.session();
   }
 
   private static getCPUUsage(): Promise<number> {
@@ -182,7 +176,7 @@ export class AdminService {
       openClawHealth,
       hermesHealth,
       ingestionStats: await this.getIngestionStats()
-    };
+    } satisfies import('../types/api').ServerStatus;
 
   }
 

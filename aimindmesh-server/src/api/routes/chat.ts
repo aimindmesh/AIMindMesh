@@ -2,16 +2,25 @@ import { FastifyInstance } from 'fastify';
 import { InferenceRouter, TaskType } from '../../services/InferenceRouter';
 import { NodeRegistry } from '../../services/NodeRegistry';
 import db from '../../db/sqlite';
+import { Logger } from '../../utils/Logger';
+import { config } from '../../config';
+import { normalizeRouting } from '../../utils/routing';
+import { deleteConversation } from '../../services/conversations';
+import { buildChatPrompt } from '../../utils/chatPrompt';
 
 export default async function (fastify: FastifyInstance) {
   fastify.post('/', async (request, reply) => {
-    const body = request.body as { messages: {role:string, content:string}[], stream?: boolean, taskType?: TaskType };
+    const body = (request.body ?? {}) as {
+      messages: {role:string, content:string}[], stream?: boolean, taskType?: TaskType, options?: { routing?: string }
+    };
+    if (!Array.isArray(body.messages)) return reply.code(400).send({ error: 'messages is required' });
+    // Preferred node chosen by the client (body option or x-routing header)
+    const routing = normalizeRouting(body.options?.routing ?? request.headers['x-routing']);
     
-    const prompt = body.messages.map(m => `${m.role}: ${m.content}`).join('\n');
+    const prompt = buildChatPrompt(body.messages);
     const taskType = body.taskType || 'GENERAL_CHAT';
     const tokensEstimate = prompt.length / 4;
     
-    const Logger = require('../../utils/Logger').Logger;
     Logger.debug('ChatAPI', `New REST request: type=${taskType}, promptLen=${prompt.length}`);
 
     try {
@@ -19,9 +28,10 @@ export default async function (fastify: FastifyInstance) {
         type: taskType,
         prompt,
         tokensEstimate,
-        options: { taskName: 'User Chat Response' }
+        options: { taskName: 'User Chat Response', routing }
       });
-      return { role: 'assistant', content: result.response, usedNode: result.provider };
+      // `response` mirrors `content` for clients (and installed APKs) that read that field
+      return { role: 'assistant', content: result.response, response: result.response, usedNode: result.provider };
     } catch (e: any) {
       reply.code(500).send({ error: e.message });
     }
@@ -33,14 +43,13 @@ export default async function (fastify: FastifyInstance) {
     const localOllama = nodes.find((n:any) => n.id === 'SERVER_LOCAL' || n.type === 'server');
     
     // Honor configuration preference
-    const preferred = (require('../../config').config.routing?.preferredNode || 'AUTO') as string;
+    const preferred = (config.routing?.preferredNode || 'AUTO') as string;
     
     if (preferred === 'SERVER_LOCAL' && localOllama) return { activeNode: 'SERVER_LOCAL' };
     if (preferred !== 'AUTO' && nodes.find((n:any) => n.id.toUpperCase() === preferred.toUpperCase())) return { activeNode: preferred };
     
     // Default fallback priority: PC -> Server Ollama -> Gemini
     const active = pcNode ? pcNode.id : localOllama ? 'SERVER_LOCAL' : 'GEMINI_API';
-    const Logger = require('../../utils/Logger').Logger;
     Logger.debug('ChatAPI', `Calculated active node: ${active} (preferred=${preferred})`);
     return { activeNode: active };
   });
@@ -52,8 +61,7 @@ export default async function (fastify: FastifyInstance) {
   });
 
   fastify.delete('/conversations/:id', async (req: any) => {
-    db.prepare('DELETE FROM direct_chats WHERE conversation_id = ?').run(req.params.id);
-    db.prepare('DELETE FROM conversations WHERE id = ?').run(req.params.id);
+    deleteConversation(req.params.id);
     return { ok: true };
   });
 

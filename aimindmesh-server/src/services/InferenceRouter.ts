@@ -9,6 +9,7 @@ import { SearchService } from './SearchService';
 import { InferenceRegistry } from './InferenceRegistry';
 import { InferenceProviders } from './InferenceProviders';
 import { GeminiQueueManager } from './GeminiQueueManager';
+import { LEAKED_CLOUD_LOCK_MS, lockEngine, lockTimeoutMs } from './inference/lockTimeouts';
 import crypto from 'crypto';
 
 export type TaskType = 'EVOLUTION' | 'INTENT_CLASSIFICATION' | 'QUERY_EXPANSION' | 'CONCEPT_EXTRACTION' | 'CONCEPT_ENRICHMENT' | 'IMPROVEMENT_DETECTION' |
@@ -56,7 +57,6 @@ export class InferenceRouter {
 
   public static nodeSockets = new Map<string, any>();
   public static pendingMobileTasks = new Map<string, { callback: (result: any) => void, onUpdate?: (update: any) => void, cleanup: () => void, node: string }>();
-  private static nodePenalties = new Map<string, number>();
   private static taskCompletionListeners: Array<(id: string, result: string, metadata: any, type: TaskType) => Promise<void>> = [];
 
   public static onTaskCompleted(listener: (id: string, result: string, metadata: any, type: TaskType) => Promise<void>) {
@@ -72,8 +72,6 @@ export class InferenceRouter {
 
   public static async init(): Promise<void> {
     try {
-      this.nodePenalties.clear();
-      
       // Load Gemini rolling window from DB
       await GeminiQueueManager.init();
 
@@ -176,7 +174,8 @@ export class InferenceRouter {
           }, 5000);
         } catch (e) { Logger.warn('InferenceRouter', `Recovery parse failed for task ${row.id}`); }
       }
-      setInterval(() => this.checkStaleTasks(), 60000);
+      // processQueue too: tasks blocked by a lock released here must not wait for the next event
+      setInterval(() => { this.checkStaleTasks(); void this.processQueue(); }, 60000);
     } catch (err: any) { Logger.error('InferenceRouter', `Init failed: ${err.message}`); }
   }
 
@@ -423,11 +422,6 @@ export class InferenceRouter {
         const info = InferenceRegistry.get(taskId);
         if (info?.status === 'PROCESSING') {
           const tgt = (info.provider || 'SERVER_LOCAL').toUpperCase();
-          const engine = info.payload?.options?.model ? 'OLLAMA' : 
-                         (tgt === 'HERMES' ? 'HERMES' : 
-                         (tgt === 'OPENCLAW' ? 'OPENCLAW' : 
-                         (info.payload?.type === 'AGENTIC' || info.payload?.type === 'AGENTIC_TASK' ? 'OPENCLAW' : 'OLLAMA')));
-
           // Determine engine type based on provider and payload
           let engineType: EngineType = 'OLLAMA';
           if (tgt === 'GEMINI' || tgt === 'GEMINI_API') engineType = 'GEMINI';
@@ -455,7 +449,7 @@ export class InferenceRouter {
       const now = Date.now();
       for (const [lock, lockInfo] of this.activeLocks.entries()) {
         const isCloud = lock.includes('GEMINI') || lock.includes('OPENROUTER');
-        const gracePeriod = isCloud ? 120000 : 24 * 60 * 60 * 1000; // 2 minutes for cloud, 24h for local/mobile
+        const gracePeriod = isCloud ? LEAKED_CLOUD_LOCK_MS : lockTimeoutMs(lockEngine(lock));
 
         if (now - lockInfo.timestamp > gracePeriod && !processingLockKeys.has(lock)) {
           Logger.warn('InferenceRouter', `[QUEUE] Force-clearing leaked lock: ${lock} (Held for ${Math.round((now - lockInfo.timestamp)/1000)}s)`);
@@ -486,8 +480,8 @@ export class InferenceRouter {
 
           if (!isEmbedding && this.activeLocks.has(lockKey)) {
             const lockInfo = this.activeLocks.get(lockKey);
-            // Self-healing: Unlock if lock is older than timeout (configurable, default 24h)
-            const timeout = engine === 'MOBILE' ? 24 * 60 * 60 * 1000 : (config.ollama?.timeoutMs || 86400000);
+            // Self-healing: unlock if the lock is older than the engine's lock timeout
+            const timeout = lockTimeoutMs(engine);
             if (lockInfo && (Date.now() - lockInfo.timestamp > timeout)) {
               const staleTaskId = lockInfo.id;
               Logger.warn('InferenceRouter', `[QUEUE] Forcibly releasing stale lock: ${lockKey} (Held by Task [${staleTaskId.slice(0, 8)}], running for >${timeout / 1000}s)`);
@@ -658,8 +652,6 @@ ${searchContext}
     } catch (err: any) {
       if (signal?.aborted) {
         // Check if this was a stale lock timeout kill
-        const lockInfo = this.activeLocks.get(lockKey); // Might be gone, check registry
-        const timeout = engine === 'MOBILE' ? 24 * 60 * 60 * 1000 : (config.ollama?.timeoutMs || 86400000);
         const taskEntry = InferenceRegistry.get(id);
         
         // If it was aborted and it's taking too long, it's likely a timeout-triggered kill
@@ -743,7 +735,6 @@ ${searchContext}
   private static _attemptRetry(item: { id: string, payload: TaskPayload, resolve: any, reject: any, lastProvider?: string }, err: any): boolean {
     const payload = item.payload;
     const id = item.id;
-    if (item.lastProvider) this.nodePenalties.set(item.lastProvider.toUpperCase(), Date.now() + 60000);
 
     const errMsg = err.message || '';
     const isGeminiQuota = errMsg.includes('GEMINI_QUOTA_EXCEEDED') || errMsg.includes('429');

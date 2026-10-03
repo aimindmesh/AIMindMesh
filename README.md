@@ -80,7 +80,14 @@ A lightweight Tauri-based client that bridges high-performance PC hardware into 
 
 ---
 
-## 🛡️ 4. Infrastructure & Privacy Stack
+## 📟 4. AIMindMesh Admin Mobile & Hermes
+
+- **Admin Mobile** (`aimindmesh-admin-mobile`): Capacitor app to operate the server from the phone — inference queue, nodes, logs, Kasm sessions, document ingestion, auto-evolution proposals and server configuration (secrets are shown masked).
+- **Hermes** (`aimindmesh-hermes`): NousResearch Hermes agent container, an alternative agent runtime next to OpenClaw, configured from the `*.example` files in its folder.
+
+---
+
+## 🛡️ 5. Infrastructure & Privacy Stack
 
 - **WireHole VPN**: WireGuard tunnel + PiHole (DNS privacy) + Unbound (Recursive DNS).
 - **Gitea**: Self-hosted Git service for autonomous VCS and evolution patches.
@@ -96,7 +103,11 @@ A lightweight Tauri-based client that bridges high-performance PC hardware into 
 ### Setup Workflow
 1. **Foundation**: Run `./deploy_infrastructure.sh` on your VPS. This sets up the networking, Gitea, SearXNG, and Kasm, while automatically disabling any native Neo4j services to prevent port conflicts.
 2. **Brain**: Deploy `aimindmesh-server` using Docker Compose. Use `./deploy_to_cloud.sh --full` for a complete automated setup of the Server, Neo4j, and OpenClaw gateway.
-3. **Nodes**: Configure Mobile and PC nodes to point to your VPS WireGuard internal IP.
+   - Create `config.json` from `config.json.example` and `src/config.ts` from `src/config.ts.example`. Set a strong `server.apiKey` and `autoEvolution.giteaWebhookSecret` (use the same secret in the Gitea webhook settings).
+   - Place `firebase-service-account.json` next to `docker-compose.yml`: it is mounted at runtime, never baked into the image.
+   - The server (3030) and Neo4j (7474/7687) are published only on `127.0.0.1` and the VPN address `10.2.0.1`.
+3. **Nodes**: Point the Mobile app, the PC client and the Admin mobile app to `http://10.2.0.1:3030` over WireGuard, with the server API key (sent as `x-api-key`, and as `?token=` on WebSockets).
+4. **CI (optional)**: register a Gitea Actions runner with the hardened example in `infrastructure/docker/services/gitea/act_runner/` to run `.gitea/workflows/ci.yml` (see `DEVELOPMENT_GUIDE.md`).
 
 ### OpenClaw Agent Setup
 The OpenClaw agent requires a configuration folder containing its skills and auth tokens.
@@ -106,7 +117,7 @@ The OpenClaw agent requires a configuration folder containing its skills and aut
 3. The folder is automatically ignored by Git to protect your tokens.
 
 ### Automation Scripts
-The repository includes `.example.sh` templates for rapid deployment (e.g., `deploy_to_cloud.sh`, `publish_android.sh`). Copy to `.sh`, configure, and run. 
+The repository includes `*.sh.example` templates for rapid deployment (e.g., `deploy_to_cloud.sh.example`, `publish_android.sh.example`). Copy each one without the `.example` suffix, configure, and run. 
 - Use `./deploy_to_cloud.sh --full` to deploy and configure the entire server stack (Server, Neo4j, OpenClaw).
 - These files are git-ignored to protect your private credentials.
 

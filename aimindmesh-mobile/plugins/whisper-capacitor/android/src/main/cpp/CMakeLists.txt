@@ -36,11 +36,18 @@ message(STATUS "Whisper root: ${WHISPER_ROOT}")
 set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(WHISPER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(WHISPER_SDL2 OFF CACHE BOOL "" FORCE)
-set(GGML_ native OFF CACHE BOOL "" FORCE) # Avoid -march=native on Android cross-compile
+set(GGML_NATIVE OFF CACHE BOOL "" FORCE) # Avoid -march=native on Android cross-compile
 set(WHISPER_NO_AVX ON CACHE BOOL "" FORCE)
 set(WHISPER_NO_AVX2 ON CACHE BOOL "" FORCE)
 set(WHISPER_NO_FMA ON CACHE BOOL "" FORCE)
 set(WHISPER_NO_F16C ON CACHE BOOL "" FORCE)
+
+# whisper and its ggml (0.9.5) are linked STATICALLY into libwhisper-capacitor.so.
+# Shared, they shipped libggml*.so files that collided with the newer ggml of the GenieX
+# SDK in the APK (pickFirst kept whisper's copies and broke Genie's GGUF/OpenCL path).
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+add_compile_options(-ffunction-sections -fdata-sections)
 
 # include whisper.cpp project
 add_subdirectory(${WHISPER_ROOT} whisper_build)
@@ -51,7 +58,6 @@ add_library(whisper-capacitor SHARED native-lib.cpp)
 # Include directories
 target_include_directories(whisper-capacitor PRIVATE
     ${WHISPER_ROOT}/include
-    ${WHISPER_ROOT}/examples
     ${WHISPER_ROOT}/ggml/include
     ${WHISPER_ROOT}/src
 )
@@ -63,7 +69,11 @@ target_link_libraries(whisper-capacitor
     ${log-lib}
 )
 
-# Android 15 16KB page size alignment
+# Android 15 16KB page size alignment.
+# --exclude-libs,ALL keeps the static ggml symbols private: only the JNI entry points are
+# exported, so they can never interpose with GenieX's libggml loaded in the same process.
 target_link_options(whisper-capacitor PRIVATE
     -Wl,-z,max-page-size=16384
+    -Wl,--exclude-libs,ALL
+    -Wl,--gc-sections
 )

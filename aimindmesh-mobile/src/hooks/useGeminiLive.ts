@@ -45,6 +45,9 @@ export const useGeminiLive = (personality: Personality, apiKey?: string, speechC
   const currentOutputTranscriptionRef = useRef('');
   const inputGainNodeRef = useRef<GainNode | null>(null);
   const isAiSpeakingRef = useRef(false);
+  // Read by the socket callbacks, which keep the state of the render that opened the session
+  const connectionStateRef = useRef<ConnectionState>(ConnectionState.IDLE);
+  connectionStateRef.current = connectionState;
 
   // Audio output refs
   const audioElementRef = useRef<HTMLAudioElement | null>(null);
@@ -375,7 +378,7 @@ export const useGeminiLive = (personality: Personality, apiKey?: string, speechC
           },
           onclose: (e: CloseEvent) => {
             logger.log('info', "Gemini Live session closed", e);
-            if (connectionState !== ConnectionState.DISCONNECTED) {
+            if (connectionStateRef.current !== ConnectionState.DISCONNECTED) {
               setConnectionState(ConnectionState.DISCONNECTED);
               cleanup();
             }
@@ -397,6 +400,15 @@ export const useGeminiLive = (personality: Personality, apiKey?: string, speechC
           ].join(' ')
         },
       });
+      // A failed connection (bad key, no network) rejects here, outside this try: report it
+      // and release the microphone instead of staying in "connecting"
+      sessionPromiseRef.current.catch((err: any) => {
+        logger.log('error', 'Gemini Live connection failed', err);
+        sessionPromiseRef.current = null;
+        setError(`Connection failed: ${err?.message || err}`);
+        setConnectionState(ConnectionState.ERROR);
+        cleanup();
+      });
 
 
     } catch (e) {
@@ -413,7 +425,7 @@ export const useGeminiLive = (personality: Personality, apiKey?: string, speechC
       setConnectionState(ConnectionState.ERROR);
       cleanup();
     }
-  }, [connectionState, personality, cleanup, stopSession, isSpeakerphoneOn, apiKey]);
+  }, [connectionState, personality, cleanup, stopSession, isSpeakerphoneOn, apiKey, speechConfig]);
 
   useEffect(() => {
     return () => {

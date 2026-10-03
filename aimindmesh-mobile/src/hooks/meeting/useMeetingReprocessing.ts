@@ -1,28 +1,37 @@
 import { useState, useRef, useCallback } from 'react';
+import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 import { Vosk } from 'vosk-capacitor';
-import { SpeakerEmbedding as SpeakerEmbeddingPlugin } from 'speaker-embedding-capacitor';
-// Filesystem import removed - no longer needed with live segment streaming
 import { TranscriptSegment } from '../../types/meeting';
 import { SpeechConfig } from '../../types';
 import { logger } from '../../services/logger';
 import { SpeakerClustering } from '../../services/speaker/speakerClustering';
-import { downsampleBuffer, floatToInt16, arrayBufferToBase64 } from '../../services/audio/audioUtils';
-import AudioConverter from '../../services/audio/audioConverter';
+import { alignClusterLabels } from '../../services/speaker/labelAlignment';
+import { floatToInt16, arrayBufferToBase64 } from '../../services/audio/audioUtils';
 import { getWhisperSTTService } from '../../services/stt/whisperSTT';
-import { Capacitor } from '@capacitor/core';
-import { getVADService, SpeechSegment } from '../../services/stt/vadService';
+import { newSegmentId } from '../../services/meeting/meetingIds';
+import { planChunks, whisperResultToSegments } from '../../services/meeting/reprocessHelpers';
+import { openMeetingPcm, PcmSource } from './meetingPcmSource';
+import { runFullAudioDiarization } from './fullAudioDiarization';
+
+const SAMPLE_RATE = 16000;
+/** Whisper gets 30 s per call: a whole meeting in one base64 string ran out of memory */
+const WHISPER_CHUNK_SAMPLES = 30 * SAMPLE_RATE;
+const VOSK_CHUNK_SAMPLES = SAMPLE_RATE;
 
 interface UseMeetingReprocessingProps {
     playback: any;
     speechConfig?: SpeechConfig;
-    transcript: TranscriptSegment[];
-    setTranscript: React.Dispatch<React.SetStateAction<TranscriptSegment[]>>;
-    diarizationRef: React.MutableRefObject<any>;
+    /** Latest transcript (a closure value would be the one from when the action started) */
+    getTranscript: () => TranscriptSegment[];
+    setTranscript: Dispatch<SetStateAction<TranscriptSegment[]>>;
+    getMeetingTimestamp: () => number;
+    diarizationRef: MutableRefObject<any>;
     settings: any;
     showToast: (msg: string, type?: 'success' | 'error' | 'info') => void;
     saveMeeting: () => Promise<void>;
-    pcmAudioBlobRef: React.MutableRefObject<Blob | null>;
-    audioFilePathRef: React.MutableRefObject<string | null>;
+    suspendAutosave: () => () => void;
+    pcmAudioBlobRef: MutableRefObject<Blob | null>;
+    audioFilePathRef: MutableRefObject<string | null>;
 }
 
 export interface MeetingReprocessingState {
@@ -32,29 +41,42 @@ export interface MeetingReprocessingState {
     fullAudioDiarization: () => Promise<void>;
     reclusterSpeakers: () => Promise<void>;
     handleCancelProcessing: () => void;
-    reprocessingStateRef: React.MutableRefObject<{
+    reprocessingStateRef: MutableRefObject<{
         audioData: Float32Array | null;
         currentOffset: number;
         isReprocessing: boolean;
     }>;
 }
 
+/** PCM of a WAV blob (header skipped) as Float32. */
+async function wavBlobToFloat(blob: Blob): Promise<Float32Array> {
+    const int16 = new Int16Array((await blob.arrayBuffer()).slice(44));
+    const out = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) out[i] = int16[i] / 32768.0;
+    return out;
+}
+
 export const useMeetingReprocessing = ({
     playback,
     speechConfig,
-    transcript,
+    getTranscript,
     setTranscript,
+    getMeetingTimestamp,
     diarizationRef,
     settings,
     showToast,
     saveMeeting,
+    suspendAutosave,
     pcmAudioBlobRef,
     audioFilePathRef
-}: UseMeetingReprocessingProps) => {
+}: UseMeetingReprocessingProps): MeetingReprocessingState => {
     const [isReclustering, setIsReclustering] = useState(false);
     const [processingStatus, setProcessingStatus] = useState<string>('');
 
     const abortProcessingRef = useRef<boolean>(false);
+    const busyRef = useRef(false);
+    /** Transcript before the run: restored when it fails or is cancelled */
+    const snapshotRef = useRef<TranscriptSegment[] | null>(null);
     const reprocessingStateRef = useRef<{
         audioData: Float32Array | null;
         currentOffset: number;
@@ -65,248 +87,186 @@ export const useMeetingReprocessing = ({
         isReprocessing: false
     });
 
+    const restoreSnapshot = useCallback(() => {
+        if (snapshotRef.current) setTranscript(snapshotRef.current);
+    }, [setTranscript]);
+
     const handleCancelProcessing = useCallback(() => {
         abortProcessingRef.current = true;
+        restoreSnapshot();
         setProcessingStatus('Cancelling...');
-    }, []);
+    }, [restoreSnapshot]);
+
+    /**
+     * One processing run at a time. Autosave is suspended while the transcript is rebuilt, the
+     * result is saved only when the run completes, otherwise the previous transcript comes back.
+     */
+    const runProcessing = async (task: () => Promise<boolean>) => {
+        if (busyRef.current) return;
+        busyRef.current = true;
+        abortProcessingRef.current = false;
+        snapshotRef.current = getTranscript();
+        const resumeAutosave = suspendAutosave();
+        setIsReclustering(true);
+        try {
+            const completed = await task();
+            if (completed && !abortProcessingRef.current) await saveMeeting();
+            else restoreSnapshot();
+        } catch (error) {
+            logger.log('error', 'Meeting processing failed', error);
+            showToast('Processing error', 'error');
+            restoreSnapshot();
+        } finally {
+            snapshotRef.current = null;
+            reprocessingStateRef.current = { audioData: null, currentOffset: 0, isReprocessing: false };
+            resumeAutosave();
+            busyRef.current = false;
+            setIsReclustering(false);
+            setProcessingStatus('');
+        }
+    };
+
+    const ensureWhisperModel = async (): Promise<boolean> => {
+        const whisperService = getWhisperSTTService();
+        if (!(await whisperService.ensureAvailable())) return false;
+        if (!(await whisperService.checkModelLoaded())) {
+            showToast('Loading Whisper model...', 'info');
+            setProcessingStatus('Loading AI Model...');
+            await whisperService.loadModel(speechConfig?.whisperModelId || 'ggml-base');
+        }
+        return true;
+    };
+
+    /** Whisper over the audio in 30 s chunks, segments placed on the recording timeline. */
+    const transcribeWithWhisper = async (source: PcmSource): Promise<TranscriptSegment[] | null> => {
+        const whisperService = getWhisperSTTService();
+        const meetingTimestamp = getMeetingTimestamp();
+        const config = {
+            language: settings.transcriptionLanguage,
+            temperature: speechConfig?.whisperTemperature ?? 0.0,
+            beamSize: speechConfig?.whisperBeamSize ?? 5
+        };
+
+        if (source.wavPath) {
+            setProcessingStatus('Transcribing file...');
+            const result = await whisperService.transcribeFile(source.wavPath, config);
+            return whisperResultToSegments(result, {
+                offsetMs: 0, durationMs: source.totalSamples / 16, meetingTimestamp, makeId: () => newSegmentId('whisper')
+            });
+        }
+
+        const segments: TranscriptSegment[] = [];
+        const chunks = planChunks(source.totalSamples, WHISPER_CHUNK_SAMPLES);
+        for (let i = 0; i < chunks.length; i++) {
+            if (abortProcessingRef.current) return null;
+            setProcessingStatus(`Transcribing: ${Math.round((i / chunks.length) * 100)}%`);
+            const { start, end } = chunks[i];
+            const samples = await source.read(start, end - start);
+            const result = await whisperService.transcribeAudio(
+                arrayBufferToBase64(floatToInt16(samples).buffer as ArrayBuffer), config as any, 'accurate'
+            );
+            segments.push(...whisperResultToSegments(result, {
+                offsetMs: start / 16, durationMs: (end - start) / 16, meetingTimestamp, makeId: () => newSegmentId('whisper')
+            }));
+        }
+        return segments;
+    };
+
+    /** Streams the audio to Vosk; segments arrive through the finalResult listener. */
+    const transcribeWithVosk = async (source: PcmSource, keepInMemory: boolean): Promise<boolean> => {
+        await (Vosk as any).startProcessing();
+        // In-memory audio lets precise mode extract embeddings of each utterance
+        const audioData = keepInMemory ? await source.read(0, source.totalSamples) : null;
+        reprocessingStateRef.current = { audioData, currentOffset: 0, isReprocessing: true };
+        setProcessingStatus('Streaming to Vosk...');
+
+        const chunks = planChunks(source.totalSamples, VOSK_CHUNK_SAMPLES);
+        for (let i = 0; i < chunks.length; i++) {
+            if (abortProcessingRef.current) break;
+            const { start, end } = chunks[i];
+            const samples = audioData ? audioData.subarray(start, end) : await source.read(start, end - start);
+            reprocessingStateRef.current.currentOffset = end;
+            await (Vosk as any).submitAudio({ data: arrayBufferToBase64(floatToInt16(samples).buffer as ArrayBuffer) });
+            if (i % 10 === 0) setProcessingStatus(`Processing: ${Math.round((i / chunks.length) * 100)}%`);
+            await new Promise(r => setTimeout(r, 5));
+        }
+
+        // Emits the last utterance before resolving
+        await (Vosk as any).stopProcessing();
+        // Let final results awaiting their embedding land before the save
+        await new Promise(r => setTimeout(r, 300));
+        return !abortProcessingRef.current;
+    };
+
+    const doFullAudioDiarization = async (): Promise<boolean> => {
+        const result = await runFullAudioDiarization({
+            audioUrl: playback.recordedAudioUrl,
+            audioFilePath: audioFilePathRef.current,
+            transcript: getTranscript(),
+            speechConfig,
+            targetSpeakerCount: settings.targetSpeakerCount,
+            similarityThreshold: diarizationRef.current.similarityThreshold,
+            showToast,
+            setStatus: setProcessingStatus,
+            isCancelled: () => abortProcessingRef.current
+        });
+        if (!result) return false;
+        setTranscript(result);
+        showToast(`Diarization complete (2-Pass + smoothing): ${new Set(result.map(s => s.speakerId)).size} speakers`, 'success');
+        return true;
+    };
 
     const reprocessMeeting = async () => {
         if (!playback.recordedAudioUrl) {
             showToast('No recorded audio to reprocess', 'error');
             return;
         }
+        const sttMode = speechConfig?.sttMode || 'vosk-only';
+        const useWhisper = sttMode === 'whisper-only' || sttMode === 'whisper-post' || sttMode === 'hybrid';
+        showToast(`Reprocessing in progress (${useWhisper ? 'Whisper' : 'Vosk'})...`, 'info');
 
-        try {
-            abortProcessingRef.current = false;
-            const sttMode = speechConfig?.sttMode || 'vosk-only';
-            const useWhisper = sttMode === 'whisper-only' || sttMode === 'whisper-post' || sttMode === 'hybrid';
-
-            showToast(`Reprocessing in progress (${useWhisper ? 'Whisper' : 'Vosk'})...`, 'info');
-            setIsReclustering(true);
+        await runProcessing(async () => {
             setProcessingStatus('Preparing audio...');
             setTranscript([]);
             diarizationRef.current.clear();
 
-            if (abortProcessingRef.current) throw new Error('Operazione annullata');
-
-            // 1. FILE BASED REPROCESSING (Best for memory)
-            if (audioFilePathRef.current) {
-                try {
-                    setProcessingStatus('Decoding audio file...');
-                    const decodeResult = await AudioConverter.decodeM4AToWav({ filePath: audioFilePathRef.current });
-                    const wavPath = decodeResult.filePath;
-                    logger.log('info', `Decoded M4A to WAV for reprocessing: ${wavPath}`);
-
-                    if (useWhisper) {
-                        const whisperService = getWhisperSTTService();
-
-                        if (await whisperService.ensureAvailable()) {
-                            if (!(await whisperService.checkModelLoaded())) {
-                                showToast('Loading Whisper model...', 'info');
-                                setProcessingStatus('Loading AI Model...');
-                                await whisperService.loadModel(speechConfig?.whisperModelId || 'ggml-base');
-                            }
-
-                            setProcessingStatus('Transcribing file...');
-                            // Whisper Plugin supports file input
-                            const result = await whisperService.transcribeFile(wavPath, {
-                                language: settings.transcriptionLanguage,
-                                temperature: speechConfig?.whisperTemperature ?? 0.0,
-                                beamSize: speechConfig?.whisperBeamSize ?? 5
-                            });
-
-                            if (result.segments && result.segments.length > 0) {
-                                const segments = result.segments.map((seg, index) => ({
-                                    id: `whisper_file_${Date.now()}_${index}`,
-                                    speakerId: 0,
-                                    text: seg.text.trim(),
-                                    timestamp: Date.now() + seg.startMs
-                                }));
-                                setTranscript(segments);
-                            } else if (result.text) {
-                                setTranscript([{
-                                    id: `whisper_file_${Date.now()}`,
-                                    speakerId: 0,
-                                    text: result.text.trim(),
-                                    timestamp: Date.now()
-                                }]);
-                            }
-                            showToast('Whisper transcription completed', 'success');
-
-                            if (speechConfig?.enableWhisperDiarization) {
-                                setProcessingStatus('Speaker Diarization...');
-                                await fullAudioDiarization();
-                            } else {
-                                await saveMeeting();
-                            }
-                            return;
-                        }
-                    }
-
-                    // Vosk Fallback for File (Chunked)
-                    if (abortProcessingRef.current) throw new Error('Operation cancelled');
-
-                    await (Vosk as any).startProcessing();
-                    setProcessingStatus('Streaming to Vosk...');
-
-                    const response = await fetch(Capacitor.convertFileSrc(wavPath));
-                    const blob = await response.blob();
-
-                    let offset = 44;
-                    const CHUNK_SIZE = 32000;
-                    const totalSize = blob.size;
-
-                    while (offset < totalSize) {
-                        if (abortProcessingRef.current) break;
-                        const chunkBlob = blob.slice(offset, offset + CHUNK_SIZE);
-                        const reader = new FileReader();
-                        const base64 = await new Promise<string>((resolve, reject) => {
-                            reader.onloadend = () => {
-                                const res = reader.result as string;
-                                resolve(res.split(',')[1]);
-                            };
-                            reader.onerror = reject;
-                            reader.readAsDataURL(chunkBlob);
-                        });
-
-                        await (Vosk as any).submitAudio({ data: base64 });
-                        offset += CHUNK_SIZE;
-
-                        if (offset % (CHUNK_SIZE * 5) === 0) {
-                            const progress = Math.round((offset / totalSize) * 100);
-                            setProcessingStatus(`Processing: ${progress}%`);
-                        }
-                        await new Promise(r => setTimeout(r, 5));
-                    }
-
-                    await (Vosk as any).stopProcessing();
-                    showToast('Reprocessing completed', 'success');
-                    await saveMeeting();
-                    return;
-
-                } catch (e) {
-                    logger.log('error', 'File reprocessing failed, falling back to legacy', e);
-                }
-            }
-
-            // 2. LEGACY MEMORY BASED REPROCESSING
-            let floatData: Float32Array;
-
-            if (pcmAudioBlobRef.current) {
-                logger.log('info', 'Using captured raw PCM data for reprocessing');
-                setProcessingStatus('Reading PCM data...');
-                const arrayBuffer = await pcmAudioBlobRef.current.arrayBuffer();
-                const int16Data = new Int16Array(arrayBuffer.slice(44));
-                floatData = new Float32Array(int16Data.length);
-                for (let i = 0; i < int16Data.length; i++) {
-                    floatData[i] = int16Data[i] / 32768.0;
-                }
+            let source: PcmSource;
+            if (!audioFilePathRef.current && pcmAudioBlobRef.current && pcmAudioBlobRef.current.size > 44) {
+                const data = await wavBlobToFloat(pcmAudioBlobRef.current);
+                source = { totalSamples: data.length, wavPath: null, read: async (s, c) => data.slice(s, s + c) };
             } else {
-                logger.log('warn', 'Raw PCM not available, retrieving from current audio');
-                const response = await fetch(playback.recordedAudioUrl);
-                const arrayBuffer = await response.arrayBuffer();
-                const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-                const audioContext = new AudioContextClass();
-                const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-                const originalData = audioBuffer.getChannelData(0);
-                floatData = downsampleBuffer(originalData, audioBuffer.sampleRate, 16000);
+                setProcessingStatus('Decoding audio...');
+                source = await openMeetingPcm(playback.recordedAudioUrl, audioFilePathRef.current);
             }
-
-            if (abortProcessingRef.current) throw new Error('Operazione annullata');
-
-            setProcessingStatus('Analyzing audio signal...');
-            const int16Data = floatToInt16(floatData);
+            if (abortProcessingRef.current) return false;
 
             if (useWhisper) {
                 try {
-                    const whisperService = getWhisperSTTService();
-                    const { blobTo16kHZPCM } = await import('../../services/audio/audioUtils');
-
-                    if (await whisperService.ensureAvailable()) {
-                        if (!(await whisperService.checkModelLoaded())) {
-                            showToast('Loading Whisper model...', 'info');
-                            setProcessingStatus('Loading AI Model...');
-                            await whisperService.loadModel(speechConfig?.whisperModelId || 'ggml-base');
-                        }
-
-                        let base64Audio: string;
-                        if (floatData && floatData.length > 0) {
-                            base64Audio = arrayBufferToBase64(int16Data.buffer as ArrayBuffer);
-                        } else {
-                            const response = await fetch(playback.recordedAudioUrl);
-                            const blob = await response.blob();
-                            base64Audio = await blobTo16kHZPCM(blob);
-                        }
-
-                        setProcessingStatus('Transcribing...');
-                        const result = await whisperService.transcribeAudio(base64Audio, {
-                            language: settings.transcriptionLanguage,
-                            temperature: speechConfig?.whisperTemperature ?? 0.0,
-                            beamSize: speechConfig?.whisperBeamSize ?? 5
-                        } as any, 'accurate');
-
-                        if (result.segments && result.segments.length > 0) {
-                            const segments = result.segments.map((seg, index) => ({
-                                id: `whisper_${Date.now()}_${index}`,
-                                speakerId: 0,
-                                text: seg.text.trim(),
-                                timestamp: Date.now()
-                            }));
-                            setTranscript(segments);
-                        } else if (result.text) {
-                            setTranscript([{
-                                id: `whisper_${Date.now()}`,
-                                speakerId: 0,
-                                text: result.text.trim(),
-                                timestamp: Date.now()
-                            }]);
-                        }
-
+                    if (await ensureWhisperModel()) {
+                        const segments = await transcribeWithWhisper(source);
+                        if (!segments) return false;
+                        setTranscript(segments);
                         showToast('Whisper transcription completed', 'success');
                         if (speechConfig?.enableWhisperDiarization) {
                             setProcessingStatus('Speaker Diarization...');
-                            await fullAudioDiarization();
-                        } else {
-                            await saveMeeting();
+                            // Reads the new transcript through getTranscript()
+                            await doFullAudioDiarization();
                         }
-                        return;
+                        return true;
                     }
                 } catch (e) {
                     logger.log('error', 'Whisper failed, fallback to Vosk', e);
                     showToast('Whisper failed, using Vosk', 'info');
+                    setTranscript([]);
                 }
             }
 
-            // Vosk fallback (Legacy)
-            await (Vosk as any).startProcessing();
-            reprocessingStateRef.current = {
-                audioData: floatData,
-                currentOffset: 0,
-                isReprocessing: true
-            };
-
-            const CHUNK_SIZE = 16000;
-            for (let i = 0; i < int16Data.length; i += CHUNK_SIZE) {
-                if (abortProcessingRef.current) break;
-                reprocessingStateRef.current.currentOffset = Math.min(i + CHUNK_SIZE, int16Data.length);
-                const chunk = int16Data.slice(i, i + CHUNK_SIZE);
-                const base64 = arrayBufferToBase64(chunk.buffer as ArrayBuffer);
-                await (Vosk as any).submitAudio({ data: base64 });
-                await new Promise(r => setTimeout(r, 10));
-            }
-
-            await (Vosk as any).stopProcessing();
-            showToast('Reprocessing completed', 'success');
-            await saveMeeting();
-
-        } catch (error) {
-            logger.log('error', 'Reprocessing failed', error);
-            showToast('Reprocessing error', 'error');
-        } finally {
-            setIsReclustering(false);
-            reprocessingStateRef.current.isReprocessing = false;
-            reprocessingStateRef.current.audioData = null;
-        }
+            // Long meetings stay on disk; short ones are kept in memory for precise-mode embeddings
+            const keepInMemory = source.totalSamples <= 10 * 60 * SAMPLE_RATE;
+            const completed = await transcribeWithVosk(source, keepInMemory);
+            if (completed) showToast('Reprocessing completed', 'success');
+            return completed;
+        });
     };
 
     const fullAudioDiarization = async () => {
@@ -314,273 +274,66 @@ export const useMeetingReprocessing = ({
             showToast('No audio to analyze', 'error');
             return;
         }
-
-        if (transcript.length === 0) {
+        if (getTranscript().length === 0) {
             showToast('No transcript to reprocess', 'info');
             return;
         }
-
-        setIsReclustering(true);
         showToast('Full audio speaker analysis...', 'info');
-
-        try {
-            // TUNED FOR ECAPA-TDNN: longer windows = better embeddings
-            const WINDOW_DURATION = 2.5;
-            const HOP_DURATION = 0.5;
-            const SAMPLE_RATE = 16000;
-            const windowSamples = Math.floor(WINDOW_DURATION * SAMPLE_RATE);
-            const hopSamples = Math.floor(HOP_DURATION * SAMPLE_RATE);
-
-            const response = await fetch(playback.recordedAudioUrl);
-            const arrayBuffer = await response.arrayBuffer();
-            const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-            const audioContext = new AudioContextClass();
-            const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-
-            const offlineCtx = new OfflineAudioContext(1, audioBuffer.duration * SAMPLE_RATE, SAMPLE_RATE);
-            const source = offlineCtx.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(offlineCtx.destination);
-            source.start();
-            const resampledBuffer = await offlineCtx.startRendering();
-            const floatData = resampledBuffer.getChannelData(0);
-
-            const embeddings: Array<{ timestamp: number; embedding: number[] }> = [];
-
-            // --- VAD / Silence Filtering ---
-            const vadEnabled = speechConfig?.enableVAD === true;
-            let speechSegments: SpeechSegment[] | null = null;
-
-            if (vadEnabled && audioFilePathRef.current) {
-                try {
-                    const vadService = getVADService();
-                    const vadReady = await vadService.checkModelLoaded();
-                    if (vadReady) {
-                        speechSegments = await vadService.processFile(audioFilePathRef.current);
-                        if (speechSegments.length > 0) {
-                            speechSegments = vadService.mergeSegments(speechSegments, 500);
-                            logger.log('info', `VAD detected ${speechSegments.length} speech segments`);
-                            showToast(`VAD: ${speechSegments.length} speech regions found`, 'info');
-                        }
-                    } else {
-                        logger.log('info', 'VAD enabled but model not loaded, using RMS energy filter');
-                    }
-                } catch (vadErr) {
-                    logger.log('warn', 'VAD processing failed, using RMS energy filter', vadErr);
-                }
-            } else if (vadEnabled) {
-                logger.log('info', 'VAD enabled but no file path available (in-memory mode), using RMS filter');
-            }
-
-            let skippedWindows = 0;
-            for (let offset = 0; offset + windowSamples <= floatData.length; offset += hopSamples) {
-                const segment = floatData.slice(offset, offset + windowSamples);
-                const timestampMs = (offset / SAMPLE_RATE) * 1000;
-                const windowEndMs = ((offset + windowSamples) / SAMPLE_RATE) * 1000;
-
-                // --- Filter: Skip non-speech windows ---
-                if (speechSegments && speechSegments.length > 0) {
-                    // VAD-based: skip if window doesn't overlap any speech segment
-                    const overlaps = speechSegments.some(seg =>
-                        timestampMs < seg.endMs && windowEndMs > seg.startMs
-                    );
-                    if (!overlaps) {
-                        skippedWindows++;
-                        continue;
-                    }
-                } else {
-                    // RMS energy fallback: skip silence windows
-                    let sumSq = 0;
-                    for (let i = 0; i < segment.length; i++) {
-                        sumSq += segment[i] * segment[i];
-                    }
-                    const rms = Math.sqrt(sumSq / segment.length);
-                    if (rms < 0.01) {
-                        skippedWindows++;
-                        continue;
-                    }
-                }
-
-                const int16 = floatToInt16(segment);
-                const base64Audio = arrayBufferToBase64(int16.buffer as ArrayBuffer);
-
-                try {
-                    const result = await SpeakerEmbeddingPlugin.extractEmbedding({ audioData: base64Audio });
-                    if (result && result.embedding && result.embedding.length > 0) {
-                        embeddings.push({ timestamp: timestampMs, embedding: result.embedding });
-                    }
-                } catch (e) {
-                    // Skip failed extraction
-                }
-            }
-
-            if (skippedWindows > 0) {
-                logger.log('info', `Skipped ${skippedWindows} silence/noise windows`);
-            }
-
-            if (embeddings.length < 2) {
-                showToast('Too few embeddings extracted', 'error');
-                return;
-            }
-
-            // PASS 1: Global Clustering of Sliding Window Embeddings
-            // This establishes the "Speaker Profiles" (Centroids) valid for the whole meeting
-            const clustering = new SpeakerClustering((msg) => logger.log('debug', 'FullDiarization', msg));
-            const storedEmbeddings = embeddings.map((e, i) => ({
-                id: `grid_${i}`,
-                embedding: e.embedding,
-                timestamp: e.timestamp,
-                originalSpeakerId: 0
-            }));
-
-            const clusterResult = clustering.cluster(storedEmbeddings, {
-                targetSpeakers: settings.targetSpeakerCount,
-                distanceThreshold: 1 - diarizationRef.current.similarityThreshold
-            });
-
-            showToast(`Pass 1: Profiles created for ${clusterResult.speakerCount} speakers`, 'info');
-
-            // PASS 2: Re-assign Transcript Segments to Global Profiles
-            // Improve assignment by looking at ALL embeddings in the segment's time window,
-            // computing their average, and matching against the global centroids.
-
-            // Sort transcript to ensure time order for window calculation
-            const sortedTranscript = [...transcript].sort((a, b) => a.timestamp - b.timestamp);
-
-            const updatedTranscript = sortedTranscript.map((seg, index) => {
-                // Determine approximate time window for this segment
-                // Start = timestamp of previous segment (or 0)
-                // End = timestamp of this segment
-                const prevTimestamp = index > 0 ? sortedTranscript[index - 1].timestamp : 0;
-                const currTimestamp = seg.timestamp;
-                const windowEnd = currTimestamp;
-                const windowStart = Math.max(0, prevTimestamp);
-
-                // Collect all sliding-window embeddings that fall within this segment's window
-                // (Relaxed window: include slight overlap to catch boundaries)
-                const relevantEmbeddings = embeddings.filter(e =>
-                    e.timestamp >= windowStart - 500 && e.timestamp <= windowEnd + 500
-                );
-
-                if (relevantEmbeddings.length > 0) {
-                    // Strategy A: Vote based on Pass 1 assignments (Simplest)
-                    // Strategy B: Centroid Matching (More Robust for mixed segments)
-                    // We use Strategy B: Average the embeddings in this window and match to closest Global Centroid
-
-                    const avgEmbedding = new Array(relevantEmbeddings[0].embedding.length).fill(0);
-                    for (const emb of relevantEmbeddings) {
-                        for (let i = 0; i < emb.embedding.length; i++) {
-                            avgEmbedding[i] += emb.embedding[i];
-                        }
-                    }
-                    // Normalize average
-                    const count = relevantEmbeddings.length;
-                    for (let i = 0; i < avgEmbedding.length; i++) {
-                        avgEmbedding[i] /= count;
-                    }
-
-                    // Match against Global Centroids from Pass 1
-                    try {
-                        const bestSpeakerId = clustering.findNearestSpeaker(avgEmbedding, clusterResult.centroids);
-                        return { ...seg, speakerId: bestSpeakerId };
-                    } catch (e) {
-                        return { ...seg }; // Fallback
-                    }
-                } else {
-                    // Fallback: If no embeddings found in window, use nearest neighbor
-                    let bestEmbedding = embeddings[0];
-                    let minDiff = Math.abs(seg.timestamp - embeddings[0].timestamp);
-
-                    for (const emb of embeddings) {
-                        const diff = Math.abs(seg.timestamp - emb.timestamp);
-                        if (diff < minDiff) {
-                            minDiff = diff;
-                            bestEmbedding = emb;
-                        }
-                    }
-
-                    const embIdx = embeddings.indexOf(bestEmbedding);
-                    // Use the cluster assignment from Pass 1
-                    const speakerId = clusterResult.speakerAssignments.get(`grid_${embIdx}`) ?? seg.speakerId;
-                    return { ...seg, speakerId };
-                }
-            });
-
-            // PASS 3: Temporal Smoothing
-            const smoothingAlgo = speechConfig?.diarizationSmoothingAlgorithm || 'median';
-            const { applyTemporalSmoothing } = await import('../../services/speaker/diarizationSmoothing');
-            const smoothedTranscript = applyTemporalSmoothing(updatedTranscript, smoothingAlgo);
-
-            setTranscript(smoothedTranscript);
-            const uniqueSpeakers = new Set(smoothedTranscript.map(s => s.speakerId)).size;
-            const smoothedCount = smoothedTranscript.filter((s, i) => s.speakerId !== updatedTranscript[i].speakerId).length;
-            if (smoothedCount > 0) {
-                logger.log('info', `Temporal smoothing corrected ${smoothedCount} segments`);
-            }
-            showToast(`Diarization complete (2-Pass + smoothing): ${uniqueSpeakers} speakers`, 'success');
-            await saveMeeting();
-
-        } catch (error) {
-            logger.log('error', 'Full audio diarization failed', error);
-            showToast('Audio diarization error', 'error');
-        } finally {
-            setIsReclustering(false);
-        }
+        await runProcessing(doFullAudioDiarization);
     };
 
     const reclusterSpeakers = async () => {
         const sessionEmbeddings = diarizationRef.current.getEmbeddingService().getSessionEmbeddings();
-
         if (sessionEmbeddings.length === 0) {
             showToast('No embeddings saved for clustering', 'info');
             return;
         }
-
-        if (transcript.length === 0) {
+        if (getTranscript().length === 0) {
             showToast('No transcript to reprocess', 'info');
             return;
         }
-
-        setIsReclustering(true);
         showToast('Speaker reprocessing in progress...', 'info');
 
-        try {
+        await runProcessing(async () => {
+            const transcript = getTranscript();
             const clustering = new SpeakerClustering((msg) => logger.log('debug', 'Clustering', msg));
-
+            const byId = new Map<string, any>(sessionEmbeddings.map((e: any) => [e.id, e]));
             const storedEmbeddings = transcript
                 .map(seg => {
-                    const stored = sessionEmbeddings.find((e: any) => e.id === seg.id);
-                    return stored ? {
+                    const stored = byId.get(seg.id);
+                    return stored && stored.embedding.length > 0 ? {
                         id: seg.id,
-                        embedding: stored.embedding,
+                        embedding: stored.embedding as number[],
                         timestamp: seg.timestamp,
                         originalSpeakerId: seg.speakerId
                     } : null;
                 })
-                .filter((s): s is NonNullable<typeof s> => s !== null && s.embedding.length > 0);
+                .filter((s): s is NonNullable<typeof s> => s !== null);
 
             const clusterResult = clustering.clusterWithAlgorithm(storedEmbeddings, settings.clusteringAlgorithm, {
                 targetSpeakers: settings.targetSpeakerCount,
                 distanceThreshold: 1 - diarizationRef.current.similarityThreshold
             });
 
-            const newAssignments = clusterResult.speakerAssignments;
-            const updatedTranscript = transcript.map(seg => ({
-                ...seg,
-                speakerId: newAssignments.get(seg.id) ?? seg.speakerId
-            }));
+            // Cluster numbers are arbitrary: keep the current ids (and their names) where they match
+            const maxSpeakerId = transcript.reduce((max, s) => Math.max(max, s.speakerId), 0);
+            const labels = alignClusterLabels(
+                storedEmbeddings
+                    .filter(e => clusterResult.speakerAssignments.has(e.id))
+                    .map(e => ({ previous: e.originalSpeakerId, cluster: clusterResult.speakerAssignments.get(e.id)! })),
+                maxSpeakerId + 1
+            );
+            const updatedTranscript = transcript.map(seg => {
+                const cluster = clusterResult.speakerAssignments.get(seg.id);
+                const speakerId = cluster === undefined ? undefined : labels.get(cluster);
+                return speakerId === undefined || speakerId === seg.speakerId ? seg : { ...seg, speakerId };
+            });
 
             setTranscript(updatedTranscript);
             const uniqueSpeakers = new Set(updatedTranscript.map(s => s.speakerId)).size;
             showToast(`Reprocessing completed: ${uniqueSpeakers} speakers`, 'success');
-            await saveMeeting();
-
-        } catch (error) {
-            logger.log('error', 'Re-clustering failed', error);
-            showToast('Speaker reprocessing error', 'error');
-        } finally {
-            setIsReclustering(false);
-        }
+            return true;
+        });
     };
 
     return {

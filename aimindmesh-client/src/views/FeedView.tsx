@@ -13,15 +13,8 @@ import { formatThreadAsMarkdown } from '../utils/debateExport';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { save } from '@tauri-apps/plugin-dialog';
 import { writeTextFile } from '@tauri-apps/plugin-fs';
+import type { FeedItem } from '@aimindmesh/api-types';
 
-interface FeedItem {
-  id: string;
-  type: string;
-  content: string;
-  source_node_ids?: string;
-  created_at: number;
-  read_at: number | null;
-}
 
 export default function FeedView() {
   const { insights, setInsights, markAsRead } = storeFunc();

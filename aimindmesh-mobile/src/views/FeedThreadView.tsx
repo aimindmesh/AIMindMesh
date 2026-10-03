@@ -85,7 +85,7 @@ const FeedThreadView: React.FC<Props> = ({ insight, serverSettings, onClose }) =
                         // Append this agent's message immediately
                         setMessages(prev => [...prev, {
                             id: `reply_${now}_${chunk.usedNode || 'agent'}`,
-                            role: (chunk.usedNode || 'assistant') as any,
+                            role: chunk.role ?? ((chunk.usedNode || 'assistant') as any),
                             content: chunk.token || '', // Fix TS2345: ensures string
                             created_at: now,
                             usedNode: chunk.usedNode
@@ -102,6 +102,15 @@ const FeedThreadView: React.FC<Props> = ({ insight, serverSettings, onClose }) =
             setStreaming(false);
             setStreamingText('');
             console.error('Debate streaming error:', e);
+            // A stopped reply is the user's choice; any other failure is shown in the thread
+            if (e?.name !== 'AbortError') {
+                setMessages(prev => [...prev, {
+                    id: `error_${Date.now()}`,
+                    role: 'assistant',
+                    content: `⚠️ Reply failed: ${e?.message || 'connection error'}`,
+                    created_at: Date.now()
+                }]);
+            }
         }
     }, [input, streaming, serverSettings, insight.id]);
 

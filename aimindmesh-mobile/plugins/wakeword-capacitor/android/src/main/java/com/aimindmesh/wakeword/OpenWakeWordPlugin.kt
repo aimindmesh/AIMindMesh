@@ -181,17 +181,25 @@ class OpenWakeWordPlugin : Plugin() {
     }
     
     private fun stopListeningInternal() {
+        // JS may ask to stop when nothing runs; starting the service just to stop it throws
+        // from the background (IllegalStateException), which would crash the plugin call
+        if (!BackgroundService.isRunning) return
         val serviceIntent = Intent(context, BackgroundService::class.java).apply {
             action = BackgroundService.ACTION_STOP_LISTENING
         }
-        context.startService(serviceIntent)
+        try {
+            context.startService(serviceIntent)
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "Could not deliver stop to wake word service", e)
+        }
     }
     
     @PluginMethod
     fun isListening(call: PluginCall) {
         // Check if service is running
+        // Detection actually capturing, not merely the service alive (e.g. for training)
         call.resolve(JSObject().apply {
-            put("listening", BackgroundService.isRunning)
+            put("listening", BackgroundService.isRunning && BackgroundService.isListening)
         })
     }
     
@@ -630,33 +638,13 @@ class OpenWakeWordPlugin : Plugin() {
     }
     
     // Broadcast receiver registration to forward events to Capacitor
-    private var receiver: android.content.BroadcastReceiver? = null
+    private var receiver: WakeWordEventForwarder? = null
     
     override fun handleOnStart() {
         super.handleOnStart()
-        // Register receiver
         if (receiver == null) {
-            receiver = object : android.content.BroadcastReceiver() {
-                override fun onReceive(context: Context?, intent: Intent?) {
-                    if (intent?.action == BackgroundService.BROADCAST_WAKE_WORD_DETECTED) {
-                        val wakeWord = intent.getStringExtra(BackgroundService.EXTRA_WAKE_WORD)
-                        val confidence = intent.getFloatExtra(BackgroundService.EXTRA_CONFIDENCE, 0f)
-                        
-                        notifyListeners("wakeWordDetected", JSObject().apply {
-                            put("wakeWord", wakeWord)
-                            put("confidence", confidence.toDouble())
-                            put("timestamp", System.currentTimeMillis())
-                        })
-                    }
-                }
-            }
-            val filter = android.content.IntentFilter(BackgroundService.BROADCAST_WAKE_WORD_DETECTED)
-            // Listen for local broadcasts if possible, or global if service is separate process (it is same process)
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
-            } else {
-                context.registerReceiver(receiver, filter)
-            }
+            receiver = WakeWordEventForwarder { event, data -> notifyListeners(event, data) }
+                .also { it.register(context) }
         }
     }
     

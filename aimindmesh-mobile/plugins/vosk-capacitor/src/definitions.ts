@@ -144,4 +144,8 @@ export interface FinalResultEvent {
     text: string;
     /** Speaker embedding vector (128-dimensional) when speaker model is loaded */
     speakerVector?: number[];
+    /** Utterance start in ms from the start of recognition/processing (0 when unknown) */
+    startMs?: number;
+    /** Utterance end in ms from the start of recognition/processing (0 when unknown) */
+    endMs?: number;
 }

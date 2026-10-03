@@ -1,7 +1,6 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { minimatch } from 'minimatch';
 import { v4 as uuidv4 } from 'uuid';
 import { Logger } from '../utils/Logger';
 import { getSession } from '../db/neo4j';
@@ -11,6 +10,7 @@ import { InferenceRegistry } from './InferenceRegistry';
 import { config } from '../config';
 import { WikiManager } from './WikiManager';
 import { Parser } from '../utils/Parser';
+import { canWrite, normalizeRepoPath } from './evolution/EvolutionPathPolicy';
 
 export interface ImprovementCandidate {
   id: string;
@@ -77,6 +77,8 @@ export class ImprovementDetector {
     try {
       const parsed = Parser.parseLLMJson(result);
       if (parsed.skip) return;
+      const paths = this.sanitizePaths(parsed);
+      if (!paths) return;
 
       const title = parsed.title;
       const deterministicId = this.generateDeterministicId(sourceId, title);
@@ -87,9 +89,9 @@ export class ImprovementDetector {
         sourceId: sourceId,
         title: parsed.title,
         description: parsed.description,
-        repository: parsed.repository ?? 'AIMindMesh',
-        targetComponent: parsed.targetComponent,
-        affectedComponents: parsed.affectedComponents ?? [],
+        repository: 'AIMindMesh',
+        targetComponent: paths.targetComponent,
+        affectedComponents: paths.affectedComponents,
         changeScope: parsed.changeScope ?? 'single_file',
         targetLanguage: parsed.targetLanguage ?? 'typescript',
         severity: 7, // Default for manual/intercepted
@@ -120,6 +122,21 @@ export class ImprovementDetector {
     } catch (e: any) {
       Logger.error('ImprovementDetector', `Failed to process intercepted result: ${e.message}`);
     }
+  }
+
+  /**
+   * Path policy for LLM-extracted candidates: the detector only targets this repository,
+   * the target must be writable and disallowed affected files are dropped.
+   */
+  private static sanitizePaths(parsed: any): { targetComponent: string; affectedComponents: string[] } | null {
+    const target = normalizeRepoPath('AIMindMesh', parsed?.targetComponent);
+    if (!target || !canWrite('AIMindMesh', target)) {
+      Logger.info('ImprovementDetector', `Candidate skipped: target not allowed for auto-evolution (${parsed?.targetComponent})`);
+      return null;
+    }
+    const affected = (Array.isArray(parsed.affectedComponents) ? parsed.affectedComponents : [])
+      .filter((p: unknown): p is string => typeof p === 'string' && canWrite('AIMindMesh', p));
+    return { targetComponent: target, affectedComponents: affected };
   }
 
   public static generateDeterministicId(sourceId: string, title: string): string {
@@ -241,34 +258,8 @@ export class ImprovementDetector {
   }
 
   private async isProtected(targetPath: string): Promise<boolean> {
-    // Check .noautoedit file
-    const protectedPaths = this.loadNoAutoEdit();
-    const fileProtected = protectedPaths.some(p => minimatch(targetPath, p));
-    if (fileProtected) return true;
-
-    // Check runtime DB
-    try {
-      const dbProtected = db.prepare(
-        `SELECT 1 FROM protected_paths WHERE ? LIKE path || '%'`
-      ).get(targetPath);
-      if (dbProtected) return true;
-    } catch (e) {}
-
-    return false;
-  }
-
-  private loadNoAutoEdit(): string[] {
-    try {
-      const filePath = path.join(this.repoPath, '.noautoedit');
-      if (!fs.existsSync(filePath)) return [];
-      const content = fs.readFileSync(filePath, 'utf-8');
-      return content
-        .split('\n')
-        .map((l: string) => l.trim())
-        .filter((l: string) => l && !l.startsWith('#'));
-    } catch (e) {
-      return [];
-    }
+    // Baseline + .noautoedit + protected_paths, see EvolutionPathPolicy
+    return !canWrite('AIMindMesh', targetPath);
   }
 
   private getWorkspaceFiles(): string[] {
@@ -281,14 +272,18 @@ export class ImprovementDetector {
           const relPath = path.relative(this.repoPath, fullPath);
           
           if (item.isDirectory()) {
-            if (['node_modules', '.git', 'dist', 'data', 'backups', 'coverage', 'build'].includes(item.name)) {
+            // Mounted volumes hold tokens and runtime data: never offered to the LLM
+            if (['node_modules', '.git', 'dist', 'data', 'backups', 'coverage', 'build',
+                 'openclaw-config', 'openclaw-workspace', 'hermes-data'].includes(item.name)) {
               continue;
             }
             walk(fullPath);
           } else {
             const ext = path.extname(item.name);
-            if (['.ts', '.tsx', '.js', '.jsx', '.json', '.kt', '.kts', '.rs', '.gradle', '.xml', '.yml', '.yaml'].includes(ext)) {
-              files.push(`aimindmesh-server/${relPath}`);
+            const repoFile = `aimindmesh-server/${relPath.split(path.sep).join('/')}`;
+            if (['.ts', '.tsx', '.js', '.jsx', '.json', '.kt', '.kts', '.rs', '.gradle', '.xml', '.yml', '.yaml'].includes(ext)
+                && canWrite('AIMindMesh', repoFile)) {
+              files.push(repoFile);
             }
           }
         }
@@ -319,6 +314,8 @@ export class ImprovementDetector {
       const parsed = Parser.parseLLMJson(res);
       
       if (parsed.skip) return null;
+      const paths = ImprovementDetector.sanitizePaths(parsed);
+      if (!paths) return null;
 
       const title = parsed.title;
       const deterministicId = ImprovementDetector.generateDeterministicId(neo4jId, title);
@@ -329,9 +326,9 @@ export class ImprovementDetector {
         sourceId: neo4jId,
         title: title,
         description: parsed.description,
-        repository: parsed.repository ?? 'AIMindMesh',
-        targetComponent: parsed.targetComponent,
-        affectedComponents: parsed.affectedComponents ?? [],
+        repository: 'AIMindMesh',
+        targetComponent: paths.targetComponent,
+        affectedComponents: paths.affectedComponents,
         changeScope: parsed.changeScope ?? 'single_file',
         targetLanguage: parsed.targetLanguage ?? 'typescript',
         severity: properties.severity ?? 5,

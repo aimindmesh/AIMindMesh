@@ -1,7 +1,7 @@
 import { Message, Personality, LLMConfig, Memory, AIMindMeshServerSettings } from "../../types";
 import { logger } from "../logger";
 import { generatePerplexityStream } from "./perplexity";
-import { generateClaudeStream } from "./claude";
+import { generateClaudeStream, resolveClaudeModel } from "./claude";
 
 // Import new provider modules
 import { generateGeminiStreamWithTools } from "./providers/geminiProvider";
@@ -12,7 +12,7 @@ import { generateLiteRTStream } from "./providers/liteRTProvider";
 import { generateGenieNPUStream, unloadGenieModel } from "./providers/genieProvider";
 import { callServerProvider } from "./providers/serverProvider";
 
-import { refineContext } from "./context/unifiedContextManager";
+import { refineContext, getProviderContextWindow } from "./context/unifiedContextManager";
 
 export type StreamChunk =
     | { type: 'text'; content: string }
@@ -35,30 +35,32 @@ import { getRecommendedThreadCount } from "../../utils/hardwareCapabilities";
 export async function* generateTextResponseStream(
     history: Message[],
     personality: Personality,
-    llmConfig: LLMConfig,
+    inputConfig: LLMConfig,
     memories: Memory[] = [],
     apiKey?: string,
     signal?: AbortSignal,
     maxResponseLength?: number,
     serverSettings?: AIMindMeshServerSettings
 ): AsyncGenerator<string | StreamChunk> { // Relaxed return type for compatibility
-    const provider = llmConfig.provider;
-
-    // Log hardware-optimized configuration suggestion
+    // Hardware-suggested threads only when none are configured, on a copy: the caller's config is never mutated
     const recommendedThreads = getRecommendedThreadCount();
-    if (!llmConfig.nThreads) {
-        // Only set if not configured at all (legacy fallback to suggested)
-        llmConfig.nThreads = recommendedThreads;
-    } else if (llmConfig.nThreads !== recommendedThreads) {
+    const llmConfig: LLMConfig = { ...inputConfig, nThreads: inputConfig.nThreads || recommendedThreads };
+    if (inputConfig.nThreads && inputConfig.nThreads !== recommendedThreads) {
         logger.log('info', `[LLMService] Configured threads: ${llmConfig.nThreads}. Hardware recommendation: ${recommendedThreads}`);
     }
+    const provider = llmConfig.provider;
+    // Provider of the switch below: the configured one, or the server's fallback
+    const localProvider: string | undefined = provider === 'aimindmesh-server' ? serverSettings?.fallbackProvider : provider;
 
     // Prune history to avoid context overflow
     // Skip pruning for providers that handle it internally with their actual system prompt
     // (GGUF, LiteRT, and Genie-NPU do their own smartContextRefinement with the real prompt)
     const skipProviderPruning = provider === 'native-gguf' || provider === 'litert' || provider === 'genie-npu';
     const { messages: effectiveHistory, systemPrompt: _prunedSysPrompt } = (() => {
-        const processedHistory = history.map(msg => {
+        // Remote APIs reject empty turns (e.g. the bubble of an answer stopped before its first token)
+        const sendable = skipProviderPruning ? history : history.filter((msg, i) =>
+            i === history.length - 1 || msg.text?.trim() || msg.images?.length || msg.audio?.length || msg.files?.length);
+        const processedHistory = sendable.map(msg => {
             if (msg.files && msg.files.length > 0) {
                 let fileContext = '\n\n--- Attached Files ---\n';
                 msg.files.forEach(file => {
@@ -76,7 +78,8 @@ export async function* generateTextResponseStream(
             return { messages: processedHistory, systemPrompt: "" };
         }
 
-        const result = refineContext(processedHistory, "", llmConfig, maxResponseLength || 512);
+        // Remote providers are pruned against their own window, not the on-device nCtx
+        const result = refineContext(processedHistory, "", llmConfig, maxResponseLength || 512, getProviderContextWindow(provider));
 
         if (result.truncated) {
             logger.log('info', `[LLMService] History pruned from ${history.length} to ${result.messages.length} messages.`);
@@ -93,6 +96,14 @@ export async function* generateTextResponseStream(
     const shouldRouteToServer = provider === 'aimindmesh-server' || (serverSettings?.enabled && serverSettings?.useAsDefaultProvider);
 
     if (shouldRouteToServer && serverSettings?.enabled) {
+        // Callback-based server provider bridged to this generator through a waiting queue
+        const queue: StreamChunk[] = [];
+        let wake: (() => void) | null = null;
+        let finished = false;
+        let failure: unknown = null;
+        let yieldedText = false;
+        const push = (chunk: StreamChunk) => { queue.push(chunk); wake?.(); };
+
         try {
             logger.log('info', `[LLMService] Routing to AIMindMesh Server...`);
             
@@ -100,11 +111,6 @@ export async function* generateTextResponseStream(
                 role: (m.role === 'model' ? 'assistant' : m.role) as 'user' | 'assistant' | 'system', 
                 content: m.text 
             }));
-            
-            // Bridge the callback-based server provider to our AsyncGenerator
-            const chunkQueue: StreamChunk[] = [];
-            let isDone = false;
-            let streamError: any = null;
 
             const serverPromise = callServerProvider({
                 settings: serverSettings,
@@ -114,52 +120,48 @@ export async function* generateTextResponseStream(
                     thinking: llmConfig.enableThinking,
                     searchEnabled: llmConfig.enableSearch
                 },
-                onChunk: (chunk: any) => {
-                    if (chunk.token) chunkQueue.push({ type: 'text', content: chunk.token });
-                    if (chunk.thought) chunkQueue.push({ type: 'thinking', content: chunk.thought });
-                    if (chunk.sources) chunkQueue.push({ type: 'sources', sources: chunk.sources });
-                    if (chunk.toolCalls) {
-                        chunk.toolCalls.forEach((tc: any) => {
-                            chunkQueue.push({ type: 'function_call', call: tc });
-                        });
-                    }
-                    if (chunk.done) isDone = true;
-                    if (chunk.error) streamError = new Error(chunk.error);
+                onChunk: chunk => {
+                    if (chunk.token) push({ type: 'text', content: chunk.token });
+                    if (chunk.thought) push({ type: 'thinking', content: chunk.thought });
                 }
             }).then(fullText => {
-                // If we got a full text (REST fallback) and didn't get any chunks yet
-                if (fullText && chunkQueue.length === 0) {
-                    chunkQueue.push({ type: 'text', content: fullText });
-                }
-                isDone = true;
+                if (fullText) push({ type: 'text', content: fullText }); // REST fallback: one block
             }).catch(err => {
-                streamError = err;
-                isDone = true;
+                failure = err;
+            }).finally(() => {
+                finished = true;
+                wake?.();
             });
 
-            // Yield chunks as they arrive in the queue
-            while (!isDone || chunkQueue.length > 0) {
-                if (streamError) throw streamError;
-                if (chunkQueue.length > 0) {
-                    const chunk = chunkQueue.shift()!;
+            while (true) {
+                if (queue.length > 0) {
+                    const chunk = queue.shift()!;
+                    if (chunk.type === 'text') yieldedText = true;
                     yield chunk;
-                } else {
-                    // Small yield point to avoid blocking the thread while waiting for next chunk
-                    await new Promise(resolve => setTimeout(resolve, 5));
-                    if (signal?.aborted) break;
+                    continue;
                 }
+                if (finished) break;
+                await new Promise<void>(resolve => { wake = resolve; });
+                wake = null;
             }
-            
-            await serverPromise; // Ensure promise is settled
+            await serverPromise;
+            if (failure) throw failure;
             return; 
         } catch (e) {
-            logger.log('warn', '[LLMService] Server unreachable or failed, falling back to local provider', e);
-            // Continue to the switch block below for transparent fallback
+            // Part of the answer is already on screen: a second answer from another provider would
+            // duplicate it, so the error is shown instead
+            if (yieldedText || signal?.aborted) throw e;
+            if (!localProvider || localProvider === 'none') throw e;
+            logger.log('warn', `[LLMService] Server failed before answering, falling back to ${localProvider}`, e);
         }
     }
 
+    if (!localProvider || localProvider === 'none') {
+        throw new Error('The AIMindMesh server is disabled and no fallback provider is set');
+    }
+
     try {
-        switch (provider) {
+        switch (localProvider) {
             case 'gemini':
                 yield* generateGeminiStreamWithTools(effectiveHistory, personality, llmConfig, memories, apiKey, signal, maxResponseLength);
                 break;
@@ -183,7 +185,8 @@ export async function* generateTextResponseStream(
                 break;
 
             case 'openrouter':
-                for await (const chunk of generateOpenRouterStream(effectiveHistory, personality, llmConfig, memories, llmConfig.openrouterApiKey || apiKey, signal, maxResponseLength)) {
+                // Only the OpenRouter key: callers pass whichever key they hold (often Gemini's)
+                for await (const chunk of generateOpenRouterStream(effectiveHistory, personality, llmConfig, memories, llmConfig.openrouterApiKey, signal, maxResponseLength)) {
                     yield { type: 'text', content: chunk };
                 }
                 break;
@@ -207,7 +210,7 @@ export async function* generateTextResponseStream(
                 yield* generateClaudeStream(
                     effectiveHistory,
                     personality,
-                    llmConfig.claudeModel || 'claude-3-5-sonnet-latest',
+                    resolveClaudeModel(llmConfig.claudeModel),
                     apiKey || '',
                     memories,
                     signal,

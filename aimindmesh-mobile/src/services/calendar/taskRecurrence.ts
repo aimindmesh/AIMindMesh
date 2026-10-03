@@ -1,59 +1,40 @@
 /**
  * Task Recurrence Service
  * Handles generation of recurring task occurrences
+ *
+ * A series is its root task (the one carrying the rule, without recurrence_parent_id) plus the
+ * occurrences generated from it, all linked to the root. The series always keeps one open
+ * occurrence: the next one is created when the latest is completed or its due date passes.
  */
 
 import { logger } from '../logger';
 import { getCalendarDatabase } from './calendarDatabase';
 import { CalendarTask, RecurrenceRule } from '../../types/calendar';
-import { createTask } from './taskDatabase';
+import { createTask } from './tasks/taskOperations';
+import { parseTaskRow } from './tasks/taskHelpers';
 
-/**
- * Parse task row from database result
- */
-function parseTaskRow(row: any): CalendarTask {
-    return {
-        id: row.id,
-        title: row.title,
-        description: row.description || '',
-        status: row.status,
-        priority: row.priority,
-        createdAt: row.created_at,
-        dueDate: row.due_date,
-        completedAt: row.completed_at || undefined,
-        category: row.category || undefined,
-        tags: row.tags ? JSON.parse(row.tags) : [],
-        assignedTo: row.assigned_to || undefined,
-        estimatedHours: row.estimated_hours || undefined,
-        actualHours: row.actual_hours || undefined,
-        parentTaskId: row.parent_task_id || undefined,
-        linkedEventId: row.linked_event_id || undefined,
-        recurrenceRule: row.recurrence_rule ? JSON.parse(row.recurrence_rule) : undefined,
-        recurrenceParentId: row.recurrence_parent_id || undefined,
-        color: row.color || undefined,
-        order: row.task_order || 0,
-        pomodoroCount: row.pomodoro_count || 0,
-        pomodoroTarget: row.pomodoro_target || undefined
-    };
-}
+/** Upper bound of the catch-up loop (a daily rule missed for years, or a corrupted rule) */
+const MAX_STEPS = 10_000;
 
 /**
  * Calculate the next due date based on recurrence rule
  */
 function calculateNextDueDate(lastDueDate: Date, rule: RecurrenceRule): Date {
     const nextDate = new Date(lastDueDate);
+    // An interval of 0 (or a missing one) would never advance
+    const interval = Math.max(1, Math.floor(rule.interval || 1));
 
     switch (rule.type) {
         case 'daily':
-            nextDate.setDate(nextDate.getDate() + rule.interval);
+            nextDate.setDate(nextDate.getDate() + interval);
             break;
 
         case 'weekly':
-            nextDate.setDate(nextDate.getDate() + (7 * rule.interval));
+            nextDate.setDate(nextDate.getDate() + (7 * interval));
             break;
 
         case 'monthly':
-            nextDate.setMonth(nextDate.getMonth() + rule.interval);
+            nextDate.setMonth(nextDate.getMonth() + interval);
             break;
 
         default:
@@ -64,21 +45,40 @@ function calculateNextDueDate(lastDueDate: Date, rule: RecurrenceRule): Date {
 }
 
 /**
- * Generate the next occurrence for a recurring task
+ * Due date of the occurrence after one due at `lastDue`: the first step of the rule after
+ * `now` (missed occurrences are skipped, not created as a pile of overdue tasks), or null
+ * when the rule has ended or cannot advance.
+ */
+export function nextOccurrenceDue(lastDue: number, rule: RecurrenceRule, now: number): number | null {
+    let next = calculateNextDueDate(new Date(lastDue), rule).getTime();
+    for (let steps = 0; next <= now && steps < MAX_STEPS; steps++) {
+        next = calculateNextDueDate(new Date(next), rule).getTime();
+    }
+    if (!Number.isFinite(next) || next <= lastDue || next <= now) return null;
+    if (rule.endDate && next > rule.endDate) return null;
+    return next;
+}
+
+/**
+ * Whether a series needs its next occurrence: its latest one is done or already past due.
+ */
+export function needsNextOccurrence(latest: Pick<CalendarTask, 'status' | 'dueDate'>, now: number): boolean {
+    return latest.status === 'done' || latest.dueDate < now;
+}
+
+/**
+ * Generate the next occurrence of the series that `task` belongs to
  */
 export async function generateNextOccurrence(
-    parentTask: CalendarTask
+    parentTask: CalendarTask,
+    now: number = Date.now()
 ): Promise<CalendarTask | null> {
     if (!parentTask.recurrenceRule) {
         return null;
     }
 
-    const rule = parentTask.recurrenceRule;
-    const lastDueDate = new Date(parentTask.dueDate);
-    const nextDueDate = calculateNextDueDate(lastDueDate, rule);
-
-    // Check if past end date
-    if (rule.endDate && nextDueDate.getTime() > rule.endDate) {
+    const nextDueDate = nextOccurrenceDue(parentTask.dueDate, parentTask.recurrenceRule, now);
+    if (nextDueDate === null) {
         logger.log('info', '[Recurrence] End date reached, stopping generation');
         return null;
     }
@@ -90,12 +90,13 @@ export async function generateNextOccurrence(
             description: parentTask.description,
             status: 'todo',
             priority: parentTask.priority,
-            dueDate: nextDueDate.getTime(),
+            dueDate: nextDueDate,
             category: parentTask.category,
             tags: parentTask.tags,
             estimatedHours: parentTask.estimatedHours,
             recurrenceRule: parentTask.recurrenceRule,
-            recurrenceParentId: parentTask.id,
+            // Always the root: the series is found by it
+            recurrenceParentId: parentTask.recurrenceParentId || parentTask.id,
             color: parentTask.color,
             pomodoroTarget: parentTask.pomodoroTarget
         });
@@ -109,50 +110,53 @@ export async function generateNextOccurrence(
 }
 
 /**
- * Check and generate upcoming occurrences for all recurring tasks
- * Should be called periodically (e.g., daily or on app startup)
+ * Latest occurrence (by due date) of the series rooted at `rootId`, the root included
  */
-export async function generateUpcomingOccurrences(daysAhead: number = 30): Promise<void> {
+async function getLatestOccurrence(rootId: string): Promise<CalendarTask | null> {
+    const db = await getCalendarDatabase();
+    const result = await db.query(
+        `SELECT * FROM calendar_tasks
+         WHERE id = ? OR recurrence_parent_id = ?
+         ORDER BY due_date DESC
+         LIMIT 1`,
+        [rootId, rootId]
+    );
+    return result.values?.[0] ? parseTaskRow(result.values[0]) : null;
+}
+
+/**
+ * Creates the next occurrence of one series when its latest occurrence is done or past due.
+ * Called when a recurring task is completed.
+ */
+export async function ensureNextOccurrence(task: CalendarTask, now: number = Date.now()): Promise<CalendarTask | null> {
+    if (!task.recurrenceRule) return null;
+    const latest = await getLatestOccurrence(task.recurrenceParentId || task.id);
+    if (!latest || !needsNextOccurrence(latest, now)) return null;
+    return generateNextOccurrence(latest, now);
+}
+
+/**
+ * Check and generate the next occurrence of every recurring series.
+ * Called when the task board loads; completion is handled by ensureNextOccurrence.
+ */
+export async function generateUpcomingOccurrences(now: number = Date.now()): Promise<void> {
     const db = await getCalendarDatabase();
 
     try {
-        // Find all recurring parent tasks (those with recurrence rule but no parent)
+        // Find all recurring root tasks (those with recurrence rule but no parent)
         const result = await db.query(
-            `SELECT * FROM calendar_tasks 
-             WHERE recurrence_rule IS NOT NULL 
-               AND recurrence_parent_id IS NULL`
+            `SELECT * FROM calendar_tasks
+             WHERE recurrence_rule IS NOT NULL
+               AND recurrence_parent_id IS NULL
+               AND parent_task_id IS NULL`
         );
 
         if (!result.values || result.values.length === 0) {
-            logger.log('info', '[Recurrence] No recurring tasks found');
             return;
         }
 
-        const now = Date.now();
-        const futureLimit = now + (daysAhead * 24 * 60 * 60 * 1000);
-
         for (const row of result.values) {
-            const parentTask = parseTaskRow(row);
-
-            // Find the latest generated occurrence for this parent
-            const latestResult = await db.query(
-                `SELECT * FROM calendar_tasks 
-                 WHERE recurrence_parent_id = ?
-                 ORDER BY due_date DESC
-                 LIMIT 1`,
-                [parentTask.id]
-            );
-
-            let lastTask = latestResult.values?.[0]
-                ? parseTaskRow(latestResult.values[0])
-                : parentTask;
-
-            // Generate occurrences until we reach the future limit
-            while (lastTask.dueDate < futureLimit) {
-                const nextTask = await generateNextOccurrence(lastTask);
-                if (!nextTask) break; // End date reached or error
-                lastTask = nextTask;
-            }
+            await ensureNextOccurrence(parseTaskRow(row), now);
         }
 
         logger.log('info', '[Recurrence] Upcoming occurrences generation complete');
@@ -169,7 +173,7 @@ export async function deleteRecurrenceSeries(parentTaskId: string): Promise<void
 
     try {
         await db.run(
-            `DELETE FROM calendar_tasks 
+            `DELETE FROM calendar_tasks
              WHERE recurrence_parent_id = ? AND due_date > ?`,
             [parentTaskId, Date.now()]
         );
@@ -189,7 +193,7 @@ export async function getRecurrenceSeries(parentTaskId: string): Promise<Calenda
 
     try {
         const result = await db.query(
-            `SELECT * FROM calendar_tasks 
+            `SELECT * FROM calendar_tasks
              WHERE recurrence_parent_id = ? OR id = ?
              ORDER BY due_date ASC`,
             [parentTaskId, parentTaskId]

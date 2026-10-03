@@ -41,6 +41,8 @@ export async function initNeo4j() {
     await session.run('CREATE CONSTRAINT repo_id_unique IF NOT EXISTS FOR (r:Repo) REQUIRE r.id IS UNIQUE');
     await session.run('CREATE CONSTRAINT roleproposal_id_unique IF NOT EXISTS FOR (p:RoleProposal) REQUIRE p.id IS UNIQUE');
     await session.run('CREATE CONSTRAINT validationrun_id_unique IF NOT EXISTS FOR (v:ValidationRun) REQUIRE v.id IS UNIQUE');
+    // Memories pushed by devices are merged on `syncId` (device id + local id): a re-push never duplicates
+    await session.run('CREATE CONSTRAINT memory_sync_id_unique IF NOT EXISTS FOR (m:Memory) REQUIRE m.syncId IS UNIQUE');
 
     console.log('Neo4j vector indices and uniqueness constraints verified.');
   } catch (err) {
