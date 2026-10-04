@@ -37,10 +37,58 @@ export enum ProactiveActionType {
     SUMMARIZE_CONTEXT = 'summarize_context',
 }
 
+export type ProactiveCategory = 'silent' | 'informative' | 'suggestive' | 'interactive' | 'autonomous';
+
+/** Category of every action type (permissions, quiet hours and limits are per category) */
+export const ACTION_CATEGORY: Record<ProactiveActionType, ProactiveCategory> = {
+    [ProactiveActionType.SILENT_PRELOAD_MODEL]: 'silent',
+    [ProactiveActionType.SILENT_SYNC_DATA]: 'silent',
+    [ProactiveActionType.SILENT_CACHE_CLEANUP]: 'silent',
+    [ProactiveActionType.SILENT_INDEX_DOCUMENTS]: 'silent',
+    [ProactiveActionType.INFO_BADGE_UPDATE]: 'informative',
+    [ProactiveActionType.INFO_TOAST]: 'informative',
+    [ProactiveActionType.INFO_SYSTEM_NOTIFICATION]: 'informative',
+    [ProactiveActionType.SUGGEST_TASK_PRIORITY]: 'suggestive',
+    [ProactiveActionType.SUGGEST_SCHEDULE_CHANGE]: 'suggestive',
+    [ProactiveActionType.SUGGEST_BREAK]: 'suggestive',
+    [ProactiveActionType.SUGGEST_KNOWLEDGE_REVIEW]: 'suggestive',
+    [ProactiveActionType.SUGGEST_OPTIMIZATION]: 'suggestive',
+    [ProactiveActionType.SUGGEST_TASK_REVIEW]: 'suggestive',
+    [ProactiveActionType.CHAT_MORNING_BRIEFING]: 'interactive',
+    [ProactiveActionType.CHAT_EVENT_REMINDER]: 'interactive',
+    [ProactiveActionType.CHAT_MEETING_BRIEFING]: 'interactive',
+    [ProactiveActionType.CHAT_EOD_SUMMARY]: 'interactive',
+    [ProactiveActionType.CHAT_FOLLOWUP_QUESTION]: 'interactive',
+    [ProactiveActionType.CHAT_CURIOSITY]: 'interactive',
+    [ProactiveActionType.AUTO_CREATE_TASK]: 'autonomous',
+    [ProactiveActionType.AUTO_RESCHEDULE_EVENT]: 'autonomous',
+    [ProactiveActionType.AUTO_CATEGORIZE_NOTE]: 'autonomous',
+    [ProactiveActionType.AUTO_TAG_MEMORY]: 'autonomous',
+    [ProactiveActionType.AUTO_ARCHIVE_OLD_DATA]: 'autonomous',
+    [ProactiveActionType.PERFORM_MEMORY_MAINTENANCE]: 'autonomous',
+    [ProactiveActionType.SUMMARIZE_CONTEXT]: 'autonomous',
+};
+
+/** Categories that reach the user: only these are held back by quiet hours, focus mode and the hourly limit */
+export const USER_FACING_CATEGORIES: ProactiveCategory[] = ['informative', 'suggestive', 'interactive'];
+
+/** Actions governed by their own toggle instead of their category permission */
+export const SELF_GATED_ACTIONS: ProactiveActionType[] = [ProactiveActionType.SUMMARIZE_CONTEXT];
+
+/** Non-urgent background work moved to Wi-Fi when "Respect Data Usage" is on */
+export const DATA_HEAVY_ACTIONS: ProactiveActionType[] = [
+    ProactiveActionType.PERFORM_MEMORY_MAINTENANCE,
+    ProactiveActionType.SILENT_SYNC_DATA,
+];
+
+export function categoryOf(type: string): ProactiveCategory {
+    return ACTION_CATEGORY[type as ProactiveActionType] ?? 'informative';
+}
+
 export interface ProactiveAction {
     id: string;
     type: ProactiveActionType;
-    category: 'silent' | 'informative' | 'suggestive' | 'interactive' | 'autonomous';
+    category: ProactiveCategory;
 
     // Metadata
     triggeredBy: string; // trigger ID

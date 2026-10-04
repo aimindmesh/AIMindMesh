@@ -48,9 +48,11 @@ async function reindexAll(): Promise<void> {
     const model = getActiveEmbeddingModel();
     if (!model) return;
     const memories = await reindexTable('memories', getMemoryDatabase, model.key);
+    // Facts get their first vector here too (new and edited ones have none)
+    const facts = await reindexTable('memory_facts', getMemoryDatabase, model.key).catch(() => 0);
     const chunks = await reindexTable('document_chunks', getKnowledgeDatabase, model.key);
-    if (memories + chunks > 0) {
-        logger.log('info', `[Reindex] Re-embedded ${memories} memories and ${chunks} document chunks with ${model.key}`);
+    if (memories + facts + chunks > 0) {
+        logger.log('info', `[Reindex] Embedded ${memories} memories, ${facts} facts and ${chunks} document chunks with ${model.key}`);
     }
 }
 
@@ -60,7 +62,7 @@ async function reindexAll(): Promise<void> {
  * the new model schedules its own run.
  */
 export async function reindexTable(
-    table: 'memories' | 'document_chunks',
+    table: 'memories' | 'memory_facts' | 'document_chunks',
     getDb: () => Promise<SQLiteDBConnection>,
     key: string
 ): Promise<number> {

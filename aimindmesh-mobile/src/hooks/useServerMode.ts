@@ -16,6 +16,7 @@ import { proactiveService } from '../services/proactive/ProactiveService';
 import { logger } from '../services/logger';
 import { nodeWorker } from '../services/worker/NodeWorker';
 import { syncNativeServerConfig } from '../services/proactive/nativeServerConfig';
+import { updateDeviceSettings } from '../services/llm/providers/serverProvider';
 
 const HEARTBEAT_INTERVAL_MS = 60_000; // 1 minute
 const MAX_FAILURES_BEFORE_FALLBACK = 3;
@@ -168,6 +169,20 @@ export function useServerMode({
             proactiveService.disableServerMode();
         }
     }, [isServerOnline, enabled, proactiveSettings.source]);
+
+    // ─── Delivery preferences on the server: mode, quiet hours, time zone ─────
+    // The server holds its pushes back in the user's quiet hours, in the phone's time zone
+    const deliveryMode = serverSettings.deliveryMode ?? 'PUSH';
+    const quietHours = proactiveSettings.quietHours;
+    const quietKey = JSON.stringify(quietHours ?? null);
+    useEffect(() => {
+        if (!isServerOnline || !enabled) return;
+        updateDeviceSettings(settingsRef.current, {
+            deliveryMode,
+            quietHours: quietHours ? { enabled: !!quietHours.enabled, start: quietHours.start, end: quietHours.end } : undefined,
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        }).catch(e => logger.log('warn', '[ServerMode] Delivery settings sync failed', e));
+    }, [isServerOnline, enabled, deliveryMode, quietKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
     // ─── Worker node: follows its toggle and the server state ────────────────
     const participateAsWorker = !!serverSettings.participateAsWorker;

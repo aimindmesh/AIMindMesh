@@ -30,7 +30,7 @@ export interface TypecheckResult {
 
 // tsc needs ~360 MB: never run two checks at the same time
 let queue: Promise<unknown> = Promise.resolve();
-function serialized<T>(fn: () => Promise<T>): Promise<T> {
+export function serialized<T>(fn: () => Promise<T>): Promise<T> {
   const run = queue.then(fn, fn);
   queue = run.catch(() => undefined);
   return run;

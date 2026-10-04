@@ -6,6 +6,7 @@ import { getMemoryDatabase, blobToFloat32Array } from './memory/memoryDatabase';
 import { listCalendarEvents, calendarEventSyncId } from './calendar';
 import { AIMindMeshServerSettings } from '../types';
 import { readSetting } from './security/secretStore';
+import { PUSH_MEETINGS_QUERY, PUSH_SEGMENTS_QUERY, pulledMeetingStatement, pulledSegmentStatement } from './sync/meetingSyncRows';
 
 const THREADS_KEY = 'conversation-threads';
 /** Phone clock: threads changed after it are pushed (compared with the phone's own updatedAt) */
@@ -110,8 +111,9 @@ export class GlobalSyncService {
         const payload: any = { deviceId, timestamp: Date.now() };
 
         const meetingDb = await getMeetingDatabase();
-        payload.meetings = (await meetingDb.query('SELECT * FROM meetings WHERE is_synced = 0')).values || [];
-        payload.meetingSegments = (await meetingDb.query('SELECT * FROM meeting_segments WHERE is_synced = 0')).values || [];
+        // Explicit columns: the speakers' voices and the search index stay on the phone
+        payload.meetings = (await meetingDb.query(PUSH_MEETINGS_QUERY)).values || [];
+        payload.meetingSegments = (await meetingDb.query(PUSH_SEGMENTS_QUERY)).values || [];
 
         // Documents are not synced: the server has no handler for them
 
@@ -189,26 +191,13 @@ export class GlobalSyncService {
         // Rows with local changes not pushed yet (is_synced = 0) are left as they are.
         for (const m of incoming.meetings || []) {
             if (deletedHere.has(`meeting:${m.id}`)) continue;
-            await meetingDb.run(
-                `INSERT INTO meetings (id, timestamp, duration, has_audio, speaker_names_json, is_synced, server_id)
-                 VALUES (?, ?, ?, ?, ?, 1, ?)
-                 ON CONFLICT(id) DO UPDATE SET timestamp = excluded.timestamp, duration = excluded.duration,
-                   has_audio = excluded.has_audio, speaker_names_json = excluded.speaker_names_json, server_id = excluded.server_id
-                 WHERE meetings.is_synced = 1`,
-                [m.id, m.timestamp, m.duration, m.has_audio, m.speaker_names_json, m.id]
-            );
+            const { statement, values } = pulledMeetingStatement(m);
+            await meetingDb.run(statement, values as any[]);
         }
         for (const s of incoming.meetingSegments || []) {
             if (deletedHere.has(`segment:${s.id}`) || deletedHere.has(`meeting:${s.meeting_id}`)) continue;
-            await meetingDb.run(
-                `INSERT INTO meeting_segments (id, meeting_id, sequence, start_ms, end_ms, text, speaker_id, original_text, is_edited, edited_at, is_synced, server_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-                 ON CONFLICT(id) DO UPDATE SET sequence = excluded.sequence, start_ms = excluded.start_ms, end_ms = excluded.end_ms,
-                   text = excluded.text, speaker_id = excluded.speaker_id, original_text = excluded.original_text,
-                   is_edited = excluded.is_edited, edited_at = excluded.edited_at, server_id = excluded.server_id
-                 WHERE meeting_segments.is_synced = 1`,
-                [s.id, s.meeting_id, s.sequence, s.start_ms, s.end_ms, s.text, s.speaker_id, s.original_text ?? null, s.is_edited ?? 0, s.edited_at ?? null, s.id]
-            );
+            const { statement, values } = pulledSegmentStatement(s);
+            await meetingDb.run(statement, values as any[]);
         }
 
         this.mergeChats(incoming);

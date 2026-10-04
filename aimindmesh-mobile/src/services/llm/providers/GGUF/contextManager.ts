@@ -1,97 +1,45 @@
-import { Message, LLMConfig, Personality, Memory } from '../../../../types';
+import { Message, LLMConfig, Personality } from '../../../../types';
 import { logger } from '../../../logger';
-import { buildSystemPrompt } from '../../promptBuilder';
+import { buildPromptContext, historyWithTurnContext } from '../../promptContext';
 import { getReActSystemPromptAddition, getReActSystemPromptCompact } from '../../../toolDefinitions';
-import { getOrInitializeSemanticMemoryRetriever } from '../../../memory/semanticMemoryRetriever';
 import { refineContext } from '../../context/unifiedContextManager';
+import { withLanguageRule } from '../../prompt/onDevicePrompt';
+import { PROMPT_TEXTS } from '../../prompt/promptTexts';
+import { routedTools } from '../../background/taskFlags';
 
 // Helper to check if tool calling is enabled
 const isToolCallingEnabled = (llmConfig: LLMConfig): boolean => {
     return llmConfig.enableToolCalling === true;
 };
 
-// Helper to derive a response length hint from the token count
-export const getResponseHintFromTokens = (maxTokens?: number): string | undefined => {
-    if (!maxTokens) return undefined;
-
-    if (maxTokens <= 200) {
-        return "Answer very briefly and directly. Use 1-3 sentences maximum. Avoid long explanations.";
-    } else if (maxTokens <= 500) {
-        return "Answer clearly and completely, but without being too wordy. Use short paragraphs and get to the point.";
-    } else {
-        return "You can provide detailed and in-depth answers when the topic requires it.";
-    }
-};
-
 export async function prepareContext(
     history: Message[],
     personality: Personality,
     llmConfig: LLMConfig,
-    memories?: Memory[],
-    maxResponseLength?: number
+    answerTokens?: number,
+    /** Gemma 4 / Qwen 3 with a template that renders tools and reasoning: no ReAct, no <thinking> instruction */
+    native: { tools?: boolean; thinking?: boolean } = {}
 ): Promise<{ systemPrompt: string; updatedHistory: Message[]; }> {
-    const responseHint = getResponseHintFromTokens(maxResponseLength);
-
-    // If semantic memory is enabled, we STILL pass the manual memory list to buildSystemPrompt.
-    // Explicit/Pinned memories should always be present.
-    // We will append the relevant semantic context (from past conversations) shortly after.
-    let systemPrompt = buildSystemPrompt(
-        personality, 
-        llmConfig?.enableSemanticMemory ? undefined : memories,
-        responseHint, 
-        true       // enableInlineMemory for local models
-    );
+    // Persona and the user profile in the system prompt; related memories and workspace documents
+    // go into the user turn, so the system prompt (and the KV cache) stays stable. The answer
+    // tokens become a length rule in the assistant's language.
+    const promptContext = await buildPromptContext({
+        personality, llmConfig, history, answerTokens,
+        onDevice: true, // compact prompt in the assistant's language
+    });
+    let systemPrompt = promptContext.systemPrompt;
+    const updatedHistory = historyWithTurnContext(history, promptContext);
     logger.log('info', `[LLM_CHAIN] Base system prompt built. Length: ${systemPrompt.length}`);
 
-    let updatedHistory = [...history];
-    // Retrieve semantically relevant memories if enabled
-    if (llmConfig.enableSemanticMemory && llmConfig.embeddingModelId && updatedHistory.length > 0) {
-        logger.log('info', '[LLM_CHAIN] Semantic memory enabled. Attempting retrieval...');
-        try {
-            // Find the index of the last user message
-            let lastUserIndex = -1;
-            for (let i = updatedHistory.length - 1; i >= 0; i--) {
-                if (updatedHistory[i].role === 'user') {
-                    lastUserIndex = i;
-                    break;
-                }
-            }
-
-            if (lastUserIndex !== -1) {
-                const lastUserMessage = updatedHistory[lastUserIndex];
-                logger.log('debug', `[LLM_CHAIN] Querying semantic memory for: "${lastUserMessage.text.substring(0, 50)}..."`);
-                const retriever = await getOrInitializeSemanticMemoryRetriever(llmConfig);
-                if (retriever) {
-                    const relevantMemories = await retriever.retrieveRelevantMemories(
-                        lastUserMessage.text,
-                        undefined,
-                        llmConfig.semanticMemoryMaxResults || 3,
-                        llmConfig.semanticMemorySimilarityThreshold || 0.75
-                    );
-                    if (relevantMemories.length > 0) {
-                        const truncated = retriever.truncateToTokenLimit(relevantMemories, 400);
-                        const mergedMemory = truncated.map((m: any) => m.content).join('\n');
-                        
-                        // Inject into user message to preserve KV Cache (prevent systemPrompt changes)
-                        updatedHistory[lastUserIndex] = {
-                            ...lastUserMessage,
-                            text: `<context>\nHere is some factual context about the user from past conversations. You MUST use this information to answer the user's query:\n${mergedMemory}\n</context>\n\n${lastUserMessage.text}`
-                        };
-                        logger.log('info', `GGUF: Injected ${truncated.length} semantic memories into user message`);
-                    }
-                }
-            }
-        } catch (error) {
-            logger.log('warn', 'GGUF: Failed to retrieve semantic memories', error);
-        }
-    }
-
-    // Add tool instructions if enabled
-    if (isToolCallingEnabled(llmConfig)) {
+    const language = promptContext.language ?? 'it';
+    if (native.tools) {
+        // The template declares the tools; the model gets the rules for using them
+        systemPrompt += '\n\n' + PROMPT_TEXTS[language].toolRules.map(r => `- ${r}`).join('\n');
+    } else if (isToolCallingEnabled(llmConfig)) {
         logger.log('info', '[LLM_CHAIN] Tool calling enabled. Injecting ReAct instructions...');
         // Use compact prompt for native-gguf to reduce token count significantly
         if (llmConfig.provider === 'native-gguf') {
-            systemPrompt += "\n" + getReActSystemPromptCompact(llmConfig.toolRules);
+            systemPrompt += "\n" + getReActSystemPromptCompact(llmConfig.toolRules, routedTools(llmConfig));
         } else {
             systemPrompt += "\n" + getReActSystemPromptAddition(llmConfig.toolRules);
         }
@@ -101,7 +49,7 @@ export async function prepareContext(
 
     // Add Chain-of-Thought prompting when thinking is enabled and tools are NOT enabled for GGUF models.
     // If tools ARE enabled, the tool prompt already includes thinking instructions.
-    if (llmConfig.enableThinking && !isToolCallingEnabled(llmConfig)) {
+    if (llmConfig.enableThinking && !isToolCallingEnabled(llmConfig) && !native.thinking) {
         systemPrompt += `
 
 IMPORTANT: Before answering, reason step-by-step. Show your thinking process enclosed in <thinking> and </thinking> tags.
@@ -116,6 +64,7 @@ Let's analyze the problem...
 Your final answer goes AFTER the thinking tags.`;
     }
 
+    systemPrompt = withLanguageRule(systemPrompt, language);
     return { systemPrompt, updatedHistory };
 }
 
@@ -159,13 +108,15 @@ export function smartContextRefinement(
     history: Message[],
     systemPrompt: string,
     llmConfig: LLMConfig,
-    maxResponseLength?: number
+    maxResponseLength?: number,
+    contextWindow?: number
 ): { messages: Message[], systemPrompt: string } {
     const { messages: refinedHistory, systemPrompt: refinedSystemPrompt } = refineContext(
         history,
         systemPrompt,
         llmConfig,
-        maxResponseLength || 512
+        maxResponseLength || 512,
+        contextWindow
     );
 
     logger.log('info', `[LLM_CHAIN] Context refinement complete. Keeping ${refinedHistory.length} messages. New system prompt length: ${refinedSystemPrompt.length}`);

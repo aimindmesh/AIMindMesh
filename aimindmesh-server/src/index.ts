@@ -1,6 +1,6 @@
 // Must stay the first import: applies a staged backup restore before config and DB load
 import './db/restoreAtBoot';
-import Fastify from 'fastify';
+import Fastify, { FastifyReply, FastifyRequest } from 'fastify';
 import axios from 'axios';
 import websocketPlugin from '@fastify/websocket';
 import cors from '@fastify/cors';
@@ -188,8 +188,10 @@ async function build() {
     }
   }
 
-  // OpenAI proxy route to forward OpenClaw requests to FreeLLMAPI after stripping the model param
-  fastify.post('/api/freellmapi-proxy/v1/chat/completions', async (request, reply) => {
+  // OpenAI proxy routes forwarding OpenClaw/Hermes requests to FreeLLMAPI. The general route strips the
+  // model (FreeLLMAPI routes and falls back); the builder route used by venture development runs applies the
+  // model chosen in the organization build settings, when there is one.
+  const proxyChatCompletions = async (request: FastifyRequest, reply: FastifyReply, modelOverride: string | null) => {
     const body = request.body as any;
     const authHeader = request.headers['authorization'];
 
@@ -203,6 +205,7 @@ async function build() {
     // Clone and strip 'model' from the request body to force FreeLLMAPI's internal routing/fallback
     const proxyBody = { ...body };
     delete proxyBody.model;
+    if (modelOverride) proxyBody.model = modelOverride;
     
     if (proxyBody.messages) {
       proxyBody.messages = normalizeMessages(proxyBody.messages);
@@ -218,7 +221,7 @@ async function build() {
       }
     }
 
-    Logger.info('FreeLLMAPI-Proxy', `Proxying chat completions from ${request.ip} (stripped model: ${body.model}, messages: ${Array.isArray(body.messages) ? body.messages.length : 0}, stream: ${!!body.stream})`);
+    Logger.info('FreeLLMAPI-Proxy', `Proxying chat completions from ${request.ip} (model: ${body.model} -> ${modelOverride ?? 'FreeLLMAPI routing'}, messages: ${Array.isArray(body.messages) ? body.messages.length : 0}, stream: ${!!body.stream})`);
 
     const freellmapiUrl = `${config.freellmapi?.baseUrl || 'http://10.2.0.54:3001'}/v1/chat/completions`;
 
@@ -289,6 +292,12 @@ async function build() {
         reply.code(status).send({ error: err.message });
       }
     }
+  };
+
+  fastify.post('/api/freellmapi-proxy/v1/chat/completions', (request, reply) => proxyChatCompletions(request, reply, null));
+  fastify.post('/api/freellmapi-proxy/builder/v1/chat/completions', (request, reply) => {
+    const { getBuildSettings } = require('./services/organization/venture/BuildSettings');
+    return proxyChatCompletions(request, reply, getBuildSettings().model);
   });
 
   fastify.register(chatWs);
@@ -328,6 +337,9 @@ async function start() {
     await checkConnectivity();
     await GiteaService.init();
     await InferenceRouter.init(); // Initialize the persistent inference queue
+    // Venture watchdog: after the inference queue, which closes the agent tasks a restart interrupted
+    const { VentureScheduler } = require('./services/organization/venture/VentureScheduler');
+    VentureScheduler.start();
     await AiTaskScheduler.init();
     ingester.initialize();
 

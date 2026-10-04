@@ -33,6 +33,8 @@ export const config = {
     repoLocalPath: SERVER_ROOT,
     autoMerge: false,
     giteaWebhookSecret: 'whsec-test',
+    // Running vitest inside every ValidationLayer test is slow: test/relatedTests.test.ts enables it
+    runRelatedTests: false,
   },
   organization: { enabled: true, allowAutoRepoCreation: false, searxngBaseUrl: 'http://127.0.0.1:1' },
 } as unknown as ServerConfig;

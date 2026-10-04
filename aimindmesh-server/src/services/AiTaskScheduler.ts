@@ -272,11 +272,7 @@ export class AiTaskScheduler {
       // Delivery via Scheduler (UI Sync)
       await DeliveryScheduler.deliver(execId, `✅ ${task.title}`, exec.outputSummary ?? 'Task complete');
 
-      // Native Push
-      await FCMDispatcher.sendToDevice(config.fcm?.testToken || '', {
-         title: `AI Task: ${task.title}`,
-         body: `Analysis complete. Result available in your feed.`
-      }).catch(e => Logger.warn('AiTaskScheduler', `FCM notification failed: ${e.message}`));
+      // The push goes through DeliveryScheduler (mode, quiet hours): no second one here
 
       exec.status = task.requiresReview ? 'needs_review' : 'completed';
 

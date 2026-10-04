@@ -64,6 +64,7 @@ npm run typecheck:test   # type-checks src/ + test/ (tsconfig.test.json)
 | `council.test.ts` | The autonomous AI council needs a human before creating repositories (unless `organization.allowAutoRepoCreation`) |
 | `contracts.test.ts` | Client/server contract fixes: `/api/chat` response + routing, empty JSON bodies, `DELETE /api/feed/:id`, `GET /api/ai-tasks/:id`, AI task provider routing, evolution process options, protected-paths insert, CI webhook registration |
 | `contract-types.test.ts` | Compile-time: server internal types stay compatible with `src/types/api.ts` |
+| `webTools.test.ts` | Outgoing web requests: private/loopback/reserved IPs (IPv4, IPv6, mapped) refused, names resolving to private IPs refused at connect time, `/api/web/search` standard mode + time range + bounded snippets, `/api/web/read` GET-only with private URLs refused, page text extraction (main content, no chrome), query passages |
 
 ### Writing new tests
 *   Put them in `aimindmesh-server/test/*.test.ts` (outside `src/`, so they never reach the build).
@@ -80,15 +81,17 @@ cd aimindmesh-mobile && npm test        # vitest run: test/*.test.ts, pure logic
 |---|---|
 | `chat-` | Context budgets per provider, history compression, stop-sequence buffering, tool catalogue (no duplicates, handlers executed, shell quoting), agent loop runs/confirmations, global document context |
 | `voice-` | Provider id normalization and voice-chat routing, TTS stop/session tokens, Whisper live chunking, Vosk permission/start-stop races, wake-word state sync |
-| `meeting-` | Rolling PCM buffer offsets, timeline and pauses, Voxtral slices, hybrid merge, speaker label alignment and AHC, save transaction, export cues, foreground service |
+| `meeting-` | PCM ring buffer, transcript timeline, recovery of native sessions and old `.pcm` (target meeting, tombstones), notes never cleared by a save, search (`search_text`, LIKE escaping), post-processing (speech windows, chunk plan, speaker chunks, incremental plan, Whisper output cleanup, pipeline), AHC and speaker labels, voice profiles (owner, size guard), speaker edits, prompts and AI notes adapter (no persona, context check, `<think>`, Markdown fallback), AI error messages, dialogs, settings migration (whisper/hybrid → vosk), capture guard, Whisper catalog, export cues, backup (parse, skips, owner voice, refused while recording) |
+| `sync-` | Meeting notes in push (explicit columns, never voices or `search_text`) and pull (written only when present), deletions |
 | `memory-` | Embedding codec and model tags, re-embedding runtime, self-match exclusion, page numbering, ids/categories, batched ingestion with cleanup |
 | `agenda-` | Reminders, recurrence, rate limit, briefing window, Kanban index mapping, calendar sync ids, Android Auto payloads |
-| `shell-` | Thread save, settings reset only on open, memory pressure levels, NDJSON/SSE parsing, download verification, NodeWorker idempotency, desktop persistence, setup |
+| `shell-` | Thread save, settings reset only on open, memory pressure levels, NDJSON/SSE parsing, download verification, NodeWorker idempotency, desktop persistence, setup (installed models skipped), app lock setting and relock after 60 s |
 | `native-` | LiteRT tool schemas and session tracking |
-| `model-` | Model residency: one heavy model at a time, engine switches, image/meeting/voice sessions, pins, memory pressure, chat model preload, voice-call RAM guard |
+| `model-` | Bundled models (wait for the first-launch copy); model residency: one heavy model at a time, engine switches, image/meeting/voice sessions, pins, memory pressure, chat model preload, voice-call RAM guard |
 | `image-` | Chat prompts for Stable Diffusion (LLM rewrite, cleanup, fallbacks), the image a tool call edits ("last"), tool pictures as chat attachments |
+| `web-` | Search result parsers on real DuckDuckGo lite / Brave pages and the DuckDuckGo html shape (ads, missing snippets), bot-check fallback chain, region/time range parameters, server delegation and fallback, page text extraction (quoted attributes, banners, dropdowns, hidden elements, link lists), parts/passages of `read_web_page`, GET-only and local-address refusal, ranking (BM25, fusion, embeddings only when loaded), `analyze_web` availability |
 
-JVM unit tests (pure Kotlin/Java logic): `cd aimindmesh-mobile/android && ./gradlew :app:testDebugUnitTest` (`DeliveryClientTest`, `StopSequenceFilterTest`) and `./gradlew :sd-capacitor:testDebugUnitTest`: Stable Diffusion noise schedule and timesteps, Euler and DPM++ 2M converging on a Gaussian with the closed-form denoiser (epsilon and v), prediction-type probe, prompt weights, aspect crops and mirrored margins, CLIP tokenizer against reference ids.
+JVM unit tests (pure Kotlin/Java logic): `cd aimindmesh-mobile/android && ./gradlew :app:testDebugUnitTest` (`DeliveryClientTest`, `StopSequenceFilterTest`; meeting port: `PcmResamplerTest`, `ModelAssetManagerTest`, `VoskAudioBridgeTest`, `WhisperRangeReadTest`, `FeatureExtractorTest`) and `./gradlew :sd-capacitor:testDebugUnitTest`: Stable Diffusion noise schedule and timesteps, Euler and DPM++ 2M converging on a Gaussian with the closed-form denoiser (epsilon and v), prediction-type probe and `metadata.json` `prediction_type`, CFG formula, prompt weights, aspect crops and mirrored margins, CLIP tokenizer against reference ids, untrained text encoder signature and NaN/Inf guard (`SDDiagnosticsTest`).
 
 The SD native tensor reader (`qnn_graph_io.cpp`) can be checked on a PC with the QAIRT SDK: compile it for x86_64 with a small harness and the SDK's `lib/x86_64-linux-clang/libQnnSystem.so`, then compare its output with `qnn-context-binary-utility --context_binary <file> --json_file <out>`.
 
@@ -182,6 +185,9 @@ Use this checklist for every release build on a **physical Snapdragon device**.
 - [ ] Genie (QNN) loads an NPU model and reports TTFT/TPS (`adb logcat -s GenieEngine GeniePlugin`)
 - [ ] Stable Diffusion on NPU generates an image (`adb logcat -s SDPlugin SDEngine QnnSdEngineNative QnnGraphIO`): the log shows `tensors from binary` for every graph and the detected `prediction` (Qualcomm SD 2.1: `v_prediction`)
 - [ ] The UberRealistic package (`sd2.1lora`, float tensors) loads and generates; compare the same prompt and seed with the Qualcomm package, Euler vs DPM++ 2M
+- [ ] At load the log shows `Text encoder check: empty prompt mean … std …` and never `text_encoder.bin looks untrained`; "a photo of a cat sitting on a red cushion" shows a cat; with `adb shell setprop log.tag.SDEngine DEBUG` every step logs `cond-uncond rms` clearly above 0 and no NaN/Inf error
+- [ ] `sd2.1lora768` (768 px) loads (`imageWidth=768`, Real-ESRGAN disabled), the cat prompt gives a sharper picture than `sd2.1lora` with the same seed, ~0.5 s per UNet call; memory stays stable over several generations
+- [ ] Z Fold5 (Snapdragon 8 Gen 2, Hexagon v73): with the V73 libraries in the APK the log shows `Pre-loaded HTP stub …libQnnHtpV73Stub.so`, `sd2.1lora_v73` generates the cat prompt, and selecting a v79 package (`sd2.1lora`) fails with `compiled for the Hexagon v79 NPU … this phone has v73` instead of a native error; on the Fold7 the opposite. Watch the v73 load: AI Hub could not profile the FP16 UNet on the S23 (QNN_COMMON_ERROR_MEM_ALLOC on the 176 MB spill-fill mapping), so `contextCreateFromBinary failed` on the Fold5 means the package needs w8a16
 - [ ] Edit a portrait photo from the gallery: upright, same proportions, low strength (40%) keeps the composition; a package without `vae_encoder.bin` shows an error instead of a random image
 - [ ] 16:9 with 4x: 2048×1152, not stretched; with the seed's "reuse" button the same prompt gives the same picture
 - [ ] `/image un gatto rosso su un divano` → the reply shows the English prompt used; `/edit` after it (no attachment) edits the generated picture; asking the assistant to "make it night" edits the last picture and shows it in the answer
@@ -230,7 +236,32 @@ Use this checklist for every release build on a **physical Snapdragon device**.
 - [ ] RAM (System Monitor overlay): at launch only the chat LLM; open the image screen → LLM out, SD in; close it → SD out, LLM back; same with `/image` in chat
 - [ ] Meeting with Voxtral: LLM out during the meeting, back after closing; a voice call with an on-device LLM + Voxtral shows the "do not fit in RAM" message
 
+### Meeting assistant port (from the standalone app)
+- [ ] First launch after the update: bundled models copied once (time and space), shown as "Bundled"; the voice chat `ggml-base.bin` and any custom ONNX models are untouched
+- [ ] Record 10+ min with the screen off, pause and resume; "Mark moment" from the lock screen notification; audio length matches the timeline
+- [ ] Live Vosk in Italian and English; Voxtral fed by the recorder (latency, times, "lagging" notice under load)
+- [ ] Transcribe while recording: final text within ~10 s after Stop for a 3-min meeting, also with the app in background
+- [ ] Whisper: Auto picks small; Cancel works; progress notification; the turbo model downloads and runs; an ARMv8.0 phone shows the "not supported" error
+- [ ] Speakers: 2-3 voices separated; re-enrollment banner after the update; owner shown as "You"; a known voice named in one meeting is recognised in the next
+- [ ] Force-stop while recording → reopen: the audio and bookmarks land in the right meeting; an old `.pcm` orphan is still recovered
+- [ ] Close Meeting mode while recording → chip → reopen; rotate / switch dark theme while recording → the screen re-attaches
+- [ ] Wake word and voice assistant blocked while recording (toast) and back after Stop; voice chat works during post-processing
+- [ ] AI notes and questions with Gemini (short text, and audio over 14 MB), Claude, OpenRouter, local server, GGUF; LiteRT audio; times in notes seek the audio
+- [ ] Sync between two devices (after deploying server migration v6): title, notes, bookmarks, questions arrive; no voices on the server
+- [ ] History with ~100 meetings stays fast; search ignores accents; playback follows the transcript; 1×–2× speed
+- [ ] Backup made here restores in the standalone Meeting Assistant and vice versa; restore refuses during a recording
+- [ ] RAM: Voxtral + Whisper; a chat LLM while Whisper is pinned shows a clear "model busy" message
+
+### Web tools
+- [ ] "Che tempo fa domani a Torino?" with an on-device model: `search_web` runs, the answer cites a URL and the *Sources* chips list the pages (`adb logcat | grep WebSearch` shows the engine used: `duckduckgo`, `duckduckgo-lite` or `brave`)
+- [ ] "Leggi https://it.wikipedia.org/wiki/Benzina e dimmi da cosa si ricava": the answer uses the page text (no "Read content successfully" in the tool result), long pages continue with `chunk_index`
+- [ ] Settings → AIMindMesh Server → Web tools: with *Web search on the server* on, `adb logcat | grep WebSearch` shows `server`; with the server off (VPN down) the phone searches by itself after the timeout
+- [ ] With *Web analysis* on, the model can use `analyze_web`; with it off the tool is not offered
+- [ ] Asking to read `http://192.168.1.1` or `http://10.2.0.1:3030` is refused by the tool
+
 ### Security
+- [ ] App lock: fingerprint and PIN; asks again after more than 60 s in background; screenshots and recent apps are blank with the lock on (also right after a cold start); a recording keeps going while locked
+- [ ] External links (provider key pages) open in the browser; the HTTP server on the LAN is still reachable
 - [ ] After updating, the API keys still work after an app restart, and `localStorage` no longer contains them (WebView inspector, debug build)
 - [ ] `adb shell am start -n com.aimindmesh.mobile/.MainActivity --es route "x'}));alert(1);//"` executes no JavaScript; the kanban / call / agenda shortcuts still work
 - [ ] Release build is not listed in `chrome://inspect`
@@ -241,5 +272,5 @@ Use this checklist for every release build on a **physical Snapdragon device**.
 ## 9. Gaps
 
 *   No automated tests for the desktop and admin apps yet (only type-checking); the mobile app has unit tests for pure logic only, not for React components or native plugins.
-*   Android: JVM unit tests for pure logic only (proactive worker, Stable Diffusion scheduler/tokenizer/geometry); no instrumented tests, and the NPU graphs run only on the device.
+*   Android: JVM unit tests for pure logic only (proactive worker, Stable Diffusion scheduler/tokenizer/geometry, meeting audio helpers, ECAPA features, bundled model copy); no instrumented tests (recording service, Voxtral feeder, app lock run only on the device), and the NPU graphs run only on the device.
 *   No end-to-end test against a running server, Neo4j and Gitea.

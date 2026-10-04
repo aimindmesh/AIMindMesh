@@ -212,7 +212,7 @@ export class AutoEvolutionPipeline {
     try {
       Logger.info('AutoEvolutionPipeline', `Resuming evolution for candidate: ${candidate.title}`);
       
-      const generationOutput = await this.generator.parseOutput(llmOutput);
+      const generationOutput = await this.generator.parseOutput(llmOutput, candidate);
       
       if (generationOutput.skip) {
         Logger.info('AutoEvolutionPipeline', `Generation skipped: ${generationOutput.skipReason}`);

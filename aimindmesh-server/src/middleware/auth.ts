@@ -48,6 +48,7 @@ export function redactUrl(url: string): string {
 // Routes that carry their own credentials: Bearer key (LLM proxy) or HMAC signature (Gitea webhooks)
 const SELF_AUTHENTICATED_ROUTES = new Set([
   '/api/freellmapi-proxy/v1/chat/completions',
+  '/api/freellmapi-proxy/builder/v1/chat/completions',
   '/api/evolution/gitea/webhook',
   '/api/organization/webhooks/gitea',
 ]);

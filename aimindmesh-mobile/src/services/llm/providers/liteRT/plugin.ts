@@ -1,6 +1,7 @@
 import { registerPlugin, PluginListenerHandle } from '@capacitor/core';
 import { logger } from '../../../logger';
 import { TOOL_DEFINITIONS } from '../../../toolDefinitions';
+import { ON_DEVICE_TOOLS } from '../../../tools/nativeToolDeclarations';
 import {
     LiteRTPlugin,
     LiteRTConfig,
@@ -79,9 +80,10 @@ export async function initLiteRTModel(config: LiteRTConfig): Promise<boolean> {
  * Registers the app's tools (JSON schemas from TOOL_DEFINITIONS) for native tool prompting,
  * or turns native tool prompting off when `enabled` is false.
  */
-export async function registerLiteRTTools(toolRules?: Record<string, string>, enabled = true): Promise<boolean> {
+export async function registerLiteRTTools(toolRules?: Record<string, string>, enabled = true, only?: string[]): Promise<boolean> {
     try {
-        const toolDefs = enabled ? buildLiteRTToolSpecs(TOOL_DEFINITIONS, toolRules) : [];
+        // The on-device set only: all 58 definitions were ~3k tokens on a small context
+        const toolDefs = enabled ? buildLiteRTToolSpecs(TOOL_DEFINITIONS.filter(t => (only ?? ON_DEVICE_TOOLS).includes(t.name)), toolRules) : [];
         if (enabled && toolDefs.length === 0) {
             logger.log('warn', '[LiteRT] No tool definitions to register (all denied)');
         }

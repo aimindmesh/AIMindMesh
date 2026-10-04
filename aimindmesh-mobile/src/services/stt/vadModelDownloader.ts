@@ -14,6 +14,8 @@ export interface VADModel {
     url: string;
     sampleRate: number;
     recommended: boolean;
+    /** Shipped in the APK (unpacked at first launch): it can't be deleted */
+    bundled?: boolean;
 }
 
 /**
@@ -35,13 +37,15 @@ export interface VADDownloadProgress {
 export const VAD_MODELS: VADModel[] = [
     {
         id: 'silero-vad-v4',
-        name: 'Silero VAD v4 (16kHz)',
-        description: 'Enterprise-grade VAD, optimized for 16kHz audio',
+        name: 'Silero VAD (16kHz)',
+        description: 'Bundled. Enterprise-grade VAD, optimized for 16kHz audio',
         size: '2 MB',
-        sizeBytes: 2097152,
-        url: 'https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx',
+        sizeBytes: 2327524,
+        // Pinned release (v6.2, the one bundled): master changes without notice
+        url: 'https://raw.githubusercontent.com/snakers4/silero-vad/v6.2/src/silero_vad/data/silero_vad.onnx',
         sampleRate: 16000,
         recommended: true,
+        bundled: true,
     },
     {
         id: 'silero-vad-v4-8k',

@@ -58,16 +58,16 @@ The server acts as the "Central Nervous System", managing long-term memory and t
 
 ### 🏛️ The AI Organization & Governance Layer
 Orchestrates autonomous operations, team roles expansion, and automated verification:
-- **AI Council Debate**: Live multi-agent sequential debate loop checking strategic viability and consensus, yielding synthetic review logs.
-- **Gitea VCS Provisioning**: Automated Gitea repository creation and template-based CI/CD workflow generation and commits.
-- **Kasm Sandbox Validation**: Automatically spins up headless development workspaces, executes smoke test validations, and shuts them down securely.
-- **HR Recruitment Service**: Autonomous analysis of system signals to identify missing capabilities, creating and materializing new Agent roles.
+- **AI Council Debate**: A short multi-role review that ends with structured votes; a two-thirds majority approves, and only a human approval starts a build.
+- **Gitea VCS Provisioning**: Repository creation with the generated technical specification, done by the server.
+- **Venture Build Loop**: The OpenClaw agent works without credentials in a server-managed folder; the server snapshots each run, validates it in a throw-away Docker container (install online, build and tests offline) and pushes it only if it passes. Every loop has a budget and a kill switch.
+- **HR Recruitment Service**: Analysis of the organization's gaps, proposing new Agent roles that a human materializes.
 - **Meeting-to-Organization Bridge**: Scans meeting transcripts on mobile nodes to extract goal/directive candidates, selectively routing them to the AI Council.
 
 ### 🧬 The Multi-Engine Evolution Loop
 AIMindMesh actively improves its own source tree through three distinct generation paths:
 1. **Server-Native Evolution**: Orchestrates multi-file contexts to ensure architecturally sound patches, delegating to **Gemini** or **Openrouter** for complex refactoring.
-2. **Agentic OpenClaw Loop**: High-autonomy worker for tasks requiring external research and sandbox validation in **Kasm Workspaces**.
+2. **Agentic OpenClaw Loop**: High-autonomy worker for user-requested projects that need external research.
 3. **On-Device Termux Scripting**: Local models generate and execute bash/python scripts via the native **Termux Bridge** for system-level Android optimizations.
 
 ---

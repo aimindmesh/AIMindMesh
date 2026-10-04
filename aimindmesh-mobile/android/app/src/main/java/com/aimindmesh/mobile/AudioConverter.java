@@ -5,6 +5,7 @@ import android.util.Log;
 
 import com.aimindmesh.mobile.meeting.MeetingRecordingFiles;
 import com.aimindmesh.mobile.utils.AudioDecoder;
+import com.aimindmesh.mobile.utils.AudioEncoder;
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
@@ -24,96 +25,12 @@ import java.util.Set;
 public class AudioConverter extends Plugin {
     private static final String TAG = "AudioConverter";
 
-    // State for active recording session
-    private File activePcmFile = null;
-    private FileOutputStream activeFos = null;
-    private int activeSampleRate = 16000;
-    private int activeChannels = 1;
-    /** Recordings being encoded (finish or recovery): never listed or recovered twice */
+    /** Recordings being encoded by a recovery: never listed or recovered twice */
     private final Set<String> busyPaths = Collections.synchronizedSet(new HashSet<>());
-
-    @PluginMethod
-    public void startWriting(PluginCall call) {
-        try {
-            closeActiveSession();
-
-            activeSampleRate = call.getInt("sampleRate", 16000);
-            activeChannels = Math.max(1, call.getInt("channels", 1));
-            long startedAt = call.getData().optLong("startedAt", System.currentTimeMillis());
-
-            // Named with the meeting it belongs to: a recording cut short by a kill is recovered from it
-            activePcmFile = MeetingRecordingFiles.newRecordingFile(getContext(), startedAt,
-                    call.getString("meetingId", ""), activeSampleRate, activeChannels);
-            activeFos = new FileOutputStream(activePcmFile);
-
-            call.resolve();
-        } catch (IOException e) {
-            Log.e(TAG, "Failed to start writing: " + e.getMessage(), e);
-            call.reject("Failed to start writing: " + e.getMessage());
-        }
-    }
-
-    @PluginMethod
-    public void writeChunk(PluginCall call) {
-        String data = call.getString("data");
-        if (data == null || activeFos == null) {
-            call.reject("No active recording or data missing");
-            return;
-        }
-
-        try {
-            byte[] pcmBytes = Base64.decode(data, Base64.DEFAULT);
-            activeFos.write(pcmBytes);
-            call.resolve();
-        } catch (IOException e) {
-            Log.e(TAG, "Failed to write chunk", e);
-            call.reject("Failed to write chunk: " + e.getMessage());
-        }
-    }
-
-    @PluginMethod
-    public void finishWriting(PluginCall call) {
-        if (activeFos == null || activePcmFile == null) {
-            call.reject("No active recording");
-            return;
-        }
-
-        // Detach the session here, after every queued writeChunk, and encode on a worker thread:
-        // encoding a long meeting on the plugin thread blocked every other plugin call meanwhile.
-        final File pcmFile = activePcmFile;
-        final FileOutputStream fos = activeFos;
-        final int sampleRate = activeSampleRate;
-        final int channels = Math.max(1, activeChannels);
-        activePcmFile = null;
-        activeFos = null;
-
-        final String busyKey = pcmFile.getAbsolutePath();
-        busyPaths.add(busyKey);
-
-        new Thread(() -> {
-            try {
-                fos.close();
-                long durationMs = MeetingRecordingFiles.durationMs(pcmFile.length(), sampleRate, channels);
-                File outputFile = MeetingRecordingFiles.encode(getContext(), pcmFile, sampleRate, channels);
-                pcmFile.delete();
-
-                JSObject result = new JSObject();
-                result.put("filePath", outputFile.getAbsolutePath());
-                result.put("durationMs", durationMs);
-                call.resolve(result);
-            } catch (Exception e) {
-                // The PCM stays where it is: it is recovered at the next start
-                Log.e(TAG, "Failed to finish writing", e);
-                call.reject("Failed to finish writing: " + e.getMessage());
-            } finally {
-                busyPaths.remove(busyKey);
-            }
-        }).start();
-    }
 
     private boolean isInUse(File file) {
         String path = file.getAbsolutePath();
-        return busyPaths.contains(path) || (activePcmFile != null && activePcmFile.getAbsolutePath().equals(path));
+        return busyPaths.contains(path);
     }
 
     /** Recordings left behind by an app killed while recording (the one in progress is excluded). */
@@ -208,14 +125,8 @@ public class AudioConverter extends Plugin {
                     return;
                 }
 
-                // Only the latest decode is in use: older ones (100+ MB per hour) piled up in the cache
                 File cacheDir = getContext().getCacheDir();
-                File[] previous = cacheDir.listFiles((dir, name) -> name.startsWith("decoded_") && name.endsWith(".wav"));
-                if (previous != null) {
-                    for (File old : previous) {
-                        old.delete();
-                    }
-                }
+                deleteStaleDecodes(cacheDir);
 
                 File outputFile = new File(cacheDir,
                         "decoded_" + System.currentTimeMillis() + ".wav");
@@ -229,6 +140,82 @@ public class AudioConverter extends Plugin {
             } catch (Exception e) {
                 Log.e(TAG, "Decoding exception", e);
                 call.reject("Decoding exception: " + e.getMessage());
+            }
+        }).start();
+    }
+
+    /**
+     * Decoded WAVs (100+ MB per hour) belong to the job that asked for them, which deletes its
+     * own: only those left by a job that never finished (app killed) are removed here. Removing
+     * every other decode broke jobs running at the same time.
+     */
+    private static void deleteStaleDecodes(File cacheDir) {
+        long cutoff = System.currentTimeMillis() - STALE_DECODE_MS;
+        File[] previous = cacheDir.listFiles((dir, name) ->
+                (name.startsWith("decoded_") || name.startsWith("import_")) && name.endsWith(".wav"));
+        if (previous == null) return;
+        for (File old : previous) {
+            if (old.lastModified() < cutoff) {
+                old.delete();
+            }
+        }
+    }
+
+    private static final long STALE_DECODE_MS = 6 * 60 * 60 * 1000L;
+
+    /**
+     * Imports an audio file (M4A, MP3, WAV, OGG, AAC, FLAC...): decodes it to a 16 kHz mono WAV in
+     * the cache (for transcription; the caller deletes it) and, with a meetingId, encodes the
+     * meeting's audio file meeting-audio/{id}.audio as AAC.
+     * Returns { wavPath, m4aPath?, durationMs }.
+     */
+    @PluginMethod
+    public void decodeAudioFile(PluginCall call) {
+        String filePath = call.getString("filePath");
+        String meetingId = call.getString("meetingId");
+        if (filePath == null) {
+            call.reject("filePath is required");
+            return;
+        }
+        final String path = filePath.startsWith("file://") ? android.net.Uri.parse(filePath).getPath() : filePath;
+
+        new Thread(() -> {
+            try {
+                File inputFile = new File(path);
+                if (!inputFile.exists()) {
+                    call.reject("Input file not found");
+                    return;
+                }
+                File cacheDir = getContext().getCacheDir();
+                deleteStaleDecodes(cacheDir);
+                File wav = new File(cacheDir, "import_" + System.currentTimeMillis() + ".wav");
+                if (!AudioDecoder.decodeToWav(inputFile, wav)) {
+                    call.reject("Failed to decode audio");
+                    return;
+                }
+                JSObject result = new JSObject();
+                result.put("wavPath", wav.getAbsolutePath());
+                result.put("durationMs", Math.max(0, wav.length() - 44) / 2 * 1000 / 16000);
+
+                if (meetingId != null && !meetingId.isEmpty()) {
+                    File dir = new File(getContext().getFilesDir(), "meeting-audio");
+                    if (!dir.exists() && !dir.mkdirs()) {
+                        throw new IOException("Cannot create " + dir);
+                    }
+                    File tmp = new File(dir, meetingId + ".audio.tmp");
+                    File m4a = new File(dir, meetingId + ".audio");
+                    if (AudioEncoder.encodePcmToAac(wav, 44, tmp, 16000, 1, AudioEncoder.DEFAULT_BIT_RATE)
+                            && tmp.renameTo(m4a)) {
+                        result.put("m4aPath", m4a.getAbsolutePath());
+                    } else {
+                        tmp.delete();
+                        Log.w(TAG, "Imported audio could not be encoded: kept as WAV only");
+                    }
+                }
+                call.resolve(result);
+            } catch (Exception e) {
+                Log.e(TAG, "decodeAudioFile error", e);
+                call.reject("Audio decoding failed: " + e.getMessage());
             }
         }).start();
     }
@@ -273,24 +260,6 @@ public class AudioConverter extends Plugin {
                 call.reject("Conversion failed: " + e.getMessage());
             }
         }).start();
-    }
-
-    /** Closes a session that was never finished: its PCM stays on disk and is recovered later. */
-    private void closeActiveSession() {
-        if (activeFos != null) {
-            try {
-                activeFos.close();
-            } catch (IOException e) {
-            }
-            activeFos = null;
-        }
-        activePcmFile = null;
-    }
-
-    @Override
-    protected void handleOnDestroy() {
-        closeActiveSession();
-        super.handleOnDestroy();
     }
 
     private String getExtension(String mimeType) {

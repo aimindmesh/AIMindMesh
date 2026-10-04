@@ -2,6 +2,9 @@ package com.aimindmesh.mobile.performance;
 
 import android.app.ActivityManager;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.os.BatteryManager;
 import android.os.Debug;
 import android.os.Process;
 import android.os.SystemClock;
@@ -86,6 +89,38 @@ public class SystemMonitorPlugin extends Plugin {
         // GPU Usage
         ret.put("gpu", getGpuUsage());
 
+        call.resolve(ret);
+    }
+
+    /**
+     * Battery power right now, for the LLM benchmark: current (mA, magnitude), voltage, power drawn
+     * from the battery (null while charging or when the device does not report the current),
+     * level and temperature.
+     */
+    @PluginMethod
+    public void getPowerSample(PluginCall call) {
+        Context context = getContext();
+        BatteryManager bm = (BatteryManager) context.getSystemService(Context.BATTERY_SERVICE);
+        long raw = bm != null ? bm.getLongProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW) : Long.MIN_VALUE;
+        Intent battery = context.registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        int voltageMv = battery != null ? battery.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1) : -1;
+        int status = battery != null ? battery.getIntExtra(BatteryManager.EXTRA_STATUS, -1) : -1;
+        int plugged = battery != null ? battery.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) : 0;
+        int level = battery != null ? battery.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) : -1;
+        int scale = battery != null ? battery.getIntExtra(BatteryManager.EXTRA_SCALE, 100) : 100;
+        int tempTenths = battery != null ? battery.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Integer.MIN_VALUE) : Integer.MIN_VALUE;
+        boolean charging = plugged != 0 || status == BatteryManager.BATTERY_STATUS_CHARGING;
+
+        JSObject ret = new JSObject();
+        Double currentMa = PowerUnits.INSTANCE.currentMa(raw);
+        Double powerMw = PowerUnits.INSTANCE.dischargeMw(raw, voltageMv, charging);
+        ret.put("timestamp", System.currentTimeMillis());
+        ret.put("charging", charging);
+        if (currentMa != null) ret.put("currentMa", currentMa);
+        if (voltageMv > 0) ret.put("voltageMv", voltageMv);
+        if (powerMw != null) ret.put("powerMw", powerMw);
+        if (level >= 0 && scale > 0) ret.put("levelPct", level * 100.0 / scale);
+        if (tempTenths != Integer.MIN_VALUE) ret.put("temperatureC", tempTenths / 10.0);
         call.resolve(ret);
     }
 

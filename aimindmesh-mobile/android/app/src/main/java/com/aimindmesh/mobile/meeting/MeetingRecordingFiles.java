@@ -16,9 +16,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Raw PCM of meeting recordings in progress. The files live in the internal files dir (the system
- * may clear the cache) and their name carries what recovery needs after the app is killed:
- * rec_<startedAt>_<meetingId>_<sampleRate>_<channels>.pcm
+ * Raw PCM recordings of older app versions (before the native recorder, recording/), left by an
+ * app killed while recording: listed and recovered at the next start. Their name carries what
+ * recovery needs: rec_<startedAt>_<meetingId>_<sampleRate>_<channels>.pcm
  */
 public final class MeetingRecordingFiles {
     private static final String TAG = "MeetingRecordingFiles";
@@ -61,12 +61,6 @@ public final class MeetingRecordingFiles {
             Log.w(TAG, "Could not create " + dir.getAbsolutePath());
         }
         return dir;
-    }
-
-    public static File newRecordingFile(Context context, long startedAt, String meetingId, int sampleRate, int channels) {
-        String id = meetingId == null ? "" : meetingId.replaceAll("[^A-Za-z0-9-]", "");
-        if (id.isEmpty()) id = "none";
-        return new File(directory(context), "rec_" + startedAt + "_" + id + "_" + sampleRate + "_" + channels + ".pcm");
     }
 
     /** Metadata of a recording file, or null when the file is not one. */

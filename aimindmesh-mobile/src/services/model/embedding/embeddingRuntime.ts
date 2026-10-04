@@ -11,6 +11,7 @@ import { TextEmbedding } from 'text-embedding-capacitor';
 import { logger } from '../../logger';
 import { EMBEDDING_MODELS, EMBEDDING_MODELS_DIR } from './types';
 import { validateEmbeddingModel } from './localModelService';
+import { isE5, readModelSource, setModelSource } from './modelSources';
 
 /**
  * Bump when the native pipeline changes the vectors it produces (tokenizer, input length,
@@ -35,13 +36,12 @@ let queue: Promise<unknown> = Promise.resolve();
 export const embeddingModelKey = (modelId: string) => `${modelId}#v${EMBEDDING_PIPELINE_VERSION}`;
 const modelDir = (modelId: string) => `${EMBEDDING_MODELS_DIR}/${modelId}`;
 
-/** E5 models need "query: " / "passage: " prefixes; imported E5 models are recognized by name. */
+/** E5 models need "query: " / "passage: " prefixes; imported E5 models are recognized by name or config. */
 export function getEmbeddingPrefixes(modelId: string): { query: string; passage: string } {
     const definition = EMBEDDING_MODELS.find(m => m.id === modelId);
     if (definition) return { query: definition.queryPrefix || '', passage: definition.passagePrefix || '' };
-    return /(^|[^a-z0-9])e5([^a-z0-9]|$)/i.test(modelId)
-        ? { query: 'query: ', passage: 'passage: ' }
-        : { query: '', passage: '' };
+    // Imported models: by name, or by their config.json (an E5 in a folder named "memories3")
+    return isE5(modelId) ? { query: 'query: ', passage: 'passage: ' } : { query: '', passage: '' };
 }
 
 export function getActiveEmbeddingModel(): ActiveEmbeddingModel | null {
@@ -94,6 +94,7 @@ export function ensureEmbeddingModelFromSettings(): Promise<boolean> {
 async function loadModel(modelId: string): Promise<boolean> {
     try {
         // The native side may still hold this model (e.g. after a WebView reload)
+        setModelSource(modelId, await readModelSource(modelId));
         const status = await TextEmbedding.isModelLoaded().catch(() => null);
         if (status?.loaded && status.modelId === modelDir(modelId)) {
             activate(modelId, status.dimension);
@@ -116,7 +117,10 @@ async function loadModel(modelId: string): Promise<boolean> {
 }
 
 function activate(modelId: string, dimension: number): void {
-    active = { modelId, key: embeddingModelKey(modelId), dimension };
+    // An E5 recognized only by its config gets prefixes it did not have before: its own key,
+    // so the vectors stored without them are re-embedded
+    const viaConfig = !EMBEDDING_MODELS.some(m => m.id === modelId) && !/(^|[^a-z0-9])e5([^a-z0-9]|$)/i.test(modelId) && isE5(modelId);
+    active = { modelId, key: embeddingModelKey(modelId) + (viaConfig ? '-e5' : ''), dimension };
     if (lastError?.modelId === modelId) lastError = null;
     // Rows embedded by another model or pipeline version are re-embedded in the background
     import('../../memory/embeddingReindexer')

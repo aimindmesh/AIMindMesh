@@ -57,6 +57,28 @@ export class Parser {
   }
 
   /**
+   * For answers that must be a JSON array. parseLLMJson takes "first { to last }", which turns a
+   * one-element array into its object: here the outermost [...] is tried first, and a lone object
+   * becomes a one-element array.
+   */
+  static parseLLMJsonArray(content: string): any[] {
+    const raw = (content ?? '').trim();
+    const start = raw.indexOf('[');
+    const end = raw.lastIndexOf(']');
+    if (start !== -1 && end > start) {
+      try {
+        const value = JSON.parse(this.fixControlChars(raw.substring(start, end + 1)));
+        if (Array.isArray(value)) return value;
+      } catch {
+        // not a plain array: fall back to the general strategies
+      }
+    }
+    const value = this.parseLLMJson(content);
+    if (Array.isArray(value)) return value;
+    return value && typeof value === 'object' ? [value] : [];
+  }
+
+  /**
    * Fixes unescaped control characters inside JSON string values using a
    * character-by-character scanner that tracks string boundaries.
    */

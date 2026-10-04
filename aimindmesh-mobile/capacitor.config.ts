@@ -5,14 +5,12 @@ const config: CapacitorConfig = {
   appName: 'AMM Mobile',
   webDir: 'dist',
   server: {
+    // http origin + cleartext: LAN servers (llama.cpp, AIMindMesh server) are plain HTTP.
+    // No allowNavigation: the WebView never leaves the app; external links open in the browser.
     androidScheme: 'http',
-    cleartext: true,
-    // Allow mixed content for local development
-    allowNavigation: ['*']
+    cleartext: true
   },
   android: {
-    // Allow WebView to access microphone and camera
-    allowMixedContent: true,
     // webContentsDebuggingEnabled is left unset: Capacitor enables chrome://inspect on debug builds only
     loggingBehavior: 'none'
   },

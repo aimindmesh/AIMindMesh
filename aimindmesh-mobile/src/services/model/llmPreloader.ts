@@ -2,6 +2,7 @@ import { LLMConfig } from '../../types';
 import { logger } from '../logger';
 import { readSetting } from '../security/secretStore';
 import { HeavyEngine, LLM_ENGINES, isHeavyWhisperModel, unloadEngines } from './modelOrchestrator';
+import { detectDeviceContext, onDeviceContextSize } from '../llm/context/contextSize';
 
 /** Local LLM engine a config chats with, or null when the chat runs on a cloud/server provider */
 export function localLlmEngine(config: Partial<LLMConfig> | null | undefined): HeavyEngine | null {
@@ -28,6 +29,7 @@ export async function preloadConfiguredLLM(config: LLMConfig): Promise<void> {
         return;
     }
 
+    await detectDeviceContext(); // the auto context of the phone, before any load
     if (engine === 'gguf') {
         const { initializeNativeModel } = await import('../llm/providers/GGUF/initialization');
         await initializeNativeModel(config);
@@ -37,7 +39,7 @@ export async function preloadConfiguredLLM(config: LLMConfig): Promise<void> {
         const uri = await Filesystem.getUri({ path: config.liteRTModelPath!, directory: Directory.Data });
         const ok = await initLiteRTModel({
             modelPath: uri.uri.replace('file://', ''),
-            maxTokens: config.contextSize || config.nCtx || 8192,
+            maxTokens: onDeviceContextSize(config),
             temperature: 0.8,
             backend: config.liteRTBackend || 'CPU',
             useNPU: config.liteRTUseNPU,
@@ -57,7 +59,7 @@ export async function preloadConfiguredLLM(config: LLMConfig): Promise<void> {
             logger.log('info', `[LLMPreloader] Loading tool model: ${config.toolUseModelPath}`);
             await nativeLLM.initNativeModel({
                 modelPath: config.toolUseModelPath,
-                nCtx: config.nCtx || 2048,
+                nCtx: Math.min(onDeviceContextSize(config), 4096), // tool calls are short
                 useVulkan: config.useVulkan,
                 useOpenCL: config.useOpenCL,
                 nGpuLayers: config.nGpuLayers,

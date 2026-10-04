@@ -15,6 +15,9 @@ android {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
              // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
             ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+            // Bundled models (assets/bundled_models) stay uncompressed: copied at full speed, and
+            // their sizes are known without reading them
+            noCompress 'bin', 'onnx', 'zip'
         }
         
         ndk {
@@ -77,6 +80,10 @@ android {
         // OpenMP runtime: shipped by more than one native module
         pickFirst '**/libomp.so'
     }
+    // JVM unit tests run on the stubbed android.jar: Log calls return instead of throwing
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
 }
 
 repositories {
@@ -121,9 +128,8 @@ dependencies {
     // LiteRT Capacitor Plugin
     implementation project(':litert-capacitor')
     
-    // ExoPlayer for robust audio segment playback
-    implementation "androidx.media3:media3-exoplayer:1.2.0"
-    implementation "androidx.media3:media3-session:1.2.0"
+    // Fingerprint / screen-lock check for the app lock (security/AppLockPlugin)
+    implementation "androidx.biometric:biometric:1.1.0"
 
     // ONNX Runtime for TextEmbedding
     implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.26.0'

@@ -8,14 +8,12 @@ interface SemanticMemoryListProps {
     viewCategory: string;
     memoryCategories: string[];
     llmConfig: LLMConfig;
-    apiKey: string;
 }
 
 export const SemanticMemoryList: React.FC<SemanticMemoryListProps> = ({
     viewCategory,
     memoryCategories,
-    llmConfig,
-    apiKey
+    llmConfig
 }) => {
     const [semanticMemories, setSemanticMemories] = useState<SemanticMemory[]>([]);
     const [isLoadingSemanticMemories, setIsLoadingSemanticMemories] = useState(false);
@@ -61,35 +59,17 @@ export const SemanticMemoryList: React.FC<SemanticMemoryListProps> = ({
     };
 
     const handleSummarizeMemories = async () => {
-        const isLocalProvider = ['native-gguf', 'litert', 'local-model', 'local', 'in-browser-downloaded'].includes(llmConfig.provider);
-        if (!apiKey && !isLocalProvider) {
-            alert('API Key required for summarization');
-            return;
-        }
         setIsSummarizing(true);
         triggerHaptic();
         try {
-            const { MemorySummarizer } = await import('../../../services/memory/memorySummarizer');
-            const summarizer = new MemorySummarizer(llmConfig, apiKey);
-
-            // 1. Consolidate (Semantic Deduplication)
-            const threshold = llmConfig.memorySimilarityThreshold || 0.80;
-            const consolidationResult = await summarizer.consolidateRedundantMemories(threshold);
-
-            // 2. Summarize Oldest (Compression)
-            const summaryResult = await summarizer.summarizeMemories(20);
-
-            let msg = '';
-            if (consolidationResult.success && consolidationResult.consolidatedCount > 0) {
-                msg += `${consolidationResult.message}\n`;
-            }
-            if (summaryResult.success) {
-                msg += summaryResult.message;
-            } else if (!consolidationResult.consolidatedCount) {
-                msg = summaryResult.message;
-            }
-
-            alert(msg || 'Maintenance completed. No actions needed.');
+            // Same maintenance as the autonomous one, started by the user: no quiet time required
+            const { runEpisodicMaintenance, EPISODE_SUMMARY_AGE_DAYS } = await import('../../../services/memory/episodicMaintenance');
+            const result = await runEpisodicMaintenance({ llmConfig, requireIdleMs: 0 });
+            const parts: string[] = [];
+            if (result.deduped > 0) parts.push(`Removed ${result.deduped} duplicate memories.`);
+            if (result.summarized > 0) parts.push(`Summarized ${result.summarized} old messages by conversation and day.`);
+            if (result.skipped) parts.push(`Summaries skipped: ${result.skipped}.`);
+            alert(parts.join('\n') || `Nothing to do: messages are summarized after ${EPISODE_SUMMARY_AGE_DAYS} days.`);
             loadSemanticMemories(); // Reload
         } catch (e: any) {
             console.error('Summarization failed', e);

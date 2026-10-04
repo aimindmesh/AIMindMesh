@@ -4,6 +4,7 @@ const calls = vi.hoisted(() => ({
   downloads: [] as { url: string; target: string; waited: boolean }[],
   stored: new Map<string, any>(),
   failUrl: '' as string,
+  installed: (_path: string): { type: string; size: number } => { throw new Error('missing'); },
 }));
 
 vi.mock('../src/services/model/modelDownloader', () => ({
@@ -27,7 +28,7 @@ vi.mock('../src/services/stt/whisperModelDownloader', () => ({ WHISPER_MODELS: [
 vi.mock('../src/services/logger', () => ({ logger: { log: vi.fn() } }));
 vi.mock('../src/utils/fileSystemAdapter', () => ({
   Directory: { Data: 'DATA' },
-  FileSystemAdapter: { mkdir: async () => undefined },
+  FileSystemAdapter: { mkdir: async () => undefined, stat: async (o: { path: string }) => calls.installed(o.path) },
 }));
 vi.mock('@capacitor/core', () => ({ registerPlugin: () => ({ downloadModel: async () => ({ path: 'x' }) }) }));
 
@@ -80,5 +81,22 @@ describe('one-click setup', () => {
 
     expect(calls.stored.has('llm-config')).toBe(false);
     expect(setupService.getProgress().currentStepName).toMatch(/1 failed/);
+  });
+
+  it('skips models already on the phone (bundled in the APK) and still selects them', async () => {
+    calls.downloads.length = 0;
+    calls.stored.clear();
+    calls.failUrl = '';
+    calls.installed = (path: string) => {
+      if (path === 'vad-models/silero-vad-v4.onnx' || path === 'models/ecapa_tdnn.onnx') return { type: 'file', size: 10 };
+      throw new Error('missing');
+    };
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ models: manifest.models.slice(3) }), { status: 200 })));
+    vi.stubGlobal('window', Object.assign(new EventTarget(), { localStorage }));
+
+    await setupService.runOneClickSetup('http://srv', 'K');
+
+    expect(calls.downloads).toEqual([]);
+    expect(setupService.getProgress()).toMatchObject({ status: 'completed' });
   });
 });

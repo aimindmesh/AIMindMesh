@@ -17,7 +17,8 @@ public:
     QnnSdEngine() = default;
     ~QnnSdEngine();
 
-    bool init(const std::string& modelDir, const std::string& nativeLibDir = "");
+    /** htpArch: the phone's Hexagon version ("v73", "v79"...), selects the QNN HTP stub; empty = v79 */
+    bool init(const std::string& modelDir, const std::string& nativeLibDir = "", const std::string& htpArch = "");
     bool isReady() const { return m_isReady; }
     void release();
 
@@ -68,7 +69,7 @@ private:
     uint32_t m_imageH = 0, m_imageW = 0, m_srH = 0, m_srW = 0;
     float m_timestepMax = 999.0f;
 
-    bool loadLibraries(const std::string& nativeLibDir);
+    bool loadLibraries(const std::string& nativeLibDir, const std::string& htpArch);
     bool loadComponent(const std::string& path, Part part);
     bool configureShapes();
     bool runSingle(Part part, const void* input, float* output) const;

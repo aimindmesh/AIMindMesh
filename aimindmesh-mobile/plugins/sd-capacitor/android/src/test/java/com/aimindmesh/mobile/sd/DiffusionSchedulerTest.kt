@@ -127,4 +127,21 @@ class DiffusionSchedulerTest {
         assertEquals(PredictionType.EPSILON, PredictionType.parse("Epsilon"))
         assertEquals(null, PredictionType.parse("sample"))
     }
+
+    @Test
+    fun guidanceInterpolatesFromTheUnconditionalPrediction() {
+        val uncond = floatArrayOf(1f, -2f, 0.5f)
+        val cond = floatArrayOf(3f, -1f, 0.5f)
+        assertArrayEquals(uncond, scheduler.guidance(uncond, cond, 0f), 0f)
+        assertArrayEquals(cond, scheduler.guidance(uncond, cond, 1f), 0f)
+        // diffusers: uncond + scale * (cond - uncond)
+        assertArrayEquals(floatArrayOf(16f, 5.5f, 0.5f), scheduler.guidance(uncond, cond, 7.5f), 1e-5f)
+    }
+
+    @Test
+    fun readsThePredictionTypeOfAPackage() {
+        assertEquals(PredictionType.V_PREDICTION, PredictionType.fromMetadata("""{"prediction_type": "v_prediction", "model_files": {}}"""))
+        assertEquals(PredictionType.EPSILON, PredictionType.fromMetadata("""{"prediction_type": "epsilon"}"""))
+        assertEquals(null, PredictionType.fromMetadata("""{"model_name": "SD 2.1"}"""))
+    }
 }

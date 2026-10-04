@@ -16,7 +16,7 @@ import { ToolCall, ToolResult, ToolConfirmationMode, ToolExecutorContext } from 
 // Import tool implementations
 import { executeCreateCalendarEvent, executeListCalendarEvents } from './calendarTools';
 import { executeAddTodo, executeCompleteTodo, executeListTodos } from './todoTools';
-import { executeSaveMemory } from './memoryTools';
+import { executeSaveMemory, executeSearchMemory, executeUpdateMemory, executeForgetMemory } from './memoryTools';
 import { executeScheduleNotification } from './notificationTools';
 import { executeSearchFiles, executeCreateTextFile, executeDownloadFile } from './fileTools';
 import { executeReadWebPage, executeSearchWeb, executeOpenBrowser, executeSearchMaps, executeAnalyzeWeb } from './webTools';
@@ -131,7 +131,16 @@ export async function executeTool(
                 return await executeScheduleNotification(call.args as any);
 
             case 'save_memory':
-                return executeSaveMemory(call.args as any, context);
+                return await executeSaveMemory(call.args);
+
+            case 'search_memory':
+                return await executeSearchMemory(call.args);
+
+            case 'update_memory':
+                return await executeUpdateMemory(call.args);
+
+            case 'forget_memory':
+                return await executeForgetMemory(call.args);
 
             case 'search_files':
                 return await executeSearchFiles(call.args as any);

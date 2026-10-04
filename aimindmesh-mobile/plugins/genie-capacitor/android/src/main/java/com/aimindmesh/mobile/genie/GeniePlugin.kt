@@ -37,6 +37,9 @@ class GeniePlugin : Plugin() {
             put("hasNpu", caps["hasNpu"] as? Boolean ?: false)
             put("npuArch", caps["npuArch"] as? String ?: "none")
             put("socModel", caps["socModel"] as? String ?: "")
+            put("board", caps["board"] as? String ?: "")
+            put("ggufNpuSupported", caps["ggufNpuSupported"] as? Boolean ?: false)
+            put("qairtSupported", caps["qairtSupported"] as? Boolean ?: false)
             val runtimes = JSArray()
             (caps["supportedRuntimes"] as? List<*>)?.forEach { runtimes.put(it) }
             put("supportedRuntimes", runtimes)
@@ -52,21 +55,14 @@ class GeniePlugin : Plugin() {
             return
         }
 
-        val runtime = call.getString("runtime") ?: "npu"
-        val temperature = call.getFloat("temperature") ?: 0.7f
-        val topP = call.getFloat("topP") ?: 0.9f
+        val runtime = call.getString("runtime") ?: "auto"
+        val contextLength = call.getInt("contextLength")
 
         scope.launch {
             try {
-                val success = engine?.loadModel(modelPath, runtime, temperature, topP) ?: false
+                val success = engine?.loadModel(modelPath, runtime, contextLength) ?: false
                 if (success) {
-                    val meta = engine?.getActiveModelMetadata() ?: emptyMap()
-                    call.resolve(JSObject().apply {
-                        put("success", true)
-                        put("modelName", meta["model_name"] as? String ?: "")
-                        put("isVision", meta["is_vision"] as? Boolean ?: false)
-                        put("precision", meta["precision"] as? String ?: "w4a16")
-                    })
+                    call.resolve(modelInfo(JSObject().apply { put("success", true) }))
                 } else {
                     call.reject("Failed to load model on Qualcomm $runtime")
                 }
@@ -90,15 +86,58 @@ class GeniePlugin : Plugin() {
     fun isLoaded(call: PluginCall) {
         val loaded = engine?.isLoaded() ?: false
         val path = engine?.getActiveModelPath()
-        val meta = engine?.getActiveModelMetadata() ?: emptyMap()
-        val result = JSObject().apply {
+        call.resolve(modelInfo(JSObject().apply {
             put("loaded", loaded)
             if (path != null) put("modelPath", path)
+        }))
+    }
+
+    /** The loaded model: name, precision, runtime (qairt | llama_cpp) and the unit it actually runs on */
+    private fun modelInfo(into: JSObject): JSObject {
+        val meta = engine?.getActiveModelMetadata() ?: emptyMap()
+        return into.apply {
             put("modelName", meta["model_name"] as? String ?: "")
             put("isVision", meta["is_vision"] as? Boolean ?: false)
             put("precision", meta["precision"] as? String ?: "w4a16")
+            engine?.getActiveRuntime()?.let { put("runtime", it) }
+            engine?.getActiveUnit()?.let { put("computeUnit", it) }
+            (meta["context_length"] as? Int)?.let { put("contextLength", it) }
         }
-        call.resolve(result)
+    }
+
+    /** Prompt from the loaded model's chat template: { messages: [{role, content, imageCount?}], enableThinking } */
+    @PluginMethod
+    fun formatChat(call: PluginCall) {
+        val array = call.getArray("messages")
+        if (array == null) {
+            call.reject("messages is required")
+            return
+        }
+        val turns = (0 until array.length()).map { i ->
+            val item = array.getJSONObject(i)
+            val calls = item.optJSONArray("toolCalls")?.let { list ->
+                (0 until list.length()).map { j ->
+                    val c = list.getJSONObject(j)
+                    GenieToolCall(c.optString("id", "call_$j"), c.optString("name"), c.optString("arguments", "{}"))
+                }
+            } ?: emptyList()
+            GenieTurn(
+                item.optString("role", "user"), item.optString("content", ""), item.optInt("imageCount", 0),
+                calls, item.optString("toolCallId").ifEmpty { null }, item.optString("toolName").ifEmpty { null }
+            )
+        }
+        val enableThinking = call.getBoolean("enableThinking") ?: false
+        val tools = call.getString("tools")
+        scope.launch {
+            try {
+                val prompt = engine?.formatChat(turns, enableThinking, tools)
+                if (prompt != null) call.resolve(JSObject().apply { put("prompt", prompt) })
+                else call.reject("No chat template for the loaded model")
+            } catch (e: Exception) {
+                Log.e(TAG, "formatChat failed", e)
+                call.reject("formatChat failed: ${e.message}")
+            }
+        }
     }
 
     @PluginMethod
@@ -113,7 +152,8 @@ class GeniePlugin : Plugin() {
                         put("model_name", item["model_name"] as? String ?: "")
                         put("path", item["path"] as? String ?: "")
                         put("precision", item["precision"] as? String ?: "w4a16")
-                        put("runtime", item["runtime"] as? String ?: "geniex_qairt")
+                        put("runtime", item["runtime"] as? String ?: "qairt")
+                        put("npuReady", item["npuReady"] as? Boolean ?: false)
                         put("is_vision", item["is_vision"] as? Boolean ?: false)
                         put("sizeBytes", item["sizeBytes"] as? Long ?: 0L)
                     }
@@ -148,20 +188,39 @@ class GeniePlugin : Plugin() {
                 stopSeqs.add(arr.getString(i))
             }
         }
+        // Images of this prompt (data URLs), written to files for the vision encoder
+        val images = call.getArray("images")?.let { arr -> (0 until arr.length()).map { arr.getString(it) } } ?: emptyList()
+        val grammar = call.getString("grammar")
 
         generationJob?.cancel()
         generationJob = scope.launch {
             try {
-                val stream = engine?.generateStream(prompt, maxTokens, temperature, topP, stopSeqs)
+                val imagePaths = if (images.isEmpty()) emptyList()
+                    else kotlinx.coroutines.withContext(Dispatchers.IO) { GenieChat.writeImages(java.io.File(context.cacheDir, "genie_images"), images) }
+                val stream = engine?.generateStream(prompt, maxTokens, temperature, topP, stopSeqs, imagePaths, grammar)
                     ?: throw IllegalStateException("Genie engine not available")
                 var finished = false
-                stream.collect { (token, isDone) ->
+                stream.collect { chunk ->
                     val data = JSObject().apply {
-                        put("text", token)
-                        put("done", isDone)
+                        put("text", chunk.text)
+                        put("done", chunk.done)
+                        chunk.profile?.let { p ->
+                            put("profile", JSObject().apply {
+                                put("ttftMs", p.ttftMs)
+                                put("promptTokens", p.promptTokens)
+                                put("generatedTokens", p.generatedTokens)
+                                put("promptTimeMs", p.promptTimeMs)
+                                put("decodeTimeMs", p.decodeTimeMs)
+                                put("prefillSpeed", p.prefillSpeed)
+                                put("decodingSpeed", p.decodingSpeed)
+                                put("stopReason", p.stopReason ?: "")
+                                put("mediaMs", p.mediaMs)
+                                engine?.getActiveUnit()?.let { put("computeUnit", it) }
+                            })
+                        }
                     }
                     call.resolve(data)
-                    if (isDone) {
+                    if (chunk.done) {
                         finished = true
                         call.setKeepAlive(false)
                         if (activeStreamingCall === call) activeStreamingCall = null

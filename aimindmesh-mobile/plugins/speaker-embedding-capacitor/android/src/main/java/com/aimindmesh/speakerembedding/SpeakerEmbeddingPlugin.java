@@ -99,6 +99,65 @@ public class SpeakerEmbeddingPlugin extends Plugin {
         }).start();
     }
 
+    /**
+     * Extracts one embedding per time range of a 16 kHz mono PCM16 WAV file, reading only those
+     * ranges. Ranges shorter than minDurationMs (default 500) get a null embedding.
+     * Input: { audioPath, ranges: [{ startMs, endMs }] } -> { embeddings: [number[] | null] }
+     */
+    @PluginMethod
+    public void extractEmbeddingsFromFile(PluginCall call) {
+        String rawPath = call.getString("audioPath");
+        String audioPath = rawPath != null && rawPath.startsWith("file://") ? rawPath.substring(7) : rawPath;
+        com.getcapacitor.JSArray ranges = call.getArray("ranges");
+        int minDurationMs = call.getInt("minDurationMs", 500);
+        if (audioPath == null || ranges == null) {
+            call.reject("audioPath and ranges are required");
+            return;
+        }
+        if (!embedder.isModelLoaded()) {
+            call.reject("Model not loaded");
+            return;
+        }
+        new Thread(() -> {
+            try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(audioPath, "r")) {
+                long totalSamples = Math.max(0, (raf.length() - 44) / 2);
+                org.json.JSONArray out = new org.json.JSONArray();
+                for (int i = 0; i < ranges.length(); i++) {
+                    org.json.JSONObject r = ranges.getJSONObject(i);
+                    long from = Math.max(0, r.getLong("startMs") * 16);
+                    long to = Math.min(totalSamples, r.getLong("endMs") * 16);
+                    if ((to - from) < minDurationMs * 16L) {
+                        out.put(org.json.JSONObject.NULL);
+                        continue;
+                    }
+                    byte[] bytes = new byte[(int) (to - from) * 2];
+                    raf.seek(44 + from * 2);
+                    raf.readFully(bytes);
+                    float[] samples = new float[bytes.length / 2];
+                    for (int k = 0; k < samples.length; k++) {
+                        samples[k] = (short) ((bytes[2 * k] & 0xff) | (bytes[2 * k + 1] << 8)) / 32768.0f;
+                    }
+                    float[] embedding = embedder.extractEmbedding(samples);
+                    if (embedding == null) {
+                        out.put(org.json.JSONObject.NULL);
+                    } else {
+                        org.json.JSONArray e = new org.json.JSONArray();
+                        for (float v : embedding) {
+                            e.put((double) v);
+                        }
+                        out.put(e);
+                    }
+                }
+                JSObject ret = new JSObject();
+                ret.put("embeddings", out);
+                call.resolve(ret);
+            } catch (Exception e) {
+                android.util.Log.e("SpeakerEmbedding", "extractEmbeddingsFromFile failed", e);
+                call.reject("Embedding extraction failed: " + e.getMessage(), e);
+            }
+        }).start();
+    }
+
     @PluginMethod
     public void getModelInfo(PluginCall call) {
         JSObject ret = new JSObject();

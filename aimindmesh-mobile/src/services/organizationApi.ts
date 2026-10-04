@@ -1,8 +1,11 @@
 import { AIMindMeshServerSettings } from '../types';
-import type { Directive, OrgRole, IdeaProposal, AuditLogEntry, DiscoveryConfig } from '@aimindmesh/api-types';
+import type {
+  Directive, OrgRole, IdeaProposal, AuditLogEntry, DiscoveryConfig, VentureRepository, VentureBuildConfig, SourceRef,
+  VentureMilestone, VentureDecision,
+} from '@aimindmesh/api-types';
 
 // Organization types come from the server contract (aimindmesh-server/src/types/api.ts)
-export type { Directive, OrgRole, IdeaProposal, AuditLogEntry, DiscoveryConfig };
+export type { Directive, OrgRole, IdeaProposal, AuditLogEntry, DiscoveryConfig, VentureRepository, VentureBuildConfig, SourceRef, VentureMilestone, VentureDecision };
 
 function headers(settings: AIMindMeshServerSettings) {
   return {
@@ -13,6 +16,17 @@ function headers(settings: AIMindMeshServerSettings) {
 
 function base(settings: AIMindMeshServerSettings) {
   return settings.serverUrl.replace(/\/$/, '');
+}
+
+/** The server's own explanation (e.g. "Venture builds are disabled…") when it gives one. */
+async function failure(resp: Response, label: string): Promise<Error> {
+  try {
+    const body = await resp.json();
+    if (body?.error) return new Error(body.error);
+  } catch {
+    // no JSON body
+  }
+  return new Error(`${label}: ${resp.status}`);
 }
 
 export const organizationApi = {
@@ -154,7 +168,8 @@ export const organizationApi = {
       body: JSON.stringify({ humanFeedback }),
       signal: AbortSignal.timeout(60000),
     });
-    if (!resp.ok) throw new Error(`Idea review failed: ${resp.status}`);
+    // 202: the council runs in the background, the verdict arrives with the ideas list
+    if (!resp.ok) throw await failure(resp, 'Idea review failed');
     return await resp.json();
   },
 
@@ -165,7 +180,7 @@ export const organizationApi = {
       body: JSON.stringify({}),
       signal: AbortSignal.timeout(10000),
     });
-    if (!resp.ok) throw new Error(`Idea approve failed: ${resp.status}`);
+    if (!resp.ok) throw await failure(resp, 'Idea approve failed');
     return await resp.json();
   },
 
@@ -179,7 +194,7 @@ export const organizationApi = {
     return await resp.json();
   },
 
-  async getRepositories(settings: AIMindMeshServerSettings) {
+  async getRepositories(settings: AIMindMeshServerSettings): Promise<VentureRepository[]> {
     const resp = await fetch(`${base(settings)}/api/organization/repositories`, {
       headers: headers(settings),
       signal: AbortSignal.timeout(10000),
@@ -219,7 +234,7 @@ export const organizationApi = {
       body: JSON.stringify({}),
       signal: AbortSignal.timeout(90000),
     });
-    if (!resp.ok) throw new Error(`Validation trigger failed: ${resp.status}`);
+    if (!resp.ok) throw await failure(resp, 'Validation trigger failed');
     return await resp.json();
   },
 
@@ -230,8 +245,52 @@ export const organizationApi = {
       body: JSON.stringify({}),
       signal: AbortSignal.timeout(15000),
     });
-    if (!resp.ok) throw new Error(`Force develop failed: ${resp.status}`);
+    if (!resp.ok) throw await failure(resp, 'Develop failed');
     return await resp.json();
+  },
+
+  async decideVenture(settings: AIMindMeshServerSettings, ideaId: string, decision: VentureDecision, notes: string) {
+    const resp = await fetch(`${base(settings)}/api/organization/ideas/${ideaId}/decision`, {
+      method: 'POST',
+      headers: headers(settings),
+      body: JSON.stringify({ decision, notes }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!resp.ok) throw await failure(resp, 'Decision failed');
+    return await resp.json();
+  },
+
+  async cancelRun(settings: AIMindMeshServerSettings, repoId: string) {
+    const resp = await fetch(`${base(settings)}/api/organization/repositories/${repoId}/cancel`, {
+      method: 'POST',
+      headers: headers(settings),
+      body: JSON.stringify({}),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!resp.ok) throw await failure(resp, 'Cancel failed');
+    return await resp.json();
+  },
+
+  async getBuildConfig(settings: AIMindMeshServerSettings): Promise<VentureBuildConfig | null> {
+    const resp = await fetch(`${base(settings)}/api/organization/build-config`, {
+      headers: headers(settings),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!resp.ok) return null; // older servers have no build settings
+    const data = await resp.json();
+    return data.config ?? null;
+  },
+
+  async updateBuildConfig(settings: AIMindMeshServerSettings, patch: Partial<VentureBuildConfig>): Promise<VentureBuildConfig> {
+    const resp = await fetch(`${base(settings)}/api/organization/build-config`, {
+      method: 'PATCH',
+      headers: headers(settings),
+      body: JSON.stringify(patch),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!resp.ok) throw await failure(resp, 'Build settings update failed');
+    const data = await resp.json();
+    return data.config;
   },
 
   async getHRProposals(settings: AIMindMeshServerSettings) {

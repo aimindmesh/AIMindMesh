@@ -5,67 +5,41 @@ import { logger } from '../../services/logger';
 import { TranscriptSegment } from '../../types/meeting';
 import { SpeakerDiarization } from '../../services/speaker/speakerDiarization';
 import { floatToInt16, arrayBufferToBase64 } from '../../services/audio/audioUtils';
-import { pickEmbeddingWindow } from '../../services/meeting/pcmBuffer';
 import { newSegmentId } from '../../services/meeting/meetingIds';
 import { MeetingRecordingState } from './useMeetingRecording';
 import { MeetingSettingsState } from './useMeetingSettings';
-import { MeetingReprocessingState } from './useMeetingReprocessing';
 
-const SAMPLES_PER_MS = 16;
 const MIN_EMBEDDING_SECONDS = 2.0; // ECAPA embeddings are unreliable below 2 s
+/** Longest stretch of an utterance used for its embedding */
+const MAX_EMBEDDING_MS = 10_000;
 const MIN_RMS = 0.01;
-/** Audio reaches JS once per chunk: wait this long at most for the utterance's audio */
-const AUDIO_WAIT_MS = 1500;
 const RECLUSTER_INTERVAL_MS = 30000;
 const RECLUSTER_MIN_SEGMENTS = 10;
 
 export interface VoskFinalResultDeps {
     settings: MeetingSettingsState;
     recording: MeetingRecordingState;
-    reprocessing: MeetingReprocessingState;
     diarizationRef: MutableRefObject<SpeakerDiarization>;
     setCurrentText: (text: string) => void;
     setTranscript: Dispatch<SetStateAction<TranscriptSegment[]>>;
-    /** Live Vosk text is used only in Vosk/Hybrid modes */
+    /** Live Vosk text is used only in Vosk mode (speaker vectors alone in "fast" recognition) */
     voskTranscribesRef: MutableRefObject<boolean>;
-    /** Final results still being processed (awaited before saving) */
+    /** Final results still being processed (awaited before the audio is saved) */
     pendingRef: MutableRefObject<number>;
     lastReclusterTime: MutableRefObject<number>;
     lastReclusterSegCount: MutableRefObject<number>;
 }
 
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-/** Audio of the utterance for the speaker embedding, with its RMS (silence is skipped). */
-async function utteranceAudio(
-    deps: VoskFinalResultDeps,
-    reprocessingNow: boolean,
-    startMs: number | undefined,
-    endMs: number | undefined
-): Promise<{ base64: string; rms: number } | null> {
-    const target = Math.ceil(Math.max(MIN_EMBEDDING_SECONDS, deps.settings.embeddingDurationRef.current) * 16000);
-    const min = Math.ceil(MIN_EMBEDDING_SECONDS * 16000);
-    const utterance = startMs !== undefined && endMs !== undefined
-        ? { start: Math.round(startMs * SAMPLES_PER_MS), end: Math.round(endMs * SAMPLES_PER_MS) }
-        : null;
-
-    let segment: Float32Array;
-    const state = deps.reprocessing.reprocessingStateRef.current;
-    if (reprocessingNow) {
-        if (!state.audioData) return null;
-        const window = pickEmbeddingWindow(state.currentOffset, utterance, target, min);
-        segment = state.audioData.slice(window.start, window.end);
-    } else {
-        // The utterance's own audio (the old "last N seconds" could be the previous speaker)
-        if (utterance) {
-            const deadline = Date.now() + AUDIO_WAIT_MS;
-            while (deps.recording.getReceivedSamples() < utterance.end && Date.now() < deadline) await sleep(100);
-        }
-        const window = pickEmbeddingWindow(deps.recording.getReceivedSamples(), utterance, target, min);
-        segment = deps.recording.getAudioRange(window.start, window.end);
-    }
-    if (segment.length === 0) return null;
-
+/**
+ * Audio of the utterance for the speaker embedding, with its RMS (silence is skipped): Vosk
+ * timestamps share the recording's clock, so it is the utterance itself (its last 10 s at most,
+ * extended back to the minimum embedding length if shorter).
+ */
+async function utteranceAudio(deps: VoskFinalResultDeps, startMs: number, endMs: number): Promise<{ base64: string; rms: number } | null> {
+    const targetMs = Math.max(MIN_EMBEDDING_SECONDS, deps.settings.embeddingDurationRef.current) * 1000;
+    const utteranceStart = Math.max(startMs, endMs - MAX_EMBEDDING_MS);
+    const segment = await deps.recording.getAudioRange(Math.max(0, Math.min(utteranceStart, endMs - targetMs)), endMs);
+    if (!segment) return null;
     let sumSq = 0;
     for (let i = 0; i < segment.length; i++) sumSq += segment[i] * segment[i];
     return {
@@ -74,39 +48,27 @@ async function utteranceAudio(
     };
 }
 
-/** Handles one Vosk final result: timing on the file timeline, speaker, transcript, mini-clustering. */
+/** Handles one live Vosk final result: speaker, transcript, periodic mini-clustering. */
 export function createVoskFinalResultHandler(deps: VoskFinalResultDeps) {
     return async (data: FinalResultEvent) => {
         const text = data.text?.trim();
         if (!text) return;
+        // Results of the voice assistant's session, or of a mode that does not use Vosk text
+        if (data.source === 'mic' || !deps.voskTranscribesRef.current) return;
+        if (!deps.recording.isRecordingRef.current && !deps.recording.isActiveRef.current) return;
 
-        const { recording } = deps;
-        const reprocessingNow = deps.reprocessing.reprocessingStateRef.current.isReprocessing;
-        const live = !reprocessingNow && (recording.isRecordingRef.current || recording.isBusyRef.current);
-        // Results of another feature's Vosk session, or of a mode that does not use Vosk text
-        if (!reprocessingNow && (!live || !deps.voskTranscribesRef.current)) return;
-
-        const timeline = recording.timelineRef.current;
         const timed = (data.endMs ?? 0) > (data.startMs ?? 0);
-        if (live) {
-            const spokenAt = timed ? timeline.voskToWall(data.startMs!) : Date.now();
-            if (timeline.isWallPaused(spokenAt) || (!timed && recording.isPausedRef.current)) {
-                deps.setCurrentText('');
-                return;
-            }
-        }
-        // Reprocessing streams the file itself: Vosk times are already file positions
-        const startMs = timed ? (live ? timeline.voskToFileMs(data.startMs!) : data.startMs!) : undefined;
-        const endMs = timed ? (live ? timeline.voskToFileMs(data.endMs!) : data.endMs!) : undefined;
+        const startMs = timed ? data.startMs : undefined;
+        const endMs = timed ? data.endMs : undefined;
 
         deps.pendingRef.current++;
         try {
             let embedding = data.speakerVector;
 
             // ONNX embedding extraction for precise mode
-            if (deps.settings.recognitionModeRef.current === 'precise') {
+            if (deps.settings.recognitionModeRef.current === 'precise' && startMs !== undefined && endMs !== undefined) {
                 try {
-                    const audio = await utteranceAudio(deps, reprocessingNow, startMs, endMs);
+                    const audio = await utteranceAudio(deps, startMs, endMs);
                     if (audio && audio.rms >= MIN_RMS) {
                         const result = await SpeakerEmbeddingPlugin.extractEmbedding({ audioData: audio.base64 });
                         if (result && result.embedding) {

@@ -1,8 +1,8 @@
 import { useState, useRef, useCallback } from 'react';
 import { Capacitor } from '@capacitor/core';
 import { KeepAwake } from '@capacitor-community/keep-awake';
-import { Message, Personality, LLMConfig, SpeechConfig, ResponseStyle, AIMindMeshServerSettings, ImageAttachment } from '../../types';
-import { ChatContext, ApiKeys, AgentContext, ToolCall, ToolRunResult } from './types';
+import { Message, Personality, LLMConfig, SpeechConfig, ResponseStyle, AIMindMeshServerSettings } from '../../types';
+import { ChatContext, ApiKeys, AgentContext, ToolCall } from './types';
 import { logger } from '../../services/logger';
 import { triggerHaptic } from '../../services/native';
 import { speak } from '../../services/tts/speech';
@@ -13,10 +13,15 @@ import { useContextCompression } from './useContextCompression';
 import { estimateTokens } from '../../services/llm/context/unifiedContextManager';
 import { applyContextSummary } from '../../services/llm/contextSummaryStore';
 import { getActiveThreadId } from '../../services/llm/threadManager';
+import { beginChatActivity } from '../../services/llm/background/chatActivity';
 import { imageFromToolData, resolveToolSourceImage } from '../../services/image/imagePrompt';
+import { lastUserText } from '../../services/llm/roles';
+import { isOnDeviceProvider } from '../../services/llm/providerKeys';
+import { memoryTaskConfig } from '../../services/memory/memoryLlmConfig';
+import { resolveLanguage } from '../../services/llm/prompt/languageRule';
+import { runAgent, type AgentDeps, type AgentRunState } from '../../services/agent/agentRunner';
 import {
-    effectiveProvider, apiKeyForProvider, compressionBudget, streamDisplayText, buildToolTurnText,
-    buildObservationMessage, mergeTextThinking, extractInlineMemories, cleanFinalAnswer, shouldNudgeModel
+    effectiveProvider, apiKeyForProvider, compressionBudget, streamDisplayText, mergeSources, findUserRequest, buildToolSummaryPrompt
 } from './agentLoopHelpers';
 
 interface UseAgenticLoopProps {
@@ -86,8 +91,8 @@ export const useAgenticLoop = ({
     }, [setIsLoading, setMessages, allowSleep]);
 
     /**
-     * Core Agentic Loop: generate, run the requested tools (pausing on those that need a
-     * confirmation), feed their results back, until the model answers or the step limit.
+     * Agentic run of one user turn, through the shared agent runner (services/agent/agentRunner):
+     * this hook supplies generation, tool execution, confirmations and the chat bubble.
      */
     const runAgenticLoop = useCallback(async (
         initialHistory: Message[],
@@ -107,310 +112,134 @@ export const useAgenticLoop = ({
         const isActiveRun = () => abortControllerRef.current === controller;
         let paused = false;
         setIsLoading(true);
+        const endActivity = beginChatActivity();
 
         if (llmConfig.keepScreenOn && Capacitor.isNativePlatform()) {
             try { KeepAwake.keepAwake(); } catch (e) { }
         }
 
-        // The model gets the thread's context summary in place of the messages it covers (the chat keeps them)
-        let conversationHistory = resumeContext ? [...resumeContext.conversationHistory] : applyContextSummary([...initialHistory], activeThreadId ?? getActiveThreadId());
         const modelMessageId = resumeContext ? resumeContext.modelMessageId : (Date.now() + 1).toString();
-        const maxIterations = llmConfig.maxAgentIterations || 5;
-        let currentIteration = resumeContext ? resumeContext.currentIteration : 0;
-
-        let accumulatedResponse = resumeContext ? resumeContext.accumulatedResponse : '';
-        let accumulatedThinking = resumeContext ? resumeContext.accumulatedThinking : '';
-        let accumulatedSources = resumeContext ? [...resumeContext.accumulatedSources] : [];
-        const accumulatedToolResults: ToolRunResult[] = resumeContext ? [...resumeContext.accumulatedToolResults] : [];
-        const generatedImages: ImageAttachment[] = resumeContext ? [...(resumeContext.generatedImages || [])] : [];
-
-        // Tool batch in progress: calls still to run, their results so far, the turn that asked for them
-        let pendingBatch: ToolCall[] = resumeContext ? [...resumeContext.pendingToolCalls] : [];
-        let batchResults: ToolRunResult[] = resumeContext ? [...(resumeContext.batchResults || [])] : [];
-        let batchModelText = resumeContext?.batchModelText ?? '';
-        let pendingDecision = pendingBatch.length > 0 ? decision : undefined; // Applies to the call that paused
-
         if (!resumeContext) {
             const modelMessage: Message = { id: modelMessageId, role: 'model', text: '', timestamp: new Date() };
             setMessages(_prev => [...initialHistory, modelMessage]);
         }
 
         let lastUpdateTimestamp = 0;
-        const throttledUpdate = (status?: string) => {
+        const updateBubble = (state: AgentRunState, status?: string) => {
             if (signal.aborted) return; // A stopped run no longer writes into the bubble
             const now = Date.now();
             if (!status && now - lastUpdateTimestamp < 100) return;
             lastUpdateTimestamp = now;
-
-            const displayText = streamDisplayText(accumulatedResponse, status);
-            const thinking = accumulatedThinking.replace(/^\s+/, '') || undefined;
-            const sources = accumulatedSources.length > 0 ? accumulatedSources : undefined;
-            const toolResults = accumulatedToolResults.length > 0 ? [...accumulatedToolResults] : undefined;
-            const images = generatedImages.length > 0 ? [...generatedImages] : undefined;
-            logger.log('debug', `[LLM_CHAIN] UI UPDATE (throttled): Text length=${displayText.length}, updating React state.`);
+            const displayText = streamDisplayText(state.accumulatedResponse, status);
+            const thinking = state.accumulatedThinking.replace(/^\s+/, '') || undefined;
+            const sources = state.accumulatedSources.length > 0 ? state.accumulatedSources : undefined;
+            const toolResults = state.accumulatedToolResults.length > 0 ? [...state.accumulatedToolResults] : undefined;
+            const images = state.generatedImages.length > 0 ? [...state.generatedImages] : undefined;
             setMessages(prev => prev.map(msg =>
                 msg.id === modelMessageId ? { ...msg, text: displayText, thinking, sources, toolResults, images } : msg
             ));
         };
 
-        const record = (result: ToolRunResult) => {
-            accumulatedToolResults.push(result);
-            batchResults.push(result);
-        };
-
         try {
             const toolContext = {
                 todos: context.todos,
-                memories: context.memories,
                 addTodo: context.addTodo,
                 completeTodo: context.completeTodo,
-                addMemory: context.addMemory,
                 confirmationMode: llmConfig.toolConfirmationMode || 'dangerous',
                 llmConfig: llmConfig
             };
-
             const provider = effectiveProvider(llmConfig, serverSettings);
             const effectiveApiKey = apiKeyForProvider(provider, apiKeys, llmConfig);
             const maxResponseTokens = getMaxTokensForStyle(responseStyle);
             const historyBudget = compressionBudget(provider, llmConfig, maxResponseTokens);
+            const onDevice = isOnDeviceProvider(provider);
+            const language = resolveLanguage(llmConfig.assistantLanguage, [lastUserText(resumeContext?.conversationHistory ?? initialHistory)]);
 
-            const runTool = async (call: ToolCall): Promise<ToolRunResult> => {
-                logger.log('debug', '[AgenticLoop] Executing tool:', call.name);
-                throttledUpdate(`🔧 Executing: ${toolLabel(call.name)}...`);
-                try {
-                    if (call.name === 'generate_image' && call.args?.source_image) {
-                        // The model names the image to edit ("last"); the pixels come from the chat
-                        const { source, error } = resolveToolSourceImage(call.args.source_image, conversationHistory, generatedImages);
-                        if (error) return { name: call.name, success: false, result: error };
-                        call = { ...call, args: { ...call.args, source_image: source } };
-                    }
-                    const result = await executeTool(call, toolContext);
-                    const image = imageFromToolData(result.data);
-                    if (image) generatedImages.push(image); // shown in the bubble, never sent back to the model
-                    let cleanResult = result.message.split('\n\n').filter((b: string) => !b.trim().startsWith('[SYSTEM')).join('\n\n').trim();
-
-                    // Tool Output Pruning: Summarize long tool outputs
-                    if (estimateTokens(cleanResult) > 800 && !signal.aborted) {
-                        throttledUpdate(`✂️ Summarizing large result from ${toolLabel(call.name)}...`);
-                        try {
-                            const summary = await generateMemorySummary(`Summarize this tool output keeping only facts relevant to answer a user request. Output: ${cleanResult.substring(0, 15000)}`, llmConfig, effectiveApiKey);
-                            if (summary) {
-                                cleanResult = `[Summarized by system due to length]\n${summary}`;
-                            }
-                        } catch (e) {
-                            logger.log('warn', '[AgenticLoop] Failed to summarize tool output, truncating instead');
+            const deps: AgentDeps = {
+                generate: (history, config, sig) =>
+                    generateTextResponseStreamWithTools(history, personality, config, effectiveApiKey, sig, maxResponseTokens, serverSettings),
+                runTool: async (call, state) => {
+                    logger.log('debug', '[AgenticLoop] Executing tool:', call.name);
+                    updateBubble(state, `🔧 Executing: ${toolLabel(call.name)}...`);
+                    try {
+                        if (call.name === 'generate_image' && call.args?.source_image) {
+                            // The model names the image to edit ("last"); the pixels come from the chat
+                            const { source, error } = resolveToolSourceImage(call.args.source_image, state.conversationHistory, state.generatedImages);
+                            if (error) return { name: call.name, success: false, result: error };
+                            call = { ...call, args: { ...call.args, source_image: source } };
                         }
+                        const result = await executeTool(call, toolContext);
+                        const image = imageFromToolData(result.data);
+                        if (image) state.generatedImages.push(image); // shown in the bubble, never sent back to the model
+                        state.accumulatedSources = mergeSources(state.accumulatedSources, result.sources); // web pages behind the answer
+                        let cleanResult = result.message.split('\n\n').filter((b: string) => !b.trim().startsWith('[SYSTEM')).join('\n\n').trim();
+                        // Long tool outputs are summarized as an internal task (no persona, memories or tools)
+                        if (estimateTokens(cleanResult) > 800 && !signal.aborted) {
+                            updateBubble(state, `✂️ Summarizing large result from ${toolLabel(call.name)}...`);
+                            try {
+                                const summary = await generateMemorySummary(buildToolSummaryPrompt(cleanResult, findUserRequest(state.conversationHistory)), memoryTaskConfig(llmConfig), effectiveApiKey);
+                                if (summary) cleanResult = `[Summarized by system due to length]\n${summary}`;
+                            } catch (e) {
+                                logger.log('warn', '[AgenticLoop] Failed to summarize tool output, truncating instead');
+                            }
+                        }
+                        cleanResult = cleanResult.substring(0, 4000);
+                        context.showToast(result.message.substring(0, 80) + (result.message.length > 80 ? '...' : ''), result.success ? 'success' : 'error');
+                        return { name: call.name, success: result.success, result: cleanResult };
+                    } catch (error) {
+                        return { name: call.name, success: false, result: (error as Error).message };
                     }
-
-                    // Always ensure we don't exceed a hard limit to prevent crash
-                    cleanResult = cleanResult.substring(0, 4000);
-                    context.showToast(result.message.substring(0, 80) + (result.message.length > 80 ? '...' : ''), result.success ? 'success' : 'error');
-                    return { name: call.name, success: result.success, result: cleanResult };
-                } catch (error) {
-                    return { name: call.name, success: false, result: (error as Error).message };
-                }
+                },
+                isDenied: call => isToolDenied(call.name, llmConfig.toolRules),
+                needsConfirmation: call => needsConfirmation(call.name, llmConfig.toolConfirmationMode || 'dangerous', {}, llmConfig.toolRules),
+                // On-device models have a small window; remote ones prune by themselves
+                compress: Number.isFinite(historyBudget) ? history => compressHistoryIfNeeded(history, historyBudget) : undefined,
+                update: updateBubble,
+                log: (level, message) => logger.log(level, message),
             };
 
-            while (currentIteration < maxIterations) {
-                if (signal.aborted) return;
+            const history = resumeContext ? [] : applyContextSummary([...initialHistory], activeThreadId ?? getActiveThreadId());
+            const outcome = await runAgent({
+                history, config: llmConfig, onDevice, language, threadId: activeThreadId ?? getActiveThreadId(),
+                resume: resumeContext ? { state: toRunState(resumeContext), decision } : undefined,
+            }, deps, signal);
 
-                if (pendingBatch.length === 0) {
-                    if (currentIteration > 0) {
-                        throttledUpdate(`🔄 Reasoning step ${currentIteration} of ${maxIterations}...`);
-                    }
-
-                    // On-device models have a small window (Gemma 3n ~4k); remote ones prune by themselves
-                    if (Number.isFinite(historyBudget)) {
-                        conversationHistory = compressHistoryIfNeeded(conversationHistory, historyBudget);
-                    }
-
-                    const stream = await generateTextResponseStreamWithTools(
-                        conversationHistory,
-                        personality,
-                        llmConfig,
-                        context.memories,
-                        effectiveApiKey,
-                        signal,
-                        maxResponseTokens,
-                        serverSettings
-                    );
-
-                    accumulatedResponse = ''; // Each step has its own answer text
-                    let iterationResponse = '';
-                    const requestedCalls: ToolCall[] = [];
-
-                    for await (const chunk of stream) {
-                        if (signal.aborted) break;
-                        if (chunk.type === 'text') {
-                            iterationResponse += chunk.content;
-                            if (!iterationResponse.trim() || accumulatedResponse.length === 0) iterationResponse = iterationResponse.trimStart();
-                            accumulatedResponse = iterationResponse;
-                            throttledUpdate();
-                        } else if (chunk.type === 'thinking') {
-                            accumulatedThinking += chunk.content;
-                            throttledUpdate();
-                        } else if (chunk.type === 'sources') {
-                            accumulatedSources = chunk.sources;
-                            throttledUpdate();
-                        } else if (chunk.type === 'function_call') {
-                            // Ensure the tool call matches the expected ToolCall interface
-                            const rawCall = chunk.call as any;
-                            requestedCalls.push({
-                                name: rawCall.name,
-                                args: rawCall.args || rawCall.arguments || {}, // Handle both for safety
-                                id: rawCall.id
-                            });
-                        }
-                    }
-                    // Providers that swallow the abort end normally: nothing of a stopped run is finalized
-                    if (signal.aborted) return;
-
-                    if (requestedCalls.length > 0 && llmConfig.enableToolCalling) {
-                        logger.log('debug', '[AgenticLoop] Processing tool calls:', requestedCalls);
-                        pendingBatch = requestedCalls;
-                        batchResults = [];
-                        batchModelText = buildToolTurnText(accumulatedResponse, accumulatedThinking, requestedCalls);
-                        // Thinking streamed as text must stay visible while the tools run
-                        accumulatedThinking = mergeTextThinking(accumulatedThinking, accumulatedResponse);
-                    } else if (shouldNudgeModel(accumulatedResponse, accumulatedThinking, currentIteration, maxIterations)) {
-                        // Only a short thought, no answer and no tool: ask the model to continue
-                        conversationHistory = [
-                            ...conversationHistory,
-                            { id: `model_${Date.now()}`, role: 'model', text: accumulatedThinking, timestamp: new Date() },
-                            {
-                                id: `nudge_${Date.now()}`,
-                                role: 'user',
-                                text: 'Please continue. If you have finished the task, provide the final answer. If you need more information, use a tool.',
-                                timestamp: new Date()
-                            }
-                        ];
-                        accumulatedResponse = '';
-                        accumulatedThinking = '';
-                        currentIteration++; // A nudge is a step: the limit bounds repeated nudges too
-                        continue;
-                    } else {
-                        break; // Final answer
-                    }
-                }
-
-                // Run the batch in order. A call that needs confirmation pauses the run; the
-                // decision resumes it on that same call.
-                while (pendingBatch.length > 0) {
-                    if (signal.aborted) return;
-                    const call = pendingBatch[0];
-
-                    if (pendingDecision) {
-                        const { allowed } = pendingDecision;
-                        pendingDecision = undefined;
-                        pendingBatch.shift();
-                        if (allowed) {
-                            record(await runTool(call));
-                        } else {
-                            record({ name: call.name, success: false, result: 'User denied execution.' });
-                            context.showToast(`Tool ${call.name} denied`, 'info');
-                        }
-                        continue;
-                    }
-
-                    if (isToolDenied(call.name, llmConfig.toolRules)) {
-                        pendingBatch.shift();
-                        record({ name: call.name, success: false, result: 'This tool is disabled in the user\'s settings.' });
-                        continue;
-                    }
-
-                    if (needsConfirmation(call.name, llmConfig.toolConfirmationMode || 'dangerous', {}, llmConfig.toolRules)) {
-                        logger.log('debug', '[AgenticLoop] Pausing for tool confirmation', call.name);
-                        pausedAgentContextRef.current = {
-                            conversationHistory,
-                            modelMessageId,
-                            currentIteration,
-                            maxIterations,
-                            accumulatedThinking,
-                            accumulatedResponse,
-                            accumulatedSources,
-                            accumulatedToolResults,
-                            iterationResponse: accumulatedResponse,
-                            pendingToolCalls: [...pendingBatch],
-                            batchResults,
-                            batchModelText,
-                            generatedImages
-                        };
-                        paused = true;
-                        setPendingToolCall(call);
-                        throttledUpdate(`⏸️ Waiting: ${call.name} requires confirmation...`);
-                        return;
-                    }
-
-                    pendingBatch.shift();
-                    record(await runTool(call));
-                }
-                if (signal.aborted) return;
-
-                // Batch complete: the model turn that asked for the tools, then only their results
-                conversationHistory = [
-                    ...conversationHistory,
-                    { id: `model_${Date.now()}`, role: 'model', text: batchModelText, timestamp: new Date() },
-                    buildObservationMessage(batchResults, `tool_${Date.now()}`)
-                ];
-                batchResults = [];
-                batchModelText = '';
-                accumulatedResponse = '';
-                currentIteration++;  // Increment AFTER tool execution (resumed batches count too)
+            if (outcome.status === 'aborted') return;
+            if (outcome.status === 'paused') {
+                logger.log('debug', '[AgenticLoop] Pausing for tool confirmation', outcome.call.name);
+                pausedAgentContextRef.current = toAgentContext(outcome.state, modelMessageId);
+                paused = true;
+                setPendingToolCall(outcome.call);
+                updateBubble(outcome.state, `⏸️ Waiting: ${outcome.call.name} requires confirmation...`);
+                return;
             }
 
-            // Fallback: If no response text but we have thinking, use thinking as the response
-            let finalResponse = accumulatedResponse;
-            if (!finalResponse.trim() && accumulatedThinking) {
-                finalResponse = accumulatedThinking;
+            const { state } = outcome;
+            let finalResponse = outcome.text;
+            if (!finalResponse.trim() && state.accumulatedToolResults.length > 0) {
+                finalResponse = state.accumulatedToolResults.map(r => `${r.name}: ${r.result}`).join('\n\n');
             }
-            // Also fallback to tool results if nothing else
-            if (!finalResponse.trim() && accumulatedToolResults.length > 0) {
-                finalResponse = accumulatedToolResults.map(r => `${r.name}: ${r.result}`).join('\n\n');
-            }
-            // If we STILL have absolutely nothing, provide a safe fallback so the app doesn't hang
+            let thinking = outcome.thinking;
             if (!finalResponse.trim()) {
                 finalResponse = "I apologize, but I wasn't able to generate a response. The context might be too large or complex.";
-                accumulatedThinking = ""; // Clear confusing thoughts
+                thinking = '';
             }
 
-            // Extract inline memories before cleaning
-            for (const memoryContent of extractInlineMemories(finalResponse)) {
-                logger.log('info', `[MemoryExtraction] Inline memory found: "${memoryContent}"`);
-                // 1. Save to explicit profile memory (Settings > Memory)
-                context.addMemory(memoryContent, 'general');
-
-                // 2. Save to semantic vector database (so it has the 'extracted' tag like before)
-                if (llmConfig.enableSemanticMemory && activeThreadId) {
-                    import('../../services/memory/semanticMemoryRetriever').then(async ({ getOrInitializeSemanticMemoryRetriever }) => {
-                        try {
-                            const retriever = await getOrInitializeSemanticMemoryRetriever(llmConfig);
-                            if (retriever) {
-                                await retriever.saveMessage(activeThreadId, 'extracted', memoryContent);
-                                logger.log('info', `[MemoryExtraction] Saved inline memory to semantic DB with role 'extracted'`);
-                            }
-                        } catch (e) {
-                            logger.log('warn', '[MemoryExtraction] Failed to save to semantic DB', e);
-                        }
-                    }).catch(err => logger.log('warn', '[MemoryExtraction] Failed to import semantic retriever', err));
-                }
-            }
-
-            const processedResponse = processCompletedResponse(cleanFinalAnswer(finalResponse), responseStyle);
+            const processedResponse = processCompletedResponse(finalResponse, responseStyle);
             setMessages(prev => prev.map(msg => msg.id === modelMessageId ? {
                 ...msg,
                 text: processedResponse,
-                thinking: accumulatedThinking || undefined,
-                sources: accumulatedSources.length > 0 ? accumulatedSources : undefined,
-                toolResults: accumulatedToolResults.length > 0 ? [...accumulatedToolResults] : undefined,
-                images: generatedImages.length > 0 ? [...generatedImages] : undefined
+                thinking: thinking || undefined,
+                sources: state.accumulatedSources.length > 0 ? state.accumulatedSources : undefined,
+                toolResults: state.accumulatedToolResults.length > 0 ? [...state.accumulatedToolResults] : undefined,
+                images: state.generatedImages.length > 0 ? [...state.generatedImages] : undefined
             } : msg));
 
             if (autoPlayAudio && processedResponse) {
                 setIsSpeaking(true);
                 speak(processedResponse, speechConfig.ttsProvider, llmConfig, speechConfig, apiKeys.gemini, () => setIsSpeaking(false));
             }
-            // NOTE: model responses are not saved to semantic memory: MemoryExtractionService
-            // stores the important facts instead (only user messages help retrieval)
+            // Facts are not written here: the background consolidation reads the conversation
 
         } catch (error: any) {
             // Errors of a stopped run (AbortError, "Generation aborted by user") are not shown
@@ -418,6 +247,7 @@ export const useAgenticLoop = ({
             const errorMessageText = `Sorry, I encountered an error: ${error.message || 'Please try again.'} `;
             setMessages(prev => prev.map(msg => msg.id === modelMessageId ? { ...msg, text: errorMessageText } : msg));
         } finally {
+            endActivity();
             // Only the run that still owns the shared state resets it (Stop already did otherwise).
             // While paused on a confirmation the bubble keeps its "processing" state.
             if (isActiveRun()) {
@@ -461,3 +291,25 @@ export const useAgenticLoop = ({
         isBusy
     };
 };
+
+/** Run state ↔ the paused context kept while a confirmation is pending */
+function toRunState(ctx: AgentContext): AgentRunState {
+    return {
+        conversationHistory: [...ctx.conversationHistory], currentIteration: ctx.currentIteration, maxIterations: ctx.maxIterations,
+        accumulatedResponse: ctx.accumulatedResponse, accumulatedThinking: ctx.accumulatedThinking,
+        accumulatedSources: [...ctx.accumulatedSources], accumulatedToolResults: [...ctx.accumulatedToolResults],
+        generatedImages: [...(ctx.generatedImages || [])], pendingToolCalls: [...ctx.pendingToolCalls],
+        batchResults: [...(ctx.batchResults || [])], batchModelText: ctx.batchModelText ?? '', executed: [...(ctx.executed || [])], batchCalls: [...(ctx.batchCalls || [])],
+    };
+}
+
+function toAgentContext(state: AgentRunState, modelMessageId: string): AgentContext {
+    return {
+        conversationHistory: state.conversationHistory, modelMessageId, currentIteration: state.currentIteration,
+        maxIterations: state.maxIterations, accumulatedThinking: state.accumulatedThinking, accumulatedResponse: state.accumulatedResponse,
+        accumulatedSources: state.accumulatedSources, accumulatedToolResults: state.accumulatedToolResults,
+        iterationResponse: state.accumulatedResponse, pendingToolCalls: [...state.pendingToolCalls], batchResults: state.batchResults,
+        batchModelText: state.batchModelText, generatedImages: state.generatedImages, executed: state.executed,
+        batchCalls: state.batchCalls,
+    };
+}

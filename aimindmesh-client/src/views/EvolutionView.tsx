@@ -5,6 +5,7 @@ import { Dropdown } from '../components/ui/Dropdown';
 import { Logger } from '../utils/logger';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import type { EvolutionProposalRow, ProtectedPathRow, EvolutionCandidateRow } from '@aimindmesh/api-types';
+import { EvolutionStatsCard, sourceLabel } from '../components/evolution/EvolutionStatsCard';
 
 // Raw rows from /api/evolution (server contract)
 type EvolutionProposal = EvolutionProposalRow;
@@ -197,6 +198,8 @@ export default function EvolutionView() {
           </button>
         </div>
       </div>
+
+      <EvolutionStatsCard />
 
       {/* SUMMARY STATS */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -599,7 +602,7 @@ export default function EvolutionView() {
                 <div className="flex flex-col gap-3">
                     <h4 className="text-[11px] font-black uppercase tracking-[0.3em] opacity-40">Inference Source</h4>
                     <div className="p-4 bg-[#0a0c14] rounded-2xl border border-white/10 font-mono text-[10px] uppercase italic tracking-wider text-white font-bold break-all shadow-inner min-h-[60px] flex items-center">
-                        {selectedCandidate.source.replace('_', ' ')}
+                        {sourceLabel(selectedCandidate.source)}
                     </div>
                 </div>
               </div>

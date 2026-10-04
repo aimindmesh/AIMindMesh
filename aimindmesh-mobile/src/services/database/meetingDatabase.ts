@@ -1,6 +1,22 @@
-import { SQLiteDBConnection, capSQLiteSet } from '@capacitor-community/sqlite';
+import { SQLiteDBConnection } from '@capacitor-community/sqlite';
 import { DatabaseManager } from './DatabaseManager';
 import { logger } from '../logger';
+import { createMeetingTables } from './meetingSchema';
+import {
+    buildMarkMeetingAudioStatement,
+    buildMeetingDeleteSet,
+    buildMeetingSaveSet,
+    buildRemoteDeletionSet,
+    buildSearchSegmentsQuery,
+    buildUpdateNotesStatement,
+    buildUpdateVoicesStatement,
+    DBMeeting,
+    DBMeetingListRow,
+    DBMeetingSegment,
+    DBSegmentMatch,
+    LIST_MEETINGS_QUERY,
+    MeetingNotesColumns
+} from './meetingStatements';
 import {
     blockMeetingSaves,
     isMeetingDeleted,
@@ -17,147 +33,14 @@ export interface SyncDeletion {
     deletedAt: number;
 }
 
-
-export interface DBMeeting {
-    id: string;
-    timestamp: number;
-    duration: number;
-    has_audio: boolean;
-    audio_file_path: string | null;
-    audio_mime_type: string | null;
-    speaker_names_json: string; // JSON string record of idx -> name
-}
-
-export interface DBMeetingSegment {
-    id: string;
-    meeting_id: string;
-    sequence: number;
-    start_ms: number;
-    end_ms: number;
-    text: string;
-    speaker_id: number;
-    stt_provider: string | null;
-    confidence: number | null;
-    words_json: string | null;
-    original_text: string | null;
-    is_edited: boolean;
-    edited_at: number | null;
-}
-
-/**
- * Statements of one meeting save, run as a single transaction. The meeting row is upserted (not
- * REPLACEd: that deletes the row, cascading to the segments and dropping server_id). Audio fields
- * only grow, so a save without new audio keeps the stored file; is_synced = 0 pushes the change.
- */
-export function buildMeetingSaveSet(meeting: DBMeeting, segments: DBMeetingSegment[], deletedAt = Date.now()): capSQLiteSet[] {
-    const set: capSQLiteSet[] = [
-        {
-            statement: `INSERT INTO meetings
-                (id, timestamp, duration, has_audio, audio_file_path, audio_mime_type, speaker_names_json, is_synced)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-                ON CONFLICT(id) DO UPDATE SET
-                    timestamp = excluded.timestamp,
-                    duration = CASE WHEN excluded.duration > 0 THEN excluded.duration ELSE meetings.duration END,
-                    has_audio = MAX(meetings.has_audio, excluded.has_audio),
-                    audio_file_path = COALESCE(excluded.audio_file_path, meetings.audio_file_path),
-                    audio_mime_type = COALESCE(excluded.audio_mime_type, meetings.audio_mime_type),
-                    speaker_names_json = excluded.speaker_names_json,
-                    is_synced = 0`,
-            values: [
-                meeting.id,
-                meeting.timestamp,
-                meeting.duration,
-                meeting.has_audio ? 1 : 0,
-                meeting.audio_file_path,
-                meeting.audio_mime_type,
-                meeting.speaker_names_json || '{}'
-            ]
-        },
-        // Every stored segment is tombstoned, then the ones written again lose their tombstone
-        // (below): what remains are the segments this save dropped, to be deleted remotely too.
-        {
-            statement: `INSERT OR REPLACE INTO sync_deletions (entity_type, entity_id, deleted_at)
-                SELECT 'segment', id, ? FROM meeting_segments WHERE meeting_id = ?`,
-            values: [deletedAt, meeting.id]
-        },
-        { statement: 'DELETE FROM meeting_segments WHERE meeting_id = ?', values: [meeting.id] }
-    ];
-
-    // A duplicated id inside one transcript would abort the whole transaction
-    const seen = new Set<string>();
-    for (const seg of segments) {
-        let id = seg.id;
-        if (seen.has(id)) id = `${id}_${seg.sequence}`;
-        seen.add(id);
-        set.push({
-            statement: `INSERT INTO meeting_segments
-                (id, meeting_id, sequence, start_ms, end_ms, text, speaker_id, stt_provider, confidence, words_json, original_text, is_edited, edited_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            values: [
-                id,
-                seg.meeting_id,
-                seg.sequence,
-                seg.start_ms,
-                seg.end_ms,
-                seg.text,
-                seg.speaker_id,
-                seg.stt_provider,
-                seg.confidence,
-                seg.words_json,
-                seg.original_text,
-                seg.is_edited ? 1 : 0,
-                seg.edited_at
-            ]
-        });
-    }
-    set.push({
-        statement: `DELETE FROM sync_deletions WHERE entity_type = 'segment'
-            AND entity_id IN (SELECT id FROM meeting_segments WHERE meeting_id = ?)`,
-        values: [meeting.id]
-    });
-    return set;
-}
-
-/** User deletion: the meeting tombstone (covering its segments) is written with the delete. */
-export function buildMeetingDeleteSet(meetingId: string, deletedAt = Date.now()): capSQLiteSet[] {
-    return [
-        {
-            statement: `INSERT OR REPLACE INTO sync_deletions (entity_type, entity_id, deleted_at) VALUES ('meeting', ?, ?)`,
-            values: [meetingId, deletedAt]
-        },
-        {
-            statement: `DELETE FROM sync_deletions WHERE entity_type = 'segment'
-                AND entity_id IN (SELECT id FROM meeting_segments WHERE meeting_id = ?)`,
-            values: [meetingId]
-        },
-        { statement: 'DELETE FROM meeting_segments WHERE meeting_id = ?', values: [meetingId] },
-        { statement: 'DELETE FROM meetings WHERE id = ?', values: [meetingId] }
-    ];
-}
-
-/** Deletions received from sync: applied without tombstones (the remote side already knows). */
-export function buildRemoteDeletionSet(meetingIds: string[], segmentIds: string[]): capSQLiteSet[] {
-    const set: capSQLiteSet[] = [];
-    for (const id of meetingIds) {
-        set.push(
-            { statement: 'DELETE FROM meeting_segments WHERE meeting_id = ?', values: [id] },
-            { statement: 'DELETE FROM meetings WHERE id = ?', values: [id] },
-            { statement: `DELETE FROM sync_deletions WHERE entity_type = 'meeting' AND entity_id = ?`, values: [id] }
-        );
-    }
-    for (const id of segmentIds) {
-        set.push(
-            { statement: 'DELETE FROM meeting_segments WHERE id = ?', values: [id] },
-            { statement: `DELETE FROM sync_deletions WHERE entity_type = 'segment' AND entity_id = ?`, values: [id] }
-        );
-    }
-    return set;
-}
+// Row types and statement builders live in meetingStatements (pure, tested): re-exported here
+export type { DBMeeting, DBMeetingSegment, DBMeetingListRow, DBSegmentMatch, MeetingNotesColumns } from './meetingStatements';
+export { buildMeetingSaveSet, buildMeetingDeleteSet, buildRemoteDeletionSet } from './meetingStatements';
 
 export class MeetingDatabase {
     private static instance: MeetingDatabase;
     private dbManager: DatabaseManager;
-    private initialized: boolean = false;
+    private initPromise: Promise<void> | null = null;
 
     private constructor() {
         this.dbManager = DatabaseManager.getInstance();
@@ -170,90 +53,20 @@ export class MeetingDatabase {
         return MeetingDatabase.instance;
     }
 
-    public async initialize(): Promise<void> {
-        if (this.initialized) return;
-
-        try {
-            const db = await this.dbManager.getDatabase('meeting');
-
-            // Create meetings table
-            await db.execute(`
-                CREATE TABLE IF NOT EXISTS meetings (
-                    id TEXT PRIMARY KEY,
-                    timestamp INTEGER NOT NULL,
-                    duration INTEGER NOT NULL,
-                    has_audio INTEGER DEFAULT 0,
-                    audio_file_path TEXT,
-                    audio_mime_type TEXT,
-                    speaker_names_json TEXT,
-                    is_synced INTEGER DEFAULT 0,
-                    server_id TEXT
-                );
-            `);
-
-            // Create meeting segments table
-            await db.execute(`
-                CREATE TABLE IF NOT EXISTS meeting_segments (
-                    id TEXT PRIMARY KEY,
-                    meeting_id TEXT NOT NULL,
-                    sequence INTEGER NOT NULL,
-                    start_ms INTEGER NOT NULL,
-                    end_ms INTEGER NOT NULL,
-                    text TEXT NOT NULL,
-                    speaker_id INTEGER,
-                    stt_provider TEXT,
-                    confidence REAL,
-                    words_json TEXT,
-                    original_text TEXT,
-                    is_edited INTEGER DEFAULT 0,
-                    edited_at INTEGER,
-                    is_synced INTEGER DEFAULT 0,
-                    server_id TEXT,
-                    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
-                );
-            `);
-
-            // Tombstones of deleted meetings/segments until sync has pushed them
-            await db.execute(`
-                CREATE TABLE IF NOT EXISTS sync_deletions (
-                    entity_type TEXT NOT NULL,
-                    entity_id TEXT NOT NULL,
-                    deleted_at INTEGER NOT NULL,
-                    PRIMARY KEY (entity_type, entity_id)
-                );
-            `);
-
-            await db.execute(`
-                CREATE INDEX IF NOT EXISTS idx_meeting_segments_meeting_id 
-                ON meeting_segments(meeting_id, sequence);
-            `);
-
-            this.initialized = true;
-            logger.log('info', 'MeetingDatabase initialized successfully');
-
-            // ── MIGRATIONS ──────────────────────────────────────────────────
-            try {
-                const tables = ['meetings', 'meeting_segments'];
-                for (const table of tables) {
-                    const tableInfo = await db.query(`PRAGMA table_info(${table});`);
-                    const columns = tableInfo.values?.map((col: any) => col.name) || [];
-                    
-                    if (!columns.includes('is_synced')) {
-                        logger.log('info', `[MeetingDB] Adding is_synced column to ${table}`);
-                        await db.execute(`ALTER TABLE ${table} ADD COLUMN is_synced INTEGER DEFAULT 0;`);
-                    }
-                    if (!columns.includes('server_id')) {
-                        logger.log('info', `[MeetingDB] Adding server_id column to ${table}`);
-                        await db.execute(`ALTER TABLE ${table} ADD COLUMN server_id TEXT;`);
-                    }
-                }
-            } catch (migErr) {
-                logger.log('warn', '[MeetingDB] Migration failed', migErr);
-            }
-        } catch (error) {
-            logger.log('error', 'Failed to initialize MeetingDatabase', error);
-            throw error;
+    /** Creates and migrates the tables once; concurrent callers share the same run. */
+    public initialize(): Promise<void> {
+        if (!this.initPromise) {
+            this.initPromise = (async () => {
+                const db = await this.dbManager.getDatabase('meeting');
+                await createMeetingTables(db, fn => this.dbManager.serializedWrite('meeting', fn));
+                logger.log('info', 'MeetingDatabase initialized successfully');
+            })().catch(error => {
+                this.initPromise = null;
+                logger.log('error', 'Failed to initialize MeetingDatabase', error);
+                throw error;
+            });
         }
+        return this.initPromise;
     }
 
     public async saveMeeting(meeting: DBMeeting, segments: DBMeetingSegment[]): Promise<void> {
@@ -406,25 +219,69 @@ export class MeetingDatabase {
     }
 
     /**
-     * Gives a meeting the audio recovered from an interrupted recording, creating the meeting when
-     * no transcript checkpoint was saved before the app was killed.
+     * Gives a meeting its recording (finished, or recovered from an interrupted one) without
+     * touching its transcript or notes, creating the meeting when no transcript was saved before.
      */
     public async attachRecoveredAudio(meeting: { id: string; timestamp: number; durationSec: number; audioPath: string; mimeType: string }): Promise<void> {
         await this.initialize();
+        const { statement, values } = buildMarkMeetingAudioStatement({
+            meetingId: meeting.id,
+            startedAt: meeting.timestamp,
+            durationSec: meeting.durationSec,
+            audioFilePath: meeting.audioPath,
+            mimeType: meeting.mimeType
+        });
         await this.dbManager.serializedWrite('meeting', db => {
             if (isMeetingDeleted(meeting.id)) throw new MeetingDeletedError(meeting.id);
-            return db.run(
-                `INSERT INTO meetings (id, timestamp, duration, has_audio, audio_file_path, audio_mime_type, speaker_names_json, is_synced)
-                 VALUES (?, ?, ?, 1, ?, ?, '{}', 0)
-                 ON CONFLICT(id) DO UPDATE SET
-                    duration = MAX(meetings.duration, excluded.duration),
-                    has_audio = 1,
-                    audio_file_path = excluded.audio_file_path,
-                    audio_mime_type = excluded.audio_mime_type,
-                    is_synced = 0`,
-                [meeting.id, meeting.timestamp, meeting.durationSec, meeting.audioPath, meeting.mimeType]
-            );
+            return db.run(statement, values);
         });
+    }
+
+    /** Updates a meeting's title, bookmarks, analysis or questions without touching the rest. */
+    public async updateNotes(meetingId: string, notes: MeetingNotesColumns): Promise<void> {
+        const update = buildUpdateNotesStatement(meetingId, notes);
+        if (!update) return;
+        await this.initialize();
+        await this.dbManager.serializedWrite('meeting', db => {
+            if (isMeetingDeleted(meetingId)) throw new MeetingDeletedError(meetingId);
+            return db.run(update.statement, update.values);
+        });
+    }
+
+    /** Stores the average voice of each speaker of a meeting (local data: not marked for sync). */
+    public async updateVoices(meetingId: string, voicesJson: string | null): Promise<void> {
+        await this.initialize();
+        const { statement, values } = buildUpdateVoicesStatement(meetingId, voicesJson);
+        await this.dbManager.serializedWrite('meeting', db => db.run(statement, values));
+    }
+
+    /** All meetings, newest first, with segment and speaker counts but no transcripts. */
+    public async listMeetings(): Promise<DBMeetingListRow[]> {
+        await this.initialize();
+        const db = await this.dbManager.getDatabase('meeting');
+        const res = await db.query(LIST_MEETINGS_QUERY);
+        return (res.values || []).map(row => ({ ...row, has_audio: row.has_audio === 1 })) as DBMeetingListRow[];
+    }
+
+    /** Transcript segments containing `query`, newest meetings first. */
+    public async searchSegments(query: string, limit?: number): Promise<DBSegmentMatch[]> {
+        await this.initialize();
+        const db = await this.dbManager.getDatabase('meeting');
+        const { statement, values } = buildSearchSegmentsQuery(query, limit);
+        const res = await db.query(statement, values);
+        return (res.values || []) as DBSegmentMatch[];
+    }
+
+    /** Raw access for small single-table helpers (voice profiles, meeting voices). */
+    public async query(statement: string, values: any[] = []): Promise<any[]> {
+        await this.initialize();
+        const db = await this.dbManager.getDatabase('meeting');
+        return (await db.query(statement, values)).values || [];
+    }
+
+    public async run(statement: string, values: any[] = []): Promise<void> {
+        await this.initialize();
+        await this.dbManager.serializedWrite('meeting', db => db.run(statement, values));
     }
 
     public async updateSegmentText(segmentId: string, _meetingId: string, newText: string): Promise<void> {

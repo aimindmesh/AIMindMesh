@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { ModelSlot, initNativeModel, unloadNativeModelSlot } from '../services/llm/nativeLLM';
 import { LLMConfig } from '../types';
 import { logger } from '../services/logger';
+import { onDeviceContextSize } from '../services/llm/context/contextSize';
 
 export const useNativeModelLoader = (
     llmConfig: LLMConfig,
@@ -42,7 +43,7 @@ export const useNativeModelLoader = (
                 tokenizerPath: llmConfig.nativeTokenizerPath,
                 nThreads: llmConfig.nThreads || 6,
                 nThreadsBatch: llmConfig.nThreadsBatch || 4,
-                nCtx: slot === 'tool' ? 2048 : (llmConfig.nCtx || 2048),
+                nCtx: slot === 'tool' ? 2048 : onDeviceContextSize(llmConfig),
                 nBatch: llmConfig.nBatch || 512,
                 flashAttn: llmConfig.flashAttn ?? true,
                 useMmap: llmConfig.useMmap ?? false,

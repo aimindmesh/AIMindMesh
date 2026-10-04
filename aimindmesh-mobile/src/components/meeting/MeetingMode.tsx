@@ -1,514 +1,509 @@
 /**
- * MeetingMode - Meeting recording and transcription assistant
- * 
- * Refactored into smaller pieces:
- * - hooks/meeting/useMeetingSettings - Settings persistence
- * - hooks/meeting/useAudioPlayback - Audio playback controls
- * - hooks/meeting/useMeetingRecording - Recording with Vosk
- * - hooks/meeting/useMeetingAnalysis - LLM Analysis
- * - hooks/meeting/useMeetingReprocessing - Audio reprocessing and diarization
- * - hooks/meeting/useVoskTranscription - Vosk listeners and ONNX embedding
- * - hooks/meeting/useWhisperTranscription - Whisper loop
- * - hooks/meeting/useMeetingInitialization - Init and model loading
- * - services/meeting/meetingStorage - Storage and export
- * - components/meeting/* - UI subcomponents
+ * MeetingMode - Meeting recording and transcription assistant. It wires together:
+ * - the meeting on screen and its saving (useMeetingSession), the user's edits (useMeetingEdits);
+ * - native recording with live Vosk or Voxtral (useMeetingRecording), crash recovery;
+ * - Whisper transcript and speakers after (and during) recording (useMeetingPostProcessing);
+ * - AI notes and questions (useMeetingNotesAI), the player the transcript follows (useAudioPlayback);
+ * - History, export and settings (components/meeting/*, services/meeting/*).
+ * It stays mounted (hidden) while a recording or a transcription goes on after it is closed.
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Capacitor } from '@capacitor/core';
+import { Haptics, ImpactStyle } from '@capacitor/haptics';
 
-import { LLMConfig, Memory, SpeechConfig } from '../../types';
-import { TranscriptSegment, SavedMeeting } from '../../types/meeting';
-
+import { AIMindMeshServerSettings, LLMConfig, SpeechConfig } from '../../types';
 import { SpeakerDiarization } from '../../services/speaker/speakerDiarization';
 import { logger } from '../../services/logger';
-import { resolveMeetingAudio } from '../../services/meeting/meetingStorage';
+import { attachRecordingToMeeting, loadMeeting } from '../../services/meeting/meetingRecords';
+import { bookmarksFromPositions, displayTitle, formatMeetingDate } from '../../services/meeting/meetingNotes';
+import { bookmarkPlaybackStart, segmentIndexAt } from '../../services/meeting/transcriptTimeline';
+import { formatClock } from '../../services/llm/meetingPrompts';
+import { supportsTaskAudio, TaskKeys } from '../../services/llm/taskCompletion';
+import { FinalizedRecording } from '../../services/audio/meetingRecorder';
 import { registerBackHandler } from '../../services/native/backButtonRegistry';
 import { onMeetingDeleted } from '../../services/meeting/meetingDeletions';
-import { describeRecoveredRecording, recoverInterruptedRecordings } from '../../services/meeting/recordingRecovery';
+import { enterActivity, leaveActivity, unloadEngines } from '../../services/model/modelOrchestrator';
+import { askChoice, askConfirm } from '../../services/ui/dialogs';
+import { EMPTY_NOTES } from '../../types/meeting';
 
-import { useMeetingSettings } from '../../hooks/meeting/useMeetingSettings';
+import { useMeetingSettings, speakerOptionsFrom, transcribeOptionsFrom } from '../../hooks/meeting/useMeetingSettings';
 import { useAudioPlayback } from '../../hooks/meeting/useAudioPlayback';
-import { useMeetingRecording, RecordingStopResult } from '../../hooks/meeting/useMeetingRecording';
+import { useMeetingRecording } from '../../hooks/meeting/useMeetingRecording';
 import { useMeetingSession } from '../../hooks/meeting/useMeetingSession';
-import { useMeetingAnalysis } from '../../hooks/meeting/useMeetingAnalysis';
-import { useMeetingReprocessing } from '../../hooks/meeting/useMeetingReprocessing';
+import { useMeetingEdits } from '../../hooks/meeting/useMeetingEdits';
+import { MeetingContext } from '../../hooks/meeting/useMeetingAnalysis';
+import { useMeetingNotesAI } from '../../hooks/meeting/useMeetingNotesAI';
+import { useRecordingRecovery } from '../../hooks/meeting/useRecordingRecovery';
+import { useDiarizationSync } from '../../hooks/meeting/useDiarizationSync';
+import { useMeetingPostProcessing, describeJob, PostProcessTarget } from '../../hooks/meeting/useMeetingPostProcessing';
 import { useVoskTranscription } from '../../hooks/meeting/useVoskTranscription';
-import { useWhisperTranscription } from '../../hooks/meeting/useWhisperTranscription';
 import { useOverlapDetection } from '../../hooks/meeting/useOverlapDetection';
-import { useHybridTranscription } from '../../hooks/meeting/useHybridTranscription';
 import { useMeetingInitialization } from '../../hooks/meeting/useMeetingInitialization';
+import { useAudioImport, ImportedAudio } from '../../hooks/meeting/useAudioImport';
 
-import { segmentAudioService } from '../../services/meeting/SegmentAudioService';
-import { hasSegmentTiming } from '../../services/speaker/segmentAssignment';
-import { MeetingHeader, MeetingTranscript, MeetingAnalysisPanel, MeetingControls, ExportBottomSheet } from '.';
+import { MeetingHeader, MeetingTranscript, MeetingNotesPanel, MeetingControls, ExportBottomSheet } from '.';
 import MeetingHistory from './MeetingHistory';
-import AudioMiniPlayer from './AudioMiniPlayer';
+import MeetingTitleBar, { MeetingView } from './MeetingTitleBar';
+import WelcomeCard, { isWelcomeDismissed } from './WelcomeCard';
+import RecoveryBanner from './RecoveryBanner';
 import Toast from '../ui/Toast';
-import { enterActivity, leaveActivity } from '../../services/model/modelOrchestrator';
+
+export interface MeetingBusyState {
+    recording: boolean;
+    /** Seconds recorded so far, while recording */
+    startedAt?: number;
+    processing: string | null;
+}
 
 interface MeetingModeProps {
+    /** Closes the screen (a recording or transcription in progress goes on in the background). */
     onClose: () => void;
-    personality: any;
+    /** Hidden: kept mounted for a recording or transcription that goes on after closing. */
+    hidden?: boolean;
+    /** What the meeting is doing, so the app keeps it mounted and shows it outside the screen. */
+    onBusyChange?: (busy: MeetingBusyState | null) => void;
+    /** Messages while hidden are shown by the app. */
+    onBackgroundToast?: (message: string, type: 'success' | 'error' | 'info') => void;
+    onOpenSettings?: (tab?: string) => void;
     llmConfig: LLMConfig;
-    apiKey?: string;
-    memories?: Memory[];
+    keys: TaskKeys;
+    serverSettings?: AIMindMeshServerSettings;
     speechConfig?: SpeechConfig;
 }
 
-const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, personality, llmConfig, apiKey, memories, speechConfig }) => {
-    // ===== State =====
-    const [currentText, setCurrentText] = useState('');
+const isWideScreen = () => typeof window !== 'undefined' && window.matchMedia('(min-width: 768px)').matches;
+
+const MeetingMode: React.FC<MeetingModeProps> = ({ onClose, hidden = false, onBusyChange, onBackgroundToast, onOpenSettings, llmConfig, keys, serverSettings, speechConfig }) => {
+    const [view, setView] = useState<MeetingView>('transcript');
+    const [showWelcome, setShowWelcome] = useState(() => !isWelcomeDismissed());
     const [isHistoryOpen, setIsHistoryOpen] = useState(false);
-    const [toast, setToast] = useState<{ message: string; isVisible: boolean; type: 'success' | 'error' | 'info' }>({
-        message: '',
-        isVisible: false,
-        type: 'success'
-    });
-    const [isWhisperTranscribing, setIsWhisperTranscribing] = useState(false);
     const [isExportSheetOpen, setIsExportSheetOpen] = useState(false);
+    const [toast, setToast] = useState<{ message: string; isVisible: boolean; type: 'success' | 'error' | 'info' }>({ message: '', isVisible: false, type: 'success' });
 
-    // ===== Refs =====
-    const diarizationRef = useRef<SpeakerDiarization>(new SpeakerDiarization());
-    const transcriptEndRef = useRef<HTMLDivElement>(null);
-    const closingRef = useRef(false);
-
-    // Audio Playback state tracking
-    const [segmentAudioState, setSegmentAudioState] = useState(segmentAudioService.getState());
-
-    useEffect(() => {
-        const unsubscribe = segmentAudioService.subscribe((state, segmentId) => {
-            setSegmentAudioState({ state, activeSegmentId: segmentId });
-        });
-        return unsubscribe;
-    }, []);
-
-    // ===== Custom Hooks =====
+    const hiddenRef = useRef(hidden);
+    hiddenRef.current = hidden;
+    const backgroundToastRef = useRef(onBackgroundToast);
+    backgroundToastRef.current = onBackgroundToast;
     const showToast = useCallback((message: string, type: 'success' | 'error' | 'info' = 'success') => {
-        setToast({ message, isVisible: true, type });
+        if (hiddenRef.current && backgroundToastRef.current) backgroundToastRef.current(message, type);
+        else setToast({ message, isVisible: true, type });
     }, []);
 
     const settings = useMeetingSettings();
     const playback = useAudioPlayback({ showToast });
-    // Transcript, names, meeting id and saving (always from the latest values)
+    const diarizationRef = useRef<SpeakerDiarization>(new SpeakerDiarization());
+    const recognizeVoicesRef = useRef(settings.recognizeVoices);
+    recognizeVoicesRef.current = settings.recognizeVoices;
+
     const session = useMeetingSession(showToast);
-    const { transcript, setTranscript, speakerNames, setSpeakerNames, audioFilePathRef, pcmAudioBlobRef } = session;
-    const { setRecordedAudioUrl, setAudioDuration } = playback;
+    const { transcript, setTranscript, speakerNames, notes, setNotes, meta, metaRef, transcriptRef, notesRef, audioFilePathRef } = session;
+    const edits = useMeetingEdits({ session, playback, diarizationRef, recognizeVoicesRef, showToast });
+    const { currentText, setCurrentText, focus, focusSegment, showAudio, addBookmarks } = edits;
+    const currentMeetingId = meta.id;
 
     const transcriptionModeRef = useRef(settings.transcriptionMode);
-    useEffect(() => {
-        transcriptionModeRef.current = settings.transcriptionMode;
-    }, [settings.transcriptionMode]);
+    transcriptionModeRef.current = settings.transcriptionMode;
+    const settingsRef = useRef(settings);
+    settingsRef.current = settings;
+    const startTranscriptionRef = useRef<(target: PostProcessTarget, recording?: FinalizedRecording) => void>(() => { });
+    const keepWavRef = useRef<() => boolean>(() => false);
 
-    const handleRecordingStopped = useCallback(async ({ filePath, pcmBlob, durationMs }: RecordingStopResult) => {
+    // ===== AI notes and questions =====
+    const ai = useMeetingNotesAI({
+        llmConfig, keys, serverSettings, showToast,
+        getScreen: () => ({ meetingId: metaRef.current.id, notes: notesRef.current }),
+        setNotes,
+        getAutoSettings: () => ({ enabled: settingsRef.current.autoAnalyze, language: settingsRef.current.transcriptionLanguage })
+    });
+    const { analyzeFinalTranscript } = ai;
+
+    const handleRecordingStopped = useCallback(async (rec: FinalizedRecording) => {
+        const bookmarks = bookmarksFromPositions(rec.bookmarks);
+        // Written at once, so the audio is linked even if the app dies before the next autosave
         try {
-            // The recording is moved into meeting storage: play it from there
-            const storedPath = await session.attachRecording(filePath, pcmBlob, durationMs);
-            if (storedPath) {
-                setRecordedAudioUrl(Capacitor.convertFileSrc(storedPath));
-            } else if (pcmBlob && pcmBlob.size > 0) {
-                setRecordedAudioUrl(URL.createObjectURL(pcmBlob));
-            } else {
-                showToast('The audio could not be saved: the transcript is kept', 'error');
-            }
-            if (durationMs > 0) setAudioDuration(durationMs / 1000);
-            await session.save();
-        } catch (error) {
-            logger.log('error', 'Error handling stopped recording', error);
-            showToast('Error saving recording', 'error');
+            await attachRecordingToMeeting({ ...rec, bookmarks });
+        } catch (e) {
+            logger.log('error', 'Failed to link the recording to its meeting', e);
         }
-    }, [session.attachRecording, session.save, setRecordedAudioUrl, setAudioDuration, showToast]);
+        if (metaRef.current.id === rec.meetingId) {
+            const durationSec = rec.durationMs / 1000;
+            showAudio(rec.audioPath, durationSec);
+            addBookmarks(bookmarks);
+            session.updateMeta({ hasAudio: true, audioMimeType: rec.mimeType, duration: durationSec });
+        }
+        if (settingsRef.current.autoTranscribe) {
+            // Voxtral and Whisper together do not fit in RAM
+            if (transcriptionModeRef.current === 'voxtral') await unloadEngines(['voxtral'], 'meeting transcription').catch(() => { });
+            startTranscriptionRef.current({ meetingId: rec.meetingId, startedAt: rec.startedAt, audioPath: rec.audioPath }, rec);
+        } else if (metaRef.current.id === rec.meetingId) {
+            // The live transcript is final: notes can start now
+            analyzeFinalTranscript(rec.meetingId, transcriptRef.current);
+        }
+    }, [showAudio, addBookmarks, analyzeFinalTranscript, session, metaRef, transcriptRef]);
+
+    const handleSessionReattached = useCallback(async ({ meetingId, startedAt, bookmarks }: { meetingId: string; startedAt: number; bookmarks: number[] }) => {
+        // The transcript autosaved before the UI went away
+        const saved = await loadMeeting(meetingId).catch(() => null);
+        edits.resetScreen();
+        session.openMeeting(saved ?? { id: meetingId, timestamp: startedAt, transcript: [], speakerNames: {}, duration: 0, hasAudio: false }, null);
+        addBookmarks(bookmarksFromPositions(bookmarks));
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [addBookmarks, session]);
 
     const recording = useMeetingRecording({
         recognitionModeRef: settings.recognitionModeRef,
         transcriptionModeRef,
         showToast,
         onRecordingStopped: handleRecordingStopped,
+        onSessionReattached: handleSessionReattached,
+        onBookmark: ms => addBookmarks(bookmarksFromPositions([ms])),
+        shouldKeepWav: () => keepWavRef.current(),
         setTranscript,
-        diarizationRef,
-        getMeetingId: session.getMeetingId
+        diarizationRef
     });
 
-    const analysis = useMeetingAnalysis({
+    /** What the AI gets to know about the meeting on screen. */
+    const currentContext = (): MeetingContext | null => meta.id ? {
+        meetingId: meta.id,
         transcript,
         speakerNames,
-        playback,
-        audioFilePathRef,
-        llmConfig,
-        personality,
-        memories,
-        apiKey,
-        showToast
-    });
+        bookmarks: notes.bookmarks,
+        questions: notes.questions,
+        language: settings.transcriptionLanguage,
+        audio: playback.recordedAudioUrl
+            ? { url: playback.recordedAudioUrl, mimeType: meta.audioMimeType ?? null, filePath: audioFilePathRef.current }
+            : undefined
+    } : null;
 
-    const reprocessing = useMeetingReprocessing({
-        playback,
-        speechConfig,
-        getTranscript: session.getTranscript,
-        setTranscript,
-        getMeetingTimestamp: session.getMeetingTimestamp,
-        diarizationRef,
-        settings,
+    // ===== On-device post-processing =====
+    const postProcessing = useMeetingPostProcessing({
         showToast,
-        saveMeeting: session.save,
-        suspendAutosave: session.suspendAutosave,
-        pcmAudioBlobRef,
-        audioFilePathRef
+        onTranscript: async (meetingId, result) => {
+            const { names, note } = await edits.applyTranscript(meetingId, result);
+            analyzeFinalTranscript(meetingId, result.transcript, names);
+            return note;
+        },
+        onSpeakers: (meetingId, result) => edits.applySpeakers(meetingId, result)
     });
 
-    // Edits, renames and late results are saved without an explicit call
+    /** Whisper on a recording: finishing what was transcribed while recording, when there is. */
+    startTranscriptionRef.current = (target: PostProcessTarget, finished?: FinalizedRecording) => {
+        if (finished) postProcessing.transcribeFinished(target, finished, transcribeOptionsFrom(settings));
+        else postProcessing.transcribe(target, transcribeOptionsFrom(settings));
+    };
+    keepWavRef.current = () => !!metaRef.current.id && postProcessing.isLive(metaRef.current.id);
+
+    /** The meeting on screen, if its audio is a file the post-processing can read. */
+    const currentTarget = (): PostProcessTarget | null =>
+        meta.id && audioFilePathRef.current
+            ? { meetingId: meta.id, startedAt: meta.timestamp, audioPath: audioFilePathRef.current }
+            : null;
+    const isProcessingCurrent = !!postProcessing.job && postProcessing.job.meetingId === meta.id;
+
+    // Edits, renames, notes and late results are saved without an explicit call
     useEffect(() => {
         session.scheduleAutosave(recording.isRecording);
-    }, [transcript, speakerNames, recording.isRecording, session.scheduleAutosave]);
+    }, [transcript, speakerNames, notes, recording.isRecording, session.scheduleAutosave]);
 
-    // ===== Sub-Hooks for Transcriptions =====
-    useVoskTranscription({
-        settings,
-        recording,
-        reprocessing,
-        diarizationRef,
-        setCurrentText,
-        setTranscript
-    });
+    const handleImported = useCallback(async (imported: ImportedAudio) => {
+        await session.flush();
+        // Stored right away: the audio file already exists under its id
+        await attachRecordingToMeeting({ meetingId: imported.meetingId, startedAt: imported.startedAt, durationMs: imported.durationSec * 1000, mimeType: imported.mimeType });
+        edits.resetScreen();
+        session.openMeeting({ id: imported.meetingId, timestamp: imported.startedAt, transcript: [], speakerNames: {}, duration: imported.durationSec, hasAudio: true, audioMimeType: imported.mimeType }, null);
+        showAudio(imported.audioPath, imported.durationSec);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [session, showAudio]);
+    const audioImport = useAudioImport({ onImported: handleImported, showToast });
 
-    useWhisperTranscription({
-        settings,
-        recording,
-        setTranscript,
-        setIsWhisperTranscribing,
-        diarizationRef,
-        recognitionModeRef: settings.recognitionModeRef
-    });
-
-    useHybridTranscription({
-        settings,
-        recording,
-        transcript,
-        setTranscript
-    });
-
-    const { isModelLoading } = useMeetingInitialization({ settings, showToast });
-
-    // Overlap detection: marks segments where two speakers talk simultaneously
+    // ===== Live transcription and speakers =====
+    useVoskTranscription({ settings, recording, diarizationRef, setCurrentText, setTranscript });
+    const { activeVoskModel, isVoskLoading } = useMeetingInitialization({ settings, speechConfig, showToast });
     useOverlapDetection({ transcript, setTranscript });
-
-    // ===== Effects =====
-
-    // Sync diarization sensitivity
-    useEffect(() => {
-        diarizationRef.current.setSimilarityThreshold(settings.diarizationSensitivity);
-    }, [settings.diarizationSensitivity]);
-
-    // Sync temporal smoothing
-    useEffect(() => {
-        diarizationRef.current.setMinTimeBetweenSwitches(settings.temporalSmoothing);
-    }, [settings.temporalSmoothing]);
-
-    // Sync advanced diarization settings
-    useEffect(() => {
-        diarizationRef.current.setEmbeddingThreshold(settings.embeddingThreshold);
-    }, [settings.embeddingThreshold]);
-
-    useEffect(() => {
-        diarizationRef.current.setRejectionThreshold(settings.embeddingRejectionThreshold);
-    }, [settings.embeddingRejectionThreshold]);
-
-    useEffect(() => {
-        diarizationRef.current.setAdaptationRate(settings.embeddingAdaptationRate);
-    }, [settings.embeddingAdaptationRate]);
-
-    useEffect(() => {
-        diarizationRef.current.setMinEmbeddingMagnitude(settings.minEmbeddingMagnitude);
-    }, [settings.minEmbeddingMagnitude]);
-
-    // Scroll to bottom
-    useEffect(() => {
-        transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, [transcript, currentText]);
+    useDiarizationSync(diarizationRef, settings);
 
     // RAM: Stable Diffusion leaves while the meeting is open; a heavy speech model (Voxtral,
-    // Whisper medium/large) frees the LLM when it loads; closing frees them and restores the LLM
+    // Whisper medium/large) frees the LLM when it loads; leaving frees them and restores the LLM
     useEffect(() => {
         void enterActivity('meeting', ['gguf', 'litert', 'genie', 'whisper', 'voxtral']).catch(() => { });
         return () => { void leaveActivity('meeting'); };
     }, []);
 
-    // ===== Handlers =====
+    // The app keeps the screen mounted (hidden) while it records or transcribes
+    const processingLabel = postProcessing.job ? describeJob(postProcessing.job) : postProcessing.live ? 'Transcribing while recording' : null;
+    const isBusyRecording = recording.isRecording || recording.isFinalizing;
+    useEffect(() => {
+        onBusyChange?.(isBusyRecording || processingLabel
+            ? { recording: isBusyRecording, startedAt: recording.isRecording ? meta.timestamp : undefined, processing: processingLabel }
+            : null);
+    }, [onBusyChange, isBusyRecording, recording.isRecording, processingLabel, meta.timestamp]);
 
-    /**
-     * Closing (X or Android Back) never drops a recording: it asks, stops, finishes the file and
-     * saves before leaving. Overlays close first.
-     */
-    const requestClose = async () => {
-        if (closingRef.current) return;
-        if (isExportSheetOpen) return setIsExportSheetOpen(false);
-        if (isHistoryOpen) return setIsHistoryOpen(false);
-        if ((recording.isRecordingRef.current || recording.isBusyRef.current) &&
-            !window.confirm('A meeting is being recorded. Stop the recording, save it and close?')) return;
-        if (reprocessing.isReclustering) {
-            if (!window.confirm('Processing is still running. Close anyway? The meeting keeps its previous transcript.')) return;
-            reprocessing.handleCancelProcessing();
+    // Recordings that a crash or a kill left unsaved
+    const hasContent = transcript.length > 0 || meta.hasAudio || notes.bookmarks.length > 0;
+    const recovery = useRecordingRecovery({
+        showToast,
+        onRecovered: recovered => {
+            if (isBusyRecording || hasContent) return;
+            void edits.openSavedMeeting(recovered.meetingId);
         }
-        closingRef.current = true;
-        try {
-            await recording.stopRecording();
-            await session.flush();
-        } catch (error) {
-            logger.log('error', 'Error while closing the meeting', error);
-        } finally {
-            onClose();
-        }
-    };
-    const requestCloseRef = useRef(requestClose);
-    requestCloseRef.current = requestClose;
-
-    useEffect(() => registerBackHandler('meeting', () => {
-        void requestCloseRef.current();
-        return true;
-    }), []);
+    });
 
     // The open meeting deleted in History or on another device: an autosave must not recreate it
     const handleOpenMeetingDeletedRef = useRef<(meetingId: string) => void>(() => { });
     handleOpenMeetingDeletedRef.current = (meetingId: string) => {
-        const result = session.handleMeetingDeleted(meetingId, recording.isRecordingRef.current || recording.isBusyRef.current);
+        const result = session.handleMeetingDeleted(meetingId, recording.isRecordingRef.current || recording.isActiveRef.current);
         if (result === 'none') return;
         if (result === 'detached') {
             showToast('This meeting was deleted: the recording continues as a new meeting', 'info');
             return;
         }
-        if (reprocessing.isReclustering) reprocessing.handleCancelProcessing();
-        void segmentAudioService.stop();
-        diarizationRef.current.clear();
-        setCurrentText('');
-        setRecordedAudioUrl(null);
-        setAudioDuration(0);
+        if (isProcessingCurrent) postProcessing.cancel();
+        playback.audioRef.current?.pause();
+        edits.resetScreen();
         showToast('The open meeting was deleted', 'info');
     };
     useEffect(() => onMeetingDeleted(id => handleOpenMeetingDeletedRef.current(id)), []);
 
-    // Recordings cut short by the app being killed are recovered and announced once
-    useEffect(() => {
-        let cancelled = false;
-        recoverInterruptedRecordings()
-            .then(recovered => {
-                if (cancelled || recovered.length === 0) return;
-                const message = recovered.map(r => describeRecoveredRecording(r)).join('\n');
-                showToast(message, 'success');
-            })
-            .catch(e => logger.log('warn', 'Recovery of interrupted recordings failed', e));
-        return () => { cancelled = true; };
-    }, [showToast]);
+    // ===== Handlers =====
+    const handleNewMeeting = async () => {
+        if (isBusyRecording) return showToast('Please stop the current recording first', 'info');
+        await session.flush();
+        edits.startNewMeeting(false);
+        setView('transcript');
+        showToast(hasContent ? 'New meeting: the previous one is saved in History' : 'New meeting session started', 'success');
+    };
 
     const handleStartRecording = async () => {
-        if (recording.isRecordingRef.current || recording.isBusyRef.current || reprocessing.isReclustering) return;
-        // Every recording is a new meeting (the previous one is already saved)
-        session.beginNewMeeting();
-        diarizationRef.current.clear();
-        setCurrentText('');
-        setRecordedAudioUrl(null);
-        setAudioDuration(0);
-        await recording.startRecording();
-    };
-
-    const handleRenameSpeaker = (speakerId: number) => {
-        const currentName = speakerNames[speakerId] || `Speaker ${speakerId + 1}`;
-        const newName = prompt('Speaker Name:', currentName);
-        if (newName && newName.trim()) {
-            setSpeakerNames(prev => ({ ...prev, [speakerId]: newName.trim() }));
+        if (recording.isActiveRef.current) return;
+        playback.audioRef.current?.pause();
+        // Each recording is its own meeting; the one on screen is already saved
+        const hadContent = hasContent;
+        const meetingId = edits.startNewMeeting(true)!;
+        setView('transcript');
+        const started = await recording.startRecording(meetingId);
+        if (!started) return;
+        // Segment timestamps count from the first recorded sample
+        if (metaRef.current.id === meetingId) session.updateMeta({ timestamp: started.startedAt });
+        if (settings.autoTranscribe && settings.transcribeWhileRecording && settings.transcriptionMode !== 'voxtral' && started.wavPath) {
+            postProcessing.startLive({ meetingId, startedAt: started.startedAt, audioPath: '', wavPath: started.wavPath }, transcribeOptionsFrom(settings));
         }
+        if (hadContent) showToast('New meeting started: the previous one is saved in History', 'info');
     };
 
-    const handleExport = async () => {
-        if (transcript.length === 0 && !session.meta.hasAudio) {
-            showToast('No transcript to export', 'info');
+    const handleImportAudio = () => {
+        if (isBusyRecording) return showToast('Please stop the current recording first', 'info');
+        audioImport.triggerAudioImport();
+    };
+
+    const handleTranscribe = async () => {
+        const target = currentTarget();
+        if (!target) {
+            showToast(meta.hasAudio ? 'This meeting has no audio file on this phone (old format, or recorded on another device)' : 'No recorded audio to transcribe', 'info');
             return;
         }
-        setIsExportSheetOpen(true);
+        const editsCount = transcript.filter(t => t.isEdited).length;
+        if (editsCount > 0 && !await askConfirm({
+            title: 'Replace the transcript?',
+            message: `The new transcript replaces the current one, including ${editsCount} manual edit${editsCount === 1 ? '' : 's'}.`,
+            confirmLabel: 'Transcribe'
+        })) return;
+        startTranscriptionRef.current(target);
     };
 
-    const handleSegmentPlay = async (segment: TranscriptSegment) => {
-        // Needs the saved audio file and the segment's position in it
-        if (!audioFilePathRef.current || !hasSegmentTiming(segment)) {
-            showToast('Audio file not ready for this segment', 'info');
-            return;
-        }
+    const handleIdentifySpeakers = () => {
+        const target = currentTarget();
+        if (!target) return showToast('No recorded audio to analyze', 'info');
+        if (transcript.length === 0) return showToast('No transcript yet: transcribe the audio first', 'info');
+        postProcessing.identifySpeakers(target, transcript, speakerOptionsFrom(settings));
+    };
 
-        try {
-            const currentState = segmentAudioService.getState();
-            if (currentState.activeSegmentId === segment.id && currentState.state === 'playing') {
-                await segmentAudioService.pause();
-            } else if (currentState.activeSegmentId === segment.id && currentState.state === 'paused') {
-                await segmentAudioService.resume();
-            } else {
-                await segmentAudioService.playSegment(segment.id, audioFilePathRef.current, segment.start_ms, segment.end_ms);
-            }
-        } catch (error) {
-            showToast('Could not play this segment', 'error');
+    const handleSeek = (ms: number) => playback.seekTo(ms / 1000, true);
+
+    /** A time in the AI notes: play it, and show where it is in the transcript. */
+    const handleSeekFromNotes = (ms: number) => {
+        // Cited times are whole seconds: "2:58" means the sentence starting within that second
+        const index = segmentIndexAt(transcript, ms + 999);
+        handleSeek(index >= 0 ? Math.min(ms, transcript[index].start_ms!) : ms);
+        if (index >= 0) {
+            if (!isWideScreen()) setView('transcript');
+            focusSegment(transcript[index].id);
         }
     };
 
-    const handleSegmentEdit = (segment: TranscriptSegment, newText: string) => {
-        // Autosave persists it (an explicit save here used to write the pre-edit transcript)
-        setTranscript(prev => prev.map(t => {
-            if (t.id === segment.id) {
-                return {
-                    ...t,
-                    text: newText,
-                    originalText: t.originalText || t.text,
-                    isEdited: true,
-                    editedAt: Date.now()
-                };
-            }
-            return t;
-        }));
+    const handleMarkMoment = async () => {
+        let ms: number | null = null;
+        if (recording.isRecording) ms = await recording.addBookmark();
+        else if (playback.recordedAudioUrl && meta.id) ms = Math.round(playback.currentTime * 1000);
+        if (ms === null) return showToast('Nothing to mark: record or play a meeting first', 'info');
+        addBookmarks(bookmarksFromPositions([ms]));
+        Haptics.impact({ style: ImpactStyle.Medium }).catch(() => { });
+        showToast(`Moment marked at ${formatClock(ms)}`, 'success');
     };
 
-    const handleHistoryReprocess = async (meeting: SavedMeeting) => {
-        if (recording.isRecordingRef.current || recording.isBusyRef.current || reprocessing.isReclustering) {
-            showToast('Stop the recording before opening another meeting', 'info');
+    /** Opens a saved meeting, optionally at one of its segments (a search result). */
+    const handleOpenMeeting = async (meetingId: string, segmentId?: string) => {
+        if (meetingId === meta.id) {
+            setIsHistoryOpen(false);
+            setView('transcript');
+            if (segmentId) focusSegment(segmentId);
             return;
         }
-        let audio: { url: string; filePath: string | null } | null = null;
-        try {
-            audio = await resolveMeetingAudio(meeting);
-        } catch (e) {
-            logger.log('warn', 'Failed to load the meeting audio', e);
-        }
-        const audioUrl = audio?.url ?? null;
-
-        if (!audioUrl) {
-            showToast('This meeting has no saved audio.', 'error');
-            return;
-        }
-        session.openMeeting(meeting, audio?.filePath ?? null);
-        diarizationRef.current.clear();
-        setRecordedAudioUrl(audioUrl);
-        setAudioDuration(meeting.duration || 0);
+        if (isBusyRecording) return showToast('Please stop the current recording first', 'info');
+        await session.flush();
+        playback.audioRef.current?.pause();
+        if (!await edits.openSavedMeeting(meetingId)) return showToast('Could not open this meeting', 'error');
+        setView('transcript');
+        if (segmentId) setTimeout(() => focusSegment(segmentId), 50); // after the transcript has rendered
         setIsHistoryOpen(false);
-        showToast('Meeting loaded. Press "Reprocess Audio" to process.', 'info');
     };
+
+    /**
+     * Closing (X or Android Back) never drops a recording: it goes on in the background, or is
+     * stopped and saved. Overlays close first.
+     */
+    const requestClose = async () => {
+        if (isExportSheetOpen) return setIsExportSheetOpen(false);
+        if (isHistoryOpen) return setIsHistoryOpen(false);
+        if (recording.isRecordingRef.current) {
+            const choice = await askChoice({
+                title: 'A meeting is being recorded',
+                choices: [
+                    { id: 'background', label: 'Keep recording in the background', description: 'Reopen it from the bar at the top of the app' },
+                    { id: 'stop', label: 'Stop and save' }
+                ]
+            });
+            if (!choice) return;
+            if (choice === 'stop') await recording.stopRecording();
+        }
+        await session.flush().catch(e => logger.log('error', 'Error while closing the meeting', e));
+        onClose();
+    };
+    const requestCloseRef = useRef(requestClose);
+    requestCloseRef.current = requestClose;
+    useEffect(() => {
+        if (hidden) return;
+        return registerBackHandler('meeting', () => { void requestCloseRef.current(); return true; });
+    }, [hidden]);
 
     // ===== Render =====
+    const aiJobHere = ai.job && ai.job.meetingId === meta.id ? ai.job : null;
+    const notesCount = (notes.analysis ? 1 : 0) + notes.questions.length;
+    const playbackMs = playback.recordedAudioUrl && (playback.isPlayingAudio || playback.currentTime > 0) ? playback.currentTime * 1000 : null;
+    const canSeek = !!playback.recordedAudioUrl && !recording.isRecording;
+    const emptyMessage = recording.isRecording
+        ? (settings.transcriptionMode === 'off' ? 'Recording audio only: the transcript is made after the meeting' : 'Listening… the live transcript appears here')
+        : meta.id && meta.hasAudio ? 'No transcript yet: use Transcribe (Whisper) below' : 'Press Record to start the meeting';
+
     return (
-        <>
+        <div className={hidden ? 'hidden' : undefined}>
             <div className="fixed inset-0 bg-background z-50 flex flex-col pt-safe pb-safe">
                 <MeetingHeader
                     onClose={() => void requestClose()}
-                    isRecording={recording.isRecording || recording.isBusy}
+                    onOpenSettings={() => onOpenSettings?.()}
                     onOpenHistory={() => setIsHistoryOpen(true)}
-                    recognitionMode={settings.recognitionMode}
-                    setRecognitionMode={settings.setRecognitionMode}
+                    onNewMeeting={handleNewMeeting}
+                    onImportAudio={handleImportAudio}
+                    settings={settings}
                     speechConfig={speechConfig}
-                    diarizationSensitivity={settings.diarizationSensitivity}
-                    setDiarizationSensitivity={settings.setDiarizationSensitivity}
-                    temporalSmoothing={settings.temporalSmoothing}
-                    setTemporalSmoothing={settings.setTemporalSmoothing}
-                    embeddingDuration={settings.embeddingDuration}
-                    setEmbeddingDuration={settings.setEmbeddingDuration}
-                    targetSpeakerCount={settings.targetSpeakerCount}
-                    setTargetSpeakerCount={settings.setTargetSpeakerCount}
-                    clusteringAlgorithm={settings.clusteringAlgorithm}
-                    setClusteringAlgorithm={settings.setClusteringAlgorithm}
-                    transcriptionLanguage={settings.transcriptionLanguage}
-                    setTranscriptionLanguage={settings.setTranscriptionLanguage}
-                    transcriptionMode={settings.transcriptionMode}
-                    setTranscriptionMode={settings.setTranscriptionMode}
-                    whisperChunkSize={settings.whisperChunkSize}
-setWhisperChunkSize={settings.setWhisperChunkSize}
-                        whisperVadFilter={settings.whisperVadFilter}
-                        setWhisperVadFilter={settings.setWhisperVadFilter}
-                        whisperConditionOnPrevious={settings.whisperConditionOnPrevious}
-                        setWhisperConditionOnPrevious={settings.setWhisperConditionOnPrevious}
-                        whisperWordTimestamps={settings.whisperWordTimestamps}
-                        setWhisperWordTimestamps={settings.setWhisperWordTimestamps}
-                        whisperProfile={settings.whisperProfile}
-                        setWhisperProfile={settings.setWhisperProfile}
-                        // Advanced Diarization
-                    embeddingThreshold={settings.embeddingThreshold}
-                    setEmbeddingThreshold={settings.setEmbeddingThreshold}
-                    embeddingRejectionThreshold={settings.embeddingRejectionThreshold}
-                    setEmbeddingRejectionThreshold={settings.setEmbeddingRejectionThreshold}
-                    embeddingAdaptationRate={settings.embeddingAdaptationRate}
-                    setEmbeddingAdaptationRate={settings.setEmbeddingAdaptationRate}
-                    minEmbeddingMagnitude={settings.minEmbeddingMagnitude}
-                    setMinEmbeddingMagnitude={settings.setMinEmbeddingMagnitude}
+                    activeVoskModel={activeVoskModel}
+                    isVoskLoading={isVoskLoading}
+                    isRecording={isBusyRecording}
+                    aiConfigured={ai.isConfigured}
                 />
 
+                <RecoveryBanner sessions={recovery.recoverable} busySessionId={recovery.busySessionId} onRecover={recovery.recover} onDiscard={recovery.discard} />
+
+                {meta.id && (
+                    <MeetingTitleBar
+                        title={recording.isRecording && !notes.title ? 'Recording…' : displayTitle({ timestamp: meta.timestamp, ...notes })}
+                        date={notes.title || notes.analysis?.title ? formatMeetingDate(meta.timestamp) : 'Tap to name this meeting'}
+                        bookmarkCount={notes.bookmarks.length}
+                        notesCount={notesCount}
+                        isAIBusy={!!aiJobHere}
+                        view={view}
+                        onViewChange={setView}
+                        onRename={edits.renameMeeting}
+                    />
+                )}
+
                 <div className="flex-1 overflow-hidden flex flex-col md:flex-row">
-                    <MeetingTranscript
+                    {!meta.id && showWelcome ? (
+                        <WelcomeCard isAIConfigured={ai.isConfigured} onOpenAISettings={() => onOpenSettings?.('llm')} onDismiss={() => setShowWelcome(false)} />
+                    ) : <MeetingTranscript
+                        key={meta.id ?? 'none'}
                         transcript={transcript}
                         currentText={currentText}
                         speakerNames={speakerNames}
-                        onRenameSpeaker={handleRenameSpeaker}
-                        transcriptEndRef={transcriptEndRef}
-                        showAnalysis={analysis.showAnalysis}
-                        isProcessing={analysis.isAnalyzing || reprocessing.isReclustering || isWhisperTranscribing}
-                        processingStatus={
-                            isWhisperTranscribing
-                                ? 'Whisper transcribing...'
-                                : reprocessing.processingStatus
-                        }
-                        onSegmentPlay={handleSegmentPlay}
-                        onSegmentEdit={handleSegmentEdit}
-                        activeSegmentId={segmentAudioState.activeSegmentId}
-                        isPlaying={segmentAudioState.state === 'playing'}
-                    />
+                        bookmarks={notes.bookmarks}
+                        onSpeakerMenu={edits.openSpeakerMenu}
+                        onSegmentEdit={isProcessingCurrent ? undefined : edits.editSegment}
+                        onSeek={canSeek ? handleSeek : undefined}
+                        onBookmarkSelect={canSeek ? b => handleSeek(bookmarkPlaybackStart(transcript, b)) : undefined}
+                        onRemoveBookmark={recording.isRecording ? undefined : edits.removeBookmark}
+                        playbackMs={canSeek ? playbackMs : null}
+                        isPlaying={playback.isPlayingAudio}
+                        isLive={recording.isRecording}
+                        focus={focus}
+                        emptyMessage={emptyMessage}
+                        isProcessing={isProcessingCurrent || recording.isFinalizing}
+                        processingStatus={recording.isFinalizing ? 'Saving recording...' : isProcessingCurrent ? describeJob(postProcessing.job) : ''}
+                        onCancelProcessing={isProcessingCurrent ? postProcessing.cancel : undefined}
+                        className={meta.id && view === 'notes' ? 'hidden md:block' : ''}
+                    />}
 
-                    <MeetingAnalysisPanel
-                        showAnalysis={analysis.showAnalysis}
-                        setShowAnalysis={analysis.setShowAnalysis}
-                        isAnalyzing={analysis.isAnalyzing}
-                        analysisResult={analysis.analysisResult}
-                    />
+                    {meta.id && view === 'notes' && (
+                        <MeetingNotesPanel
+                            analysis={notes.analysis}
+                            questions={notes.questions}
+                            bookmarkCount={notes.bookmarks.length}
+                            job={aiJobHere}
+                            isBusyElsewhere={!!ai.job && !aiJobHere}
+                            isConfigured={ai.isConfigured}
+                            canAnalyzeAudio={!!playback.recordedAudioUrl && supportsTaskAudio(llmConfig, serverSettings) && !recording.isRecording}
+                            hasTranscript={transcript.length > 0}
+                            onAnalyze={source => { const ctx = currentContext(); if (ctx) ai.analyze(ctx, source); }}
+                            onAsk={question => { const ctx = currentContext(); if (ctx) ai.ask(ctx, question); }}
+                            onCancel={ai.cancel}
+                            onDeleteQuestion={edits.deleteQuestion}
+                            onOpenSettings={() => onOpenSettings?.('llm')}
+                            onSeek={canSeek ? handleSeekFromNotes : undefined}
+                            className="md:w-2/5 md:flex-none md:border-l md:border-surface"
+                        />
+                    )}
                 </div>
 
                 <MeetingControls
                     isRecording={recording.isRecording}
                     isPaused={recording.isPaused}
-                    isLoading={isModelLoading || recording.isBusy}
-                    audioLevel={recording.audioLevel}
+                    isLoading={recording.isFinalizing}
+                    subscribeLevel={recording.subscribeLevel}
+                    liveTranscribedMs={postProcessing.live?.meetingId === meta.id ? postProcessing.live.transcribedMs : null}
                     onStartRecording={handleStartRecording}
                     onStopRecording={recording.stopRecording}
                     onTogglePause={recording.togglePause}
-                    recordedAudioUrl={playback.recordedAudioUrl}
-                    isPlayingAudio={playback.isPlayingAudio}
-                    currentTime={playback.currentTime}
-                    audioDuration={playback.audioDuration}
-                    onTogglePlayback={playback.togglePlayback}
-                    onSkipForward={playback.skipForward}
-                    onSkipBackward={playback.skipBackward}
-                    formatTime={playback.formatTime}
-                    audioRef={playback.audioRef}
-                    onTimeUpdate={playback.handleTimeUpdate}
-                    onLoadedMetadata={playback.handleLoadedMetadata}
-                    onAudioEnded={playback.handleAudioEnded}
-                    onAudioError={playback.handleAudioError}
+                    onMarkMoment={handleMarkMoment}
+                    bookmarkCount={notes.bookmarks.length}
+                    onImportAudio={handleImportAudio}
+                    playback={playback}
                     transcriptLength={transcript.length}
-                    isAnalyzing={analysis.isAnalyzing}
-                    isReclustering={reprocessing.isReclustering}
-                    onReprocessMeeting={reprocessing.reprocessMeeting}
-                    onRecluster={playback.recordedAudioUrl ? reprocessing.fullAudioDiarization : reprocessing.reclusterSpeakers}
-                    onAnalyzeText={analysis.handleAnalyze}
-                    onAnalyzeAudio={analysis.handleAnalyzeAudio}
-                    onExport={handleExport}
+                    isPostProcessing={!!postProcessing.job}
+                    onTranscribe={handleTranscribe}
+                    onIdentifySpeakers={handleIdentifySpeakers}
+                    onExport={() => (transcript.length === 0 && !playback.recordedAudioUrl
+                        ? showToast('Nothing to export yet', 'info')
+                        : setIsExportSheetOpen(true))}
                 />
-
-                <div className="absolute bottom-0 left-0 right-0 z-50 pointer-events-auto">
-                    <AudioMiniPlayer />
-                </div>
             </div>
 
-            <Toast
-                message={toast.message}
-                isVisible={toast.isVisible}
-                onClose={() => setToast(prev => ({ ...prev, isVisible: false }))}
-                type={toast.type}
-            />
+            <Toast message={toast.message} isVisible={toast.isVisible} onClose={() => setToast(prev => ({ ...prev, isVisible: false }))} type={toast.type} />
 
             <MeetingHistory
                 isOpen={isHistoryOpen}
                 onClose={() => setIsHistoryOpen(false)}
-                onReprocess={handleHistoryReprocess}
+                onOpenMeeting={handleOpenMeeting}
+                onDeleted={id => handleOpenMeetingDeletedRef.current(id)}
+                currentMeetingId={currentMeetingId}
+                recordingMeetingId={isBusyRecording ? currentMeetingId : null}
             />
 
             {isExportSheetOpen && <ExportBottomSheet
@@ -516,15 +511,24 @@ setWhisperChunkSize={settings.setWhisperChunkSize}
                 onClose={() => setIsExportSheetOpen(false)}
                 transcript={transcript}
                 speakerNames={speakerNames}
-                meeting={session.meta.id ? {
-                    id: session.meta.id,
-                    timestamp: session.meta.timestamp,
-                    duration: session.meta.duration,
-                    hasAudio: session.meta.hasAudio && !recording.isRecording,
-                    audioMimeType: session.meta.audioMimeType
+                notes={notes ?? EMPTY_NOTES}
+                meeting={meta.id ? {
+                    id: meta.id,
+                    timestamp: meta.timestamp,
+                    duration: meta.duration,
+                    hasAudio: meta.hasAudio && !recording.isRecording && !!playback.recordedAudioUrl,
+                    audioMimeType: meta.audioMimeType
                 } : undefined}
             />}
-        </>
+
+            <input
+                type="file"
+                ref={audioImport.fileInputRef}
+                onChange={audioImport.handleFileSelected}
+                accept="audio/*,.m4a,.mp3,.wav,.ogg,.aac,.flac"
+                className="hidden"
+            />
+        </div>
     );
 };
 

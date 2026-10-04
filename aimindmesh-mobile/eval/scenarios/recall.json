@@ -1,0 +1,261 @@
+[
+  {
+    "id": "recall-residence-missing",
+    "category": "recall",
+    "smoke": true,
+    "note": "Fold7 regression: answered 'I have no memories', then searched the web",
+    "facts": [
+      {
+        "content": "Corre tre volte a settimana al parco di Gallarate",
+        "kind": "routine"
+      }
+    ],
+    "user": "Ricordi dove abito?",
+    "expect": {
+      "anyOf": [
+        "(non|mai) (me l'hai|mi hai|me l'ha|mi ha) (ancora |mai )?(detto|fornito|dato|comunicato|indicato|parlato|raccontato)",
+        "non (lo )?so",
+        "Gallarate",
+        "non (ho|conosco)",
+        "non mi (è|sono) stat[oaie] (mai |ancora )?(fornit|dett|comunicat|indicat|dat)"
+      ],
+      "mustNotInclude": [
+        "non ho (accesso a(lla)? )?memori",
+        "Milano",
+        "Roma"
+      ],
+      "lang": "it"
+    }
+  },
+  {
+    "id": "recall-residence-known",
+    "category": "recall",
+    "smoke": true,
+    "facts": [
+      {
+        "content": "Vive a Gallarate con la moglie Sara",
+        "kind": "identity",
+        "importance": 5
+      }
+    ],
+    "user": "Ti ricordi dove abito?",
+    "expect": {
+      "mustInclude": [
+        "Gallarate"
+      ],
+      "lang": "it"
+    }
+  },
+  {
+    "id": "recall-sister",
+    "category": "recall",
+    "facts": [
+      {
+        "content": "La sorella si chiama Giulia e fa l'architetto",
+        "kind": "person",
+        "subject": "Giulia"
+      },
+      {
+        "content": "Ama il trekking in montagna",
+        "kind": "preference"
+      }
+    ],
+    "user": "Come si chiama mia sorella?",
+    "expect": {
+      "mustInclude": [
+        "Giulia"
+      ],
+      "lang": "it"
+    }
+  },
+  {
+    "id": "recall-job",
+    "category": "recall",
+    "smoke": true,
+    "facts": [
+      {
+        "content": "Lavora come infermiere all'ospedale di Varese",
+        "kind": "identity",
+        "importance": 5
+      },
+      {
+        "content": "Ha un gatto di nome Miele",
+        "kind": "person"
+      }
+    ],
+    "user": "Sai che lavoro faccio?",
+    "expect": {
+      "mustInclude": [
+        "infermier"
+      ],
+      "lang": "it"
+    }
+  },
+  {
+    "id": "recall-what-you-know",
+    "category": "recall",
+    "facts": [
+      {
+        "content": "Vive a Gallarate",
+        "kind": "identity",
+        "importance": 5
+      },
+      {
+        "content": "Lavora come infermiere",
+        "kind": "identity",
+        "importance": 5
+      },
+      {
+        "content": "Ha un gatto di nome Miele",
+        "kind": "person"
+      }
+    ],
+    "user": "Cosa sai di me?",
+    "expect": {
+      "mustInclude": [
+        "Gallarate",
+        "infermier"
+      ],
+      "mustNotInclude": [
+        "non ho (accesso a(lla)? )?memori"
+      ],
+      "lang": "it"
+    }
+  },
+  {
+    "id": "recall-plans",
+    "category": "recall",
+    "smoke": true,
+    "facts": [
+      {
+        "content": "Giro in bici sul lago Maggiore",
+        "kind": "event",
+        "dueInDays": 2
+      },
+      {
+        "content": "Corre la mattina presto",
+        "kind": "routine"
+      }
+    ],
+    "user": "Ti ricordi cosa volevo fare nei prossimi giorni?",
+    "expect": {
+      "anyOf": [
+        "bici",
+        "lago Maggiore"
+      ],
+      "lang": "it"
+    }
+  },
+  {
+    "id": "recall-dog-missing",
+    "category": "recall",
+    "facts": [
+      {
+        "content": "Lavora come infermiere",
+        "kind": "identity"
+      }
+    ],
+    "user": "Ti ricordi come si chiama il mio cane?",
+    "expect": {
+      "anyOf": [
+        "(non|mai) (me l'hai|mi hai|me l'ha|mi ha) (ancora |mai )?(detto|fornito|dato|comunicato|indicato|parlato|raccontato)",
+        "non (lo )?so",
+        "non (ho|conosco)",
+        "non ricordo",
+        "non mi (è|sono) stat[oaie] (mai |ancora )?(fornit|dett|comunicat|indicat|dat)"
+      ],
+      "mustNotInclude": [
+        "non ho (accesso a(lla)? )?memori"
+      ],
+      "lang": "it"
+    }
+  },
+  {
+    "id": "recall-from-past-conversation",
+    "category": "recall",
+    "memories": [
+      "Il mio cane si chiama Pepe ed è un beagle"
+    ],
+    "user": "Ricordi il nome del mio cane?",
+    "expect": {
+      "mustInclude": [
+        "Pepe"
+      ],
+      "lang": "it"
+    }
+  },
+  {
+    "id": "recall-preference-implicit",
+    "category": "recall",
+    "facts": [
+      {
+        "content": "Non beve caffè, preferisce il tè verde",
+        "kind": "preference",
+        "importance": 4
+      }
+    ],
+    "user": "Sto per fare una pausa, cosa mi consigli di bere?",
+    "expect": {
+      "anyOf": [
+        "tè",
+        "the verde"
+      ],
+      "mustNotInclude": [
+        "\\bun caffè\\b"
+      ],
+      "lang": "it"
+    }
+  },
+  {
+    "id": "recall-correction",
+    "category": "recall",
+    "facts": [
+      {
+        "content": "Vive a Gallarate",
+        "kind": "identity",
+        "importance": 5
+      }
+    ],
+    "history": [
+      {
+        "role": "user",
+        "text": "Sai, mi sono trasferito a Busto Arsizio la settimana scorsa"
+      },
+      {
+        "role": "model",
+        "text": "Che bella novità! Come ti trovi nella nuova casa?"
+      }
+    ],
+    "user": "Allora, dove abito adesso?",
+    "expect": {
+      "mustInclude": [
+        "Busto"
+      ],
+      "lang": "it"
+    }
+  },
+  {
+    "id": "recall-birthday",
+    "category": "recall",
+    "facts": [
+      {
+        "content": "Compleanno della moglie Sara",
+        "kind": "event",
+        "dueInDays": 5,
+        "importance": 4
+      }
+    ],
+    "user": "Quando è il compleanno di mia moglie?",
+    "expect": {
+      "anyOf": [
+        "\\d{1,2}",
+        "giorni",
+        "settimana"
+      ],
+      "mustNotInclude": [
+        "non ho (accesso a(lla)? )?memori"
+      ],
+      "lang": "it"
+    }
+  }
+]

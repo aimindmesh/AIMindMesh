@@ -145,22 +145,22 @@ export class KGManager {
     }
   }
 
-  /** Stores a memory. With `syncId` (device push) an existing node is updated instead of duplicated. */
-  public static async upsertMemory(content: string, embedding: number[], category: string, source: string, syncId?: string) {
+  /** Stores a memory; with `syncId` (device push) it is updated, not duplicated. `createdAt`: ms on the device. */
+  public static async upsertMemory(content: string, embedding: number[], category: string, source: string, syncId?: string, createdAt?: number) {
     const session = getSession();
     try {
       const result = await session.run(syncId ? `
         MERGE (m:Memory {syncId: $syncId})
-        ON CREATE SET m.id = randomUUID(), m.createdAt = timestamp()
+        ON CREATE SET m.id = randomUUID(), m.createdAt = coalesce($createdAt, timestamp())
         SET m.content = $content, m.embedding = $embedding, m.category = $category, m.source = $source
         RETURN m.id AS id
       ` : `
         CREATE (m:Memory {
           id: randomUUID(), content: $content, embedding: $embedding,
-          category: $category, source: $source, createdAt: timestamp()
+          category: $category, source: $source, createdAt: coalesce($createdAt, timestamp())
         })
         RETURN m.id AS id
-      `, { content, embedding, category, source, syncId: syncId ?? null });
+      `, { content, embedding, category, source, syncId: syncId ?? null, createdAt: createdAt ?? null });
 
       if (result.records.length === 0) {
         throw new Error('Neo4j returned no result for upsertMemory');

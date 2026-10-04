@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { Logger } from '../utils/Logger';
 import { InferenceRouter } from './InferenceRouter';
 import { sendToDevice } from './FCMDispatcher';
+import { DeliveryScheduler } from './DeliveryScheduler';
 import { NodeRegistry } from './NodeRegistry';
 import cron, { ScheduledTask } from 'node-cron';
 import { config } from '../config';
@@ -324,7 +325,10 @@ export class DebateEngine {
     this.pushDebateUpdate(thread.insightId, nextRound, orchestratorReply ?? lastReply ?? '');
 
     // ── Auto-Evolution Conclusion Extraction ─────────────────────────────
-    if (lastReply && (history.includes('Developer:') || lastReply.includes('implement') || lastReply.includes('add'))) {
+    // Only a debate with a DEVELOPER voice can conclude on code, and only when insight-driven evolution is on
+    // (the old trigger, any reply containing "add", fired on almost every round)
+    const developerSpoke = participants.some(p => p.name.toUpperCase() === 'DEVELOPER');
+    if (lastReply && developerSpoke && config.autoEvolution?.sources?.insights === true) {
         this.extractEvolutionConclusion(thread.insightId, history + '\n\nORCHESTRATOR: ' + orchestratorReply);
     }
 
@@ -346,7 +350,7 @@ export class DebateEngine {
         CONCLUSION:`;
         
         const conclusion = await this.runInference(conclusionPrompt, 'Conclusion Extraction');
-        if (conclusion !== 'NONE') {
+        if (conclusion.trim() && !/^\W*none\b/i.test(conclusion.trim())) {
             await session.run(`
                 MATCH (i:Insight {id: $insightId})
                 SET i.developerConclusion = $conclusion, 
@@ -460,16 +464,15 @@ export class DebateEngine {
     return row ?? null;
   }
 
+  /** Not in quiet hours nor in contextual mode: a round never wakes the user (it is in the thread) */
   private static pushDebateUpdate(insightId: string, round: number, latestMessage: string): void {
-    const nodes = NodeRegistry.getNodes().filter(n => n.type === 'mobile' && n.fcm_token);
-    for (const node of nodes) {
-      if (node.fcm_token) {
-        sendToDevice(node.fcm_token, {
-          title: '🧠 Debate — Round ' + round,
-          body: latestMessage.substring(0, 80) + '...',
-          data: { insightId, type: 'DEBATE_UPDATE', round: String(round) }
-        });
-      }
+    for (const node of NodeRegistry.getNodes().filter(n => n.type === 'mobile' && n.fcm_token)) {
+      if (DeliveryScheduler.getModeForDevice(node.id) !== 'PUSH' || DeliveryScheduler.isQuietHour(node.id)) continue;
+      sendToDevice(node.fcm_token!, {
+        title: '🧠 Debate — Round ' + round,
+        body: latestMessage.substring(0, 80) + '...',
+        data: { insightId, type: 'DEBATE_UPDATE', round: String(round) }
+      });
     }
   }
 

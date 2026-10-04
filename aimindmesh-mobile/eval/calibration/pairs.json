@@ -1,0 +1,42 @@
+{
+  "note": "Invented data. Each query matches the passage at the same index; every other passage is unrelated to it. 'noise' are ordinary messages that should retrieve nothing.",
+  "pairs": [
+    ["Ricordi dove abito?", "L'utente vive a Varese con la moglie Giulia."],
+    ["Come si chiama mia moglie?", "La moglie dell'utente si chiama Giulia."],
+    ["Che lavoro faccio?", "L'utente lavora come infermiere all'ospedale di Gallarate."],
+    ["Quando è il compleanno di mia sorella?", "La sorella dell'utente, Anna, compie gli anni il 12 marzo."],
+    ["Ti ho detto come si chiama il mio cane?", "L'utente ha un beagle di nome Pepe."],
+    ["Cosa mi piace bere la mattina?", "All'utente non piace il caffè: beve solo tè verde."],
+    ["Quando vado in palestra?", "Ogni martedì sera l'utente va in palestra con un amico."],
+    ["A che ora ho il dentista?", "L'utente ha il dentista giovedì alle 15."],
+    ["Di cosa avevamo parlato riguardo alla macchina?", "L'utente vuole cambiare la sua auto di quindici anni con una ibrida."],
+    ["Sai a cosa sono allergico?", "L'utente è allergico alle noci."],
+    ["Dove andiamo in vacanza quest'estate?", "L'utente ha prenotato una settimana in Sardegna ad agosto con la famiglia."],
+    ["Come si chiamano i miei figli?", "L'utente ha due figli, Luca e Sara."],
+    ["Che sport faceva mio padre?", "Il padre dell'utente giocava a pallavolo da giovane."],
+    ["Ricordi il libro che stavo leggendo?", "L'utente sta leggendo 'Il nome della rosa' di Umberto Eco."],
+    ["Quale squadra tifo?", "L'utente tifa per l'Inter."],
+    ["Che corso sto seguendo?", "L'utente segue un corso serale di tedesco il giovedì."],
+    ["Cosa dovevo comprare per la festa?", "L'utente deve comprare le candeline per la festa di Sara sabato."],
+    ["Ti ricordi del mio progetto di lavoro?", "L'utente sta preparando la migrazione del gestionale dell'ospedale entro novembre."],
+    ["Che musica ascolto?", "All'utente piace il jazz, soprattutto Chet Baker."],
+    ["Dove sono nato?", "L'utente è nato a Bergamo."],
+    ["Quanti anni ha mia madre?", "La madre dell'utente ha 72 anni e vive a Como."],
+    ["Cosa mi aveva detto il medico?", "Il medico ha consigliato all'utente di camminare mezz'ora al giorno."],
+    ["Come va la dieta che avevo iniziato?", "L'utente ha iniziato una dieta senza zuccheri a settembre."],
+    ["Ricordi il nome del mio collega?", "Il collega dell'utente si chiama Marco e lavora in radiologia."],
+    ["Ti avevo parlato del trasloco?", "L'utente ha raccontato che a dicembre trasloca in una casa più grande a Varese."]
+  ],
+  "noise": [
+    "Che tempo fa domani?",
+    "Scrivimi una poesia sull'autunno",
+    "Quanto fa 15 per 12?",
+    "Come si dice buongiorno in inglese?",
+    "Dammi un consiglio per dormire meglio",
+    "Spiegami cos'è una NPU",
+    "Metti una sveglia alle 7",
+    "Ciao, come stai?",
+    "Raccontami una barzelletta",
+    "Qual è la capitale del Portogallo?"
+  ]
+}

@@ -20,4 +20,16 @@
     <string name="shortcut_assistant_long">Start Assistant Call</string>
     <string name="shortcut_agenda_short">Agenda</string>
     <string name="shortcut_agenda_long">Open Agenda</string>
+
+    <!-- Meeting recording and processing notifications -->
+    <string name="recording_channel_name">Meeting recording</string>
+    <string name="recording_channel_description">Shown while a meeting is being recorded</string>
+    <string name="recording_in_progress">Recording meeting</string>
+    <string name="recording_paused">Recording paused</string>
+    <string name="recording_tap_to_open">Tap to open the meeting</string>
+    <string name="recording_mark_moment">Mark moment</string>
+    <string name="recording_moment_marked">Moment marked at %1$s</string>
+    <string name="processing_channel_name">Meeting transcription</string>
+    <string name="processing_transcript">Transcribing the meeting</string>
+    <string name="processing_speakers">Identifying speakers</string>
 </resources>

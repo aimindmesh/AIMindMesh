@@ -120,6 +120,12 @@ class SetupService {
                 });
                 
                 try {
+                    // Models bundled in the APK (or installed before) are not downloaded again
+                    if (await this.isInstalled(step)) {
+                        installed.push(step);
+                        this.log(`✓ ${step.name} already installed.`);
+                        continue;
+                    }
                     await this.processStep(step, downloadUrl, apiKey, onStepProgress);
                     installed.push(step);
                     this.log(`✓ ${step.name} installed successfully.`);
@@ -158,6 +164,28 @@ class SetupService {
         await this.downloadFile(url, `${subdir}/${filename}`, apiKey, onProgress);
     }
 
+    /** Where a step's model ends up, when it is one the app can find already installed */
+    private installedPath(step: SetupStep): string | null {
+        switch (step.category) {
+            case 'Vosk': return step.id === 'vosk-spk' ? 'vosk-models/vosk-model-spk-0.4' : `vosk-models/${step.id}`;
+            case 'Whisper': return `whisper-models/${step.id}.bin`;
+            case 'SpeakerID': return `models/${step.target}`;
+            case 'VAD': return `${VAD_DIR}/${VAD_MODEL_ID}.onnx`;
+            default: return null;
+        }
+    }
+
+    private async isInstalled(step: SetupStep): Promise<boolean> {
+        const path = this.installedPath(step);
+        if (!path) return false;
+        try {
+            const stat = await Filesystem.stat({ path, directory: Directory.Data });
+            return stat.type === 'directory' || stat.size > 0;
+        } catch {
+            return false;
+        }
+    }
+
     private async processStep(step: SetupStep, url: string, apiKey: string, onProgress: (fraction: number) => void) {
         switch (step.category) {
             case 'GGUF':
@@ -187,12 +215,10 @@ class SetupService {
 
             case 'Whisper':
                 {
-                    const whisperModel = WHISPER_MODELS.find(m => m.id === step.id) || {
-                        id: step.id,
-                        url: url,
-                        sizeBytes: step.size,
-                        name: step.name
-                    };
+                    // From the setup server (its copy may differ from the catalog's): no exact size check,
+                    // the native downloader already checks the length it was sent
+                    const known = WHISPER_MODELS.find(m => m.id === step.id);
+                    const whisperModel = { ...(known ?? { name: step.name }), id: step.id, url, sizeBytes: 0 };
                     await downloadWhisperModel(whisperModel as any, p => onProgress(p.percentage / 100));
                 }
                 break;

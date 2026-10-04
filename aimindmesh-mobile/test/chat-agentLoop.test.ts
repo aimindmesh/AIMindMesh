@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   effectiveProvider, apiKeyForProvider, compressionBudget, streamDisplayText, buildToolTurnText,
-  buildObservationMessage, mergeTextThinking, extractInlineMemories, cleanFinalAnswer, shouldNudgeModel
+  buildObservationMessage, mergeTextThinking, extractInlineMemories, cleanFinalAnswer, shouldNudgeModel,
+  mergeSources, findUserRequest, buildToolSummaryPrompt
 } from '../src/hooks/chat/agentLoopHelpers';
 import type { LLMConfig, AIMindMeshServerSettings } from '../src/types';
 
@@ -24,8 +25,9 @@ describe('provider and key selection', () => {
 
   it('compresses history only for on-device engines, scaled to their context', () => {
     expect(compressionBudget('gemini', config({ nCtx: 2048 }), 1500)).toBe(Infinity);
-    expect(compressionBudget('native-gguf', config({ nCtx: 2048 }), 1500)).toBe(1500);
-    expect(compressionBudget('litert', config({ nCtx: 8192 }), 1500)).toBe(8192 - 1500 - 1000);
+    expect(compressionBudget('native-gguf', config({ nCtx: 2048, contextMode: 'manual' }), 1500)).toBe(1500);
+    expect(compressionBudget('litert', config({ nCtx: 8192, contextMode: 'manual' }), 1500)).toBe(8192 - 1500 - 1000);
+    expect(compressionBudget('litert', config({ nCtx: 2048 }), 1500)).toBe(4096 - 1500 - 1000); // auto, NPU unknown
   });
 });
 
@@ -63,5 +65,27 @@ describe('displayed text', () => {
     expect(shouldNudgeModel('', 'Let me think', 0, 5)).toBe(true);
     expect(shouldNudgeModel('An answer', 'Let me think', 0, 5)).toBe(false);
     expect(shouldNudgeModel('', 'Let me think', 4, 5)).toBe(false);
+  });
+});
+
+describe('web sources and tool summaries', () => {
+  it('merges sources keeping the first ones and each URL once', () => {
+    const a = { title: 'A', uri: 'https://a' };
+    expect(mergeSources([a], [{ title: 'A2', uri: 'https://a' }, { title: '', uri: 'https://b' }])).toEqual([a, { title: 'https://b', uri: 'https://b' }]);
+    expect(mergeSources([a], undefined)).toEqual([a]);
+    const many = Array.from({ length: 15 }, (_, i) => ({ title: `${i}`, uri: `https://${i}` }));
+    expect(mergeSources([], many)).toHaveLength(10);
+  });
+
+  it('finds the user request behind observations and nudges', () => {
+    const at = new Date();
+    const history = [
+      { id: '1', role: 'user', text: 'Quanto costa la benzina?', timestamp: at },
+      { id: 'model_1', role: 'model', text: '<tool>search_web({})</tool>', timestamp: at },
+      { id: 'tool_1', role: 'user', text: 'Observation: ...', timestamp: at },
+      { id: 'nudge_1', role: 'user', text: 'Please continue.', timestamp: at },
+    ] as any;
+    expect(findUserRequest(history)).toBe('Quanto costa la benzina?');
+    expect(buildToolSummaryPrompt('long output', 'Quanto costa la benzina?')).toContain('The user asked: "Quanto costa la benzina?"');
   });
 });

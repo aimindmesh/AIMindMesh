@@ -1,14 +1,12 @@
 import React, { useState } from 'react';
 import { CloseIcon, SaveIcon } from '../../constants';
-import { TranscriptSegment } from '../../types/meeting';
+import { EMPTY_NOTES, MeetingNotes, TranscriptSegment } from '../../types/meeting';
 import { exportMeetingAs } from '../../services/meeting/meetingExportService';
 import { meetingExportPlugin } from '../../services/meeting/meetingExportPlugin';
 import { prepareMeetingAudioExport } from '../../services/meeting/meetingStorage';
 import { logger } from '../../services/logger';
-import { useLocalStorage } from '../../hooks/useLocalStorage';
-import { AIMindMeshServerSettings, DEFAULT_AIMINDMESH_SERVER_SETTINGS } from '../../types';
-import { extractMeetingCandidates, MeetingActionCandidate } from '../../services/meetingOrganizationBridge';
-import { organizationApi } from '../../services/organizationApi';
+import { showAlert } from '../../services/ui/dialogs';
+import MeetingCouncilBridge from './MeetingCouncilBridge';
 
 /** The saved meeting being exported (its real date and duration, and whether it has audio) */
 export interface ExportMeetingInfo {
@@ -26,6 +24,8 @@ interface ExportBottomSheetProps {
     transcript: TranscriptSegment[];
     speakerNames: Record<number, string>;
     meeting?: ExportMeetingInfo;
+    /** Title, AI notes and marked moments (exported before the transcript in Markdown and PDF) */
+    notes?: MeetingNotes;
     /** Format selected when the sheet opens (e.g. 'audio' from the history's audio button) */
     initialFormat?: string;
     onExportComplete?: (filePath: string) => void;
@@ -37,31 +37,23 @@ const ExportBottomSheet: React.FC<ExportBottomSheetProps> = ({
     transcript,
     speakerNames,
     meeting,
+    notes = EMPTY_NOTES,
     initialFormat,
     onExportComplete
 }) => {
-    const [aimindmeshServer] = useLocalStorage<AIMindMeshServerSettings>(
-        'aimindmesh-server-settings',
-        DEFAULT_AIMINDMESH_SERVER_SETTINGS
-    );
-
     const [format, setFormat] = useState<string>(initialFormat ?? (transcript.length === 0 && meeting?.hasAudio ? 'audio' : 'markdown'));
     const [includeTimestamps, setIncludeTimestamps] = useState(true);
     const [includeSpeakers, setIncludeSpeakers] = useState(true);
+    const [includeNotes, setIncludeNotes] = useState(true);
+    const hasNotes = !!notes.analysis || notes.bookmarks.length > 0;
     const [isExporting, setIsExporting] = useState(false);
-
-    // AI Bridge State
     const [isBridgeScreen, setIsBridgeScreen] = useState(false);
-    const [candidates, setCandidates] = useState<MeetingActionCandidate[]>([]);
-    const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
-    const [isSubmittingBridge, setIsSubmittingBridge] = useState(false);
-    const [bridgeResults, setBridgeResults] = useState<string[]>([]);
 
     if (!isOpen) return null;
 
     const handleExport = async () => {
-        if (format !== 'audio' && transcript.length === 0) {
-            alert('No transcript to export');
+        if (format !== 'audio' && transcript.length === 0 && !hasNotes) {
+            await showAlert({ title: 'No transcript to export' });
             return;
         }
         setIsExporting(true);
@@ -81,12 +73,14 @@ const ExportBottomSheet: React.FC<ExportBottomSheetProps> = ({
                 transcript,
                 speakerNames,
                 duration: meeting?.duration ?? 0,
-                hasAudio: !!meeting?.hasAudio
+                hasAudio: !!meeting?.hasAudio,
+                ...notes
             };
 
             const options = {
                 includeSpeakerLabels: includeSpeakers,
                 includeTimestamps: includeTimestamps,
+                includeNotes,
             };
 
             if (format === 'pdf') {
@@ -105,86 +99,9 @@ const ExportBottomSheet: React.FC<ExportBottomSheetProps> = ({
             }
         } catch (error) {
             logger.log('error', 'Export failed', error);
-            alert('Export failed: ' + (error instanceof Error ? error.message : String(error)));
+            await showAlert({ title: 'Export failed', message: error instanceof Error ? error.message : String(error) });
         } finally {
             setIsExporting(false);
-        }
-    };
-
-    const handleExtractAndBridge = () => {
-        const transcriptText = transcript.map(s => {
-            const name = speakerNames[s.speakerId] || `Speaker ${s.speakerId + 1}`;
-            return `${name}: ${s.text}`;
-        }).join('\n');
-
-        const extracted = extractMeetingCandidates(transcriptText);
-        setCandidates(extracted);
-        setSelectedIndices(extracted.map((_, i) => i)); // all selected by default
-        setIsBridgeScreen(true);
-    };
-
-    const handleSubmitBridge = async () => {
-        if (!aimindmeshServer.enabled) {
-            alert('AIMindMesh Server is currently disabled. Please enable it in Settings.');
-            return;
-        }
-
-        setIsSubmittingBridge(true);
-        setBridgeResults([]);
-        let successCount = 0;
-        let failCount = 0;
-        const newResults: string[] = [];
-
-        for (let i = 0; i < candidates.length; i++) {
-            if (!selectedIndices.includes(i)) continue;
-            const cand = candidates[i];
-
-            try {
-                if (cand.type === 'idea') {
-                    await organizationApi.createIdea(aimindmeshServer, {
-                        title: cand.title,
-                        problemStatement: cand.summary,
-                        summary: cand.summary,
-                        sourceSignals: ['Extracted from meeting transcript'],
-                        strategicScore: 65,
-                        feasibilityScore: 60,
-                        noveltyScore: 70,
-                        overallScore: 65
-                    });
-                    newResults.push(`Submitted Idea: "${cand.title}"`);
-                    successCount++;
-                } else {
-                    await organizationApi.createDirective(aimindmeshServer, {
-                        title: cand.title,
-                        description: cand.summary,
-                        goalType: cand.type === 'directive' ? 'explore' : 'build',
-                        priority: 50,
-                        constraints: {}
-                    });
-                    newResults.push(`Submitted Directive: "${cand.title}"`);
-                    successCount++;
-                }
-            } catch (error: any) {
-                newResults.push(`Error submitting "${cand.title}": ${error.message}`);
-                failCount++;
-            }
-        }
-
-        setBridgeResults(newResults);
-        setIsSubmittingBridge(false);
-
-        if (failCount === 0 && successCount > 0) {
-            alert(`Successfully proposed ${successCount} item(s) to the AI Council!`);
-            setIsBridgeScreen(false);
-            onClose();
-        }
-    };
-
-    const toggleCandidate = (index: number) => {
-        if (selectedIndices.includes(index)) {
-            setSelectedIndices(selectedIndices.filter(i => i !== index));
-        } else {
-            setSelectedIndices([...selectedIndices, index]);
         }
     };
 
@@ -223,8 +140,18 @@ const ExportBottomSheet: React.FC<ExportBottomSheetProps> = ({
                     </button>
                 </div>
 
+                {isBridgeScreen && (
+                    <MeetingCouncilBridge
+                        transcript={transcript}
+                        speakerNames={speakerNames}
+                        analysis={notes.analysis}
+                        onBack={() => setIsBridgeScreen(false)}
+                        onDone={() => { setIsBridgeScreen(false); onClose(); }}
+                    />
+                )}
+
                 {/* Body */}
-                <div className="p-6 max-h-[60vh] overflow-y-auto space-y-6">
+                {!isBridgeScreen && <div className="p-6 max-h-[60vh] overflow-y-auto space-y-6">
                     {!isBridgeScreen ? (
                         <>
                             {/* Format Selection */}
@@ -270,6 +197,21 @@ const ExportBottomSheet: React.FC<ExportBottomSheetProps> = ({
                                         />
                                     </label>
 
+                                    {hasNotes && (format === 'markdown' || format === 'pdf') && (
+                                        <label className="flex items-center justify-between p-3 bg-white/5 rounded-xl cursor-pointer hover:bg-white/10 transition-colors">
+                                            <div className="flex flex-col">
+                                                <span className="text-sm font-medium text-white">Include AI notes and marked moments</span>
+                                                <span className="text-xs text-text-secondary">Before the transcript</span>
+                                            </div>
+                                            <input
+                                                type="checkbox"
+                                                checked={includeNotes}
+                                                onChange={e => setIncludeNotes(e.target.checked)}
+                                                className="w-5 h-5 accent-primary bg-surface border-white/20 rounded"
+                                            />
+                                        </label>
+                                    )}
+
                                     <label className="flex items-center justify-between p-3 bg-white/5 rounded-xl cursor-pointer hover:bg-white/10 transition-colors">
                                         <div className="flex flex-col">
                                             <span className="text-sm font-medium text-white">Include Speaker Labels</span>
@@ -288,7 +230,7 @@ const ExportBottomSheet: React.FC<ExportBottomSheetProps> = ({
                             {/* Bridge Shortcut */}
                             <div className="pt-2">
                                 <button
-                                    onClick={handleExtractAndBridge}
+                                    onClick={() => setIsBridgeScreen(true)}
                                     className="w-full p-4 rounded-xl border border-primary/20 bg-primary/5 hover:bg-primary/10 transition-all text-left flex items-center justify-between"
                                 >
                                     <div>
@@ -301,77 +243,11 @@ const ExportBottomSheet: React.FC<ExportBottomSheetProps> = ({
                                 </button>
                             </div>
                         </>
-                    ) : (
-                        <div className="space-y-4">
-                            <div className="flex justify-between items-center">
-                                <span className="text-xs text-text-secondary font-bold uppercase tracking-wider">
-                                    Extracted Candidates ({candidates.length})
-                                </span>
-                                <button
-                                    onClick={() => setIsBridgeScreen(false)}
-                                    className="text-xs text-primary font-semibold hover:underline"
-                                >
-                                    Back to Export
-                                </button>
-                            </div>
-
-                            {candidates.length === 0 ? (
-                                <div className="text-center py-6 text-text-secondary bg-white/5 rounded-xl border border-white/10">
-                                    No clear goals or ideas detected in the transcript.
-                                </div>
-                            ) : (
-                                <div className="space-y-2">
-                                    {candidates.map((cand, idx) => (
-                                        <div
-                                            key={idx}
-                                            onClick={() => toggleCandidate(idx)}
-                                            className={`p-3 rounded-xl border transition-all cursor-pointer flex items-start gap-3 ${selectedIndices.includes(idx)
-                                                ? 'border-primary/40 bg-primary/5'
-                                                : 'border-white/10 bg-white/5 hover:bg-white/10'
-                                                }`}
-                                        >
-                                            <input
-                                                type="checkbox"
-                                                checked={selectedIndices.includes(idx)}
-                                                readOnly
-                                                className="mt-1 w-4 h-4 accent-primary"
-                                            />
-                                            <div className="flex-1">
-                                                <div className="flex items-center gap-2 mb-1">
-                                                    <span className={`text-[10px] font-bold uppercase px-1.5 py-0.5 rounded-full ${cand.type === 'idea'
-                                                        ? 'bg-purple-500/20 text-purple-300'
-                                                        : 'bg-blue-500/20 text-blue-300'
-                                                        }`}>
-                                                        {cand.type}
-                                                    </span>
-                                                    <span className="text-xs text-text-secondary">
-                                                        Confidence: {Math.round(cand.confidence * 100)}%
-                                                    </span>
-                                                </div>
-                                                <h4 className="text-sm font-semibold text-white">{cand.title}</h4>
-                                                <p className="text-xs text-text-secondary mt-1 line-clamp-2">
-                                                    {cand.summary}
-                                                </p>
-                                            </div>
-                                        </div>
-                                    ))}
-                                </div>
-                            )}
-
-                            {bridgeResults.length > 0 && (
-                                <div className="p-3 bg-black/40 rounded-xl border border-white/10 text-xs space-y-1">
-                                    <span className="font-bold text-text-secondary block mb-1">Submission Logs:</span>
-                                    {bridgeResults.map((res, i) => (
-                                        <div key={i} className="text-text-secondary">{res}</div>
-                                    ))}
-                                </div>
-                            )}
-                        </div>
-                    )}
-                </div>
+                    ) : null}
+                </div>}
 
                 {/* Footer */}
-                <div className="p-6 pt-2 border-t border-white/10 bg-surface-hover">
+                {!isBridgeScreen && <div className="p-6 pt-2 border-t border-white/10 bg-surface-hover">
                     {!isBridgeScreen ? (
                         <button
                             onClick={handleExport}
@@ -393,26 +269,8 @@ const ExportBottomSheet: React.FC<ExportBottomSheetProps> = ({
                                 </>
                             )}
                         </button>
-                    ) : (
-                        <button
-                            onClick={handleSubmitBridge}
-                            disabled={isSubmittingBridge || selectedIndices.length === 0}
-                            className={`w-full py-4 rounded-xl font-bold flex items-center justify-center gap-3 shadow-lg transition-all ${isSubmittingBridge || selectedIndices.length === 0
-                                ? 'bg-white/10 text-text-secondary cursor-not-allowed'
-                                : 'bg-primary text-white hover:brightness-110 active:scale-[0.98]'
-                                }`}
-                        >
-                            {isSubmittingBridge ? (
-                                <>
-                                    <div className="w-5 h-5 border-2 border-white/20 border-t-white rounded-full animate-spin" />
-                                    <span>Proposing to Council...</span>
-                                </>
-                            ) : (
-                                <span>Propose Selected ({selectedIndices.length})</span>
-                            )}
-                        </button>
-                    )}
-                </div>
+                    ) : null}
+                </div>}
             </div>
         </div>
     );

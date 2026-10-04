@@ -7,6 +7,10 @@ export interface DirectiveRepository {
   update(id: string, patch: Partial<Directive>): Promise<void>;
   markCancelled(id: string): Promise<void>;
   findActive(): Promise<Directive[]>;
+  /** Active directives that apply to the whole organization (not derived from one idea). */
+  findActiveGlobal(): Promise<Directive[]>;
+  /** Global directives plus those derived from this idea. */
+  findActiveForIdea(ideaId: string): Promise<Directive[]>;
   findById(id: string): Promise<Directive | null>;
 }
 
@@ -22,6 +26,7 @@ export class SQLiteDirectiveRepository implements DirectiveRepository {
       status: row.status as any,
       createdBy: row.created_by,
       supersedesId: row.supersedes_id,
+      ideaId: row.idea_id ?? null,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
@@ -30,8 +35,8 @@ export class SQLiteDirectiveRepository implements DirectiveRepository {
   async insert(directive: Directive): Promise<void> {
     db.prepare(`
       INSERT INTO organization_directives (
-        id, title, description, goal_type, constraints, priority, status, created_by, supersedes_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        id, title, description, goal_type, constraints, priority, status, created_by, supersedes_id, idea_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       directive.id,
       directive.title,
@@ -42,6 +47,7 @@ export class SQLiteDirectiveRepository implements DirectiveRepository {
       directive.status,
       directive.createdBy,
       directive.supersedesId || null,
+      directive.ideaId || null,
       directive.createdAt,
       directive.updatedAt
     );
@@ -87,6 +93,16 @@ export class SQLiteDirectiveRepository implements DirectiveRepository {
 
   async findActive(): Promise<Directive[]> {
     const rows = db.prepare("SELECT * FROM organization_directives WHERE status = 'active' ORDER BY priority DESC").all();
+    return rows.map(r => this.mapRow(r));
+  }
+
+  async findActiveGlobal(): Promise<Directive[]> {
+    const rows = db.prepare("SELECT * FROM organization_directives WHERE status = 'active' AND idea_id IS NULL ORDER BY priority DESC").all();
+    return rows.map(r => this.mapRow(r));
+  }
+
+  async findActiveForIdea(ideaId: string): Promise<Directive[]> {
+    const rows = db.prepare("SELECT * FROM organization_directives WHERE status = 'active' AND (idea_id IS NULL OR idea_id = ?) ORDER BY priority DESC").all(ideaId);
     return rows.map(r => this.mapRow(r));
   }
 

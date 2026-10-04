@@ -15,11 +15,11 @@ export const productivityTools: ToolDefinition[] = [
                 },
                 date: {
                     type: Type.STRING,
-                    description: 'The date of the event in YYYY-MM-DD format'
+                    description: 'The date: YYYY-MM-DD, or the user\'s own words ("domani", "giovedì") which the app converts. Never ask the user for it when they named a day.'
                 },
                 time: {
                     type: Type.STRING,
-                    description: 'The time of the event in HH:MM format (24-hour)'
+                    description: 'The time in HH:MM (24-hour), or the user\'s words ("alle 15"); 09:00 when the user gave none'
                 },
                 duration_minutes: {
                     type: Type.NUMBER,

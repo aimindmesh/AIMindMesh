@@ -113,6 +113,14 @@ export interface Message {
   sources?: { title: string; uri: string }[];  // Search grounding sources
   toolResults?: { name: string; success: boolean; result: string }[]; // Tool execution results
   isSummary?: boolean;         // Flag to identify summary messages (for context compression)
+  /** Agent tool turns: the calls of a model turn, or the results of an observation turn. Engines
+   *  with a native tool format render them as tool calls and tool messages; others read `text`. */
+  toolMeta?: ToolTurnMeta;
+}
+
+export interface ToolTurnMeta {
+  calls?: Array<{ id: string; name: string; args: Record<string, unknown> }>;
+  results?: Array<{ id: string; name: string; success: boolean; result: string }>;
 }
 
 export * from './proactive';
@@ -159,7 +167,7 @@ export interface LLMConfig {
   // Qualcomm Genie NPU configuration
   genieModelPath?: string;     // Path to Qualcomm AI Hub / Genie NPU model
   genieModelId?: string;       // Model identifier (e.g. qwen3.5, qwen2.5, gemma2)
-  genieRuntime?: 'npu' | 'gpu' | 'cpu'; // Execution runtime (default: npu)
+  genieRuntime?: 'auto' | 'npu' | 'gpu' | 'cpu'; // Compute unit of GGUF models on GenieX (default auto: NPU, then GPU, then CPU)
   // Stable Diffusion Qualcomm NPU / Local configuration
   sdModelPath?: string;        // Path to Stable Diffusion model bundle (.zip or directory)
   sdModelId?: string;          // Model identifier / folder name (e.g. stable_diffusion_v2_1)
@@ -174,7 +182,8 @@ export interface LLMConfig {
   nThreads?: number;          // CPU threads for inference (default: 6 for Z Fold)
   nThreadsBatch?: number;     // CPU threads for batch processing (default: 4)
   autoThreads?: boolean;       // Auto-detect optimal thread count (default: false)
-  nCtx?: number;              // Context size (default: 2048)
+  nCtx?: number;              // Context size set by hand (used when contextMode is 'manual')
+  contextMode?: 'auto' | 'manual'; // On-device context: auto per phone (default) or nCtx/contextSize
   nBatch?: number;            // Batch size for prompt processing (default: 512)
   nUBatch?: number;           // Micro-batch size (default: 512)
   multimodalProj?: string;    // Path to multimodal projector file (.mmproj)
@@ -205,6 +214,7 @@ export interface LLMConfig {
 
   // Thinking and Search features
   enableThinking?: boolean;   // Enable model thinking/reasoning display
+  assistantLanguage?: 'auto' | 'it' | 'en'; // Language of answers and memories (auto: the user's messages)
   thinkingBudget?: number;    // Token budget for thinking (0-24576, 0=disable)
   enableSearch?: boolean;     // Enable Google Search grounding (Gemini/Perplexity)
   // Semantic Memory configuration

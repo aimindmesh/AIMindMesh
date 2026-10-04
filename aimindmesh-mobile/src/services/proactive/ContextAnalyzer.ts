@@ -14,6 +14,8 @@ import { logger } from '../logger';
 import { CalendarEvent as BriefingEvent, toBriefingEvents } from './meetingBriefingService';
 import { applyContextSummary } from '../llm/contextSummaryStore';
 import { getActiveThreadId } from '../llm/threadManager';
+import { getLastChatActivityAt } from '../llm/background/chatActivity';
+import { onDeviceContextSize } from '../llm/context/contextSize';
 
 /**
  * Context window of the configured model: the provider's window for remote providers
@@ -22,7 +24,7 @@ import { getActiveThreadId } from '../llm/threadManager';
 export function getContextWindow(llmConfig: Partial<LLMConfig> | null | undefined): number {
     if (!llmConfig) return 2048;
     return (llmConfig.provider && getProviderContextWindow(llmConfig.provider))
-        || llmConfig.nCtx || llmConfig.contextSize || 2048;
+        || onDeviceContextSize(llmConfig);
 }
 
 export interface ProactiveContext {
@@ -62,25 +64,38 @@ export interface ProactiveContext {
     };
 }
 
+/** Device state measured by the native worker for this check */
+export interface DeviceSignals {
+    screenOn?: boolean;
+    /** System Do Not Disturb: treated as focus mode */
+    dnd?: boolean;
+}
+
+const IDLE_AFTER_MS = 30 * 60 * 1000;
+/** With the screen off the user is not using the phone: idle much sooner */
+const IDLE_SCREEN_OFF_AFTER_MS = 3 * 60 * 1000;
+
+/** User activity from the last interaction and the screen state */
+export function inferActivity(now: number, lastInteraction: number, focus: boolean, screenOn?: boolean): 'idle' | 'active' | 'focus' {
+    if (focus) return 'focus';
+    const since = now - lastInteraction;
+    if (since > IDLE_AFTER_MS || (screenOn === false && since > IDLE_SCREEN_OFF_AFTER_MS)) return 'idle';
+    return 'active';
+}
+
 class ContextAnalyzer {
     private currentScreen: string = 'home';
     private isFocusMode: boolean = false;
 
-    async analyze(): Promise<ProactiveContext> {
+    async analyze(signals: DeviceSignals = {}): Promise<ProactiveContext> {
         const timestamp = Date.now();
         const deviceContext = await this.getDeviceContext();
         const dataContext = await this.getDataContext();
+        const focusMode = this.isFocusMode || signals.dnd === true;
 
-        // User activity inference (simple heuristic for now)
-        const lastInteraction = this.getLastInteractionTime(dataContext.recentChatHistory);
-        const timeSinceInteraction = timestamp - lastInteraction;
-        let activity: 'idle' | 'active' | 'focus' = 'active';
-
-        if (this.isFocusMode) {
-            activity = 'focus';
-        } else if (timeSinceInteraction > 30 * 60 * 1000) { // 30 mins
-            activity = 'idle';
-        }
+        // Last interaction: chat activity of this app run, else the last message of the chat
+        const lastInteraction = Math.max(getLastChatActivityAt(), this.getLastInteractionTime(dataContext.recentChatHistory));
+        const activity = inferActivity(timestamp, lastInteraction, focusMode, signals.screenOn);
 
         // Chat context calculation
         const chatContextUsage = await this.getChatContextUsage();
@@ -94,7 +109,7 @@ class ContextAnalyzer {
             },
             app: {
                 currentScreen: this.currentScreen,
-                focusMode: this.isFocusMode,
+                focusMode,
             },
             data: dataContext,
             chat: chatContextUsage,
@@ -265,10 +280,12 @@ class ContextAnalyzer {
         }
     }
 
+    /** Time of the last chat message (0: no chat yet) */
     private getLastInteractionTime(messages: Message[]): number {
-        if (messages.length === 0) return Date.now();
+        if (messages.length === 0) return 0;
         const lastMsg = messages[messages.length - 1];
-        return lastMsg.timestamp instanceof Date ? lastMsg.timestamp.getTime() : Date.now();
+        const time = lastMsg.timestamp instanceof Date ? lastMsg.timestamp.getTime() : new Date(lastMsg.timestamp as any).getTime();
+        return Number.isFinite(time) ? time : 0;
     }
 }
 

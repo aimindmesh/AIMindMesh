@@ -52,8 +52,8 @@ export const EMBEDDING_MODELS: EmbeddingModelDefinition[] = [
     // E5 Models (Microsoft)
     {
         id: 'e5-small-v2',
-        name: 'E5 Small v2 ⭐',
-        description: '+5% accuracy vs MiniLM, same speed',
+        name: 'E5 Small v2',
+        description: 'English only: +5% accuracy vs MiniLM, same speed',
         dimension: 384,
         size: 33_000_000, // ~33MB
         sizeBytes: 34603008,
@@ -61,12 +61,12 @@ export const EMBEDDING_MODELS: EmbeddingModelDefinition[] = [
         tokenizerUrl: 'https://huggingface.co/intfloat/e5-small-v2/resolve/main/tokenizer.json',
         queryPrefix: 'query: ',  // E5 requires prefix
         passagePrefix: 'passage: ',
-        recommended: true,
+        recommended: false,
     },
     {
         id: 'multilingual-e5-small',
-        name: 'E5 Small Multilingual',
-        description: 'Best for Italian and multilingual content',
+        name: 'E5 Small Multilingual ⭐',
+        description: 'Recommended: Italian and other languages (memories and questions in the same language as you write)',
         dimension: 384,
         size: 117_000_000, // ~117MB
         sizeBytes: 122683392,
@@ -74,7 +74,7 @@ export const EMBEDDING_MODELS: EmbeddingModelDefinition[] = [
         tokenizerUrl: 'https://huggingface.co/intfloat/multilingual-e5-small/resolve/main/tokenizer.json',
         queryPrefix: 'query: ',
         passagePrefix: 'passage: ',
-        recommended: false,
+        recommended: true,
     },
     // BGE Models (BAAI)
     {

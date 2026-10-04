@@ -134,7 +134,6 @@ export const NoteEditor: React.FC<NoteEditorProps> = ({
                 [{ role: 'user', text: prompt, id: 'note-gen', timestamp: new Date() }],
                 notePersonality,
                 noteGenerationConfig,
-                [],
                 apiKey
             );
 

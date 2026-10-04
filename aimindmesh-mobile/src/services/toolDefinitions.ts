@@ -16,6 +16,7 @@ import { agendaTools } from './tools/definitions/agendaToolDefinitions';
 import { documentTools } from './tools/documentTools';
 import { workspaceTools } from './tools/workspaceTools';
 import { mediaTools } from './tools/mediaTools';
+import { memoryTools } from './tools/definitions/memoryToolDefinitions';
 
 // Re-export types for consumers
 export * from './tools/types';
@@ -33,15 +34,21 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     ...agendaTools,
     ...documentTools,
     ...workspaceTools,
-    ...mediaTools
+    ...mediaTools,
+    ...memoryTools
 ].filter((tool, index, all) => all.findIndex(t => t.name === tool.name) === index);
+
+/** A tool the model is offered: not denied by the user and available (e.g. its server feature is on). */
+export function isToolOffered(tool: ToolDefinition, toolRules: Record<string, string> = {}): boolean {
+    return (toolRules[tool.name] || 'confirm') !== 'deny' && (tool.isAvailable?.() ?? true);
+}
 
 /**
  * Get function declarations in Gemini format
  */
 export function getGeminiFunctionDeclarations(toolRules: Record<string, string> = {}): FunctionDeclaration[] {
     return TOOL_DEFINITIONS
-        .filter(t => (toolRules[t.name] || 'confirm') !== 'deny')
+        .filter(t => isToolOffered(t, toolRules))
         .map(tool => ({
             name: tool.name,
             description: tool.description,
@@ -64,7 +71,7 @@ export function getToolByName(name: string): ToolDefinition | undefined {
  */
 export function getFormattedToolDefinitions(toolRules: Record<string, string> = {}): string {
     return TOOL_DEFINITIONS
-        .filter(t => (toolRules[t.name] || 'confirm') !== 'deny')
+        .filter(t => isToolOffered(t, toolRules))
         .map(tool => {
             const params = Object.entries(tool.parameters.properties)
                 .map(([name, prop]) => `  - ${name}: ${prop.description}${tool.parameters.required.includes(name) ? ' (required)' : ''}`)
@@ -135,8 +142,8 @@ Assistant: <thinking>User wants to create a task with deadline. Using create_tas
 
 // Compact usage descriptions for GGUF models
 const COMPACT_TOOL_DESCRIPTIONS: Record<string, string> = {
-    'search_web': '- search_web({"query":"..."}) - Search web',
-    'read_web_page': '- read_web_page({"url":"..."}) - Read URL',
+    'search_web': '- search_web({"query":"...","time_range":"week"}) - Search web (time_range optional: day|week|month|year)',
+    'read_web_page': '- read_web_page({"url":"...","query":"..."}) - Read a page (query optional: only relevant passages; chunk_index: next part)',
     'download_file': '- download_file({"url":"...","filename":"..."})',
     'run_termux_command': '- run_termux_command({"command":"..."}) - Shell',
     'create_calendar_event': '- create_calendar_event({"title":"..","date":"YYYY-MM-DD","time":"HH:MM"})',
@@ -148,16 +155,20 @@ const COMPACT_TOOL_DESCRIPTIONS: Record<string, string> = {
     'termux_install_pkg': '- termux_install_pkg({"package":"..."})',
     'launch_app': '- launch_app({"app_name":"..."})',
     'set_brightness': '- set_brightness({"level":128})',
-    'set_volume': '- set_volume({"stream":"music","level":10})'
+    'set_volume': '- set_volume({"stream":"music","level":10})',
+    'set_alarm': '- set_alarm({"hour":7,"minute":0}) - Alarm clock',
+    'search_memory': '- search_memory({"query":"..."}) - What you know about the user (with ids)',
+    'save_memory': '- save_memory({"content":"..."}) - Remember a lasting fact the user asked you to remember',
+    'forget_memory': '- forget_memory({"memory_id":"..."}) - Forget a fact'
 };
 
 /**
  * Get COMPACT ReAct-style instructions for GGUF models (reduces prompt tokens by 70%+)
  */
-export function getReActSystemPromptCompact(toolRules: Record<string, string> = {}): string {
-    // Dynamically build the list of tools based on rules
+export function getReActSystemPromptCompact(toolRules: Record<string, string> = {}, only?: string[]): string {
+    // The allowed tools (only those the router chose for the turn, when it did)
     const activeTools = Object.entries(COMPACT_TOOL_DESCRIPTIONS)
-        .filter(([name]) => (toolRules[name] || 'confirm') !== 'deny')
+        .filter(([name]) => (toolRules[name] || 'confirm') !== 'deny' && (!only || only.includes(name)))
         .map(([_, desc]) => desc)
         .join('\n');
 
@@ -169,31 +180,17 @@ Use <tool>name({"param":"value"})</tool> to execute actions.
 ${activeTools}
 
 ### Rules:
-1. **CRITICAL**: After search_web, you MUST call read_web_page on at least one link to verify information. NEVER answer based only on search snippets.
+1. **Web**: after search_web, answer from the snippets only if they clearly contain the answer; for details, numbers, dates or verification call read_web_page on the most relevant URL. Cite the URLs you used. If the results do not contain the answer, say so.
 2. **Sequential Logic**: Each tool call is followed by an "Observation". After an Observation, you MUST use <thinking> again to plan your next step until the task is complete.
 3. DO NOT invent or hallucinate information. If you don't know, use a tool or say you don't know.
-4. Format:
+4. **Memory**: questions about the user's own life (where they live, their people, plans, what they told you) are answered from WHAT YOU KNOW ABOUT THE USER and the <context>; if it is not there, call search_memory. Never search the web for the user's personal facts.
+5. **Actions**: never say you set, created or added something (reminders, events, alarms, lists) unless you wrote the <tool> call that does it. Use a tool only when it is needed.
+6. Format:
 <thinking>
 [reasoning about the current state and next step]
 </thinking>
 <tool>name({...})</tool>
 OR
 [final response starting with "Answer: "]
-
-### Examples:
-User: "Find gemma weights"
-<thinking>The user wants to find download links for Gemma weights. I'll search the web.</thinking>
-<tool>search_web({"query":"gemma weights download links"})</tool>
-Observation: [1] Gemma Models - Hugging Face. URL: https://huggingface.co/google/gemma
-<thinking>I found a relevant link. Now I must read the page to verify the exact download details.</thinking>
-<tool>read_web_page({"url":"https://huggingface.co/google/gemma"})</tool>
-Observation: Page contains instructions: "Download official weights from the Files and versions tab..."
-Answer: You can download Gemma weights from Hugging Face here: https://huggingface.co/google/gemma. Follow the "Files and versions" tab.
-
-User: "ls in termux"
-<thinking>The user wants to see the contents of the current directory. I'll run the 'ls' command.</thinking>
-<tool>run_termux_command({"command":"ls"})</tool>
-Observation: file1.txt file2.jpg
-Answer: I found file1.txt and file2.jpg in the current directory.
 `;
 }

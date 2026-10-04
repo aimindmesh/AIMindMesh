@@ -1,11 +1,11 @@
-import { Message, Personality, Memory, LLMConfig } from '../../types';
+import { Message, Personality, LLMConfig } from '../../types';
 import { logger } from '../logger';
-import { buildSystemPrompt } from './promptBuilder';
+import { buildPromptContext, systemPromptWithContext } from './promptContext';
 import { StreamChunk } from './llmService';
 import { getReActSystemPromptCompact } from '../toolDefinitions';
 import { parseReActToolCalls } from '../tools';
 import { createThinkingParser } from './thinkingParser';
-import { toChatRole, lastUserText } from './roles';
+import { toChatRole } from './roles';
 import { resolveClaudeModel } from './claudeModels';
 
 export { DEFAULT_CLAUDE_MODEL, resolveClaudeModel } from './claudeModels';
@@ -18,7 +18,6 @@ export async function* generateClaudeStream(
     personality: Personality,
     model: string,
     apiKey: string,
-    memories?: Memory[],
     signal?: AbortSignal,
     maxTokens?: number,
     llmConfig?: LLMConfig
@@ -27,43 +26,8 @@ export async function* generateClaudeStream(
         throw new Error("Claude API key is missing");
     }
 
-    // Prepare system prompt with semantic memory support
-    let systemPrompt = buildSystemPrompt(personality, llmConfig?.enableSemanticMemory ? undefined : memories);
-
-    // Retrieve semantically relevant memories if enabled
-    if (llmConfig?.enableSemanticMemory && llmConfig.embeddingModelId && history.length > 0) {
-        try {
-            const { getOrInitializeSemanticMemoryRetriever } = await import('../memory/semanticMemoryRetriever');
-            const retriever = await getOrInitializeSemanticMemoryRetriever(llmConfig);
-            if (retriever) {
-                const lastUserMessage = [...history].reverse().find(m => m.role === 'user');
-                if (lastUserMessage) {
-                    const relevantMemories = await retriever.retrieveRelevantMemories(
-                        lastUserMessage.text,
-                        undefined,
-                        llmConfig.semanticMemoryMaxResults || 3,
-                        llmConfig.semanticMemorySimilarityThreshold || 0.75
-                    );
-                    if (relevantMemories.length > 0) {
-                        const truncated = retriever.truncateToTokenLimit(relevantMemories, 400);
-                        const semanticContext = retriever.formatForContext(truncated);
-                        systemPrompt += '\n\n' + semanticContext;
-                        logger.log('info', `Claude: Injected ${truncated.length} semantic memories into context`);
-                    }
-                }
-            }
-        } catch (error) {
-            logger.log('warn', 'Claude: Failed to retrieve semantic memories', error);
-        }
-    }
-
-    // Inject Workspace Documents Context (as the other providers do)
-    try {
-        const { contextInjector } = await import('./contextInjector');
-        systemPrompt = await contextInjector.buildSystemPromptWithContext(lastUserText(history), systemPrompt);
-    } catch (e) {
-        logger.log('warn', 'Claude: Failed to inject workspace context', e);
-    }
+    // Persona, what is known about the user, related memories and workspace documents
+    let systemPrompt = systemPromptWithContext(await buildPromptContext({ personality, llmConfig, history }));
 
     // Add tool instructions if enabled
     if (llmConfig?.enableToolCalling) {

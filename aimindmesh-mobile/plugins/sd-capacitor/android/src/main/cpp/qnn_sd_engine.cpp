@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 
@@ -51,7 +52,7 @@ void QnnSdEngine::release() {
     LOGI("QNN Stable Diffusion Native Engine released");
 }
 
-bool QnnSdEngine::loadLibraries(const std::string& nativeLibDir) {
+bool QnnSdEngine::loadLibraries(const std::string& nativeLibDir, const std::string& htpArch) {
     if (!nativeLibDir.empty()) {
         std::string dspPath = nativeLibDir + ";/dsp;/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp/cdsp";
         setenv("ADSP_LIBRARY_PATH", dspPath.c_str(), 1);
@@ -69,7 +70,12 @@ bool QnnSdEngine::loadLibraries(const std::string& nativeLibDir) {
     if (!nativeLibDir.empty()) {
         dlopen((nativeLibDir + "/libPlatformValidatorShared.so").c_str(), RTLD_NOW | RTLD_GLOBAL);
         dlopen((nativeLibDir + "/libQnnHtpPrepare.so").c_str(), RTLD_NOW | RTLD_GLOBAL);
-        dlopen((nativeLibDir + "/libQnnHtpV79Stub.so").c_str(), RTLD_NOW | RTLD_GLOBAL);
+        // The stub of this phone's Hexagon version (the APK may ship several: V73, V79, V81)
+        std::string arch = htpArch.empty() ? "v79" : htpArch;
+        for (char& ch : arch) ch = static_cast<char>(toupper(static_cast<unsigned char>(ch)));
+        const std::string stub = nativeLibDir + "/libQnnHtp" + arch + "Stub.so";
+        if (dlopen(stub.c_str(), RTLD_NOW | RTLD_GLOBAL)) LOGI("Pre-loaded HTP stub %s", stub.c_str());
+        else LOGW("HTP stub %s not loaded (%s): this NPU is not supported by the bundled QNN libraries", stub.c_str(), dlerror());
         m_libSystem = dlopen((nativeLibDir + "/libQnnSystem.so").c_str(), RTLD_NOW | RTLD_GLOBAL);
     }
     if (!m_libSystem) m_libSystem = dlopen("libQnnSystem.so", RTLD_NOW | RTLD_GLOBAL);
@@ -306,9 +312,9 @@ bool QnnSdEngine::configureShapes() {
     return true;
 }
 
-bool QnnSdEngine::init(const std::string& modelDir, const std::string& nativeLibDir) {
+bool QnnSdEngine::init(const std::string& modelDir, const std::string& nativeLibDir, const std::string& htpArch) {
     release();
-    if (!loadLibraries(nativeLibDir)) {
+    if (!loadLibraries(nativeLibDir, htpArch)) {
         release();
         return false;
     }

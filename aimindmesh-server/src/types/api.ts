@@ -108,7 +108,7 @@ export type DirectiveGoalType = 'explore' | 'build' | 'improve' | 'stop' | 'pivo
 export type DirectiveStatus = 'active' | 'completed' | 'cancelled';
 export type RoleStatus = 'active' | 'paused' | 'archived';
 export type ProposalStatus = 'proposed' | 'approved' | 'rejected' | 'materialized';
-export type IdeaStatus = 'proposed' | 'reviewing' | 'approved' | 'rejected' | 'characterized' | 'development';
+export type IdeaStatus = 'proposed' | 'reviewing' | 'approved' | 'rejected' | 'characterized' | 'development' | 'mvp_ready' | 'killed';
 
 export interface Directive {
   id: string;
@@ -120,6 +120,8 @@ export interface Directive {
   status: DirectiveStatus;
   createdBy: string;
   supersedesId?: string | null;
+  /** Idea the directive was derived from (council recommendations); null = organization-wide. */
+  ideaId?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -157,12 +159,20 @@ export interface RoleCreationProposal {
   updatedAt: string;
 }
 
+/** A web page an idea was derived from. */
+export interface SourceRef {
+  title: string;
+  url: string;
+}
+
 export interface IdeaProposal {
   id: string;
   title: string;
   problemStatement: string;
   summary: string;
+  /** Plain strings (rendered as text by older apps); structured links are in `sources`. */
   sourceSignals: string[];
+  sources?: SourceRef[];
   strategicScore: number;
   feasibilityScore: number;
   noveltyScore: number;
@@ -171,6 +181,10 @@ export interface IdeaProposal {
   /** Council debate synthesis (GET /ideas) */
   analysisSynthesis?: string | null;
   humanFeedback?: string | null;
+  /** Why the discovery judge gave these scores. */
+  judgeRationale?: string | null;
+  /** Reason given when the venture was closed or pivoted. */
+  outcomeNotes?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -187,6 +201,66 @@ export interface AuditLogEntry {
   created_at: string;
 }
 
+/**
+ * validation_status of a venture repository. `blocked` waits for a human (attempt budget spent,
+ * paused by an upgrade); older rows may still hold `needs_verification` or `verifying`.
+ */
+export type VentureRepoStatus =
+  'pending' | 'evolving' | 'cooldown' | 'verifying' | 'needs_verification' | 'healthy' | 'broken' | 'blocked';
+
+/** One milestone of a venture: the acceptance criteria (AC ids) it must make pass. */
+export interface VentureMilestone {
+  seq: number;
+  title: string;
+  criteria: string[];
+  status: 'pending' | 'in_progress' | 'done';
+  attempts: number;
+  /** Criteria passing at the last validation. */
+  passed: string[];
+}
+
+/** POST /api/organization/ideas/:id/decision, once the MVP is ready. */
+export type VentureDecision = 'continue' | 'pivot' | 'kill';
+
+/** GET /api/organization/repositories row (snake_case, as stored). */
+export interface VentureRepository {
+  id: string;
+  repo_name: string;
+  namespace: string;
+  gitea_url: string;
+  created_from_idea_id: string | null;
+  bootstrap_template: string;
+  validation_status: VentureRepoStatus | string;
+  retry_count: number;
+  cooldown_until: string | null;
+  blocked_reason: string | null;
+  agent_last_triggered_at: string | null;
+  last_ci_status: string | null;
+  created_at: string;
+  /** A development run or validation is in progress. */
+  isEvolving: boolean;
+  /** OpenClaw session of the development agent (log viewer). */
+  sessionKey: string;
+  /** Summary of the last validation, when there is one. */
+  lastValidation?: string | null;
+  milestones?: VentureMilestone[];
+}
+
+/** GET/PATCH /api/organization/build-config: the venture build loop and its kill switch. */
+export interface VentureBuildConfig {
+  enabled: boolean;
+  /** Model of the development agent; null keeps the OpenClaw default. */
+  model: string | null;
+  maxAttempts: number;
+  dailyRunLimit: number;
+  maxConcurrentBuilds: number;
+  /** Development runs a venture may use in total before it is blocked. */
+  maxRunsPerVenture: number;
+  agentRunTimeoutMs: number;
+  validationImage: string;
+  validationTimeoutMs: number;
+}
+
 export interface DiscoveryConfig {
   enabled: boolean;
   cronExpression: string;
@@ -200,6 +274,19 @@ export interface DiscoveryConfig {
 }
 
 // ── Auto-evolution (/api/evolution) ──────────────────────────────────────────
+
+/** GET /api/evolution/stats row: what each candidate source turned into. */
+export interface EvolutionSourceStats {
+  source: string;
+  candidates: number;
+  /** Candidates whose generation or validation failed. */
+  failed: number;
+  /** Candidates the model declined to change. */
+  skipped: number;
+  proposals: number;
+  merged: number;
+  rejected: number;
+}
 
 export type EvolutionProposalStatus = 'proposed' | 'merged' | 'rejected' | 'failed' | 'rolled_back';
 
@@ -383,12 +470,53 @@ export interface SyncChatMessage {
   received_at: number | null;
 }
 
+/**
+ * A meeting as pushed by a device and returned by the pull. The notes fields are sent by app
+ * versions that have them; a pushed meeting without them keeps the stored notes.
+ */
+export interface SyncMeeting {
+  id: string;
+  timestamp: number;
+  /** Seconds */
+  duration: number;
+  has_audio: number | boolean;
+  audio_file_path?: string | null;
+  audio_mime_type?: string | null;
+  speaker_names_json?: string | null;
+  title?: string | null;
+  /** JSON: [{ id, ms, note? }] */
+  bookmarks_json?: string | null;
+  /** JSON: the structured AI notes of the meeting */
+  analysis_json?: string | null;
+  /** JSON: [{ id, question, answer, createdAt }] */
+  questions_json?: string | null;
+  device_id?: string;
+  created_at?: number;
+  updated_at?: number;
+}
+
+export interface SyncMeetingSegment {
+  id: string;
+  meeting_id: string;
+  sequence: number;
+  start_ms: number;
+  end_ms: number;
+  text: string;
+  speaker_id?: number | null;
+  stt_provider?: string | null;
+  confidence?: number | null;
+  words_json?: string | null;
+  original_text?: string | null;
+  is_edited?: number | boolean;
+  edited_at?: number | null;
+}
+
 /** GET /api/sync/pull?deviceId=&since= (since = `timestamp` of the previous pull, server time) */
 export interface SyncPullResponse {
   deviceId: string;
   timestamp: number;
-  meetings: any[];
-  meetingSegments: any[];
+  meetings: SyncMeeting[];
+  meetingSegments: SyncMeetingSegment[];
   calendarEvents: any[];
   chats: SyncChatMessage[];
   conversations: { id: string; title: string; created_at: number; last_message_at: number | null }[];

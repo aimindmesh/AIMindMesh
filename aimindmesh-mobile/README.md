@@ -9,7 +9,8 @@
 - **Agentic Chat**: Execute shell commands, manage files, and control hardware via natural language.
 - **Semantic Memory**: A vector-based long-term memory system (RAG) that preserves context across conversations.
 - **Offline TTS Engine**: Multi-lingual, zero-latency local voice synthesis using Kokoro v1.0 (via Sherpa-ONNX) and Piper.
-- **Meeting Mode**: Real-time transcription with multi-pass speaker diarization and smoothing.
+- **Meeting Mode**: Native background recording with live Vosk or Voxtral, accurate on-device Whisper transcription with speaker separation after Stop, known voices, AI notes and questions, bookmarks, search, playback, export and backup (shared format with the standalone Meeting Assistant). Speech models ship in the APK (`scripts/fetch-bundled-models.sh`).
+- **Privacy**: Optional app lock (fingerprint / PIN) that also hides the app from screenshots and recent apps.
 - **Proactive Assistant**: Autonomous background actions (context summarization, memory maintenance).
 - **Meeting-to-Organization Bridge**: Extracts action items and proposes directives/ideas directly to the server's AI Council from transcripts.
 - **Android Auto**: A dedicated, safety-optimized UI for hands-free interaction in the car.
@@ -31,6 +32,7 @@
     ```bash
     npm install
     ```
+    For Android builds, also put the bundled speech models in place (once): `./scripts/fetch-bundled-models.sh`.
 2.  **Run development server**:
     ```bash
     npm run dev

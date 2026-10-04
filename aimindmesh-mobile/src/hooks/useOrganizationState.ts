@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react';
-import { organizationApi, Directive, OrgRole, IdeaProposal, AuditLogEntry, DiscoveryConfig } from '../services/organizationApi';
+import { organizationApi, Directive, OrgRole, IdeaProposal, AuditLogEntry, DiscoveryConfig, VentureRepository, VentureBuildConfig, VentureDecision } from '../services/organizationApi';
 import { AIMindMeshServerSettings } from '../types';
 
 export function useOrganizationState() {
@@ -10,6 +10,7 @@ export function useOrganizationState() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [discoveryConfig, setDiscoveryConfig] = useState<(DiscoveryConfig & { isRunning: boolean }) | null>(null);
+  const [buildConfig, setBuildConfig] = useState<VentureBuildConfig | null>(null);
 
   const fetchDirectives = useCallback(async (settings: AIMindMeshServerSettings) => {
     setLoading(true);
@@ -147,7 +148,7 @@ export function useOrganizationState() {
     }
   }, []);
 
-  const [repositories, setRepositories] = useState<any[]>([]);
+  const [repositories, setRepositories] = useState<VentureRepository[]>([]);
   const [hrProposals, setHrProposals] = useState<any[]>([]);
 
   const fetchRepositories = useCallback(async (settings: AIMindMeshServerSettings) => {
@@ -216,8 +217,51 @@ export function useOrganizationState() {
       const data = await organizationApi.getRepositories(settings);
       setRepositories(data);
     } catch (e: any) {
-      setError(e.message || 'Failed to force development');
+      setError(e.message || 'Failed to start development');
       throw e;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const cancelRun = useCallback(async (settings: AIMindMeshServerSettings, repoId: string) => {
+    setError(null);
+    try {
+      await organizationApi.cancelRun(settings, repoId);
+      setRepositories(await organizationApi.getRepositories(settings));
+    } catch (e: any) {
+      setError(e.message || 'Failed to cancel the run');
+    }
+  }, []);
+
+  const decideVenture = useCallback(async (settings: AIMindMeshServerSettings, ideaId: string, decision: VentureDecision, notes: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      await organizationApi.decideVenture(settings, ideaId, decision, notes);
+      const [ideaList, repos] = await Promise.all([organizationApi.getIdeas(settings), organizationApi.getRepositories(settings)]);
+      setIdeas(ideaList);
+      setRepositories(repos);
+    } catch (e: any) {
+      setError(e.message || 'Failed to record the decision');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const fetchBuildConfig = useCallback(async (settings: AIMindMeshServerSettings) => {
+    try {
+      setBuildConfig(await organizationApi.getBuildConfig(settings));
+    } catch { /* non-blocking */ }
+  }, []);
+
+  const updateBuildConfig = useCallback(async (settings: AIMindMeshServerSettings, patch: Partial<VentureBuildConfig>) => {
+    setLoading(true);
+    setError(null);
+    try {
+      setBuildConfig(await organizationApi.updateBuildConfig(settings, patch));
+    } catch (e: any) {
+      setError(e.message || 'Failed to update build settings');
     } finally {
       setLoading(false);
     }
@@ -447,6 +491,7 @@ export function useOrganizationState() {
     repositories,
     hrProposals,
     discoveryConfig,
+    buildConfig,
     loading,
     error,
     fetchDirectives,
@@ -464,6 +509,10 @@ export function useOrganizationState() {
     bootstrapCiCd,
     runValidation,
     forceDevelop,
+    cancelRun,
+    decideVenture,
+    fetchBuildConfig,
+    updateBuildConfig,
     fetchHRProposals,
     analyzeRecruitment,
     materializeProposal,

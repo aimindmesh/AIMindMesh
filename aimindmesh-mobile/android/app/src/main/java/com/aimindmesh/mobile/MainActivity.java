@@ -18,7 +18,6 @@ import com.aimindmesh.vad.VADPlugin;
 import com.aimindmesh.mobile.performance.PerformancePlugin;
 import com.aimindmesh.mobile.performance.SystemMonitorPlugin;
 import com.aimindmesh.auto.AndroidAutoPlugin;
-import com.aimindmesh.mobile.audio.AudioPlaybackPlugin;
 import com.aimindmesh.mobile.security.SecureStoragePlugin;
 import com.aimindmesh.mobile.meeting.MeetingExportPlugin;
 import com.aimindmesh.fcm.FCMCapacitorPlugin;
@@ -42,7 +41,6 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(PerformancePlugin.class);
         registerPlugin(SystemMonitorPlugin.class); // Added SystemMonitorPlugin
         registerPlugin(AndroidAutoPlugin.class);
-        registerPlugin(AudioPlaybackPlugin.class);
         registerPlugin(SecureStoragePlugin.class);
         registerPlugin(MeetingExportPlugin.class);
         registerPlugin(com.aimindmesh.mobile.proactive.ProactivePlugin.class);
@@ -50,8 +48,18 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(com.aimindmesh.mobile.tts.kokoro.KokoroTTSPlugin.class);
         registerPlugin(com.aimindmesh.mobile.genie.GeniePlugin.class);
         registerPlugin(com.aimindmesh.mobile.sd.SDPlugin.class);
+        registerPlugin(com.aimindmesh.mobile.utils.BundledModelsPlugin.class);
+        registerPlugin(com.aimindmesh.mobile.recording.MeetingRecorderPlugin.class);
+        registerPlugin(com.aimindmesh.mobile.recording.BackgroundWorkPlugin.class);
+        registerPlugin(com.aimindmesh.mobile.meeting.BackupPlugin.class);
+        registerPlugin(com.aimindmesh.mobile.security.AppLockPlugin.class);
 
         super.onCreate(savedInstanceState);
+        // App lock on: content hidden from screenshots and recent apps from the first frame
+        com.aimindmesh.mobile.security.AppLockPlugin.applySavedSecureFlag(this);
+
+        // Speech models bundled in the APK go to files/ in the background (about a minute the first time)
+        com.aimindmesh.mobile.utils.ModelAssetManager.unpackBundledModelsAsync(this);
 
         // API keys are moved to the Android Keystore by the JS secret store (secretStore.ts)
 
@@ -131,6 +139,8 @@ public class MainActivity extends BridgeActivity {
 
         // Handle widget intent
         handleWidgetIntent(getIntent());
+        // Opened from a feed notification
+        handleNotificationIntent(getIntent());
         // Handle shortcut intent
         handleShortcutIntent(getIntent());
         // A recreated activity (savedInstanceState) must not reopen voice mode
@@ -145,6 +155,23 @@ public class MainActivity extends BridgeActivity {
         handleWidgetIntent(intent);
         handleShortcutIntent(intent);
         handleAssistantIntent(intent);
+        handleNotificationIntent(intent);
+    }
+
+    /**
+     * Opened from a feed notification (FCM): the web app opens the Feed. Kept as the pending
+     * launch action until JS reads it, since on a cold start the event fires before the
+     * app's listener exists.
+     */
+    private void handleNotificationIntent(Intent intent) {
+        if (intent == null || !"feed".equals(intent.getStringExtra("navigate_to")))
+            return;
+        String insightId = intent.getStringExtra("insight_id");
+        PerformancePlugin.setPendingLaunchAction(insightId != null ? "feed:" + insightId : "feed");
+        // Read once: a later onNewIntent/recreation must not open the Feed again
+        intent.removeExtra("navigate_to");
+        String jsCode = "window.dispatchEvent(new CustomEvent('assistantLaunch'));";
+        getBridge().getWebView().post(() -> getBridge().getWebView().evaluateJavascript(jsCode, null));
     }
 
     /**

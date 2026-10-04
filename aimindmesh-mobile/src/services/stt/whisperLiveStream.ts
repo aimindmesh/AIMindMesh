@@ -188,7 +188,7 @@ export class WhisperLiveStreamManager {
 
             const text = result.text?.trim();
             if (text && !isNonSpeechMarker(text)) {
-                logger.log('info', `[WhisperLiveStream] Recognized: "${text}"`);
+                logger.log('info', `[WhisperLiveStream] Recognized: ${text.length} chars`);
                 session.transcript = (session.transcript ? `${session.transcript} ` : '') + text;
                 session.onUpdate(session.transcript);
             }

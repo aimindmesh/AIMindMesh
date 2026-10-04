@@ -6,6 +6,8 @@
 #include <fstream>
 #include <thread>
 #include <cstdio>
+#include <cstring>
+#include <atomic>
 #include "whisper.h"
 
 // Log tag
@@ -132,6 +134,18 @@ static void append_json_escaped(std::stringstream &ss, const char *text) {
     }
 }
 
+// whisper.cpp logs to stderr by default, which Android discards: forward to logcat.
+static void whisper_log_to_logcat(enum ggml_log_level level, const char *text, void * /*user_data*/) {
+    __android_log_print(level >= GGML_LOG_LEVEL_ERROR ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO, "whisper.cpp", "%s", text);
+}
+
+// Set from Java (nativeAbort) to stop a running whisper_full as soon as possible.
+static std::atomic<bool> g_abort_requested{false};
+
+static bool abort_requested(void * /*user_data*/) {
+    return g_abort_requested.load();
+}
+
 // Helper to format result as JSON
 std::string format_result(struct whisper_context * ctx) {
     std::stringstream ss;
@@ -162,6 +176,8 @@ std::string format_result(struct whisper_context * ctx) {
     // Add processing time?
     // Not standard exposed by whisper_full, but we can measure outside
     
+    const int lang_id = whisper_full_lang_id(ctx);
+    ss << "\"language\":\"" << (lang_id >= 0 ? whisper_lang_str(lang_id) : "") << "\",";
     ss << "\"processingTimeMs\": 0"; // Placeholder
     ss << "}";
     return ss.str();
@@ -172,6 +188,8 @@ Java_com_aimindmesh_whisper_WhisperContext_nativeLoadModel(
         JNIEnv *env,
         jclass clazz,
         jstring modelPath) {
+    whisper_log_set(whisper_log_to_logcat, nullptr);
+    LOGI("whisper system info: %s", whisper_print_system_info());
     std::string path = jstring2string(env, modelPath);
     struct whisper_context_params cparams = whisper_context_default_params();
     // Enable GPU?
@@ -282,7 +300,8 @@ Java_com_aimindmesh_whisper_WhisperContext_nativeTranscribeAudioOptimized(
         jint minSilenceDurationMs,
         jint speechPadMs,
         jboolean conditionOnPreviousText,
-        jboolean wordTimestamps) {
+        jboolean wordTimestamps,
+        jint audioCtx) {
 
     struct whisper_context *ctx = (struct whisper_context *) contextPtr;
     if (!ctx) return env->NewStringUTF("{}");
@@ -311,6 +330,8 @@ Java_com_aimindmesh_whisper_WhisperContext_nativeTranscribeAudioOptimized(
     params.temperature = temperature;
     params.initial_prompt = prompt.empty() ? nullptr : prompt.c_str();
     params.no_context = !conditionOnPreviousText;
+    // Encoder frames to use (1500 = 30 s); 0 = full window. Shorter is faster on short chunks.
+    params.audio_ctx = audioCtx;
     
     // Note: VAD filter handling varies by whisper.cpp version.
     // Recent versions support 'no_speech_thold' or similar, but explicit VAD filter might need custom logic or check available params.
@@ -336,12 +357,18 @@ Java_com_aimindmesh_whisper_WhisperContext_nativeTranscribeAudioOptimized(
     // Or ignore if not directly mapped.
     // We will log them for debug.
     
-    LOGI("Optimized Transcribe: Lang=%s, Temp=%.2f, Beam=%d, Prompt=%s", lang.c_str(), temperature, beamSize, prompt.c_str());
+    whisper_reset_timings(ctx);
+    params.abort_callback = abort_requested;
+    params.abort_callback_user_data = nullptr;
+    g_abort_requested.store(false);
+
+    LOGI("Optimized Transcribe: Lang=%s, Temp=%.2f, Beam=%d, Threads=%d, Samples=%d", lang.c_str(), temperature, beamSize, nThreads, (int) pcmf32.size());
 
     if (whisper_full(ctx, params, pcmf32.data(), pcmf32.size()) != 0) {
         LOGE("Failed to transcribe optimized");
         return env->NewStringUTF("{}");
     }
+    whisper_print_timings(ctx);
 
     std::string json = format_result(ctx);
     return utf8_to_jstring(env, json);
@@ -529,4 +556,9 @@ Java_com_aimindmesh_whisper_WhisperContext_nativeTranscribeAudioStreaming(
 
     std::string json = format_result(ctx);
     return utf8_to_jstring(env, json);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_aimindmesh_whisper_WhisperContext_nativeAbort(JNIEnv * /*env*/, jclass /*clazz*/) {
+    g_abort_requested.store(true);
 }

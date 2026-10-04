@@ -12,7 +12,9 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "vitest run"
+    "test": "vitest run",
+    "eval": "vitest run --config vitest.eval.config.mts",
+    "eval:device": "vitest run --config vitest.eval.config.mts eval/device.eval.ts"
   },
   "dependencies": {
     "@blocknote/core": "^0.49.0",

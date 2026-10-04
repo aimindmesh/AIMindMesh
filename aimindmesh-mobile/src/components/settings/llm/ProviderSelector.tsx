@@ -104,7 +104,7 @@ const ProviderSelector: React.FC<ProviderSelectorProps> = ({ currentProvider, on
                         {
                             id: 'genie-npu',
                             label: 'Qualcomm NPU (Genie)',
-                            desc: 'Hardware accelerated on Snapdragon Hexagon NPU. Qwen 3.5 / Gemma at 50+ tok/s.',
+                            desc: 'On-device on the Snapdragon Hexagon NPU: Qwen 3.5 and Gemma 4 GGUF files (8 Gen 2 and newer), AI Hub bundles (8 Elite).',
                             badge: '⚡ Hexagon NPU',
                             badgeColor: 'bg-amber-500/20 text-amber-400 border-amber-500/30'
                         },

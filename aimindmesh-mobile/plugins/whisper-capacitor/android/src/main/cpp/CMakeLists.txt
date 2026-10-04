@@ -10,17 +10,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ============================================================================
 if(ANDROID)
     if(ANDROID_ABI STREQUAL "arm64-v8a")
-        # Aggressive optimization flags for release builds
-        set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -ffast-math -fno-finite-math-only -fvectorize -funroll-loops -finline-functions")
-        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -ffast-math -fno-finite-math-only -fvectorize -funroll-loops -finline-functions")
-        
-        # RelWithDebInfo also gets optimizations
-        set(CMAKE_C_FLAGS_RELWITHDEBINFO "${CMAKE_C_FLAGS_RELWITHDEBINFO} -O3 -ffast-math -fno-finite-math-only -fvectorize -funroll-loops")
-        set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -O3 -ffast-math -fno-finite-math-only -fvectorize -funroll-loops")
-        
+        # Optimize every build type, debug APKs included: unoptimized whisper.cpp runs at a
+        # fraction of real time, which makes post-meeting transcription unusable.
+        foreach(cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+            set(CMAKE_C_FLAGS_${cfg} "-O3 -DNDEBUG")
+            set(CMAKE_CXX_FLAGS_${cfg} "-O3 -DNDEBUG")
+        endforeach()
+
+        # NEON dot-product and fp16 kernels (ARMv8.2: every Snapdragon since the 845).
+        # WhisperContext checks the CPU for them before loading the library.
+        set(GGML_CPU_ARM_ARCH "armv8.2-a+dotprod+fp16" CACHE STRING "" FORCE)
+
         message(STATUS "ARM64 optimization flags enabled for Android")
     endif()
-    
+
     # Enable OpenMP for multi-threaded inference (critical for performance)
     set(GGML_OPENMP ON CACHE BOOL "Enable OpenMP" FORCE)
 endif()

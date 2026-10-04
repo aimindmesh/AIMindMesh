@@ -1,4 +1,4 @@
-import { Message, Personality, LLMConfig, Memory, AIMindMeshServerSettings } from "../../types";
+import { Message, Personality, LLMConfig, AIMindMeshServerSettings } from "../../types";
 import { logger } from "../logger";
 import { generatePerplexityStream } from "./perplexity";
 import { generateClaudeStream, resolveClaudeModel } from "./claude";
@@ -24,19 +24,56 @@ export type StreamChunk =
 // Main Orchestrator Functions
 // ------------------------------------------------------------------
 
+import { getRecommendedThreadCount } from "../../utils/hardwareCapabilities";
+import { isBackgroundTask, isInternalTask } from "./background/taskFlags";
+import { readSetting } from "../security/secretStore";
+import { yieldToChat } from "./background/llmArbiter";
+import { beginChatActivity } from "./background/chatActivity";
+
+/** The user profile for the server, when "Share What I Know With the Server" is on (never for internal tasks) */
+async function serverProfileMessage(llmConfig: LLMConfig): Promise<string | null> {
+    if (isInternalTask(llmConfig) || !readSetting<boolean>('share-profile-with-server', false)) return null;
+    const [{ factStore }, { buildProfile }] = await Promise.all([
+        import('../memory/facts/factStore'),
+        import('../memory/context/memoryContext'),
+    ]);
+    await factStore.ready.catch(() => undefined);
+    const profile = buildProfile(factStore.isReady() ? factStore.active() : [], 2000).text;
+    return profile || null;
+}
+
 /**
  * Main entry point for generating streaming responses from the active LLM provider.
  * Supports thinking chunks, formatting, and provider selection.
+ * A foreground generation first stops any background one (on-device engines hold a single
+ * conversation) and counts as chat activity; background tasks (llmArbiter) skip both.
  */
-import { getRecommendedThreadCount } from "../../utils/hardwareCapabilities";
-
-// ... existing imports ...
-
 export async function* generateTextResponseStream(
     history: Message[],
     personality: Personality,
     inputConfig: LLMConfig,
-    memories: Memory[] = [],
+    apiKey?: string,
+    signal?: AbortSignal,
+    maxResponseLength?: number,
+    serverSettings?: AIMindMeshServerSettings
+): AsyncGenerator<string | StreamChunk> {
+    if (isBackgroundTask(inputConfig)) {
+        yield* generateStream(history, personality, inputConfig, apiKey, signal, maxResponseLength, serverSettings);
+        return;
+    }
+    await yieldToChat();
+    const endActivity = beginChatActivity();
+    try {
+        yield* generateStream(history, personality, inputConfig, apiKey, signal, maxResponseLength, serverSettings);
+    } finally {
+        endActivity();
+    }
+}
+
+async function* generateStream(
+    history: Message[],
+    personality: Personality,
+    inputConfig: LLMConfig,
     apiKey?: string,
     signal?: AbortSignal,
     maxResponseLength?: number,
@@ -111,6 +148,9 @@ export async function* generateTextResponseStream(
                 role: (m.role === 'model' ? 'assistant' : m.role) as 'user' | 'assistant' | 'system', 
                 content: m.text 
             }));
+            // The server drops the persona and memories: the profile goes only if the user allowed it
+            const profile = await serverProfileMessage(llmConfig);
+            if (profile) serverHistory.unshift({ role: 'system', content: profile });
 
             const serverPromise = callServerProvider({
                 settings: serverSettings,
@@ -163,30 +203,30 @@ export async function* generateTextResponseStream(
     try {
         switch (localProvider) {
             case 'gemini':
-                yield* generateGeminiStreamWithTools(effectiveHistory, personality, llmConfig, memories, apiKey, signal, maxResponseLength);
+                yield* generateGeminiStreamWithTools(effectiveHistory, personality, llmConfig, apiKey, signal, maxResponseLength);
                 break;
 
 
             case 'native-gguf':
                 // Check if LiteRT engine is selected (hybrid approach)
                 if (llmConfig.engine === 'litert' && llmConfig.liteRTModelPath) {
-                    for await (const chunk of generateLiteRTStream(effectiveHistory, personality, llmConfig, memories, signal)) {
+                    for await (const chunk of generateLiteRTStream(effectiveHistory, personality, llmConfig, signal)) {
                         yield chunk;
                     }
                 } else {
-                    yield* generateNativeGGUFStream(effectiveHistory, personality, llmConfig, memories, signal, maxResponseLength);
+                    yield* generateNativeGGUFStream(effectiveHistory, personality, llmConfig, signal, maxResponseLength);
                 }
                 break;
 
             case 'local':
-                for await (const chunk of generateLocalStream(effectiveHistory, personality, llmConfig, memories, signal, maxResponseLength)) {
+                for await (const chunk of generateLocalStream(effectiveHistory, personality, llmConfig, signal, maxResponseLength)) {
                     yield { type: 'text', content: chunk };
                 }
                 break;
 
             case 'openrouter':
                 // Only the OpenRouter key: callers pass whichever key they hold (often Gemini's)
-                for await (const chunk of generateOpenRouterStream(effectiveHistory, personality, llmConfig, memories, llmConfig.openrouterApiKey, signal, maxResponseLength)) {
+                for await (const chunk of generateOpenRouterStream(effectiveHistory, personality, llmConfig, llmConfig.openrouterApiKey, signal, maxResponseLength)) {
                     yield { type: 'text', content: chunk };
                 }
                 break;
@@ -198,7 +238,6 @@ export async function* generateTextResponseStream(
                     personality,
                     llmConfig.perplexityModel || 'sonar-pro',
                     apiKey || '',
-                    memories,
                     signal,
                     maxResponseLength,
                     llmConfig
@@ -212,7 +251,6 @@ export async function* generateTextResponseStream(
                     personality,
                     resolveClaudeModel(llmConfig.claudeModel),
                     apiKey || '',
-                    memories,
                     signal,
                     maxResponseLength,
                     llmConfig
@@ -221,14 +259,14 @@ export async function* generateTextResponseStream(
 
             case 'litert':
                 // LiteRT provider - supports audio and vision modalities
-                for await (const chunk of generateLiteRTStream(effectiveHistory, personality, llmConfig, memories, signal)) {
+                for await (const chunk of generateLiteRTStream(effectiveHistory, personality, llmConfig, signal)) {
                     yield chunk;
                 }
                 break;
 
             case 'genie-npu':
                 // Qualcomm Genie / QAIRT Hexagon NPU provider
-                yield* generateGenieNPUStream(effectiveHistory, personality, llmConfig, memories, signal, maxResponseLength);
+                yield* generateGenieNPUStream(effectiveHistory, personality, llmConfig, signal, maxResponseLength);
                 break;
 
             default:
@@ -249,13 +287,12 @@ export async function* generateTextResponseStreamWithTools(
     history: Message[],
     personality: Personality,
     llmConfig: LLMConfig,
-    memories: Memory[] = [],
     apiKey?: string,
     signal?: AbortSignal,
     maxResponseLength?: number,
     serverSettings?: AIMindMeshServerSettings
 ): AsyncGenerator<StreamChunk> {
-    const stream = generateTextResponseStream(history, personality, llmConfig, memories, apiKey, signal, maxResponseLength, serverSettings);
+    const stream = generateTextResponseStream(history, personality, llmConfig, apiKey, signal, maxResponseLength, serverSettings);
 
     for await (const chunk of stream) {
         logger.log('debug', `[LLM_CHAIN] generateTextResponseStreamWithTools yielded a chunk`);
@@ -309,7 +346,7 @@ export async function generateMemorySummary(
     let summary = '';
 
     try {
-        for await (const chunk of generateTextResponseStream(summaryHistory, dummyPersonality, summaryConfig, [], apiKey)) {
+        for await (const chunk of generateTextResponseStream(summaryHistory, dummyPersonality, summaryConfig, apiKey)) {
             if (typeof chunk === 'string') {
                 summary += chunk;
             } else if (chunk.type === 'text' && chunk.content) {
@@ -340,7 +377,7 @@ export async function generateProactiveMessage(
 
     let message = '';
     try {
-        for await (const chunk of generateTextResponseStream(history, personality, llmConfig, [], apiKey)) {
+        for await (const chunk of generateTextResponseStream(history, personality, llmConfig, apiKey)) {
             if (typeof chunk === 'string') {
                 message += chunk;
             } else if (chunk.type === 'text' && chunk.content) {

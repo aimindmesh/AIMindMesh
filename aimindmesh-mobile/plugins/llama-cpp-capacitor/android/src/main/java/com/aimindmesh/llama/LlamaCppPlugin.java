@@ -194,13 +194,15 @@ public class LlamaCppPlugin extends Plugin {
         int contextId = call.getInt("contextId", 0);
         String messages = call.getString("messages", "");
         String chatTemplate = call.getString("chatTemplate", "");
+        String tools = call.getString("tools", "");
+        boolean enableThinking = Boolean.TRUE.equals(call.getBoolean("enableThinking", false));
         JSObject params = call.getObject("params", new JSObject());
 
         LlamaCppInference inference = smol.get(contextId);
         if (inference != null && inference.isLoaded()) {
             try {
                 Log.i(TAG, "Calling inference.getFormattedChat() for context: " + contextId);
-                String result = inference.getFormattedChat(messages, chatTemplate);
+                String result = inference.getFormattedChat(messages, chatTemplate, tools, enableThinking);
                 Log.i(TAG, "inference.getFormattedChat() completed");
                 JSObject jsResult = new JSObject();
                 jsResult.put("type", "llama-chat");

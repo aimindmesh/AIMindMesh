@@ -16,7 +16,7 @@ export type TaskType = 'EVOLUTION' | 'INTENT_CLASSIFICATION' | 'QUERY_EXPANSION'
                        'PROACTIVE_INSIGHT' | 'DEBATE_PARTICIPATION' | 'DEBATE_SUMMARY' | 'INSIGHT_DEDUP' | 
                        'WIKI_SYNTHESIS' | 'WIKI_TOPIC_MAP' | 'CODE_EVOLUTION' | 'EVOLUTION_VALIDATION' |
                        'EMBEDDING_GENERATION' | 'GENERAL_CHAT' | 'WEB_RESEARCH' | 'AGENTIC_TASK' | 'SCHEDULED_TASK' |
-                       'DIRECTIVES_EXTRACTION';
+                       'DIRECTIVES_EXTRACTION' | 'ORGANIZATION_DESIGN';
 export type EngineType = 'OLLAMA' | 'GEMINI' | 'OPENROUTER' | 'MOBILE' | 'OPENCLAW' | 'HERMES';
 
 export interface TaskPayload {
@@ -54,6 +54,9 @@ export class InferenceRouter {
   private static pausedTasks = new Set<string>();
   // AbortController per ogni task in PROCESSING - permette la cancellazione/re-routing
   private static activeAbortControllers = new Map<string, AbortController>();
+  // Work the router did not dispatch (venture agent runs, validations): shown in the activity queue and
+  // cancellable, but never zombie-killed, re-queued as a prompt or re-routed
+  private static externalTasks = new Map<string, () => void>();
 
   public static nodeSockets = new Map<string, any>();
   public static pendingMobileTasks = new Map<string, { callback: (result: any) => void, onUpdate?: (update: any) => void, cleanup: () => void, node: string }>();
@@ -61,6 +64,15 @@ export class InferenceRouter {
 
   public static onTaskCompleted(listener: (id: string, result: string, metadata: any, type: TaskType) => Promise<void>) {
     this.taskCompletionListeners.push(listener);
+  }
+
+  /** Registers a task run outside the queue: cancelTask and the brake call `cancel`, the stale check skips it. */
+  public static trackExternalTask(id: string, cancel: () => void): void {
+    this.externalTasks.set(id, cancel);
+  }
+
+  public static untrackExternalTask(id: string): void {
+    this.externalTasks.delete(id);
   }
 
   public static clearLocks() {
@@ -79,6 +91,14 @@ export class InferenceRouter {
       const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
       db.prepare('DELETE FROM gemini_calls WHERE timestamp <= ?').run(oneDayAgo);
       
+      // Venture agent runs and validations cannot resume after a restart: the run is lost and
+      // re-triggering here raced with the venture watchdog (two agents on one repo). They end here.
+      const interrupted = db.prepare(`
+        UPDATE inference_queue SET status = 'FAILED', error_msg = 'Interrupted by restart', completed_at = ?
+        WHERE type = 'AGENT_TASK' AND status IN ('QUEUED', 'PROCESSING', 'WAITING', 'STALLED', 'PAUSED')
+      `).run(Date.now());
+      if (interrupted.changes > 0) Logger.warn('InferenceRouter', `${interrupted.changes} venture agent task(s) interrupted by the restart`);
+
       // Select PROCESSING tasks to determine their fate
       const procRows = db.prepare(`SELECT id, created_at FROM inference_queue WHERE status = 'PROCESSING'`).all() as any[];
       for (const row of procRows) {
@@ -101,51 +121,6 @@ export class InferenceRouter {
       Logger.info('InferenceRouter', `Recovering ${rows.length} pending inferences...`);
       for (const row of rows) {
         try {
-          if (row.type === 'AGENT_TASK') {
-            const payload = JSON.parse(row.payload);
-            const { repoId, repoName } = payload;
-            Logger.info('InferenceRouter', `Recovering AGENT_TASK: ${row.task_name} for repo ${repoName}`);
-
-            // Re-register and mark as processing
-            InferenceRegistry.register(row.id, row.type, row.task_name, row.model, payload, row.provider || 'freellmapi');
-            InferenceRegistry.setStatus(row.id, 'PROCESSING');
-
-            setTimeout(async () => {
-              try {
-                const { VentureOrchestrator } = await import('./organization/VentureOrchestrator');
-                const repoRow = db.prepare('SELECT * FROM organization_repositories WHERE id = ?').get(repoId) as any;
-                if (repoRow) {
-                  if (row.model === 'kasm-validation') {
-                    const gitUrl = repoRow.gitea_url;
-                    const gitUrlWithToken = process.env.GITEA_TOKEN
-                      ? gitUrl.replace('http://', `http://token:${process.env.GITEA_TOKEN}@`)
-                      : gitUrl;
-                    VentureOrchestrator.runKasmValidation(repoId, repoName, gitUrlWithToken).catch((err) => {
-                      Logger.error('InferenceRouter', `Failed to resume Kasm validation for ${repoName}: ${err.message}`);
-                    });
-                  } else if (row.model === 'openclaw') {
-                    const ideaRow = db.prepare('SELECT * FROM organization_ideas WHERE id = ?').get(repoRow.created_from_idea_id) as any;
-                    VentureOrchestrator.triggerDevelopmentAgent(
-                      repoId,
-                      repoName,
-                      repoRow.gitea_url,
-                      ideaRow || { title: repoName },
-                      ideaRow?.analysis_synthesis || null
-                    ).catch((err) => {
-                      Logger.error('InferenceRouter', `Failed to resume OpenClaw agent for ${repoName}: ${err.message}`);
-                    });
-                  }
-                } else {
-                  InferenceRegistry.finish(row.id, undefined, 'Repository not found');
-                }
-              } catch (resumeErr: any) {
-                Logger.error('InferenceRouter', `Failed to import or execute resume of AGENT_TASK: ${resumeErr.message}`);
-                InferenceRegistry.finish(row.id, undefined, resumeErr.message);
-              }
-            }, 5000);
-            continue;
-          }
-
           const task = JSON.parse(row.payload) as TaskPayload;
           if (!task.options) task.options = {};
           InferenceRegistry.register(row.id, row.type, row.task_name, task.options?.model, task, task.options?.routing || 'AUTO');
@@ -191,6 +166,9 @@ export class InferenceRouter {
     });
 
     for (const task of activeTasks) {
+      // External tasks own their timeouts and their registry entry
+      if (this.externalTasks.has(task.id)) continue;
+
       // --- Zombie Detection: PROCESSING in registry but no active execution context ---
       const hasController = this.activeAbortControllers.has(task.id);
       const hasPendingMobile = this.pendingMobileTasks.has(task.id);
@@ -299,6 +277,13 @@ export class InferenceRouter {
       pending.callback({ error: 'CANCELLED_BY_USER' });
       Logger.info('InferenceRouter', `[ABORT] Aborted mobile task [${id.slice(0, 8)}]`);
     }
+    // 3. Abort a task run outside the queue (it releases its own resources)
+    const external = this.externalTasks.get(id);
+    if (external) {
+      this.externalTasks.delete(id);
+      external();
+      Logger.info('InferenceRouter', `[ABORT] Cancelled external task [${id.slice(0, 8)}]`);
+    }
     InferenceRegistry.finish(id, undefined, 'CANCELLED_BY_USER');
   }
 
@@ -323,12 +308,22 @@ export class InferenceRouter {
         pending.callback({ error: 'SYSTEM_BRAKE_ACTIVE' });
       }
       
-      // 3. Clear locks
+      // 3. Cancel the tasks run outside the queue: they cannot be resumed from a payload
+      const externalIds = new Set(this.externalTasks.keys());
+      for (const [id, cancel] of this.externalTasks.entries()) {
+        Logger.info('InferenceRouter', `[BRAKE] Cancelling external task [${id.slice(0, 8)}] due to system brake`);
+        cancel();
+      }
+      this.externalTasks.clear();
+
+      // 4. Clear locks
       this.activeLocks.clear();
       
-      // 4. Update registry: set all PROCESSING to QUEUED so they can resume later
+      // 5. Update registry: set all PROCESSING to QUEUED so they can resume later
       const activeTasks = InferenceRegistry.getActive();
       for (const task of activeTasks) {
+        // An agent task payload is {repoId, repoName}, not a prompt: never re-inject it into the queue
+        if (externalIds.has(task.id) || task.type === 'AGENT_TASK') continue;
         if (task.status === 'PROCESSING') {
           InferenceRegistry.setStatus(task.id, 'QUEUED');
           // Re-inject into memory queue if missing
@@ -352,6 +347,8 @@ export class InferenceRouter {
   public static updateQueuedTask(id: string, routing: string): boolean {
     const info = InferenceRegistry.get(id);
     if (!info) return false;
+    // Agent runs are not prompts: they cannot move to another provider
+    if (this.externalTasks.has(id) || info.type === 'AGENT_TASK') return false;
 
     const routingChanged = info.provider !== routing;
     const wasProcessing = info.status === 'PROCESSING';

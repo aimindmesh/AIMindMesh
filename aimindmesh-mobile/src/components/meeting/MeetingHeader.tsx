@@ -1,134 +1,113 @@
 import React from 'react';
-import { MicrophoneIcon } from '../../constants';
-import { ClusteringAlgorithm, SpeechConfig, WhisperLanguage } from '../../types';
-import { RecognitionMode, TranscriptionMode } from '../../types/meeting';
+import { CloseIcon, MicrophoneIcon } from '../../constants';
+import { SpeechConfig, WhisperLanguage } from '../../types';
+import { MeetingSettingsState, resolveLiveLanguage } from '../../hooks/meeting/useMeetingSettings';
+import { MeetingDiarizationControls } from './MeetingDiarizationControls';
+import { listLocalWhisperModels, WHISPER_MODELS } from '../../services/stt/whisperModelDownloader';
 
 interface MeetingHeaderProps {
-    onClose: () => void;
+    onClose?: () => void;
+    onOpenSettings?: () => void;
     onOpenHistory: () => void;
-    /** Modes are locked while recording: switching mid-recording left engines running or stopped */
-    isRecording?: boolean;
-    // Recognition settings
-    recognitionMode: RecognitionMode;
-    setRecognitionMode: (mode: RecognitionMode) => void;
+    onNewMeeting?: () => void;
+    onImportAudio?: () => void;
+    onOpenHelp?: () => void;
+    settings: MeetingSettingsState;
     speechConfig?: SpeechConfig;
-    // Diarization settings
-    diarizationSensitivity: number;
-    setDiarizationSensitivity: (value: number) => void;
-    temporalSmoothing: number;
-    setTemporalSmoothing: (value: number) => void;
-    embeddingDuration: number;
-    setEmbeddingDuration: (value: number) => void;
-    targetSpeakerCount: number | undefined;
-    setTargetSpeakerCount: (value: number | undefined) => void;
-    clusteringAlgorithm: ClusteringAlgorithm;
-    setClusteringAlgorithm: (value: ClusteringAlgorithm) => void;
-    // Language settings
-    transcriptionLanguage: WhisperLanguage;
-    setTranscriptionLanguage: (value: WhisperLanguage) => void;
-    // New Settings
-    transcriptionMode: TranscriptionMode;
-    setTranscriptionMode: (mode: TranscriptionMode) => void;
-    whisperChunkSize: number;
-    setWhisperChunkSize: (value: number) => void;
-    whisperVadFilter: boolean;
-    setWhisperVadFilter: (value: boolean) => void;
-    whisperConditionOnPrevious: boolean;
-    setWhisperConditionOnPrevious: (value: boolean) => void;
-    whisperWordTimestamps: boolean;
-    setWhisperWordTimestamps: (value: boolean) => void;
-    whisperProfile: 'fast' | 'accurate';
-    setWhisperProfile: (value: 'fast' | 'accurate') => void;
-
-    // Advanced Diarization
-    embeddingThreshold: number;
-    setEmbeddingThreshold: (value: number) => void;
-    embeddingRejectionThreshold: number;
-    setEmbeddingRejectionThreshold: (value: number) => void;
-    embeddingAdaptationRate: number;
-    setEmbeddingAdaptationRate: (value: number) => void;
-    minEmbeddingMagnitude: number;
-    setMinEmbeddingMagnitude: (value: number) => void;
+    activeVoskModel: string | null;
+    isVoskLoading: boolean;
+    /** Modes can't change mid-recording: the capture was set up for the ones in use. */
+    isRecording?: boolean;
+    /** An AI provider is set up, so automatic notes can work. */
+    aiConfigured?: boolean;
 }
 
 const MeetingHeader: React.FC<MeetingHeaderProps> = ({
     onClose,
+    onOpenSettings,
     onOpenHistory,
+    onNewMeeting,
+    onImportAudio,
+    onOpenHelp,
+    settings,
+    activeVoskModel,
+    isVoskLoading,
     isRecording = false,
-    recognitionMode,
-    setRecognitionMode,
-    speechConfig,
-    diarizationSensitivity,
-    setDiarizationSensitivity,
-    temporalSmoothing,
-    setTemporalSmoothing,
-    embeddingDuration,
-    setEmbeddingDuration,
-    targetSpeakerCount,
-    setTargetSpeakerCount,
-    clusteringAlgorithm,
-    setClusteringAlgorithm,
-    transcriptionLanguage,
-    setTranscriptionLanguage,
-    transcriptionMode,
-    setTranscriptionMode,
-    whisperChunkSize,
-    setWhisperChunkSize,
-    whisperVadFilter,
-    setWhisperVadFilter,
-    whisperConditionOnPrevious,
-    setWhisperConditionOnPrevious,
-    whisperWordTimestamps,
-    setWhisperWordTimestamps,
-    whisperProfile,
-    setWhisperProfile,
-
-    embeddingThreshold,
-    setEmbeddingThreshold,
-    embeddingRejectionThreshold,
-    setEmbeddingRejectionThreshold,
-    embeddingAdaptationRate,
-    setEmbeddingAdaptationRate,
-    minEmbeddingMagnitude,
-    setMinEmbeddingMagnitude
+    aiConfigured = false
 }) => {
+    const {
+        recognitionMode,
+        setRecognitionMode,
+        diarizationSensitivity,
+        setDiarizationSensitivity,
+        temporalSmoothing,
+        setTemporalSmoothing,
+        embeddingDuration,
+        setEmbeddingDuration,
+        targetSpeakerCount,
+        setTargetSpeakerCount,
+        clusteringAlgorithm,
+        setClusteringAlgorithm,
+        transcriptionLanguage,
+        setTranscriptionLanguage,
+        voskItalianModel,
+        setVoskItalianModel,
+        voskEnglishModel,
+        setVoskEnglishModel,
+        transcriptionMode,
+        setTranscriptionMode,
+        whisperProfile,
+        setWhisperProfile,
+        autoTranscribe,
+        setAutoTranscribe,
+        postDiarize,
+        setPostDiarize,
+        whisperModel,
+        setWhisperModel,
+        autoAnalyze,
+        setAutoAnalyze,
+        transcribeWhileRecording,
+        setTranscribeWhileRecording,
+        recognizeVoices,
+        setRecognizeVoices,
+        embeddingThreshold,
+        setEmbeddingThreshold,
+        embeddingRejectionThreshold,
+        setEmbeddingRejectionThreshold,
+        embeddingAdaptationRate,
+        setEmbeddingAdaptationRate,
+        minEmbeddingMagnitude,
+        setMinEmbeddingMagnitude
+    } = settings;
+
     const [isSettingsOpen, setIsSettingsOpen] = React.useState(false);
-    const [showAdvancedDiarization, setShowAdvancedDiarization] = React.useState(false);
+    const [installedWhisperModels, setInstalledWhisperModels] = React.useState<string[]>([]);
+
+    React.useEffect(() => {
+        if (!isSettingsOpen) return;
+        listLocalWhisperModels().then(setInstalledWhisperModels).catch(() => setInstalledWhisperModels([]));
+    }, [isSettingsOpen]);
 
     return (
         <header className="flex flex-col border-b border-surface bg-background/95 backdrop-blur-md sticky top-0 z-10 transition-shadow shadow-sm">
             {/* Top Row: Navigation & Title */}
-            <div className="flex justify-between items-center p-4">
-                <div className="flex items-center gap-3">
-                    <button
-                        onClick={onClose}
-                        className="p-2 -ml-2 hover:bg-surface rounded-full text-text-secondary hover:text-primary transition-colors focus:outline-none focus:ring-2 focus:ring-primary/50"
-                        title="Go Back"
-                        aria-label="Go Back"
-                    >
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
-                        </svg>
-                    </button>
-                    <div className="flex flex-col">
-                        <h2 className="text-xl font-bold text-primary flex items-center gap-2">
-                            <MicrophoneIcon className="w-6 h-6" />
+            <div className="flex justify-between items-center gap-2 p-4">
+                <div className="flex items-center gap-3 min-w-0">
+                    <div className="p-2 bg-primary/20 rounded-xl hidden sm:block">
+                        <MicrophoneIcon className="w-6 h-6 text-primary" />
+                    </div>
+                    <div className="flex flex-col min-w-0">
+                        <h2 className="text-lg font-bold text-white tracking-tight whitespace-nowrap">
                             Meeting Assistant
                         </h2>
                         {/* Compact Status Indicator (Visible when collapsed) */}
                         {!isSettingsOpen && (
-                            <div className="flex items-center gap-2 text-[10px] text-text-secondary mt-0.5 animate-fade-in">
-                                {/* Recording Status */}
+                            <div className="flex items-center gap-2 text-[10px] text-text-secondary mt-0.5 animate-fade-in whitespace-nowrap">
                                 <span className={`w-1.5 h-1.5 rounded-full ${transcriptionMode === 'off' ? 'bg-gray-500' : 'bg-red-500 animate-pulse'}`}></span>
-
-                                {/* Transcription Mode Info */}
-                                <span className={transcriptionMode === 'whisper' ? 'text-purple-300' : transcriptionMode === 'voxtral' ? 'text-fuchsia-300' : transcriptionMode === 'hybrid' ? 'text-indigo-300' : transcriptionMode === 'vosk' ? 'text-blue-300' : 'text-gray-400'}>
-                                    {transcriptionMode === 'off' ? 'Audio Rec' : transcriptionMode === 'whisper' ? 'Whisper Live' : transcriptionMode === 'voxtral' ? 'Voxtral Live' : transcriptionMode === 'hybrid' ? 'Hybrid Live' : 'Vosk Live'}
+                                <span className={transcriptionMode === 'vosk' ? 'text-blue-300' : transcriptionMode === 'voxtral' ? 'text-amber-300' : 'text-gray-400'}>
+                                    {transcriptionMode === 'off' ? 'Audio Only' : transcriptionMode === 'voxtral' ? 'Voxtral Live' : 'Vosk Live'}
                                 </span>
-
                                 <span className="text-white/20">•</span>
-
-                                {/* Speaker Mode Info */}
                                 <span className={recognitionMode === 'precise' ? 'text-purple-300' : recognitionMode === 'fast' ? 'text-blue-300' : 'text-gray-400'}>
                                     {recognitionMode === 'off' ? 'No Diarization' : recognitionMode === 'precise' ? 'Precise Spk' : 'Std Spk'}
                                 </span>
@@ -137,35 +116,100 @@ const MeetingHeader: React.FC<MeetingHeaderProps> = ({
                     </div>
                 </div>
 
-                <div className="flex items-center gap-2">
-                    <button
-                        onClick={() => setIsSettingsOpen(!isSettingsOpen)}
-                        className={`text-text-secondary hover:text-white flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-colors text-sm font-medium border ${isSettingsOpen ? 'bg-surface border-white/10' : 'border-transparent hover:bg-surface hover:border-white/5'}`}
-                        title={isSettingsOpen ? "Hide Settings" : "Show Settings"}
-                    >
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                            <path fillRule="evenodd" d="M11.49 3.17c-.38-1.56-2.6-1.56-2.98 0a1.532 1.532 0 01-2.286.948c-1.372-.836-2.942.734-2.106 2.106.54.886.061 2.042-.947 2.287-1.561.379-1.561 2.6 0 2.978a1.532 1.532 0 01.947 2.287c-.836 1.372.734 2.942 2.106 2.106a1.532 1.532 0 012.287.947c.379 1.561 2.6 1.561 2.978 0a1.533 1.533 0 012.287-.947c1.372.836 2.942-.734 2.106-2.106a1.533 1.533 0 01.947-2.287c1.561-.379 1.561-2.6 0-2.978a1.532 1.532 0 01-.947-2.287c.836-1.372-.734-2.942-2.106-2.106a1.532 1.532 0 01-2.287-.947zM10 13a3 3 0 100-6 3 3 0 000 6z" clipRule="evenodd" />
-                        </svg>
-                        <span className="hidden sm:inline">Settings</span>
-                    </button>
+                <div className="flex items-center gap-1.5">
+                    {onNewMeeting && (
+                        <button
+                            onClick={onNewMeeting}
+                            className="text-text-secondary hover:text-white p-2 rounded-lg hover:bg-surface transition-colors"
+                            title={'New Meeting'}
+                        >
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                                <path fillRule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clipRule="evenodd" />
+                            </svg>
+                        </button>
+                    )}
+
+                    {onImportAudio && (
+                        <button
+                            onClick={onImportAudio}
+                            className="hidden sm:block text-text-secondary hover:text-white p-2 rounded-lg hover:bg-surface transition-colors"
+                            title={'Import Audio File'}
+                        >
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                            </svg>
+                        </button>
+                    )}
 
                     <button
                         onClick={onOpenHistory}
-                        className="text-text-secondary hover:text-white flex items-center gap-1.5 px-3 py-1.5 rounded-lg hover:bg-surface transition-colors text-sm font-medium border border-transparent hover:border-white/5"
+                        className="text-text-secondary hover:text-white flex items-center gap-1 px-2.5 py-1.5 rounded-lg hover:bg-surface transition-colors text-xs font-medium"
+                        title={'History'}
                     >
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 opacity-70" viewBox="0 0 20 20" fill="currentColor">
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
                             <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-12a1 1 0 10-2 0v4a1 1 0 00.293.707l2.828 2.829a1 1 0 101.415-1.415L11 9.586V6z" clipRule="evenodd" />
                         </svg>
                         <span className="hidden sm:inline">History</span>
                     </button>
+
+                    <button
+                        onClick={() => setIsSettingsOpen(!isSettingsOpen)}
+                        className={`text-text-secondary hover:text-white flex items-center gap-1 px-2.5 py-1.5 rounded-lg transition-colors text-xs font-medium border ${isSettingsOpen ? 'bg-surface border-white/10 text-white' : 'border-transparent hover:bg-surface'}`}
+                        title={'Audio / Diarization Parameters'}
+                    >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                            <path fillRule="evenodd" d="M3 5a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM3 10a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM3 15a1 1 0 011-1h6a1 1 0 110 2H4a1 1 0 01-1-1z" clipRule="evenodd" />
+                        </svg>
+                        <span className="hidden sm:inline">Audio</span>
+                    </button>
+
+                    {onOpenHelp && (
+                        <button
+                            onClick={onOpenHelp}
+                            className="text-text-secondary hover:text-white p-2 rounded-lg hover:bg-surface transition-colors"
+                            title={'Help & Documentation'}
+                        >
+                            <span className="w-5 h-5 flex items-center justify-center rounded-full border border-white/20 text-xs font-bold hover:border-white/40">
+                                ?
+                            </span>
+                        </button>
+                    )}
+
+                    {onOpenSettings && (
+                        <button
+                            onClick={onOpenSettings}
+                            className="text-text-secondary hover:text-white p-2 rounded-lg hover:bg-surface transition-colors"
+                            title={'App Settings'}
+                        >
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                                <path fillRule="evenodd" d="M11.49 3.17c-.38-1.56-2.6-1.56-2.98 0a1.532 1.532 0 01-2.286.948c-1.372-.836-2.942.734-2.106 2.106.54.886.061 2.042-.947 2.287-1.561.379-1.561 2.6 0 2.978a1.532 1.532 0 01.947 2.287c-.836 1.372.734 2.942 2.106 2.106a1.532 1.532 0 012.287.947c.379 1.561 2.6 1.561 2.978 0a1.533 1.533 0 012.287-.947c1.372.836 2.942-.734 2.106-2.106a1.533 1.533 0 01.947-2.287c1.561-.379 1.561-2.6 0-2.978a1.532 1.532 0 01-.947-2.287c.836-1.372-.734-2.942-2.106-2.106a1.532 1.532 0 01-2.287-.947zM10 13a3 3 0 100-6 3 3 0 000 6z" clipRule="evenodd" />
+                            </svg>
+                        </button>
+                    )}
+
+                    {onClose && (
+                        <button
+                            onClick={onClose}
+                            className="text-text-secondary hover:text-white p-2 rounded-lg hover:bg-surface transition-colors"
+                            title={'Close'}
+                        >
+                            <CloseIcon className="w-5 h-5" />
+                        </button>
+                    )}
                 </div>
             </div>
 
             {/* Collapsible Settings Panel */}
             {isSettingsOpen && (
-                <div className="px-4 pb-4 space-y-4 animate-fade-in-down border-t border-white/5 pt-4 bg-surface/10">
+                <fieldset
+                    disabled={isRecording}
+                    className="min-w-0 px-4 pb-4 space-y-4 animate-fade-in-down border-t border-white/5 pt-4 bg-surface/10 disabled:opacity-60"
+                >
                     <div className="flex items-center justify-between mb-2">
                         <h3 className="text-sm font-semibold text-text-primary">Transcription Settings</h3>
+                        {isRecording && (
+                            <span className="text-[10px] text-amber-300">Locked while recording</span>
+                        )}
                     </div>
 
                     {/* Transcription Mode Selector */}
@@ -173,14 +217,14 @@ const MeetingHeader: React.FC<MeetingHeaderProps> = ({
                         <span className="text-xs font-medium text-text-secondary uppercase tracking-wider">
                             Real-time Transcription
                         </span>
-                        <div className={`flex bg-surface rounded-lg p-1 border border-white/5 ${isRecording ? 'pointer-events-none opacity-50' : ''}`}>
+                        <div className="flex bg-surface rounded-lg p-1 border border-white/5">
                             <button
                                 onClick={() => setTranscriptionMode('off')}
                                 className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all flex items-center gap-2 ${transcriptionMode === 'off'
                                     ? 'bg-gray-600/80 text-white shadow-sm ring-1 ring-white/10'
                                     : 'text-text-secondary hover:text-white'
                                     }`}
-                                title="No real-time transcription"
+                                title={'No real-time transcription'}
                             >
                                 <div className={`w-1.5 h-1.5 rounded-full ${transcriptionMode === 'off' ? 'bg-white' : 'bg-gray-500'}`} />
                                 Off
@@ -191,117 +235,109 @@ const MeetingHeader: React.FC<MeetingHeaderProps> = ({
                                     ? 'bg-blue-600/80 text-white shadow-sm ring-1 ring-white/10'
                                     : 'text-text-secondary hover:text-white'
                                     }`}
-                                title="Vosk (Standard) - Fast, on-device, continuous"
+                                title={'Vosk (Standard) - Fast, on-device, continuous'}
                             >
                                 <div className={`w-1.5 h-1.5 rounded-full ${transcriptionMode === 'vosk' ? 'bg-white' : 'bg-blue-500'}`} />
-                                Vosk
+                                Live (Vosk)
                             </button>
                             <button
                                 onClick={() => setTranscriptionMode('voxtral')}
                                 className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all flex items-center gap-2 ${transcriptionMode === 'voxtral'
-                                    ? 'bg-fuchsia-600/80 text-white shadow-sm ring-1 ring-white/10'
+                                    ? 'bg-amber-600/80 text-white shadow-sm ring-1 ring-white/10'
                                     : 'text-text-secondary hover:text-white'
                                     }`}
-                                title="Voxtral (Premium) - High-quality real-time, 13 languages"
+                                title={'Voxtral - On-device, more accurate, heavier (needs the Voxtral model)'}
                             >
-                                <div className={`w-1.5 h-1.5 rounded-full ${transcriptionMode === 'voxtral' ? 'bg-white' : 'bg-fuchsia-500'}`} />
+                                <div className={`w-1.5 h-1.5 rounded-full ${transcriptionMode === 'voxtral' ? 'bg-white' : 'bg-amber-500'}`} />
                                 Voxtral
-                            </button>
-                            <button
-                                onClick={() => setTranscriptionMode('whisper')}
-                                className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all flex items-center gap-2 ${transcriptionMode === 'whisper'
-                                    ? 'bg-purple-600/80 text-white shadow-sm ring-1 ring-white/10'
-                                    : 'text-text-secondary hover:text-white'
-                                    }`}
-                                title="Whisper (High Quality) - Slower, chunk-based"
-                            >
-                                <div className={`w-1.5 h-1.5 rounded-full ${transcriptionMode === 'whisper' ? 'bg-white' : 'bg-purple-500'}`} />
-                                Whisper
-                            </button>
-                            <button
-                                onClick={() => setTranscriptionMode('hybrid')}
-                                className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all flex items-center gap-2 ${transcriptionMode === 'hybrid'
-                                    ? 'bg-gradient-to-r from-blue-600/80 to-purple-600/80 text-white shadow-sm ring-1 ring-white/10'
-                                    : 'text-text-secondary hover:text-white'
-                                    }`}
-                                title="Hybrid (Vosk + Whisper) - Vosk real-time, Whisper refines every 30s"
-                            >
-                                <div className={`w-1.5 h-1.5 rounded-full ${transcriptionMode === 'hybrid' ? 'bg-white' : 'bg-gradient-to-r from-blue-500 to-purple-500'}`} />
-                                Hybrid
                             </button>
                         </div>
                     </div>
 
-                    {/* Whisper Chunk Size Slider (Only visible if Whisper is selected) */}
-                    {(transcriptionMode === 'whisper' || transcriptionMode === 'hybrid') && (
-                        <>
-                            <div className="flex items-center gap-3 p-2 bg-purple-500/10 rounded-lg border border-purple-500/20 animate-fade-in">
-                                <span className="text-xs text-purple-200 whitespace-nowrap w-24">Chunk Size:</span>
-                                <input
-                                    type="range"
-                                    min="2"
-                                    max="10"
-                                    step="5"
-                                    value={whisperChunkSize}
-                                    onChange={(e) => setWhisperChunkSize(parseInt(e.target.value))}
-                                    className="w-full h-1.5 bg-surface-hover rounded-lg appearance-none cursor-pointer accent-purple-500"
-                                    title={`Transcribe every ${whisperChunkSize} seconds`}
-                                />
-                                <span className="text-xs text-purple-200 font-mono w-8 text-right">{whisperChunkSize}s</span>
+                    {/* After recording: on-device Whisper transcript and speakers */}
+                    <div className="flex flex-col gap-2 p-3 bg-purple-500/10 rounded-xl border border-purple-500/20">
+                        <span className="text-xs font-medium text-purple-200 uppercase tracking-wider">
+                            After recording
+                        </span>
+                        <label className="flex items-center justify-between gap-3 cursor-pointer">
+                            <span className="text-xs text-purple-100">Accurate transcript (Whisper, on device)</span>
+                            <input type="checkbox" checked={autoTranscribe} onChange={(e) => setAutoTranscribe(e.target.checked)} className="accent-purple-500 w-4 h-4" />
+                        </label>
+                        <label className={`flex items-center justify-between gap-3 cursor-pointer ${autoTranscribe ? '' : 'opacity-50'}`}>
+                            <span className="text-xs text-purple-100">
+                                Transcribe while recording
+                                <span className="block text-[10px] text-purple-200/60">Ready soon after you stop; uses more battery</span>
+                            </span>
+                            <input type="checkbox" checked={transcribeWhileRecording} disabled={!autoTranscribe} onChange={(e) => setTranscribeWhileRecording(e.target.checked)} className="accent-purple-500 w-4 h-4" />
+                        </label>
+                        <label className="flex items-center justify-between gap-3 cursor-pointer">
+                            <span className="text-xs text-purple-100">Identify speakers</span>
+                            <input type="checkbox" checked={postDiarize} onChange={(e) => setPostDiarize(e.target.checked)} className="accent-purple-500 w-4 h-4" />
+                        </label>
+                        <label className={`flex items-center justify-between gap-3 cursor-pointer ${postDiarize ? '' : 'opacity-50'}`}>
+                            <span className="text-xs text-purple-100">
+                                Recognize known voices
+                                <span className="block text-[10px] text-purple-200/60">People you named before get their name; voices stay on the phone</span>
+                            </span>
+                            <input type="checkbox" checked={recognizeVoices} disabled={!postDiarize} onChange={(e) => setRecognizeVoices(e.target.checked)} className="accent-purple-500 w-4 h-4" />
+                        </label>
+                        <label className="flex items-center justify-between gap-3 cursor-pointer">
+                            <span className="text-xs text-purple-100">
+                                AI notes (summary, decisions, tasks)
+                                <span className="block text-[10px] text-purple-200/60">
+                                    {aiConfigured ? 'Sends the transcript to your AI provider' : 'Set up an AI provider in Settings first'}
+                                </span>
+                            </span>
+                            <input type="checkbox" checked={autoAnalyze} onChange={(e) => setAutoAnalyze(e.target.checked)} className="accent-purple-500 w-4 h-4" />
+                        </label>
+                        <div className="flex items-center justify-between gap-3">
+                            <span className="text-xs text-purple-100">Model</span>
+                            <select
+                                value={installedWhisperModels.includes(whisperModel) ? whisperModel : 'auto'}
+                                onChange={(e) => setWhisperModel(e.target.value)}
+                                className="bg-surface text-text-primary text-xs rounded-lg px-2.5 py-1.5 border border-white/10 focus:ring-1 focus:ring-primary focus:outline-none max-w-[210px]"
+                                title={'Auto uses Small (recommended) or the bundled Base. Large v3 Turbo is the most accurate but slower than real time. Download models in Settings → Models.'}
+                            >
+                                <option value="auto">Auto (Small if installed)</option>
+                                {installedWhisperModels.map(id => (
+                                    <option key={id} value={id}>{WHISPER_MODELS.find(m => m.id === id)?.name ?? id}</option>
+                                ))}
+                            </select>
+                        </div>
+                        <div className="flex items-center justify-between">
+                            <span className="text-xs text-purple-100">Quality</span>
+                            <div className="flex bg-surface rounded-lg p-1 border border-white/5">
+                                <button
+                                    onClick={() => setWhisperProfile('fast')}
+                                    className={`px-2 py-1 rounded-md text-xs font-medium transition-all ${whisperProfile === 'fast' ? 'bg-purple-500 text-white shadow-sm' : 'text-text-secondary hover:text-white'}`}
+                                    title={'Greedy decoding: about 8x faster than real time'}
+                                >
+                                    Fast
+                                </button>
+                                <button
+                                    onClick={() => setWhisperProfile('accurate')}
+                                    className={`px-2 py-1 rounded-md text-xs font-medium transition-all ${whisperProfile === 'accurate' ? 'bg-purple-500 text-white shadow-sm' : 'text-text-secondary hover:text-white'}`}
+                                    title={'Beam search: more accurate, about 1.5x slower'}
+                                >
+                                    Accurate
+                                </button>
                             </div>
-
-                            {/* Whisper Profile Selector */}
-                            <div className="flex items-center justify-between p-2 bg-purple-500/10 rounded-lg border border-purple-500/20 animate-fade-in">
-                                <span className="text-xs text-purple-200 whitespace-nowrap">Profile:</span>
-                                <div className="flex bg-surface rounded-lg p-1 border border-white/5">
-                                    <button
-                                        onClick={() => setWhisperProfile('fast')}
-                                        className={`px-2 py-1 rounded-md text-xs font-medium transition-all ${whisperProfile === 'fast' ? 'bg-purple-500 text-white shadow-sm' : 'text-text-secondary hover:text-white'}`}
-                                        title="Fast: greedy decoding, no VAD (best for real-time)"
-                                    >
-                                        Fast
-                                    </button>
-                                    <button
-                                        onClick={() => setWhisperProfile('accurate')}
-                                        className={`px-2 py-1 rounded-md text-xs font-medium transition-all ${whisperProfile === 'accurate' ? 'bg-purple-500 text-white shadow-sm' : 'text-text-secondary hover:text-white'}`}
-                                        title="Accurate: beam search 5, VAD filter, word timestamps"
-                                    >
-                                        Accurate
-                                    </button>
-                                </div>
-                            </div>
-
-                            {/* Whisper Advanced Toggles */}
-                            <div className="flex flex-wrap gap-2 p-2 bg-purple-500/10 rounded-lg border border-purple-500/20 animate-fade-in">
-                                <label className="flex items-center gap-1.5 cursor-pointer" title="Filter silence before transcription">
-                                    <input type="checkbox" checked={whisperVadFilter} onChange={(e) => setWhisperVadFilter(e.target.checked)} className="accent-purple-500 w-3 h-3" />
-                                    <span className="text-xs text-purple-200">VAD</span>
-                                </label>
-                                <label className="flex items-center gap-1.5 cursor-pointer" title="Use previous chunk text for context continuity">
-                                    <input type="checkbox" checked={whisperConditionOnPrevious} onChange={(e) => setWhisperConditionOnPrevious(e.target.checked)} className="accent-purple-500 w-3 h-3" />
-                                    <span className="text-xs text-purple-200">Context</span>
-                                </label>
-                                <label className="flex items-center gap-1.5 cursor-pointer" title="Enable word-level timestamps">
-                                    <input type="checkbox" checked={whisperWordTimestamps} onChange={(e) => setWhisperWordTimestamps(e.target.checked)} className="accent-purple-500 w-3 h-3" />
-                                    <span className="text-xs text-purple-200">Words</span>
-                                </label>
-                            </div>
-                        </>
-                    )}
+                        </div>
+                    </div>
 
                     {/* Speaker ID Mode Selector */}
                     <div className={`flex items-center justify-between ${transcriptionMode === 'off' ? 'opacity-50' : ''}`}>
                         <span className="text-xs font-medium text-text-secondary uppercase tracking-wider">
-                            Speaker Recognition
+                            Live Speakers
                         </span>
-                        <div className={`flex bg-surface rounded-lg p-1 border border-white/5 ${isRecording ? 'pointer-events-none opacity-50' : ''}`}>
+                        <div className="flex bg-surface rounded-lg p-1 border border-white/5">
                             <button
                                 onClick={() => setRecognitionMode('off')}
                                 className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all flex items-center gap-2 ${recognitionMode === 'off'
                                     ? 'bg-gray-600 text-white shadow-sm'
                                     : 'text-text-secondary hover:text-white'
                                     }`}
-                                title="No speaker recognition - Audio recording only"
+                                title={'No speaker recognition - Audio recording only'}
                             >
                                 <div className="w-2 h-2 rounded-full bg-gray-400" />
                                 Audio Only
@@ -313,7 +349,7 @@ const MeetingHeader: React.FC<MeetingHeaderProps> = ({
                                     ? 'bg-primary text-white shadow-sm'
                                     : 'text-text-secondary hover:text-white'
                                     } ${transcriptionMode === 'off' ? 'cursor-not-allowed' : ''}`}
-                                title={transcriptionMode === 'off' ? "Available only with transcription" : "Vosk Embeddings - Fast speaker recognition, less precise"}
+                                title={transcriptionMode === 'off' ? 'Available only with transcription' : 'Vosk Embeddings - Fast speaker recognition, less precise'}
                             >
                                 <div className="w-2 h-2 rounded-full bg-blue-400" />
                                 Standard
@@ -325,7 +361,7 @@ const MeetingHeader: React.FC<MeetingHeaderProps> = ({
                                     ? 'bg-purple-500 text-white shadow-sm'
                                     : 'text-text-secondary hover:text-white'
                                     } ${transcriptionMode === 'off' ? 'cursor-not-allowed' : ''}`}
-                                title={transcriptionMode === 'off' ? "Available only with transcription" : "ONNX ECAPA Embeddings - Precise speaker recognition, requires ONNX model"}
+                                title={transcriptionMode === 'off' ? 'Available only with transcription' : 'ONNX ECAPA Embeddings - Precise speaker recognition, requires ONNX model'}
                             >
                                 <div className="w-2 h-2 rounded-full bg-purple-300" />
                                 Precise
@@ -333,207 +369,93 @@ const MeetingHeader: React.FC<MeetingHeaderProps> = ({
                         </div>
                     </div>
 
-                    {/* Language Selector (relevant for Whisper modes) */}
-                    {(transcriptionMode === 'whisper' || speechConfig?.sttMode === 'whisper-post' || speechConfig?.sttMode === 'hybrid') && (
-                        <div className="flex items-center justify-between">
-                            <span className="text-xs font-medium text-text-secondary uppercase tracking-wider">
-                                Language
-                            </span>
-                            <div className="flex items-center gap-2">
-                                <select
-                                    value={transcriptionLanguage}
-                                    onChange={(e) => setTranscriptionLanguage(e.target.value as WhisperLanguage)}
-                                    className="bg-surface text-text-primary text-xs rounded-lg px-3 py-1.5 border border-white/10 focus:ring-1 focus:ring-primary focus:outline-none"
-                                    title="Transcription language"
-                                >
-                                    <option value="auto">Auto Detect</option>
-                                    <option value="en">English</option>
-                                    <option value="it">Italian</option>
-                                </select>
-                            </div>
-                        </div>
-                    )}
-
-                    {/* Sliders group - Dedicated row (hidden in 'off' mode) */}
-                    {recognitionMode !== 'off' && (
-                        <div className="flex flex-wrap items-center justify-between sm:justify-start gap-4 p-2 bg-surface/20 rounded-lg border border-white/5">
-                            {/* Diarization Sensitivity */}
-                            <div className="flex items-center gap-2 flex-grow sm:flex-grow-0">
-                                <span className="text-xs text-text-secondary whitespace-nowrap">Sensitivity:</span>
-                                <input
-                                    type="range"
-                                    min="0.3"
-                                    max="0.8"
-                                    step="0.05"
-                                    value={diarizationSensitivity}
-                                    onChange={(e) => setDiarizationSensitivity(parseFloat(e.target.value))}
-                                    className="w-full sm:w-24 h-1.5 bg-surface-hover rounded-lg appearance-none cursor-pointer accent-primary"
-                                    title={`Speaker detection sensitivity: ${diarizationSensitivity.toFixed(2)}`}
-                                />
-                                <span className="text-xs text-text-secondary w-8 font-mono text-right">{diarizationSensitivity.toFixed(2)}</span>
+                    {/* Language & Model Selector */}
+                    {(
+                        <div className="flex flex-col gap-2.5 p-3 bg-surface/30 rounded-xl border border-white/5">
+                            {/* Language Row */}
+                            <div className="flex items-center justify-between">
+                                <span className="text-xs font-medium text-text-secondary uppercase tracking-wider">
+                                    Language
+                                </span>
+                                <div className="flex items-center gap-2">
+                                    <select
+                                        value={transcriptionLanguage}
+                                        onChange={(e) => setTranscriptionLanguage(e.target.value as WhisperLanguage)}
+                                        className="bg-surface text-text-primary text-xs rounded-lg px-3 py-1.5 border border-white/10 focus:ring-1 focus:ring-primary focus:outline-none"
+                                        title={'Transcription language. Auto: Whisper detects it; live Vosk uses the phone\'s language.'}
+                                    >
+                                        <option value="auto">Auto</option>
+                                        <option value="it">Italian (it)</option>
+                                        <option value="en">English (en)</option>
+                                    </select>
+                                </div>
                             </div>
 
-                            <div className="h-4 w-px bg-white/10 hidden sm:block"></div>
-
-                            {/* Temporal Smoothing */}
-                            <div className="flex items-center gap-2 flex-grow sm:flex-grow-0">
-                                <span className="text-xs text-text-secondary whitespace-nowrap">Min Pause:</span>
-                                <input
-                                    type="range"
-                                    min="0"
-                                    max="10000"
-                                    step="500"
-                                    value={temporalSmoothing}
-                                    onChange={(e) => setTemporalSmoothing(parseInt(e.target.value))}
-                                    className="w-full sm:w-20 h-1.5 bg-surface-hover rounded-lg appearance-none cursor-pointer accent-primary"
-                                    title={`Minimum time between speaker switches: ${temporalSmoothing / 1000}s`}
-                                />
-                                <span className="text-xs text-text-secondary w-8 font-mono text-right">{(temporalSmoothing / 1000).toFixed(1)}s</span>
-                            </div>
-
-                            <div className="h-4 w-px bg-white/10 hidden sm:block"></div>
-
-                            {/* Embedding Duration (only for ONNX mode) */}
-                            {recognitionMode === 'precise' && (
-                                <div className="flex items-center gap-2 flex-grow sm:flex-grow-0">
-                                    <span className="text-xs text-text-secondary whitespace-nowrap">Audio:</span>
-                                    <input
-                                        type="range"
-                                        min="2"
-                                        max="6"
-                                        step="0.5"
-                                        value={embeddingDuration}
-                                        onChange={(e) => setEmbeddingDuration(parseFloat(e.target.value))}
-                                        className="w-full sm:w-16 h-1.5 bg-surface-hover rounded-lg appearance-none cursor-pointer accent-primary"
-                                        title={`Audio duration for embedding: ${embeddingDuration}s (longer = more precise)`}
-                                    />
-                                    <span className="text-xs text-text-secondary w-6 font-mono text-right">{embeddingDuration}s</span>
+                            {/* Vosk Model Variant Selector */}
+                            {transcriptionMode === 'vosk' && (
+                                <div className="flex items-center justify-between pt-2 border-t border-white/5">
+                                    <span className="text-xs font-medium text-text-secondary">
+                                        Vosk Model
+                                    </span>
+                                    {resolveLiveLanguage(transcriptionLanguage) === 'it' ? (
+                                        <select
+                                            value={voskItalianModel}
+                                            onChange={(e) => setVoskItalianModel(e.target.value)}
+                                            className="bg-surface text-text-primary text-xs rounded-lg px-2.5 py-1.5 border border-white/10 focus:ring-1 focus:ring-primary focus:outline-none max-w-[210px]"
+                                            title={'Italian Vosk Model Variant'}
+                                        >
+                                            <option value="vosk-model-small-it-0.22">Lightweight (Small ~49MB)</option>
+                                            <option value="vosk-model-it-0.22">High Precision (Large ~1.4GB)</option>
+                                        </select>
+                                    ) : (
+                                        <select
+                                            value={voskEnglishModel}
+                                            onChange={(e) => setVoskEnglishModel(e.target.value)}
+                                            className="bg-surface text-text-primary text-xs rounded-lg px-2.5 py-1.5 border border-white/10 focus:ring-1 focus:ring-primary focus:outline-none max-w-[210px]"
+                                            title={'English Vosk Model Variant'}
+                                        >
+                                            <option value="vosk-model-small-en-us-0.15">Lightweight (Small ~41MB)</option>
+                                            <option value="vosk-model-en-us-0.22-lgraph">Standard (Accurate ~130MB)</option>
+                                        </select>
+                                    )}
                                 </div>
                             )}
 
-                            <div className="h-4 w-px bg-white/10 hidden sm:block"></div>
-
-                            {/* Target Speaker Count */}
-                            <div className="flex items-center gap-2">
-                                <span className="text-xs text-text-secondary whitespace-nowrap">Speakers:</span>
-                                <select
-                                    value={targetSpeakerCount !== undefined ? targetSpeakerCount.toString() : 'auto'}
-                                    onChange={(e) => setTargetSpeakerCount(e.target.value === 'auto' ? undefined : parseInt(e.target.value))}
-                                    className="bg-surface text-text-primary text-xs rounded px-2 py-1 border border-white/10"
-                                    title="Number of speakers (auto = automatic detection)"
-                                >
-                                    <option value="auto">Auto</option>
-                                    <option value="2">2</option>
-                                    <option value="3">3</option>
-                                    <option value="4">4</option>
-                                    <option value="5">5+</option>
-                                </select>
-                            </div>
-
-                            <div className="h-4 w-px bg-white/10 hidden sm:block"></div>
-
-                            {/* Clustering Algorithm */}
-                            <div className="flex items-center gap-2">
-                                <span className="text-xs text-text-secondary whitespace-nowrap">Algorithm:</span>
-                                <select
-                                    value={clusteringAlgorithm}
-                                    onChange={(e) => setClusteringAlgorithm(e.target.value as ClusteringAlgorithm)}
-                                    className="bg-surface text-text-primary text-xs rounded px-2 py-1 border border-white/10"
-                                    title="Clustering algorithm for post-processing"
-                                >
-                                    <option value="ahc">AHC (Standard)</option>
-                                    <option value="spectral">Spectral (Precise)</option>
-                                    <option value="incremental">Incremental (Fast)</option>
-                                </select>
-                            </div>
-                        </div>
-                    )}
-
-                    {/* Advanced Diarization Settings (Collapsible) */}
-                    {recognitionMode !== 'off' && (
-                        <div className="bg-surface/20 rounded-lg border border-white/5 p-2 mt-4">
-                            <button
-                                onClick={() => setShowAdvancedDiarization(!showAdvancedDiarization)}
-                                className="flex items-center gap-2 text-xs font-medium text-text-secondary hover:text-white transition-colors w-full"
-                            >
-                                <span className="text-[10px]">{showAdvancedDiarization ? '▼' : '▶'}</span> Advanced Diarization
-                            </button>
-
-                            {showAdvancedDiarization && (
-                                <div className="mt-3 space-y-3 animate-fade-in pl-2 border-l border-white/10 ml-1">
-                                    {/* Match Threshold */}
-                                    <div>
-                                        <div className="flex justify-between mb-1">
-                                            <label className="text-xs text-text-secondary">Match Threshold</label>
-                                            <span className="text-xs font-mono text-primary">{embeddingThreshold?.toFixed(2) || '0.80'}</span>
-                                        </div>
-                                        <input
-                                            type="range"
-                                            min="0.50"
-                                            max="0.95"
-                                            step="0.01"
-                                            value={embeddingThreshold || 0.80}
-                                            onChange={(e) => setEmbeddingThreshold(parseFloat(e.target.value))}
-                                            className="w-full h-1.5 bg-surface-hover rounded-lg appearance-none cursor-pointer accent-primary"
-                                        />
-                                    </div>
-
-                                    {/* Rejection Threshold */}
-                                    <div>
-                                        <div className="flex justify-between mb-1">
-                                            <label className="text-xs text-text-secondary">Rejection Threshold</label>
-                                            <span className="text-xs font-mono text-primary">{embeddingRejectionThreshold?.toFixed(2) || '0.50'}</span>
-                                        </div>
-                                        <input
-                                            type="range"
-                                            min="0.30"
-                                            max="0.90"
-                                            step="0.01"
-                                            value={embeddingRejectionThreshold || 0.50}
-                                            onChange={(e) => setEmbeddingRejectionThreshold(parseFloat(e.target.value))}
-                                            className="w-full h-1.5 bg-surface-hover rounded-lg appearance-none cursor-pointer accent-primary"
-                                        />
-                                    </div>
-
-                                    <div className="flex gap-4">
-                                        {/* Adaptation Rate */}
-                                        <div className="flex-1">
-                                            <div className="flex justify-between mb-1">
-                                                <label className="text-xs text-text-secondary">Adaptation</label>
-                                                <span className="text-xs font-mono text-primary">{embeddingAdaptationRate?.toFixed(2) || '0.03'}</span>
-                                            </div>
-                                            <input
-                                                type="range"
-                                                min="0.0"
-                                                max="0.20"
-                                                step="0.01"
-                                                value={embeddingAdaptationRate || 0.03}
-                                                onChange={(e) => setEmbeddingAdaptationRate(parseFloat(e.target.value))}
-                                                className="w-full h-1.5 bg-surface-hover rounded-lg appearance-none cursor-pointer accent-primary"
-                                            />
-                                        </div>
-
-                                        {/* Min Magnitude */}
-                                        <div className="flex-1">
-                                            <div className="flex justify-between mb-1">
-                                                <label className="text-xs text-text-secondary">Min Mag</label>
-                                                <span className="text-xs font-mono text-primary">{minEmbeddingMagnitude?.toFixed(2) || '0.50'}</span>
-                                            </div>
-                                            <input
-                                                type="range"
-                                                min="0.0"
-                                                max="1.5"
-                                                step="0.05"
-                                                value={minEmbeddingMagnitude || 0.50}
-                                                onChange={(e) => setMinEmbeddingMagnitude(parseFloat(e.target.value))}
-                                                className="w-full h-1.5 bg-surface-hover rounded-lg appearance-none cursor-pointer accent-primary"
-                                            />
-                                        </div>
-                                    </div>
+                            {/* Active Model Indicator Badge */}
+                            {transcriptionMode === 'vosk' && <div className="flex items-center justify-between pt-2 border-t border-white/5 text-[11px]">
+                                <span className="text-text-secondary font-medium">Active STT Model:</span>
+                                <div className="flex items-center gap-1.5 font-mono text-xs">
+                                    <span className={`w-2 h-2 rounded-full ${isVoskLoading ? 'bg-amber-400 animate-ping' : 'bg-green-400'}`}></span>
+                                    <span className="text-text-primary font-medium truncate max-w-[220px]">
+                                        {isVoskLoading ? 'Loading model...' : (activeVoskModel || (resolveLiveLanguage(transcriptionLanguage) === 'it' ? voskItalianModel : voskEnglishModel))}
+                                    </span>
                                 </div>
-                            )}
+                            </div>}
                         </div>
                     )}
+
+                    {/* Diarization Sliders and Advanced Controls */}
+                    <MeetingDiarizationControls
+                        recognitionMode={recognitionMode}
+                        diarizationSensitivity={diarizationSensitivity}
+                        setDiarizationSensitivity={setDiarizationSensitivity}
+                        temporalSmoothing={temporalSmoothing}
+                        setTemporalSmoothing={setTemporalSmoothing}
+                        embeddingDuration={embeddingDuration}
+                        setEmbeddingDuration={setEmbeddingDuration}
+                        targetSpeakerCount={targetSpeakerCount}
+                        setTargetSpeakerCount={setTargetSpeakerCount}
+                        clusteringAlgorithm={clusteringAlgorithm}
+                        setClusteringAlgorithm={setClusteringAlgorithm}
+                        embeddingThreshold={embeddingThreshold}
+                        setEmbeddingThreshold={setEmbeddingThreshold}
+                        embeddingRejectionThreshold={embeddingRejectionThreshold}
+                        setEmbeddingRejectionThreshold={setEmbeddingRejectionThreshold}
+                        embeddingAdaptationRate={embeddingAdaptationRate}
+                        setEmbeddingAdaptationRate={setEmbeddingAdaptationRate}
+                        minEmbeddingMagnitude={minEmbeddingMagnitude}
+                        setMinEmbeddingMagnitude={setMinEmbeddingMagnitude}
+                    />
 
                     {/* Battery saving mode indicator */}
                     {recognitionMode === 'off' && (
@@ -544,7 +466,7 @@ const MeetingHeader: React.FC<MeetingHeaderProps> = ({
                             <span className="text-xs text-gray-400">Battery saving: audio recording only, transcription later</span>
                         </div>
                     )}
-                </div>
+                </fieldset>
             )}
         </header>
     );

@@ -13,9 +13,9 @@ const DEFAULT_LLM_CONFIG: LLMConfig = {
   localEndpoint: 'http://localhost:11434/v1',
   localModel: 'llama3',
   selectedGGUF: 'Phi-3-mini-4k-instruct-q4f32_1-MLC',
-  enableThinking: true,
+  enableThinking: false, // the user turns reasoning on in the settings
   enableToolCalling: true,
-  nCtx: 2048,
+  nCtx: 2048, // used only when the context is set by hand (contextMode 'manual')
   useMmap: true,
 };
 
@@ -76,12 +76,12 @@ export function useAppSettings() {
 
   // --- Config Migration (Ensure defaults for new features) ---
   useEffect(() => {
-    // Check if critical new flags are undefined and default them to true
+    // Flags missing from an old config get their defaults (thinking off, tools on)
     if (llmConfig.enableThinking === undefined || llmConfig.enableToolCalling === undefined) {
       logger.log('info', '[App] Migrating LLM config with new defaults');
       setLlmConfig(prev => ({
         ...prev,
-        enableThinking: prev.enableThinking ?? true,
+        enableThinking: prev.enableThinking ?? false,
         enableToolCalling: prev.enableToolCalling ?? true
       }));
     }

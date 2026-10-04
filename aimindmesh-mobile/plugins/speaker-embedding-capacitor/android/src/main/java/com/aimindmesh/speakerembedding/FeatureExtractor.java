@@ -11,15 +11,23 @@ import java.util.Arrays;
  * - Mel Bins: 80
  * - Window Type: Hamming
  */
+/**
+ * Log-Mel filterbank features as WeSpeaker computes them for its ECAPA-TDNN models
+ * (torchaudio.compliance.kaldi.fbank with a Hamming window and no dither, then cepstral mean
+ * normalization): 25 ms frames every 10 ms on int16-scaled audio, per-frame DC removal and
+ * pre-emphasis, 512-point FFT power spectrum, 80 triangular filters on Kaldi's mel scale
+ * (20 Hz - 8 kHz), log, and the per-utterance mean of each filter subtracted.
+ */
 public class FeatureExtractor {
-
     private static final int SAMPLE_RATE = 16000;
     private static final int WINDOW_SIZE = 400; // 25ms
     private static final int HOP_SIZE = 160; // 10ms
     private static final int N_FFT = 512; // Next power of 2 >= 400
     private static final int N_MELS = 80;
     private static final float F_MIN = 20.0f;
-    private static final float F_MAX = 7600.0f; // Nyquist is 8000
+    private static final float F_MAX = SAMPLE_RATE / 2.0f;
+    private static final float PREEMPHASIS = 0.97f;
+    private static final float LOG_FLOOR = Math.ulp(1.0f); // FLT_EPSILON, as Kaldi
 
     private final float[] hammingWindow;
     private final float[][] melFilters;
@@ -30,62 +38,62 @@ public class FeatureExtractor {
     }
 
     /**
-     * Extracts Log-Mel Filterbank features from audio samples.
-     * 
-     * @param audio Audio samples (16kHz, normalized -1.0 to 1.0)
-     * @return 2D array [Frames][80]
+     * @param audio 16 kHz mono samples in [-1, 1]
+     * @return [frames][80] normalized log-Mel features
      */
     public float[][] extractFeatures(float[] audio) {
         if (audio == null || audio.length < WINDOW_SIZE) {
             return new float[0][0];
         }
-
-        // Pre-emphasis (standard coefficient 0.97)
-        float[] emphasizedAudio = preEmphasis(audio, 0.97f);
-
-        int numFrames = (emphasizedAudio.length - WINDOW_SIZE) / HOP_SIZE + 1;
-        if (numFrames <= 0)
-            return new float[0][0];
-
+        int numFrames = (audio.length - WINDOW_SIZE) / HOP_SIZE + 1;
         float[][] features = new float[numFrames][N_MELS];
+        float[] frame = new float[WINDOW_SIZE];
+        float[] padded = new float[N_FFT];
 
         for (int i = 0; i < numFrames; i++) {
             int start = i * HOP_SIZE;
-            float[] frame = new float[N_FFT]; // Zero-padded by default
-
-            // Apply window
+            float mean = 0;
             for (int j = 0; j < WINDOW_SIZE; j++) {
-                if (start + j < emphasizedAudio.length) {
-                    frame[j] = emphasizedAudio[start + j] * hammingWindow[j];
-                }
+                frame[j] = audio[start + j] * 32768.0f; // the model was trained on int16-scaled audio
+                mean += frame[j];
             }
+            mean /= WINDOW_SIZE;
+            for (int j = 0; j < WINDOW_SIZE; j++) {
+                frame[j] -= mean;
+            }
+            for (int j = WINDOW_SIZE - 1; j > 0; j--) {
+                frame[j] -= PREEMPHASIS * frame[j - 1];
+            }
+            frame[0] -= PREEMPHASIS * frame[0];
 
-            // FFT
-            float[] powerSpectrum = computePowerSpectrum(frame);
+            java.util.Arrays.fill(padded, 0f);
+            for (int j = 0; j < WINDOW_SIZE; j++) {
+                padded[j] = frame[j] * hammingWindow[j];
+            }
+            float[] powerSpectrum = computePowerSpectrum(padded);
 
-            // Apply Mel Filterbank
             for (int m = 0; m < N_MELS; m++) {
                 float sum = 0;
-                for (int k = 0; k < N_FFT / 2 + 1; k++) {
-                    sum += powerSpectrum[k] * melFilters[m][k];
+                float[] filter = melFilters[m];
+                for (int k = 0; k < filter.length; k++) {
+                    sum += powerSpectrum[k] * filter[k];
                 }
-                // Log (with small offset to avoid log(0))
-                features[i][m] = (float) Math.log(Math.max(sum, 1e-7));
+                features[i][m] = (float) Math.log(Math.max(sum, LOG_FLOOR));
             }
         }
 
-        return features;
-    }
-
-    private float[] preEmphasis(float[] audio, float coeff) {
-        float[] result = new float[audio.length];
-        if (audio.length == 0)
-            return result;
-        result[0] = audio[0];
-        for (int i = 1; i < audio.length; i++) {
-            result[i] = audio[i] - coeff * audio[i - 1];
+        // Cepstral mean normalization over the whole segment
+        for (int m = 0; m < N_MELS; m++) {
+            double mean = 0;
+            for (int i = 0; i < numFrames; i++) {
+                mean += features[i][m];
+            }
+            float fm = (float) (mean / numFrames);
+            for (int i = 0; i < numFrames; i++) {
+                features[i][m] -= fm;
+            }
         }
-        return result;
+        return features;
     }
 
     private float[] createHammingWindow(int size) {
@@ -171,42 +179,32 @@ public class FeatureExtractor {
         }
     }
 
+    /** Kaldi's mel banks: triangles linear on the mel scale, over the first N_FFT/2 bins. */
     private float[][] createMelFilters(int sampleRate, int nFft, int nMels, float fMin, float fMax) {
-        float[] melPoints = new float[nMels + 2];
-        float melMin = hzToMel(fMin);
-        float melMax = hzToMel(fMax);
-        float step = (melMax - melMin) / (nMels + 1);
-
-        for (int i = 0; i < melPoints.length; i++) {
-            melPoints[i] = melToHz(melMin + i * step);
-        }
-
-        float[][] filters = new float[nMels][nFft / 2 + 1];
-
+        int numBins = nFft / 2;
+        double melLow = kaldiMel(fMin);
+        double melHigh = kaldiMel(fMax);
+        double delta = (melHigh - melLow) / (nMels + 1);
+        float[][] filters = new float[nMels][numBins];
         for (int m = 0; m < nMels; m++) {
-            float fLeft = melPoints[m];
-            float fCenter = melPoints[m + 1];
-            float fRight = melPoints[m + 2];
-
-            for (int k = 0; k < nFft / 2 + 1; k++) {
-                float hz = (k * sampleRate) / (float) nFft;
-                if (hz >= fLeft && hz <= fCenter) {
-                    filters[m][k] = (hz - fLeft) / (fCenter - fLeft);
-                } else if (hz > fCenter && hz <= fRight) {
-                    filters[m][k] = (fRight - hz) / (fRight - fCenter);
-                } else {
-                    filters[m][k] = 0;
-                }
+            double left = melLow + m * delta;
+            double center = melLow + (m + 1) * delta;
+            double right = melLow + (m + 2) * delta;
+            for (int k = 0; k < numBins; k++) {
+                double mel = kaldiMel(k * (double) sampleRate / nFft);
+                double up = (mel - left) / (center - left);
+                double down = (right - mel) / (right - center);
+                filters[m][k] = (float) Math.max(0, Math.min(up, down));
             }
         }
         return filters;
     }
 
-    private float hzToMel(float hz) {
-        return (float) (2595 * Math.log10(1 + hz / 700));
+    private static double kaldiMel(double hz) {
+        return 1127.0 * Math.log(1.0 + hz / 700.0);
     }
 
-    private float melToHz(float mel) {
-        return (float) (700 * (Math.pow(10, mel / 2595) - 1));
-    }
+
+
+
 }

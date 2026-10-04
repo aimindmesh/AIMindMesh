@@ -37,8 +37,14 @@ class PromptToolsTest {
         val vOut = FloatArray(n) { i -> (sqrt(alphaBar) * noise[i] - sqrt(1 - alphaBar) * x0Hat[i]).toFloat() }
         assertEquals(PredictionType.V_PREDICTION, PredictionTypeProbe.decide(vOut, noise))
 
+        // Correlations measured on UberRealistic (v): 0.41 at 768 px on CPU, 0.6 on the NPU with a broken text encoder
+        for (c in listOf(0.41f, 0.6f)) {
+            val out = FloatArray(n) { i -> c * noise[i] + sqrt(1f - c * c) * random.nextGaussian().toFloat() }
+            assertEquals(PredictionType.V_PREDICTION, PredictionTypeProbe.decide(out, noise))
+        }
+
         // Ambiguous output: no decision
-        val mixed = FloatArray(n) { i -> 0.6f * noise[i] + 0.8f * random.nextGaussian().toFloat() }
+        val mixed = FloatArray(n) { i -> 0.78f * noise[i] + 0.626f * random.nextGaussian().toFloat() }
         assertNull(PredictionTypeProbe.decide(mixed, noise))
     }
 

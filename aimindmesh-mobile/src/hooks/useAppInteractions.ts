@@ -4,7 +4,8 @@ import { logger } from '../services/logger';
 import { isDesktop } from '../utils/platform';
 import { App as CapacitorApp } from '@capacitor/app';
 import { runBackHandler } from '../services/native/backButtonRegistry';
-import { ASSISTANT_LAUNCH_EVENT, consumeAssistantLaunch } from '../services/native/assistantLaunch';
+import { ASSISTANT_LAUNCH_EVENT, OPEN_FEED_EVENT, consumeLaunchAction } from '../services/native/assistantLaunch';
+import { isMeetingCaptureActive, VOICE_PAUSED_MESSAGE } from '../services/meeting/meetingCapture';
 
 /** Back steps for screens App owns; each returns true when it handled the press */
 export interface AppBackHandlers {
@@ -16,7 +17,7 @@ export interface AppBackHandlers {
 
 export const useAppInteractions = (backHandlersRef: React.MutableRefObject<AppBackHandlers | null>) => {
     const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-    const [isVoiceMode, setIsVoiceMode] = useState(false);
+    const [isVoiceMode, setVoiceModeState] = useState(false);
     const [isProactiveThinking, setIsProactiveThinking] = useState(false);
     const [incomingCall, setIncomingCall] = useState<Personality | null>(null);
     const [isThreadListOpen, setIsThreadListOpen] = useState(false);
@@ -32,6 +33,21 @@ export const useAppInteractions = (backHandlersRef: React.MutableRefObject<AppBa
     }, []);
 
     const hideToast = useCallback(() => setToast(prev => ({ ...prev, isVisible: false })), []);
+
+    /**
+     * Voice mode from anywhere (button, widget, shortcut, assistant gesture, wake word, call):
+     * refused while a meeting is recording, which owns the microphone and live recognition.
+     */
+    const setIsVoiceMode = useCallback((value: React.SetStateAction<boolean>) => {
+        setVoiceModeState(prev => {
+            const next = typeof value === 'function' ? value(prev) : value;
+            if (next && !prev && isMeetingCaptureActive()) {
+                setTimeout(() => showToast(VOICE_PAUSED_MESSAGE, 'info'), 0);
+                return prev;
+            }
+            return next;
+        });
+    }, [showToast]);
 
     // --- Interaction Handlers ---
     useEffect(() => {
@@ -70,10 +86,14 @@ export const useAppInteractions = (backHandlersRef: React.MutableRefObject<AppBa
         // Assistant gesture / wake word session: MainActivity keeps the request until it is read,
         // so a cold start (event fired before this listener existed) is caught by the check below
         const openVoiceIfRequested = () => {
-            consumeAssistantLaunch().then(requested => {
-                if (requested) {
+            consumeLaunchAction().then(action => {
+                if (action === 'voice') {
                     logger.log('info', '[App] Opened as assistant: starting voice mode');
                     setIsVoiceMode(true);
+                } else if (action?.startsWith('feed')) {
+                    logger.log('info', '[App] Opened from a feed notification');
+                    const insightId = action.split(':')[1];
+                    window.dispatchEvent(new CustomEvent(OPEN_FEED_EVENT, { detail: insightId }));
                 }
             });
         };

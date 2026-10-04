@@ -1,14 +1,15 @@
 
-import { backgroundServicePlugin } from './BackgroundServicePlugin';
+import { backgroundServicePlugin, ProactiveCheckDetail } from './BackgroundServicePlugin';
 import { contextAnalyzer } from './ContextAnalyzer';
 import { permissionManager } from './PermissionManager';
 import { actionExecutor, onProactiveAction } from './ActionExecutor';
 import { ProactiveAction, ProactiveActionType } from '../../types/proactive';
-import { ProactiveSettings, DEFAULT_PROACTIVE_SETTINGS, AIMindMeshServerSettings } from '../../types';
+import { ProactiveSettings, AIMindMeshServerSettings } from '../../types';
 import { logger } from '../logger';
 import { activityLogger } from './ActivityLogger';
 import { proactiveNotificationService } from './ProactiveNotificationService';
 import { getEventsPendingBriefing, buildBriefingPrompt, markEventBriefed } from './meetingBriefingService';
+import { readProactiveSettings } from './proactiveSettings';
 
 /** A dismissed or accepted suggestion type stays quiet at least this long */
 const SUPPRESS_MS = 60 * 60 * 1000;
@@ -23,7 +24,7 @@ class ProactiveService {
     /** Suggestion type -> time until which it is not proposed again */
     private suppressedUntil = new Map<string, number>();
     /** One listener for the whole app life: re-adding it would run every check several times */
-    private readonly handleCheck = (timestamp: number) => { void this.handlePeriodicCheck(timestamp); };
+    private readonly handleCheck = (detail: ProactiveCheckDetail) => this.handlePeriodicCheck(detail);
 
     // v4.0.0 — server mode state
     private serverModeActive = false;
@@ -81,15 +82,7 @@ class ProactiveService {
     }
 
     private getProactiveSettings(): ProactiveSettings {
-        try {
-            const settingsStr = localStorage.getItem('proactive-settings');
-            if (settingsStr) {
-                return JSON.parse(settingsStr);
-            }
-        } catch (e) {
-            logger.log('error', '[ProactiveService] Failed to load settings', e);
-        }
-        return DEFAULT_PROACTIVE_SETTINGS;
+        return readProactiveSettings();
     }
 
     private isSuppressed(type: string, now: number): boolean {
@@ -100,14 +93,15 @@ class ProactiveService {
         return this.suggestions.some(predicate);
     }
 
-    private async handlePeriodicCheck(timestamp: number) {
-        logger.log('info', `[ProactiveService] Handling check at ${timestamp}`);
+    private async handlePeriodicCheck(detail: ProactiveCheckDetail) {
+        logger.log('info', `[ProactiveService] Handling check at ${detail.timestamp}`);
 
         const settings = this.getProactiveSettings();
         if (!settings.enabled) return;
 
         try {
-            const context = await contextAnalyzer.analyze();
+            // Screen and Do Not Disturb as the native worker measured them
+            const context = await contextAnalyzer.analyze({ screenOn: detail.screenOn, dnd: detail.dnd });
             logger.log('debug', '[ProactiveService] Context evaluated', context);
             const now = Date.now();
             this.pruneSuggestions(now, context);
@@ -194,8 +188,9 @@ class ProactiveService {
                             action: 'meeting_briefing'
                         }
                     };
-                    markEventBriefed(event.id);
-                    await this.processAction(action, context);
+                    // Marked only once delivered: a briefing held back (quiet hours, limits) is
+                    // tried again at the next check while the event is still ahead
+                    if (await this.processAction(action, context)) markEventBriefed(event.id);
                 }
             }
 
@@ -276,7 +271,8 @@ class ProactiveService {
         }
     }
 
-    private async processAction(action: ProactiveAction, context: any) {
+    /** True when the action was allowed (shown or executed) */
+    private async processAction(action: ProactiveAction, context: any): Promise<boolean> {
         const permission = await permissionManager.checkPermission(action.type, context, action.priority);
 
         if (permission.allowed) {
@@ -285,11 +281,12 @@ class ProactiveService {
             } else {
                 await actionExecutor.execute(action);
             }
-        } else {
-            logger.log('info', `[ProactiveService] Action blocked: ${permission.reason}`);
-            action.status = 'ignored';
-            await activityLogger.log(action);
+            return true;
         }
+        logger.log('info', `[ProactiveService] Action blocked: ${permission.reason}`);
+        action.status = 'ignored';
+        await activityLogger.log(action);
+        return false;
     }
 
     // --- State Management ---

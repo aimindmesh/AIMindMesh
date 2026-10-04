@@ -25,6 +25,16 @@ export interface SpeakerEmbeddingPlugin {
     extractEmbedding(options: { audioData: string }): Promise<EmbeddingResult>;
 
     /**
+     * One L2-normalized embedding per time range of a 16 kHz mono WAV file, reading only those
+     * ranges. Ranges shorter than minDurationMs (default 500) get null.
+     */
+    extractEmbeddingsFromFile(options: {
+        audioPath: string;
+        ranges: Array<{ startMs: number; endMs: number }>;
+        minDurationMs?: number;
+    }): Promise<{ embeddings: Array<number[] | null> }>;
+
+    /**
      * Get information about the loaded model.
      */
     getModelInfo(): Promise<ModelInfo>;

@@ -9,9 +9,10 @@
 import { TextEmbedding } from 'text-embedding-capacitor';
 import { saveMemoryToDb, getRecentMemories, getMemoryDatabase, getMemoryEmbeddings, getMemoriesByIds, pruneOldMemories } from '../memory/memoryDatabase';
 import { cosineSimilarity } from './embeddingCodec';
-import { isSelfMatch, withoutSelfMatches } from './selfMatch';
+import { withoutSelfMatches } from './selfMatch';
 import { embedText, ensureEmbeddingModel, getActiveEmbeddingModel, getEmbeddingLoadError, unloadEmbeddingModel } from '../model/embedding/embeddingRuntime';
 import { logger } from '../logger';
+import { memoryThresholds } from './context/memoryThresholds';
 
 export interface RelevantMemory {
     content: string;
@@ -131,11 +132,13 @@ class SemanticMemoryRetriever {
             // Embedding with the model's passage prefix, tagged with the model key
             const { vector: embedding, key } = await embedText(content, 'passage');
 
-            // Deduplication check: compare with recent memories of the same model
+            // Deduplication check: recent memories of the same model and role (a fact must never be
+            // skipped because the chat turn it comes from says the same thing)
             const recentMemories = await getRecentMemories(30, undefined, 30, key); // Check last 30 entries
             const DUPLICATE_THRESHOLD = 0.90;
 
             for (const mem of recentMemories) {
+                if (mem.role !== role) continue;
                 const similarity = cosineSimilarity(embedding, mem.embedding);
                 if (similarity >= DUPLICATE_THRESHOLD) {
                     logger.log('info', `[SemanticMemory] ⏭️ Skipping duplicate (similarity: ${similarity.toFixed(3)}): "${mem.content.substring(0, 40)}..."`);
@@ -176,23 +179,23 @@ class SemanticMemoryRetriever {
         query: string,
         sessionId?: string,
         maxResults: number = this.config.maxResults!,
-        minSimilarity: number = this.config.minSimilarity!
+        minSimilarity: number = this.config.minSimilarity!,
+        /** Rows of this conversation from `since` on: already in the model's context */
+        exclude?: { sessionId: string; since: number }
     ): Promise<RelevantMemory[]> {
         const queryPreview = query.length > 60 ? query.substring(0, 60) + '...' : query;
         logger.log('info', `[SemanticMemory] Retrieving memories for query: "${queryPreview}"`);
 
         const startTime = performance.now();
 
-        // Handle empty query - return most recent memories
-        if (!query.trim()) {
-            logger.log('warn', '[SemanticMemory] Empty query, using recency fallback');
-            return this.getRecentMemoriesFallback(maxResults);
-        }
+        // No query or no model: no memories. Recent rows are not relevant ones (the model has the
+        // recent history already), and old unrelated rows only confused small models
+        if (!query.trim()) return [];
 
         // Check if model is loaded
         if (!this.isModelLoaded || !getActiveEmbeddingModel()) {
-            logger.log('warn', '[SemanticMemory] Model not loaded, using recency fallback');
-            return this.getRecentMemoriesFallback(maxResults, query);
+            logger.log('warn', '[SemanticMemory] Model not loaded, no memories this turn');
+            return [];
         }
 
         try {
@@ -209,6 +212,7 @@ class SemanticMemoryRetriever {
             }
 
             const candidates = vectors
+                .filter(v => !exclude || v.sessionId !== exclude.sessionId || v.timestamp < exclude.since)
                 .map(v => {
                     let similarity = cosineSimilarity(queryEmbedding, v.embedding);
                     // Boost current session matches
@@ -228,41 +232,10 @@ class SemanticMemoryRetriever {
 
             const rows = new Map((await getMemoriesByIds(candidates.map(m => m.id))).map(r => [r.id, r]));
             // The message being answered was saved just before this call: it is not a memory
-            let results: RelevantMemory[] = withoutSelfMatches(candidates.flatMap(m => {
+            const results: RelevantMemory[] = withoutSelfMatches(candidates.flatMap(m => {
                 const row = rows.get(m.id);
                 return row ? [{ id: m.id, content: row.content, similarity: m.similarity, role: row.role, timestamp: row.timestamp }] : [];
             }), query, maxResults);
-
-            // Enrich with graph-related memories (if graph is available)
-            try {
-                const { getMemoryGraphService } = await import('../memory/memoryGraph');
-                const graphService = getMemoryGraphService();
-
-                if (results.length > 0 && results[0].id) {
-                    // Find memories related via graph to the top result (by its real id)
-                    const graphRelated = await graphService.findRelatedMemories(results[0].id, 2);
-
-                    // Add graph-related memories that aren't already in results
-                    const existingContent = new Set(results.map(r => r.content));
-                    for (const related of graphRelated) {
-                        if (existingContent.has(related.memory.content) || isSelfMatch(related.memory.content, query)) continue;
-                        if (results.length < maxResults + 2) {
-                            results.push({
-                                id: related.memory.id,
-                                content: related.memory.content,
-                                similarity: related.score * 0.9, // Slightly lower score for graph-based
-                                role: 'memory', // Graph nodes don't have role, default to 'memory'
-                                timestamp: related.memory.timestamp,
-                            });
-                            existingContent.add(related.memory.content);
-                            logger.log('debug', `[SemanticMemory] Added graph-related memory: "${related.memory.content.substring(0, 30)}..."`);
-                        }
-                    }
-                }
-            } catch (graphError) {
-                // Graph service not available, continue without enrichment
-                logger.log('debug', '[SemanticMemory] Memory graph not available, skipping enrichment');
-            }
 
             const elapsed = performance.now() - startTime;
             const topSimilarity = results[0]?.similarity.toFixed(3);
@@ -277,7 +250,7 @@ class SemanticMemoryRetriever {
             return results;
         } catch (error) {
             logger.log('error', '[SemanticMemory] ✗ Failed to retrieve memories', error);
-            return this.getRecentMemoriesFallback(maxResults, query);
+            return [];
         }
     }
 
@@ -312,25 +285,6 @@ class SemanticMemoryRetriever {
         }
 
         return truncated;
-    }
-
-    /**
-     * Fallback: get most recent memories without semantic matching
-     */
-    private async getRecentMemoriesFallback(limit: number, query: string = ''): Promise<RelevantMemory[]> {
-        try {
-            const memories = await getRecentMemories(limit + 1);
-            return withoutSelfMatches(memories.map(m => ({
-                id: m.id,
-                content: m.content,
-                similarity: 0,
-                role: m.role,
-                timestamp: m.timestamp,
-            })), query, limit);
-        } catch (error) {
-            logger.log('error', 'Failed to get recent memories fallback', error);
-            return [];
-        }
     }
 
     /**
@@ -411,7 +365,7 @@ export async function getOrInitializeSemanticMemoryRetriever(
 
     const retriever = getSemanticMemoryRetriever({
         maxResults: config.semanticMemoryMaxResults || 3,
-        minSimilarity: config.semanticMemorySimilarityThreshold || 0.75,
+        minSimilarity: memoryThresholds(config).related,
     });
 
     // Loads the selected model, or switches to it when another one is loaded

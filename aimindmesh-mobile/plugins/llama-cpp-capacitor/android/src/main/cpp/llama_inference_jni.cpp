@@ -427,7 +427,7 @@ Java_com_aimindmesh_llama_LlamaCppInference_loadStateNative(
  */
 JNIEXPORT jstring JNICALL
 Java_com_aimindmesh_llama_LlamaCppInference_getFormattedChatNative(
-    JNIEnv* env, jobject thiz, jlong modelPtr, jstring messages, jstring chatTemplate) {
+    JNIEnv* env, jobject thiz, jlong modelPtr, jstring messages, jstring chatTemplate, jstring tools, jboolean enableThinking) {
 
     auto entry = findEntry(modelPtr);
     if (!entry) {
@@ -445,11 +445,14 @@ Java_com_aimindmesh_llama_LlamaCppInference_getFormattedChatNative(
     std::string templateStr(templateCstr ? templateCstr : "");
     env->ReleaseStringUTFChars(messages, messagesCstr);
     releaseChars(env, chatTemplate, templateCstr);
+    const char* toolsCstr = tools ? env->GetStringUTFChars(tools, nullptr) : nullptr;
+    std::string toolsStr(toolsCstr ? toolsCstr : "");
+    releaseChars(env, tools, toolsCstr);
 
     std::string result;
     std::string error;
     try {
-        result = entry->inference->getFormattedChat(messagesStr, templateStr);
+        result = entry->inference->getFormattedChat(messagesStr, templateStr, toolsStr, enableThinking == JNI_TRUE);
     } catch (std::exception& e) {
         error = e.what();
     }

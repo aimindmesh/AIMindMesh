@@ -3,6 +3,7 @@ import { SpeechConfig, ClusteringAlgorithm } from '../../../types';
 import { triggerHaptic } from '../../../services/native';
 import { TrashIcon } from '../../../constants';
 import VoiceEnrollmentModal from '../../modals/VoiceEnrollmentModal';
+import { needsVoiceReenrollment } from '../../../services/speaker/speakerCalibration';
 import { logger } from '../../../services/logger';
 import { FilePicker } from '@capawesome/capacitor-file-picker';
 
@@ -223,14 +224,14 @@ const SpeakerSettings: React.FC<SpeakerSettingsProps> = ({ speechConfig, onSpeec
                             <div>
                                 <div className="flex justify-between mb-1">
                                     <label className="text-xs text-text-secondary">Match Threshold</label>
-                                    <span className="text-xs font-mono text-primary">{speechConfig.embeddingThreshold?.toFixed(2) || '0.80'}</span>
+                                    <span className="text-xs font-mono text-primary">{speechConfig.embeddingThreshold?.toFixed(2) || '0.60'}</span>
                                 </div>
                                 <input
                                     type="range"
                                     min="0.50"
                                     max="0.95"
                                     step="0.01"
-                                    value={speechConfig.embeddingThreshold || 0.80}
+                                    value={speechConfig.embeddingThreshold || 0.60}
                                     onChange={(e) => handleSpeechConfigChange('embeddingThreshold', parseFloat(e.target.value))}
                                     className="w-full h-1 bg-surface rounded-lg appearance-none cursor-pointer accent-primary"
                                 />
@@ -436,6 +437,12 @@ const SpeakerSettings: React.FC<SpeakerSettingsProps> = ({ speechConfig, onSpeec
                         Record your voice to allow the assistant to identify you as "You" in meetings.
                         Requires ONNX model installed.
                     </p>
+
+                    {needsVoiceReenrollment() && (
+                        <p className="text-xs text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-lg p-2 mb-3">
+                            Speaker recognition was improved: record your voice again so meetings recognize you.
+                        </p>
+                    )}
 
                     <div className="flex items-center gap-2 mb-3">
                         <span className="text-xs text-text-secondary">Status:</span>

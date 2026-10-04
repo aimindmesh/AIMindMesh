@@ -59,12 +59,15 @@ object PredictionTypeProbe {
         return if (va <= 0.0 || vb <= 0.0) 0.0 else cov / sqrt(va * vb)
     }
 
-    /** null when the output is ambiguous: the caller keeps its default. */
+    /**
+     * null when the output is ambiguous: the caller keeps its default. Measured on UberRealistic
+     * (v, float32 on CPU): 0.21 at 512 px, 0.41 at 768 px; an epsilon model returns the noise (> 0.9).
+     */
     fun decide(output: FloatArray, noise: FloatArray): PredictionType? {
         val c = correlation(output, noise)
         return when {
-            c > 0.75 -> PredictionType.EPSILON
-            c < 0.4 -> PredictionType.V_PREDICTION
+            c > 0.85 -> PredictionType.EPSILON
+            c < 0.7 -> PredictionType.V_PREDICTION
             else -> null
         }
     }

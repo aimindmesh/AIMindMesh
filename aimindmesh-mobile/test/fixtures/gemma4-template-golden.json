@@ -1,0 +1,222 @@
+{
+ "tools_thinking": {
+  "request": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Sei Atlas.\n\nRegole."
+    },
+    {
+     "role": "user",
+     "content": "Ciao"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "search_web",
+      "description": "Cerca sul web",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string",
+         "description": "la ricerca"
+        },
+        "time_range": {
+         "type": "string",
+         "description": "periodo",
+         "enum": [
+          "day",
+          "week"
+         ]
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "set_volume",
+      "description": "Volume",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "level": {
+         "type": "number",
+         "description": "0-15"
+        },
+        "tags": {
+         "type": "array",
+         "description": "etichette",
+         "items": {
+          "type": "string"
+         }
+        }
+       },
+       "required": [
+        "level"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "list_tasks",
+      "description": "Elenca le attività"
+     }
+    }
+   ],
+   "chat_template_kwargs": {
+    "enable_thinking": true
+   }
+  },
+  "prompt": "<|turn>system\n<|think|>\nSei Atlas.\n\nRegole.<|tool>declaration:search_web{description:<|\"|>Cerca sul web<|\"|>,parameters:{properties:{query:{description:<|\"|>la ricerca<|\"|>,type:<|\"|>STRING<|\"|>},time_range:{description:<|\"|>periodo<|\"|>,enum:[<|\"|>day<|\"|>,<|\"|>week<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>query<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><|tool>declaration:set_volume{description:<|\"|>Volume<|\"|>,parameters:{properties:{level:{description:<|\"|>0-15<|\"|>,type:<|\"|>NUMBER<|\"|>},tags:{description:<|\"|>etichette<|\"|>,items:{type:<|\"|>STRING<|\"|>},type:<|\"|>ARRAY<|\"|>}},required:[<|\"|>level<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><|tool>declaration:list_tasks{description:<|\"|>Elenca le attività<|\"|>}<tool|><turn|>\n<|turn>user\nCiao<turn|>\n<|turn>model\n"
+ },
+ "roundtrip": {
+  "request": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "S"
+    },
+    {
+     "role": "user",
+     "content": "Alza il volume"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "a",
+       "type": "function",
+       "function": {
+        "name": "set_volume",
+        "arguments": "{\"level\":10,\"tags\":[\"x\",\"y\"]}"
+       }
+      },
+      {
+       "id": "b",
+       "type": "function",
+       "function": {
+        "name": "list_tasks",
+        "arguments": "{}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "a",
+     "name": "set_volume",
+     "content": "Volume 10"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "b",
+     "name": "list_tasks",
+     "content": "Nessuna"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "search_web",
+      "description": "Cerca sul web",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string",
+         "description": "la ricerca"
+        },
+        "time_range": {
+         "type": "string",
+         "description": "periodo",
+         "enum": [
+          "day",
+          "week"
+         ]
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "set_volume",
+      "description": "Volume",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "level": {
+         "type": "number",
+         "description": "0-15"
+        },
+        "tags": {
+         "type": "array",
+         "description": "etichette",
+         "items": {
+          "type": "string"
+         }
+        }
+       },
+       "required": [
+        "level"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "list_tasks",
+      "description": "Elenca le attività"
+     }
+    }
+   ],
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   }
+  },
+  "prompt": "<|turn>system\nS<|tool>declaration:search_web{description:<|\"|>Cerca sul web<|\"|>,parameters:{properties:{query:{description:<|\"|>la ricerca<|\"|>,type:<|\"|>STRING<|\"|>},time_range:{description:<|\"|>periodo<|\"|>,enum:[<|\"|>day<|\"|>,<|\"|>week<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>query<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><|tool>declaration:set_volume{description:<|\"|>Volume<|\"|>,parameters:{properties:{level:{description:<|\"|>0-15<|\"|>,type:<|\"|>NUMBER<|\"|>},tags:{description:<|\"|>etichette<|\"|>,items:{type:<|\"|>STRING<|\"|>},type:<|\"|>ARRAY<|\"|>}},required:[<|\"|>level<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><|tool>declaration:list_tasks{description:<|\"|>Elenca le attività<|\"|>}<tool|><turn|>\n<|turn>user\nAlza il volume<turn|>\n<|turn>model\n<|tool_call>call:set_volume{level:10,tags:[<|\"|>x<|\"|>,<|\"|>y<|\"|>]}<tool_call|><|tool_call>call:list_tasks{}<tool_call|><|tool_response>response:set_volume{value:<|\"|>Volume 10<|\"|>}<tool_response|><|tool_response>response:list_tasks{value:<|\"|>Nessuna<|\"|>}<tool_response|>"
+ },
+ "plain": {
+  "request": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "S"
+    },
+    {
+     "role": "user",
+     "content": "Ciao"
+    },
+    {
+     "role": "assistant",
+     "content": "Ciao!"
+    },
+    {
+     "role": "user",
+     "content": "Come va?"
+    }
+   ],
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   }
+  },
+  "prompt": "<|turn>system\nS<turn|>\n<|turn>user\nCiao<turn|>\n<|turn>model\nCiao!<turn|>\n<|turn>user\nCome va?<turn|>\n<|turn>model\n"
+ }
+}

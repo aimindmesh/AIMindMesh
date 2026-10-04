@@ -25,7 +25,8 @@ export class InferenceProviders {
       GENERAL_CHAT: 'General Chat',
       WEB_RESEARCH: 'Deep Web Research',
       AGENTIC_TASK: 'Autonomous Agent Task',
-      DIRECTIVES_EXTRACTION: 'Directives Extraction'
+      DIRECTIVES_EXTRACTION: 'Directives Extraction',
+      ORGANIZATION_DESIGN: 'Organization Design'
     };
     return names[type] || `${type} Inference`;
   }
@@ -112,7 +113,9 @@ export class InferenceProviders {
       EMBEDDING_GENERATION: 'EMBEDDING',
       WEB_RESEARCH: 'RESEARCH',
       AGENTIC_TASK: 'AGENTIC',
-      DIRECTIVES_EXTRACTION: 'STANDARD'
+      DIRECTIVES_EXTRACTION: 'STANDARD',
+      // Specs and role designs: a plain completion, never the tool-using agent
+      ORGANIZATION_DESIGN: 'COMPLEX'
     };
     const legacyType = legacyMap[type];
     if (legacyType) return config.routing?.taskPriorities?.[legacyType] || null;

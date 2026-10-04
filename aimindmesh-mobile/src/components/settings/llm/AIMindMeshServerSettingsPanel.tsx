@@ -11,6 +11,7 @@ import { triggerHaptic } from '../../../services/native';
 import { forceRegisterToken, FCMCapacitor } from '../../../services/fcmService';
 import { logger } from '../../../services/logger';
 import { nodeWorker } from '../../../services/worker/NodeWorker';
+import ServerWebToolsSection from './ServerWebToolsSection';
 
 interface Props {
     settings: ServerSettingsType;
@@ -347,6 +348,8 @@ const AIMindMeshServerSettingsPanel: React.FC<Props> = ({ settings, onChange, is
                 </select>
             </div>
             
+            <ServerWebToolsSection settings={settings} update={update} />
+
             {/* Delivery Mode Toggle */}
             <div className="flex items-center justify-between mb-4 mt-2 bg-purple-500/5 p-3 rounded-lg border border-purple-500/20">
                 <div>

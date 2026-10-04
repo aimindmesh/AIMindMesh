@@ -86,7 +86,9 @@ class FCMCapacitorPlugin : Plugin() {
 
             val openIntent = context.packageManager.getLaunchIntentForPackage(context.packageName)
             if (openIntent != null) {
-                openIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+                // Brings the running app forward (onNewIntent): CLEAR_TASK would recreate the activity
+            // and reload the WebView, dropping the worker link and any generation in progress
+            openIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
                 openIntent.putExtra("navigate_to", "feed")
                 if (insightId != null) openIntent.putExtra("insight_id", insightId)
                 builder.setContentIntent(

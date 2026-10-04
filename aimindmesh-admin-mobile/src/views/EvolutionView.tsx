@@ -10,6 +10,7 @@ import { evolutionApi, adminApi } from '../services/api';
 import { useAdminStore } from '../store/adminStore';
 import { CategorizedSelector, SelectorGroup } from '../components/ui/CategorizedSelector';
 import type { EvolutionCandidateRow, EvolutionProposalRow, ProtectedPathRow } from '@aimindmesh/api-types';
+import { EvolutionStatsCard, sourceLabel } from '../components/evolution/EvolutionStatsCard';
 
 
 
@@ -251,6 +252,7 @@ export default function EvolutionView() {
         {/* ── CANDIDATES ─────────────────────────────────────────────────── */}
         {activeSection === 'candidates' && (
           <>
+            <EvolutionStatsCard />
             {candidates.length === 0 && !isLoading && (
               <div className="text-center py-12 text-muted-foreground text-[10px] italic opacity-50">No candidates detected.</div>
             )}
@@ -585,7 +587,7 @@ export default function EvolutionView() {
               <div>
                 <h4 className="text-[9px] font-black uppercase tracking-widest opacity-40 mb-2">Source</h4>
                 <div className="p-4 bg-surface-lighter border border-border/50 rounded-2xl font-mono text-[10px] uppercase italic text-white/90 shadow-sm">
-                  {selectedCandidate.source?.replace('_', ' ')}
+                  {sourceLabel(selectedCandidate.source)}
                 </div>
               </div>
             </div>

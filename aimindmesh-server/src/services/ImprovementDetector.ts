@@ -11,10 +11,11 @@ import { config } from '../config';
 import { WikiManager } from './WikiManager';
 import { Parser } from '../utils/Parser';
 import { canWrite, normalizeRepoPath } from './evolution/EvolutionPathPolicy';
+import { detectSignalCandidates } from './evolution/signals/SignalCandidates';
 
 export interface ImprovementCandidate {
   id: string;
-  source: "open_question" | "low_confidence_insight" | "debate_conclusion" | "manual";
+  source: "open_question" | "low_confidence_insight" | "debate_conclusion" | "manual" | "runtime_error" | "inference_failure";
   sourceId: string;
   title: string;
   description: string;
@@ -151,6 +152,18 @@ export class ImprovementDetector {
 
   async detectCandidates(onCandidateDetected?: (c: ImprovementCandidate) => void): Promise<ImprovementCandidate[]> {
     const candidates: ImprovementCandidate[] = [];
+
+    // 0. Runtime evidence: recurring errors and failing inference tasks (on by default)
+    try {
+      candidates.push(...await detectSignalCandidates(() => this.getWorkspaceFiles(), onCandidateDetected));
+    } catch (err: any) {
+      Logger.error('ImprovementDetector', `Signal detection failed: ${err.message}`);
+    }
+
+    // LLM-generated insights (knowledge graph, debates, wiki) only when explicitly enabled: they are
+    // reflections on the user's notes, not evidence about the code
+    if (config.autoEvolution?.sources?.insights !== true) return candidates;
+
     const session = getSession();
 
     try {

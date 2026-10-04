@@ -4,8 +4,11 @@ import { logger } from '../logger';
 import { MeetingDatabase } from '../database/meetingDatabase';
 import { isMeetingDeleted } from './meetingDeletions';
 import { storeMeetingAudioFile } from './meetingStorage';
+import { attachRecordingToMeeting } from './meetingRecords';
+import { bookmarksFromPositions } from './meetingNotes';
+import { MeetingRecorder, RecoverableSession } from '../audio/meetingRecorder';
 
-/** A recording left on disk by an app killed while recording (native AudioConverter). */
+/** A recording left on disk by an app killed while recording (legacy AudioConverter .pcm). */
 export interface OrphanRecording {
     path: string;
     /** Empty when the recording was not tied to a meeting (older versions) */
@@ -16,7 +19,6 @@ export interface OrphanRecording {
 
 /** AudioConverter methods used by meetings (the native plugin implements them). */
 export interface MeetingAudioConverter {
-    startWriting(options: { sampleRate: number; channels: number; meetingId?: string; startedAt?: number }): Promise<void>;
     listOrphanRecordings(): Promise<{ recordings: OrphanRecording[] }>;
     recoverRecording(options: { path: string }): Promise<{ filePath: string; durationMs: number }>;
     discardRecording(options: { path: string }): Promise<void>;
@@ -35,7 +37,50 @@ export interface RecoveredRecording {
 /** Below this nothing worth keeping was recorded */
 const MIN_RECOVERY_MS = 1000;
 
-let running: Promise<RecoveredRecording[]> | null = null;
+export interface RecoveryResult {
+    recovered: RecoveredRecording[];
+    /** Native sessions whose audio could not be saved now: offered again (or to discard) */
+    failed: RecoverableSession[];
+}
+
+let running: Promise<RecoveryResult> | null = null;
+
+/**
+ * The meeting a recovered recording goes to: its own, unless that meeting was deleted by the
+ * user (here or on another device); then a new id that never reuses an existing meeting (its
+ * audio would be overwritten).
+ */
+async function recoveryTarget(meetingId: string, startedAt: number): Promise<string> {
+    const db = MeetingDatabase.getInstance();
+    if (meetingId && !isMeetingDeleted(meetingId) && !await db.hasSyncDeletion('meeting', meetingId)) return meetingId;
+    const base = `recovered_${startedAt}`;
+    let target = base;
+    for (let n = 2; await db.getMeetingById(target); n++) target = `${base}_${n}`;
+    return target;
+}
+
+/** A session of the native recorder left on disk: encoded into its meeting, with its marks. */
+async function recoverSession(session: RecoverableSession): Promise<RecoveredRecording | null> {
+    if (session.durationMs < MIN_RECOVERY_MS) {
+        await MeetingRecorder.discard({ sessionId: session.sessionId });
+        return null;
+    }
+    const meetingId = await recoveryTarget(session.meetingId, session.startedAt);
+    const existing = await MeetingDatabase.getInstance().getMeetingById(meetingId);
+    const audio = await MeetingRecorder.finalizeRecording({
+        sessionId: session.sessionId,
+        targetMeetingId: meetingId !== session.meetingId ? meetingId : undefined
+    });
+    await attachRecordingToMeeting({
+        meetingId: audio.meetingId,
+        startedAt: audio.startedAt,
+        durationMs: audio.durationMs,
+        mimeType: audio.mimeType,
+        bookmarks: bookmarksFromPositions(audio.bookmarks)
+    });
+    logger.log('info', `[Meeting] Recovered ${Math.round(audio.durationMs / 1000)} s of interrupted recording into ${audio.meetingId}`);
+    return { meetingId: audio.meetingId, startedAt: audio.startedAt, durationMs: audio.durationMs, created: !existing };
+}
 
 async function recoverOne(recording: OrphanRecording): Promise<RecoveredRecording | null> {
     if (recording.durationMs < MIN_RECOVERY_MS) {
@@ -44,14 +89,7 @@ async function recoverOne(recording: OrphanRecording): Promise<RecoveredRecordin
     }
 
     const db = MeetingDatabase.getInstance();
-    let meetingId = recording.meetingId;
-    // A meeting deleted by the user gets the audio under a new id rather than coming back;
-    // a new id never reuses an existing meeting (its audio would be overwritten)
-    if (!meetingId || isMeetingDeleted(meetingId) || await db.hasSyncDeletion('meeting', meetingId)) {
-        const base = `recovered_${recording.startedAt}`;
-        meetingId = base;
-        for (let n = 2; await db.getMeetingById(meetingId); n++) meetingId = `${base}_${n}`;
-    }
+    const meetingId = await recoveryTarget(recording.meetingId, recording.startedAt);
 
     // Encoded natively; the PCM is deleted only once the audio file exists
     const { filePath, durationMs } = await meetingAudioConverter.recoverRecording({ path: recording.path });
@@ -72,33 +110,58 @@ async function recoverOne(recording: OrphanRecording): Promise<RecoveredRecordin
 
 /**
  * Recovers recordings cut short by the app being killed: each is encoded, attached to its
- * checkpointed meeting (or to a new one) and reported once. A failure keeps the PCM for the next
- * start. Concurrent callers share the same run.
+ * checkpointed meeting (or to a new one) and reported once. Sessions of the native recorder come
+ * first, then the .pcm files of older versions. A failure keeps the audio for the next start
+ * (native sessions are also returned, so the user can retry or discard them). Concurrent callers
+ * share the same run.
  */
-export function recoverInterruptedRecordings(): Promise<RecoveredRecording[]> {
-    if (!Capacitor.isNativePlatform()) return Promise.resolve([]);
+export function recoverInterruptedRecordingsDetailed(): Promise<RecoveryResult> {
+    if (!Capacitor.isNativePlatform()) return Promise.resolve({ recovered: [], failed: [] });
     if (running) return running;
 
     running = (async () => {
-        const recovered: RecoveredRecording[] = [];
+        const result: RecoveryResult = { recovered: [], failed: [] };
+        try {
+            for (const session of (await MeetingRecorder.listRecoverable()).sessions ?? []) {
+                try {
+                    const recovered = await recoverSession(session);
+                    if (recovered) result.recovered.push(recovered);
+                } catch (error) {
+                    logger.log('error', '[Meeting] Recovery of an interrupted recording failed', error);
+                    result.failed.push(session);
+                }
+            }
+        } catch (error) {
+            logger.log('warn', '[Meeting] Interrupted recordings could not be listed', error);
+        }
+
         let recordings: OrphanRecording[] = [];
         try {
             recordings = (await meetingAudioConverter.listOrphanRecordings()).recordings ?? [];
         } catch (error) {
-            logger.log('warn', '[Meeting] Interrupted recordings could not be listed', error);
-            return recovered;
+            logger.log('warn', '[Meeting] Interrupted recordings of older versions could not be listed', error);
         }
         for (const recording of recordings) {
             try {
-                const result = await recoverOne(recording);
-                if (result) recovered.push(result);
+                const recovered = await recoverOne(recording);
+                if (recovered) result.recovered.push(recovered);
             } catch (error) {
                 logger.log('error', '[Meeting] Recovery of an interrupted recording failed (retried next time)', error);
             }
         }
-        return recovered;
+        return result;
     })().finally(() => { running = null; });
     return running;
+}
+
+/** As recoverInterruptedRecordingsDetailed, the recordings recovered only. */
+export async function recoverInterruptedRecordings(): Promise<RecoveredRecording[]> {
+    return (await recoverInterruptedRecordingsDetailed()).recovered;
+}
+
+/** Retries a native session whose recovery failed. */
+export async function retryRecoverSession(session: RecoverableSession): Promise<RecoveredRecording | null> {
+    return recoverSession(session);
 }
 
 /** "Recording interrupted at 14:05 recovered (12 min)": the time is where the audio ends */

@@ -8,7 +8,7 @@ import { alignClusterLabels } from './labelAlignment';
  * Matches speaker vectors (from Vosk or ONNX) to known speakers.
  * 
  * IMPROVEMENTS (v2.0):
- * - Higher default threshold (0.80) tuned for ECAPA-TDNN
+ * - Thresholds (0.60 / 0.35) tuned for ECAPA-TDNN with WeSpeaker features (Kaldi fbank + CMN)
  * - Rejection threshold (0.50) for definite non-matches
  * - Embedding magnitude validation to reject bad embeddings
  * - User profile (Speaker 0) never drifts toward other speakers
@@ -23,8 +23,8 @@ export class SpeakerEmbedding {
     private sessionEmbeddings: Array<{ id: string; embedding: number[]; timestamp: number; speakerId: number }> = [];
 
     // Configurable parameters - TUNED FOR ECAPA-TDNN
-    private threshold = 0.80; // Increased from 0.65 - ECAPA same-speaker typically 0.85-0.95
-    private rejectionThreshold = 0.50; // Below this = definitely different speaker
+    private threshold = 0.60; // ECAPA (Kaldi fbank + CMN): same voice ~0.6-0.95, others ~0-0.35
+    private rejectionThreshold = 0.35; // Below this = definitely different speaker
     private adaptationRate = 0.03; // Reduced from 0.05 for more stable profiles
 
     // Minimum embedding magnitude (L2-normalized should be ~1.0)

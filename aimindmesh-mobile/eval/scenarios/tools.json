@@ -1,0 +1,233 @@
+[
+  {
+    "id": "tool-weather",
+    "category": "tools",
+    "smoke": true,
+    "user": "Che tempo fa domani a Varese?",
+    "expect": {
+      "tool": "search_web",
+      "args": {
+        "query": [
+          "varese"
+        ]
+      }
+    }
+  },
+  {
+    "id": "tool-news",
+    "category": "tools",
+    "user": "Cerca le ultime notizie sul lancio di Gemma 4",
+    "expect": {
+      "tool": "search_web",
+      "args": {
+        "query": [
+          "gemma"
+        ]
+      }
+    }
+  },
+  {
+    "id": "tool-read-page",
+    "category": "tools",
+    "user": "Leggi https://example.com/articolo-batterie e riassumimi i punti principali",
+    "expect": {
+      "tool": "read_web_page",
+      "args": {
+        "url": [
+          "example\\.com/articolo-batterie"
+        ]
+      }
+    }
+  },
+  {
+    "id": "tool-task-friday",
+    "category": "tools",
+    "smoke": true,
+    "user": "Ricordami di pagare l'affitto venerdì",
+    "expect": {
+      "tool": [
+        "create_task",
+        "create_calendar_event"
+      ],
+      "args": {}
+    }
+  },
+  {
+    "id": "tool-shopping",
+    "category": "tools",
+    "smoke": true,
+    "user": "Aggiungi il latte alla lista della spesa",
+    "expect": {
+      "tool": "add_shopping_item",
+      "args": {
+        "item": [
+          "latte"
+        ]
+      }
+    }
+  },
+  {
+    "id": "tool-agenda-today",
+    "category": "tools",
+    "user": "Che impegni ho oggi?",
+    "expect": {
+      "tool": [
+        "list_calendar_events",
+        "list_agenda_day",
+        "list_tasks"
+      ]
+    }
+  },
+  {
+    "id": "tool-event",
+    "category": "tools",
+    "user": "Segna in agenda il dentista giovedì alle 15",
+    "expect": {
+      "tool": [
+        "create_calendar_event",
+        "add_agenda_event"
+      ]
+    }
+  },
+  {
+    "id": "tool-alarm",
+    "category": "tools",
+    "user": "Metti una sveglia alle 7 domattina",
+    "expect": {
+      "tool": "set_alarm"
+    }
+  },
+  {
+    "id": "tool-open-app",
+    "category": "tools",
+    "user": "Apri Spotify",
+    "expect": {
+      "tool": "launch_app",
+      "args": {
+        "app_name": [
+          "spotify"
+        ]
+      }
+    }
+  },
+  {
+    "id": "tool-brightness",
+    "category": "tools",
+    "user": "Abbassa la luminosità dello schermo",
+    "expect": {
+      "tool": "set_brightness"
+    }
+  },
+  {
+    "id": "tool-list-tasks",
+    "category": "tools",
+    "user": "Quali attività mi restano da fare?",
+    "expect": {
+      "tool": "list_tasks"
+    }
+  },
+  {
+    "id": "notool-greeting",
+    "category": "tools",
+    "smoke": true,
+    "user": "Ciao! Come stai oggi?",
+    "expect": {
+      "tool": null,
+      "lang": "it"
+    }
+  },
+  {
+    "id": "notool-poem",
+    "category": "tools",
+    "user": "Scrivimi una poesia di quattro versi sull'autunno",
+    "expect": {
+      "tool": null,
+      "lang": "it"
+    }
+  },
+  {
+    "id": "notool-math",
+    "category": "tools",
+    "user": "Quanto fa 15 per 12?",
+    "expect": {
+      "tool": null,
+      "mustInclude": [
+        "180"
+      ]
+    }
+  },
+  {
+    "id": "notool-translate",
+    "category": "tools",
+    "user": "Come si dice 'buongiorno' in inglese?",
+    "expect": {
+      "tool": null,
+      "mustInclude": [
+        "good morning"
+      ]
+    }
+  },
+  {
+    "id": "notool-advice",
+    "category": "tools",
+    "smoke": true,
+    "user": "Dammi un consiglio per dormire meglio",
+    "expect": {
+      "tool": null,
+      "lang": "it"
+    }
+  },
+  {
+    "id": "notool-recall",
+    "category": "tools",
+    "note": "Fold7 regression: personal question → web search",
+    "user": "Dove abito?",
+    "expect": {
+      "tool": null
+    }
+  },
+  {
+    "id": "notool-explain",
+    "category": "tools",
+    "user": "Spiegami in due frasi cos'è una NPU",
+    "expect": {
+      "tool": null,
+      "lang": "it"
+    }
+  },
+  {
+    "id": "notool-opinion",
+    "category": "tools",
+    "user": "Oggi ho iniziato il nuovo lavoro, sono un po' agitato",
+    "expect": {
+      "tool": null,
+      "lang": "it"
+    }
+  },
+  {
+    "id": "remember-allergy",
+    "category": "tools",
+    "smoke": true,
+    "user": "Ricordati che sono allergico alle noci",
+    "expect": {
+      "remembers": "noci",
+      "lang": "it",
+      "tool": [
+        "save_memory",
+        null
+      ]
+    }
+  },
+  {
+    "id": "remember-sister",
+    "category": "tools",
+    "user": "Segnati che mia sorella si chiama Giulia",
+    "expect": {
+      "remembers": "Giulia",
+      "tool": [
+        "save_memory",
+        null
+      ]
+    }
+  }
+]

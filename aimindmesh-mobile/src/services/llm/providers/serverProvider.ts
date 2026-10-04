@@ -330,7 +330,16 @@ export async function fetchServerAgentStatus(settings: AIMindMeshServerSettings)
 }
 
 /** Update node settings (e.g. delivery mode) */
-export async function updateDeviceSettings(settings: AIMindMeshServerSettings, deviceSettings: { deliveryMode: 'PUSH' | 'CONTEXTUAL' }): Promise<void> {
+/** Delivery preferences of this device on the server (partial updates) */
+export interface DeviceDeliverySettings {
+    deliveryMode?: 'PUSH' | 'CONTEXTUAL';
+    /** The proactive quiet hours (hours 0-23): the server holds pushes back meanwhile */
+    quietHours?: { enabled: boolean; start: number; end: number };
+    /** IANA time zone the quiet hours are in (e.g. Europe/Rome) */
+    timezone?: string;
+}
+
+export async function updateDeviceSettings(settings: AIMindMeshServerSettings, deviceSettings: DeviceDeliverySettings): Promise<void> {
     const resp = await fetch(`${settings.serverUrl}/api/delivery/settings`, {
         method: 'PUT',
         headers: {

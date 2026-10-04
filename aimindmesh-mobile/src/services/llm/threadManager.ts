@@ -88,10 +88,27 @@ function saveThreads(threads: ConversationThread[]): boolean {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(threads));
         return true;
     } catch (error) {
-        // QuotaExceededError: the previous content is still there, untouched
-        console.error('Failed to save threads:', error);
-        return false;
+        // QuotaExceededError: the previous content is still there, untouched. Inline images are
+        // what fills the storage: keep the conversations' text rather than lose them whole
+        try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(withoutInlineImages(threads)));
+            console.warn('Threads saved without their inline images: storage full', error);
+            return true;
+        } catch (retryError) {
+            console.error('Failed to save threads:', retryError);
+            return false;
+        }
     }
+}
+
+/** The threads with the image data dropped (name, type and file paths stay, so the chat shows what was attached) */
+export function withoutInlineImages(threads: ConversationThread[]): ConversationThread[] {
+    return threads.map(thread => ({
+        ...thread,
+        messages: thread.messages.map(msg => msg.images?.some(img => img.base64)
+            ? { ...msg, images: msg.images.map(({ base64: _dropped, ...rest }) => rest) }
+            : msg),
+    }));
 }
 
 /**

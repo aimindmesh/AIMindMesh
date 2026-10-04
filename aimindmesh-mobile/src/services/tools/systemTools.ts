@@ -208,13 +208,13 @@ export const systemTools: ToolDefinition[] = [
     },
     {
         name: 'set_brightness',
-        description: 'Sets the screen brightness level.',
+        description: 'Sets the screen brightness level. When the user only says lower/raise, pick a level yourself instead of asking.',
         parameters: {
             type: Type.OBJECT,
             properties: {
                 level: {
                     type: Type.NUMBER,
-                    description: 'Brightness level (0-255)'
+                    description: 'Brightness level (0-255): about 60 for "lower", 200 for "raise", 255 for "maximum"'
                 }
             },
             required: ['level']

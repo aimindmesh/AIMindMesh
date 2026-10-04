@@ -15,12 +15,12 @@ function schemaType(type: unknown): string {
 }
 
 /**
- * Builds LiteRT tool specs from the app's TOOL_DEFINITIONS, skipping denied tools.
+ * Builds LiteRT tool specs from the app's TOOL_DEFINITIONS, skipping denied and unavailable tools.
  * Pure (takes the list as input) so it can be unit tested without the tool modules.
  */
 export function buildLiteRTToolSpecs(tools: ToolDefinition[], toolRules?: ToolRules): LiteRTToolSpec[] {
     return tools
-        .filter(tool => ((toolRules ?? {})[tool.name] || 'confirm') !== 'deny')
+        .filter(tool => ((toolRules ?? {})[tool.name] || 'confirm') !== 'deny' && (tool.isAvailable?.() ?? true))
         .map(tool => {
             const properties: Record<string, Record<string, unknown>> = {};
             for (const [name, prop] of Object.entries(tool.parameters?.properties ?? {})) {

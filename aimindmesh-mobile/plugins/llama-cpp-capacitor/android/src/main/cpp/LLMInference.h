@@ -187,7 +187,9 @@ public:
      * @param chatTemplate Optional custom Jinja template (uses model's default if empty)
      * @return The formatted prompt
      */
-    std::string getFormattedChat(const std::string& messages, const std::string& chatTemplate = "") const;
+    // tools: JSON array of OpenAI-style declarations ("" = none); enableThinking: the template's thinking flag
+    std::string getFormattedChat(const std::string& messages, const std::string& chatTemplate = "",
+                                 const std::string& tools = "", bool enableThinking = false) const;
 
     /**
      * Generates the next token(s) and returns text when valid UTF-8 is available.

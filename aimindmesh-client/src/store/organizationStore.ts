@@ -1,12 +1,15 @@
 import { create } from 'zustand';
-import { organizationApi, OrgRole, Directive, IdeaProposal, AuditLogEntry, DiscoveryConfig } from '../services/organizationApi';
+import { organizationApi, OrgRole, Directive, IdeaProposal, AuditLogEntry, DiscoveryConfig, VentureRepository, VentureBuildConfig, VentureDecision } from '../services/organizationApi';
+
+/** Server error text of an axios failure (e.g. "Venture builds are disabled…"), not the generic status line. */
+const errorText = (e: any, fallback: string) => e?.response?.data?.error || e?.message || fallback;
 
 interface OrganizationState {
   roles: OrgRole[];
   directives: Directive[];
   ideas: IdeaProposal[];
   auditLogs: AuditLogEntry[];
-  repositories: any[];
+  repositories: VentureRepository[];
   hrProposals: any[];
   loading: boolean;
   error: string | null;
@@ -30,6 +33,11 @@ interface OrganizationState {
   bootstrapCiCd: (repoId: string) => Promise<void>;
   runValidation: (repoId: string) => Promise<void>;
   forceDevelop: (repoId: string) => Promise<void>;
+  cancelRun: (repoId: string) => Promise<void>;
+  decideVenture: (ideaId: string, decision: VentureDecision, notes: string) => Promise<void>;
+  buildConfig: VentureBuildConfig | null;
+  fetchBuildConfig: () => Promise<void>;
+  updateBuildConfig: (patch: Partial<VentureBuildConfig>) => Promise<void>;
   fetchHRProposals: () => Promise<void>;
   analyzeRecruitment: () => Promise<void>;
   materializeProposal: (proposalId: string) => Promise<void>;
@@ -55,6 +63,7 @@ export const useOrganizationStore = create<OrganizationState>((set) => ({
   loading: false,
   error: null,
   discoveryConfig: null,
+  buildConfig: null,
 
   fetchRoles: async () => {
     set({ loading: true, error: null });
@@ -291,7 +300,49 @@ export const useOrganizationStore = create<OrganizationState>((set) => ({
         await useOrganizationStore.getState().fetchRepositories();
       }
     } catch (e: any) {
-      set({ error: e.message || 'Failed to force development' });
+      set({ error: errorText(e, 'Failed to start development') });
+    } finally {
+      set({ loading: false });
+    }
+  },
+
+  cancelRun: async (repoId) => {
+    try {
+      await organizationApi.cancelRun(repoId);
+      await useOrganizationStore.getState().fetchRepositories();
+    } catch (e: any) {
+      set({ error: errorText(e, 'Failed to cancel the run') });
+    }
+  },
+
+  decideVenture: async (ideaId, decision, notes) => {
+    set({ loading: true, error: null });
+    try {
+      await organizationApi.decideVenture(ideaId, decision, notes);
+      await Promise.all([useOrganizationStore.getState().fetchIdeas(), useOrganizationStore.getState().fetchRepositories()]);
+    } catch (e: any) {
+      set({ error: errorText(e, 'Failed to record the decision') });
+    } finally {
+      set({ loading: false });
+    }
+  },
+
+  fetchBuildConfig: async () => {
+    try {
+      const res = await organizationApi.getBuildConfig();
+      if (res.data.success) set({ buildConfig: res.data.config });
+    } catch {
+      // non-blocking — older servers have no build settings
+    }
+  },
+
+  updateBuildConfig: async (patch) => {
+    set({ loading: true, error: null });
+    try {
+      const res = await organizationApi.updateBuildConfig(patch);
+      if (res.data.success) set({ buildConfig: res.data.config });
+    } catch (e: any) {
+      set({ error: errorText(e, 'Failed to update build settings') });
     } finally {
       set({ loading: false });
     }
@@ -380,7 +431,7 @@ export const useOrganizationStore = create<OrganizationState>((set) => ({
         await useOrganizationStore.getState().fetchIdeas();
       }
     } catch (e: any) {
-      set({ error: e.message || 'Failed to review idea' });
+      set({ error: errorText(e, 'Failed to review idea') });
     } finally {
       set({ loading: false });
     }
@@ -394,7 +445,7 @@ export const useOrganizationStore = create<OrganizationState>((set) => ({
         await useOrganizationStore.getState().fetchIdeas();
       }
     } catch (e: any) {
-      set({ error: e.message || 'Failed to approve idea' });
+      set({ error: errorText(e, 'Failed to approve idea') });
     } finally {
       set({ loading: false });
     }
@@ -445,7 +496,7 @@ export const useOrganizationStore = create<OrganizationState>((set) => ({
         ]);
       }
     } catch (e: any) {
-      set({ error: e.message || 'Failed to transition idea to development' });
+      set({ error: errorText(e, 'Failed to transition idea to development') });
     } finally {
       set({ loading: false });
     }

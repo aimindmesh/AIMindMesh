@@ -43,6 +43,18 @@ export class WhisperWeb extends WebPlugin implements WhisperPlugin {
         throw new Error('Whisper is not available on web platform');
     }
 
+    async transcribeRange(_options: {
+        audioPath: string;
+        startMs: number;
+        endMs: number;
+    }): Promise<{ text: string; segments: TranscriptSegment[]; language: string; processingTimeMs: number }> {
+        throw new Error('Whisper is not available on web platform');
+    }
+
+    async abort(): Promise<void> {
+        // nothing to abort on web
+    }
+
     async copyFile(_options: {
         sourcePath: string;
         fileName: string;

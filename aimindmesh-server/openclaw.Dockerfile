@@ -31,8 +31,7 @@ RUN npm install -g \
     @xdevplatform/xurl \
     clawhub
 
-# Configure Git system-wide to use the GITEA_TOKEN environment variable for authentication
-RUN git config --system credential.helper '!f() { echo username=token; echo password=$GITEA_TOKEN; }; f'
+# No git credential helper: the agent has no Gitea credentials (venture repos are pushed by the server)
 
 # Switch back to node user
 USER node

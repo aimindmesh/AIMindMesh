@@ -80,7 +80,17 @@ export interface VADPlugin {
      * @param options.audioPath Path to audio file (WAV, 16kHz mono)
      * @returns Array of speech segments
      */
-    processFile(options: { audioPath: string }): Promise<{ segments: SpeechSegment[] }>;
+    processFile(options: {
+        audioPath: string;
+        /** Analyze only from this time (ms), e.g. the new part of a file still being recorded */
+        startMs?: number;
+        /** ...up to this time (ms); the file length bounds it anyway */
+        endMs?: number;
+    }): Promise<{
+        segments: SpeechSegment[];
+        /** Start (ms) of speech still going on at the end of the range, if any */
+        openStartMs?: number;
+    }>;
 
     /**
      * Reset VAD state (call between recordings)

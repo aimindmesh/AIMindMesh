@@ -5,6 +5,7 @@ import { config } from '../config';
 import { CodeGenerationOutput } from './CodeGenerationTask';
 import { isSelfRepo, normalizeRepoPath } from './evolution/EvolutionPathPolicy';
 import { typecheckPatch, PatchFile, TypecheckResult } from './evolution/PatchTypeChecker';
+import { runRelatedTests } from './evolution/PatchTestRunner';
 
 export interface ValidationResult {
   passed: boolean;
@@ -143,6 +144,15 @@ export class ValidationLayer {
           output: result.errors.join('\n'),
           durationMs: Date.now() - start
         });
+
+        // Tests that import the patched files, on the same kind of private copy
+        if (blocking.length === 0 && config.autoEvolution?.runRelatedTests !== false) {
+          const testStart = Date.now();
+          const tests = await runRelatedTests(this.repoPath, this.collectPatchFiles(repository, targetComponent, output), this.TIMEOUT_MS * 3);
+          if (tests.status === 'failed') errors.push(`Related tests failing:\n${tests.errors.join('\n').slice(0, 1500)}`);
+          if (tests.status === 'unavailable') warnings.push(`Related tests not run: ${tests.errors.join('; ')}`);
+          steps.push({ name: 'Related tests', passed: tests.status !== 'failed', output: tests.errors.join('\n'), durationMs: Date.now() - testStart });
+        }
       }
     } else {
       Logger.info('ValidationLayer', `Skipping TypeScript validation for non-JS/TS file: ${ext}`);

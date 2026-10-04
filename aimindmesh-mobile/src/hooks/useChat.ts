@@ -7,8 +7,9 @@ import { logger } from '../services/logger';
 import { triggerHaptic } from '../services/native';
 import { fileToBase64 } from '../utils/fileUtils';
 import { stopSpeaking } from '../services/tts/speech';
-import { getOrInitializeSemanticMemoryRetriever } from '../services/memory/semanticMemoryRetriever';
+import { beginChatActivity } from '../services/llm/background/chatActivity';
 import { imageGenService } from '../services/image/imageGenService';
+import { shrinkImageAttachment } from '../services/image/attachmentImage';
 import { imageFromToolData, resolveToolSourceImage, rewriteImagePrompt } from '../services/image/imagePrompt';
 import { generateMemorySummary } from '../services/llm/llmService';
 import { apiKeyForProvider, effectiveProvider } from './chat/agentLoopHelpers';
@@ -81,11 +82,12 @@ export const useChat = (
                     if (result.files.length > 0) {
                         const file = result.files[0];
                         if (file.data) {
-                            setPendingImages(prev => [...prev, {
-                                base64: file.data!,
+                            // Photos are shrunk: inline they would fill the chat storage
+                            shrinkImageAttachment({
+                                base64: file.data,
                                 mimeType: file.mimeType || 'image/jpeg',
                                 name: file.name || 'image.jpg'
-                            }]);
+                            }).then(img => setPendingImages(prev => [...prev, img]));
                         }
                     }
                 }).catch(err => {
@@ -100,11 +102,12 @@ export const useChat = (
                     const file = (e.target as HTMLInputElement).files?.[0];
                     if (file) {
                         const base64 = await fileToBase64(file);
-                        setPendingImages(prev => [...prev, {
+                        const img = await shrinkImageAttachment({
                             base64,
                             mimeType: file.type || 'image/jpeg',
                             name: file.name
-                        }]);
+                        });
+                        setPendingImages(prev => [...prev, img]);
                     }
                 };
                 input.click();
@@ -185,24 +188,8 @@ export const useChat = (
         }
     };
 
-    /**
-     * Helper to save semantic memory
-     */
-    const saveToSemanticMemory = async (role: 'user' | 'model', content: string) => {
-        if (!llmConfig.enableSemanticMemory || !llmConfig.embeddingModelId || !activeThreadId) return;
-
-        try {
-            const retriever = await getOrInitializeSemanticMemoryRetriever(llmConfig);
-            if (retriever) {
-                await retriever.saveMessage(activeThreadId, role, content);
-            }
-        } catch (err) {
-            logger.log('warn', '[useChat] Failed to save semantic memory', err);
-        }
-    };
-
-    // True from the moment a message is accepted until its run has started (the semantic memory
-    // save and image generation are awaited first): a second send meanwhile is ignored
+    // True from the moment a message is accepted until its run has started (attachments and
+    // image generation are awaited first): a second send meanwhile is ignored
     const sendingRef = useRef(false);
 
     const triggerAIResponse = useCallback((history: Message[]) => {
@@ -211,8 +198,8 @@ export const useChat = (
     }, [runAgenticLoop, isBusy]);
 
     const addPendingImage = useCallback((img: ImageAttachment) => {
-        setPendingImages(prev => [...prev, img]);
         triggerHaptic();
+        shrinkImageAttachment(img).then(small => setPendingImages(prev => [...prev, small]));
     }, []);
 
     const sendMessage = useCallback(async (textToSend: string, options?: { hidden?: boolean, role?: 'user' | 'system' }) => {
@@ -220,6 +207,8 @@ export const useChat = (
         // One answer at a time (Enter while streaming, voice input, Gemini Live turns)
         if (sendingRef.current || isBusy()) return;
         sendingRef.current = true;
+        // The chat is busy from now on: background work waits (or is stopped by the run)
+        const endSending = beginChatActivity();
 
         triggerHaptic();
         stopSpeaking();
@@ -271,16 +260,18 @@ export const useChat = (
             } finally {
                 setIsLoading(false);
                 sendingRef.current = false;
+                endSending();
             }
             return;
         }
 
         const newHistory = [...messages, userInput];
-        // Save user message to semantic memory FIRST to prevent concurrent ONNX/LiteRT embedding calls
-        await saveToSemanticMemory('user', textToSend);
+        // Raw messages are not stored as memories (questions and small talk crowded them out):
+        // the background consolidation writes facts and a summary of the conversation
 
         sendingRef.current = false; // The run takes over (it marks itself busy before its first await)
         runAgenticLoop(newHistory);
+        endSending();
     }, [pendingImages, pendingAudio, pendingFiles, messages, runAgenticLoop, isBusy, setInput, llmConfig, activeThreadId, setMessages, apiKeys, serverSettings]);
 
     const handleResend = useCallback((message: Message) => {

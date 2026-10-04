@@ -15,6 +15,8 @@ export interface WhisperModel {
     url: string;
     languages: string[];
     recommended: boolean;
+    /** Shipped in the APK (unpacked at first launch): it can't be deleted */
+    bundled?: boolean;
 }
 
 /**
@@ -37,39 +39,80 @@ export const WHISPER_MODELS: WhisperModel[] = [
     {
         id: 'ggml-tiny',
         name: 'Whisper Tiny',
-        description: 'Fastest, for real-time on low-end devices',
-        size: '75 MB',
-        sizeBytes: 78643200,
+        description: 'Fastest, for real-time voice chat on low-end devices',
+        size: '74 MB',
+        sizeBytes: 77691713,
         url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin',
         languages: ['multilingual'],
         recommended: false,
     },
     {
+        id: 'ggml-base-q8_0',
+        name: 'Whisper Base (q8_0)',
+        description: 'Bundled. Fast; fine on clear close-up speech, poor in noisy rooms (~28% word errors in Italian)',
+        size: '82 MB',
+        sizeBytes: 81768585,
+        url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q8_0.bin',
+        languages: ['multilingual'],
+        recommended: false,
+        bundled: true,
+    },
+    {
         id: 'ggml-base',
         name: 'Whisper Base',
-        description: 'Balanced speed and accuracy',
-        size: '142 MB',
-        sizeBytes: 148897792,
+        description: 'Same text as Base q8_0, about 3x slower',
+        size: '141 MB',
+        sizeBytes: 147951465,
         url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin',
+        languages: ['multilingual'],
+        recommended: false,
+    },
+    {
+        id: 'ggml-small-q8_0',
+        name: 'Whisper Small (q8_0)',
+        description: 'Recommended for meetings: ~16% word errors in Italian, about as fast as Base on meeting turns',
+        size: '264 MB',
+        sizeBytes: 264464607,
+        url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q8_0.bin',
         languages: ['multilingual'],
         recommended: true,
     },
     {
+        id: 'ggml-small-q5_1',
+        name: 'Whisper Small (q5_1)',
+        description: 'Smaller Small: close to q8_0 accuracy',
+        size: '181 MB',
+        sizeBytes: 190085487,
+        url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin',
+        languages: ['multilingual'],
+        recommended: false,
+    },
+    {
         id: 'ggml-small',
         name: 'Whisper Small',
-        description: 'High accuracy, slower',
-        size: '466 MB',
-        sizeBytes: 488636416,
+        description: 'Same text as Small q8_0, slower',
+        size: '465 MB',
+        sizeBytes: 487601967,
         url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin',
+        languages: ['multilingual'],
+        recommended: false,
+    },
+    {
+        id: 'ggml-large-v3-turbo-q8_0',
+        name: 'Whisper Large v3 Turbo (q8_0)',
+        description: 'Near-perfect (~1% word errors) but slower than real time: choose it explicitly for short or important meetings',
+        size: '834 MB',
+        sizeBytes: 874188075,
+        url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q8_0.bin',
         languages: ['multilingual'],
         recommended: false,
     },
     {
         id: 'ggml-medium',
         name: 'Whisper Medium',
-        description: 'Best accuracy, requires 16GB+ RAM',
-        size: '1.5 GB',
-        sizeBytes: 1610612736,
+        description: 'Best accuracy of the classic models, requires a lot of RAM',
+        size: '1.4 GB',
+        sizeBytes: 1533763059,
         url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin',
         languages: ['multilingual'],
         recommended: false,
@@ -95,147 +138,42 @@ export async function downloadWhisperModel(
     }
 
     const targetPath = `${MODELS_DIR}/${model.id}.bin`;
-
     try {
-        // Ensure directory exists
-        try {
-            await Filesystem.mkdir({
-                path: MODELS_DIR,
-                directory: Directory.Data,
-                recursive: true
-            });
-        } catch {
-            // Directory may already exist
+        await Filesystem.mkdir({ path: MODELS_DIR, directory: Directory.Data, recursive: true }).catch(() => { /* already there */ });
+
+        // Native download (no copy of the file through the WebView): written to a .part file and
+        // renamed when complete, so an interrupted download never looks like an installed model
+        const { downloadModel } = await import('../model/modelDownloader');
+        await downloadModel(model.url, targetPath, p => onProgress?.({
+            bytesDownloaded: p.bytesDownloaded,
+            totalBytes: p.totalBytes || model.sizeBytes,
+            percentage: p.percentage,
+            completed: false,
+            failed: false
+        }));
+
+        const stat = await Filesystem.stat({ path: targetPath, directory: Directory.Data });
+        if (model.sizeBytes > 0 && stat.size !== model.sizeBytes) {
+            throw new Error(`Incomplete download: ${stat.size} of ${model.sizeBytes} bytes`);
         }
 
-        // Delete existing file if any
-        try {
-            await Filesystem.deleteFile({
-                path: targetPath,
-                directory: Directory.Data
-            });
-        } catch {
-            // File doesn't exist, ignore
-        }
-
-        // Create empty file
-        await Filesystem.writeFile({
-            path: targetPath,
-            data: '',
-            directory: Directory.Data
-        });
-
-        // Download using fetch with progress tracking
-        const response = await fetch(model.url);
-
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-
-        const contentLength = Number(response.headers.get('content-length')) || model.sizeBytes;
-        const reader = response.body?.getReader();
-
-        if (!reader) {
-            throw new Error('Failed to get response reader');
-        }
-
-        let receivedBytes = 0;
-        let buffer: Uint8Array = new Uint8Array(0);
-        const CHUNK_SIZE = 5 * 1024 * 1024; // Write every 5MB
-
-        while (true) {
-            const { done, value } = await reader.read();
-
-            if (done) {
-                // Write remaining buffer
-                if (buffer.length > 0) {
-                    await appendBufferToFile(targetPath, buffer);
-                }
-                break;
-            }
-
-            // Append new value to buffer
-            const newBuffer = new Uint8Array(buffer.length + value.length);
-            newBuffer.set(buffer);
-            newBuffer.set(value, buffer.length);
-            buffer = newBuffer;
-
-            receivedBytes += value.length;
-
-            // Write chunk if buffer is large enough
-            if (buffer.length >= CHUNK_SIZE) {
-                await appendBufferToFile(targetPath, buffer);
-                buffer = new Uint8Array(0); // Clear buffer
-            }
-
-            if (onProgress) {
-                onProgress({
-                    bytesDownloaded: receivedBytes,
-                    totalBytes: contentLength,
-                    percentage: Math.round((receivedBytes / contentLength) * 100),
-                    completed: false,
-                    failed: false
-                });
-            }
-        }
-
-        if (onProgress) {
-            onProgress({
-                bytesDownloaded: receivedBytes,
-                totalBytes: contentLength,
-                percentage: 100,
-                completed: true,
-                failed: false
-            });
-        }
-
+        onProgress?.({ bytesDownloaded: stat.size, totalBytes: stat.size, percentage: 100, completed: true, failed: false });
         logger.log('info', `[WhisperDownloader] Download complete: ${model.id}`);
         return targetPath;
 
     } catch (error) {
         logger.log('error', `[WhisperDownloader] Download failed: ${(error as any).message}`);
-
-        // Try to clean up partial file
-        try {
-            await Filesystem.deleteFile({
-                path: targetPath,
-                directory: Directory.Data
-            });
-        } catch { }
-
-        if (onProgress) {
-            onProgress({
-                bytesDownloaded: 0,
-                totalBytes: model.sizeBytes,
-                percentage: 0,
-                completed: false,
-                failed: true,
-                errorMessage: (error as any).message
-            });
-        }
-
+        await Filesystem.deleteFile({ path: targetPath, directory: Directory.Data }).catch(() => { });
+        onProgress?.({
+            bytesDownloaded: 0,
+            totalBytes: model.sizeBytes,
+            percentage: 0,
+            completed: false,
+            failed: true,
+            errorMessage: (error as any).message
+        });
         throw error;
     }
-}
-
-/**
- * Helper to append binary buffer to file via base64
- */
-async function appendBufferToFile(path: string, buffer: Uint8Array): Promise<void> {
-    // Convert buffer to base64
-    // Use a chunked approach for btoa to avoid stack overflow on large buffers
-    let binary = '';
-    const len = buffer.byteLength;
-    for (let i = 0; i < len; i += 32768) {
-        binary += String.fromCharCode(...buffer.subarray(i, Math.min(i + 32768, len)));
-    }
-    const base64Data = btoa(binary);
-
-    await Filesystem.appendFile({
-        path,
-        data: base64Data,
-        directory: Directory.Data
-    });
 }
 
 /**

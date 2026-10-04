@@ -83,7 +83,7 @@ export const VADModelSection: React.FC<VADModelSectionProps> = ({
                                 <div className="flex flex-col gap-2 items-end">
                                     {downloadedModels.includes(model.id) ? (
                                         <div className="flex items-center gap-2">
-                                            <span className="text-xs text-green-400 font-medium px-2 py-1 bg-green-500/10 rounded">Downloaded</span>
+                                            <span className="text-xs text-green-400 font-medium px-2 py-1 bg-green-500/10 rounded">{model.bundled ? 'Bundled' : 'Downloaded'}</span>
                                             <div className="flex items-center gap-1">
                                                 <input
                                                     type="radio"
@@ -92,6 +92,7 @@ export const VADModelSection: React.FC<VADModelSectionProps> = ({
                                                     onChange={() => onSpeechConfigChange({ ...speechConfig, vadModelId: model.id })}
                                                     className="h-4 w-4 text-green-500 bg-input border-surface focus:ring-green-500"
                                                 />
+                                                {!model.bundled && (
                                                 <button
                                                     onClick={() => onDelete(model.id)}
                                                     className="p-1.5 text-red-400 hover:bg-red-500/10 rounded-full transition-colors"
@@ -101,6 +102,7 @@ export const VADModelSection: React.FC<VADModelSectionProps> = ({
                                                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                                                     </svg>
                                                 </button>
+                                                )}
                                             </div>
                                         </div>
                                     ) : (

@@ -38,8 +38,29 @@ let resolvedIp: string | null = null;
 let isVersion2 = false;
 // Maps to track pending operations
 const pendingRpcs = new Map<string, (val: any) => void>();
+// The 'agent' RPC answers twice with the same id: accepted ({runId}), then the final result at the end of the run
+const finalRpcHandlers = new Map<string, (val: any) => void>();
 const pendingRuns = new Map<string, { sessionKey: string, resolve: (val: any) => void, reject: (err: any) => void, timeout: NodeJS.Timeout }>();
 const streamHandlers = new Map<string, (chunk: string) => void>();
+
+// Terminal events of agent runs started with startAgentRun (waitForAgentRun). An event that
+// arrives before its waiter is kept for a minute: the 'agent' RPC reply can follow the run's end.
+export type AgentRunEvent = { phase: 'end' | 'error' | 'disconnected'; output?: string; error?: string };
+const runWaiters = new Map<string, (event: AgentRunEvent) => void>();
+const earlyRunEvents = new Map<string, { event: AgentRunEvent; at: number }>();
+const EARLY_EVENT_TTL_MS = 60_000;
+
+function emitRunEvent(runId: string, event: AgentRunEvent): void {
+  const waiter = runWaiters.get(runId);
+  if (waiter) {
+    runWaiters.delete(runId);
+    waiter(event);
+    return;
+  }
+  const now = Date.now();
+  for (const [id, entry] of earlyRunEvents) if (now - entry.at > EARLY_EVENT_TTL_MS) earlyRunEvents.delete(id);
+  earlyRunEvents.set(runId, { event, at: now });
+}
 
 export function isSessionActive(sessionKey: string): boolean {
   for (const [_, val] of pendingRuns) {
@@ -257,12 +278,18 @@ async function connectWebSocket() {
       if (msg.type === 'res' || msg.type === 'result') {
         const handler = pendingRpcs.get(msg.id);
         if (handler) {
+          pendingRpcs.delete(msg.id);
           if (msg.ok === false) {
             handler({ error: msg.error?.message || 'RPC Failed' });
           } else {
             handler(msg.result || msg.payload || msg);
           }
-          pendingRpcs.delete(msg.id);
+          return;
+        }
+        const finalHandler = finalRpcHandlers.get(msg.id);
+        if (finalHandler) {
+          finalRpcHandlers.delete(msg.id);
+          finalHandler(msg.ok === false ? { status: 'error', error: msg.error?.message || 'Run failed' } : (msg.result || msg.payload || msg));
         }
         return;
       }
@@ -305,6 +332,9 @@ async function connectWebSocket() {
         // Handle agent lifecycle events (Run completion/error)
         if (eventName === 'agent' && payload.stream === 'lifecycle' && payload.runId) {
           const runId = payload.runId;
+          const phase = payload.data?.phase;
+          if (phase === 'end') emitRunEvent(runId, { phase: 'end', output: payload.data?.output });
+          else if (phase === 'error') emitRunEvent(runId, { phase: 'error', error: String(payload.data?.error || 'Execution failed') });
           const pending = pendingRuns.get(runId);
           if (pending) {
             const data = payload.data || {};
@@ -322,6 +352,11 @@ async function connectWebSocket() {
         // Protocol 4: Handle agent events with status "completed" or "failed"
         if (eventName === 'agent' && (payload.status === 'completed' || payload.status === 'failed')) {
           const runId = payload.runId;
+          if (runId) {
+            emitRunEvent(runId, payload.status === 'completed'
+              ? { phase: 'end', output: payload.output }
+              : { phase: 'error', error: String(payload.error || payload.output || 'Run failed') });
+          }
           const pending = pendingRuns.get(runId);
           if (pending) {
             pending.resolve(payload.output || 'Task finalized.');
@@ -337,6 +372,12 @@ async function connectWebSocket() {
   ws.on('close', (code: number, reason: Buffer) => {
     wsReady = false;
     wsConnecting = false;
+    // Runs cannot be followed across a reconnection: their waiters learn it now, not at their timeout
+    for (const [runId, waiter] of runWaiters) {
+      runWaiters.delete(runId);
+      waiter({ phase: 'disconnected', error: `Gateway connection closed (${code})` });
+    }
+    finalRpcHandlers.clear();
     Logger.warn('OpenClawBridge', 'Neural link terminated (Code: ' + code + ', Reason: ' + (reason.toString() || 'None') + '). Retrying in ' + (retryDelay / 1000) + 's...');
     setTimeout(() => {
       retryDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY);
@@ -351,14 +392,16 @@ async function connectWebSocket() {
   });
 }
 
-async function callOpenClawRpc(method: string, params: any): Promise<any> {
+async function callOpenClawRpc(method: string, params: any, onFinal?: (payload: any) => void): Promise<any> {
   if (!wsReady || !ws) {
     throw new Error('OpenClaw WebSocket not ready');
   }
   const requestId = crypto.randomUUID();
+  if (onFinal) finalRpcHandlers.set(requestId, onFinal);
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       pendingRpcs.delete(requestId);
+      finalRpcHandlers.delete(requestId);
       reject(new Error('RPC Timeout: ' + method));
     }, 3600000); // 1 hour
     pendingRpcs.set(requestId, (result: any) => {
@@ -431,6 +474,85 @@ export async function runTask(prompt: string, sessionKey: string): Promise<Agent
     
     Logger.error('OpenClawBridge', 'Task execution failed: ' + err.message);
     throw err;
+  }
+}
+
+/**
+ * Starts an agent run and returns its id without waiting (see waitForAgentRun).
+ * `extra` carries optional RPC params supported by the gateway (e.g. a model override).
+ */
+export async function startAgentRun(message: string, sessionKey: string, extra: Record<string, unknown> = {}): Promise<string> {
+  if (!wsReady) throw new Error('OpenClaw gateway not connected');
+  let runId: string | undefined;
+  let earlyFinal: any;
+  const onFinal = (payload: any) => {
+    if (!runId) { earlyFinal = payload; return; }
+    emitRunEvent(runId, finalEventOf(payload));
+  };
+  const res = await callOpenClawRpc('agent', {
+    ...extra,
+    message,
+    sessionKey,
+    deliver: false,
+    idempotencyKey: crypto.randomUUID(),
+  }, onFinal);
+  if (res?.error) throw new Error(`OpenClaw Gateway Error: ${res.error}`);
+  runId = res?.runId || res?.payload?.runId || res?.result?.runId;
+  if (!runId) throw new Error('Failed to start agent run: no runId returned');
+  if (earlyFinal) emitRunEvent(runId, finalEventOf(earlyFinal));
+  return runId;
+}
+
+/** Final 'agent' response: {status, stopReason, result: {payloads: [{text}], meta}}. */
+function finalEventOf(payload: any): AgentRunEvent {
+  const status = String(payload?.status ?? '');
+  if (status === 'error' || status === 'timeout' || payload?.error) {
+    return { phase: 'error', error: String(payload?.error || payload?.stopReason || status || 'Run failed') };
+  }
+  const payloads: any[] = payload?.result?.payloads ?? [];
+  const text = payloads.map(p => (typeof p?.text === 'string' ? p.text : '')).filter(Boolean).join('\n');
+  return { phase: 'end', output: text || undefined };
+}
+
+/** Stops a run on the gateway (best effort): used when the caller gives up waiting. */
+export async function abortAgentRun(sessionKey: string, runId: string): Promise<boolean> {
+  try {
+    const res = await callOpenClawRpc('chat.abort', { sessionKey, runId });
+    return !res?.error;
+  } catch {
+    return false;
+  }
+}
+
+/** Resolves with the terminal event of a run, or null on timeout or abort (the run is not stopped). */
+export function waitForAgentRun(runId: string, timeoutMs: number, signal?: AbortSignal): Promise<AgentRunEvent | null> {
+  const early = earlyRunEvents.get(runId);
+  if (early) {
+    earlyRunEvents.delete(runId);
+    return Promise.resolve(early.event);
+  }
+  return new Promise(resolve => {
+    const done = (event: AgentRunEvent | null) => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      runWaiters.delete(runId);
+      resolve(event);
+    };
+    const onAbort = () => done(null);
+    const timer = setTimeout(() => done(null), timeoutMs);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    runWaiters.set(runId, event => done(event));
+  });
+}
+
+/** Last assistant message of a session (the lifecycle 'end' event usually carries no text). */
+export async function getLastAssistantReply(sessionKey: string): Promise<string> {
+  try {
+    const history = await getSessionHistory(sessionKey);
+    const last = [...(history || [])].reverse().find((m: any) => m?.role === 'assistant');
+    return typeof last?.content === 'string' ? last.content : '';
+  } catch {
+    return '';
   }
 }
 

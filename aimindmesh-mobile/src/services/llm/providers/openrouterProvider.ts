@@ -1,7 +1,7 @@
-import { Message, Personality, LLMConfig, Memory } from '../../../types';
+import { Message, Personality, LLMConfig } from '../../../types';
 import { logger } from '../../logger';
-import { buildSystemPrompt } from '../promptBuilder';
-import { toChatRole, lastUserText } from '../roles';
+import { buildPromptContext, systemPromptWithContext } from '../promptContext';
+import { toChatRole } from '../roles';
 
 const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const OPENROUTER_MODELS_URL = 'https://openrouter.ai/api/v1/models';
@@ -35,7 +35,6 @@ export async function* generateOpenRouterStream(
     history: Message[],
     personality: Personality,
     llmConfig: LLMConfig,
-    memories: Memory[] = [],
     apiKey?: string,
     signal?: AbortSignal,
     maxResponseLength?: number
@@ -46,15 +45,8 @@ export async function* generateOpenRouterStream(
     }
 
     const model = llmConfig.openrouterModel || 'google/gemini-2.0-flash-lite:free';
-    let systemPrompt = buildSystemPrompt(personality, memories);
-
-    // Inject Workspace Documents Context (as the other providers do)
-    try {
-        const { contextInjector } = await import('../contextInjector');
-        systemPrompt = await contextInjector.buildSystemPromptWithContext(lastUserText(history), systemPrompt);
-    } catch (e) {
-        logger.log('warn', '[OpenRouter] Failed to inject workspace context', e);
-    }
+    // Persona, what is known about the user, related memories and workspace documents
+    const systemPrompt = systemPromptWithContext(await buildPromptContext({ personality, llmConfig, history }));
 
     const messages = [
         { role: 'system', content: systemPrompt },

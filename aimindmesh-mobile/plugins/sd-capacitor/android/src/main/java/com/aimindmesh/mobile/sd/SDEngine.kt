@@ -7,8 +7,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
 import java.io.File
+import java.util.Locale
 import java.util.Random
 
 data class SDRequest(
@@ -52,25 +52,29 @@ class SDEngine(private val context: Context) {
     /** SD 1.x (768-dim CLIP) pads prompts with the end token, SD 2.x (OpenCLIP) with "!" */
     private val padToken get() = if (modelInfo.embedDim == 768) ClipTokenizer.END_TOKEN_ID else ClipTokenizer.SD2_PAD_TOKEN_ID
 
+    private val socModel get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Build.SOC_MODEL else ""
+
+    /** Hexagon version of this phone's NPU ("v73", "v79"...), null for chips the app does not know */
+    private val deviceArch by lazy { HexagonArch.forDevice(socModel, Build.BOARD, Build.HARDWARE) }
+
     fun detectCapabilities(): Map<String, Any> {
-        val hardware = Build.HARDWARE.lowercase()
-        val board = Build.BOARD.lowercase()
-        val soc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Build.SOC_MODEL.lowercase() else ""
-        val isSnapdragon8Elite = hardware.contains("qcom") && (board.contains("sun") || soc.contains("sm8750") || hardware.contains("sm8750"))
-        val isSnapdragon8Gen3 = hardware.contains("qcom") && (board.contains("pineapple") || soc.contains("sm8650") || hardware.contains("sm8650"))
-        val hasNpu = isSnapdragon8Elite || isSnapdragon8Gen3 || hardware.contains("qcom")
-        val npuArch = when {
-            isSnapdragon8Elite -> "v79"
-            isSnapdragon8Gen3 -> "v75"
-            hardware.contains("qcom") -> "v73"
-            else -> "none"
-        }
+        // The NPU is usable only if the APK ships the QNN HTP stub (and skel) of its Hexagon version
+        val arch = deviceArch
+        val hasNpu = arch != null && File(context.applicationInfo.nativeLibraryDir, HexagonArch.stubLibrary(arch)).isFile
         return mapOf(
             "hasNpu" to hasNpu,
-            "npuArch" to npuArch,
+            "npuArch" to (arch ?: "none"),
             "supportedBackends" to if (hasNpu) listOf("cpu", "gpu", "npu") else listOf("cpu"),
-            "socModel" to soc.ifEmpty { Build.HARDWARE }
+            "socModel" to socModel.ifEmpty { Build.HARDWARE }
         )
+    }
+
+    /** Refuses a package compiled for another Hexagon version before its contexts reach the NPU. */
+    private fun checkPackageArch(dir: File) {
+        val meta = File(dir, "metadata.json")
+        val packageArch = if (meta.isFile) runCatching { HexagonArch.forPackage(meta.readText()) }.getOrNull() else null
+        HexagonArch.incompatibility(packageArch, deviceArch)?.let { throw IncompatiblePackageException(it) }
+        Log.i(TAG, "Package for Hexagon ${packageArch ?: "unknown"}, phone ${deviceArch ?: "unknown"} (${socModel.ifEmpty { Build.HARDWARE }})")
     }
 
     /** Loads a package directory (text_encoder.bin, unet.bin, vae.bin, optional vae_encoder.bin / realesrgan_x4plus.bin). */
@@ -94,9 +98,10 @@ class SDEngine(private val context: Context) {
                 return false
             }
             Log.i(TAG, "Loading Stable Diffusion QNN pipeline on $backend from ${dir.absolutePath}")
+            checkPackageArch(dir)
             emptyEmbedding = null
             // nativeInit releases any previous pipeline first; report its real outcome
-            val ready = qnnBridge.initializeFromDirectory(dir)
+            val ready = qnnBridge.initializeFromDirectory(dir, deviceArch)
             isInitialized = ready
             activeModelDir = if (ready) dir.absolutePath else null
             if (!ready) {
@@ -104,9 +109,16 @@ class SDEngine(private val context: Context) {
                 return false
             }
             modelInfo = qnnBridge.modelInfo()
+            checkTextEncoder()
             predictionType = resolvePredictionType(dir)
             Log.i(TAG, "Model ready: $modelInfo, prediction=${predictionType.id}")
             true
+        } catch (e: IncompatiblePackageException) {
+            // The caller (and the UI) gets the reason, not a generic load failure
+            Log.e(TAG, e.message ?: "Incompatible package")
+            isInitialized = false
+            activeModelDir = null
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load SD model", e)
             isInitialized = false
@@ -120,7 +132,7 @@ class SDEngine(private val context: Context) {
         val meta = File(dir, "metadata.json")
         if (meta.isFile) {
             try {
-                PredictionType.parse(JSONObject(meta.readText()).optString("prediction_type", ""))?.let {
+                PredictionType.fromMetadata(meta.readText())?.let {
                     Log.i(TAG, "Prediction type from metadata.json: ${it.id}")
                     return it
                 }
@@ -154,6 +166,21 @@ class SDEngine(private val context: Context) {
     private fun emptyPromptEmbedding(): FloatArray =
         emptyEmbedding ?: qnnBridge.runTextEncoder(clipTokenizer.encode("", padToken)).also { emptyEmbedding = it }
 
+    /** Logs the empty-prompt embedding and flags a text encoder exported without its weights. */
+    private fun checkTextEncoder() {
+        try {
+            val empty = emptyPromptEmbedding()
+            if (SDDiagnostics.looksUntrainedTextEncoder(empty, modelInfo.embedDim)) {
+                Log.e(TAG, "text_encoder.bin looks untrained (every token has mean 0 and std 1): it was exported " +
+                    "without its weights, images will ignore the prompt. Re-export it or use the SD 2.1 text_encoder.bin")
+            } else {
+                Log.i(TAG, "Text encoder check: empty prompt ${TensorStats.of(empty)}")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Text encoder check failed", e)
+        }
+    }
+
     fun isLoaded(): Boolean = isInitialized && activeModelDir != null && qnnBridge.isReady()
 
     fun getActiveModelPath(): String? = activeModelDir
@@ -182,6 +209,7 @@ class SDEngine(private val context: Context) {
     private fun encodePrompt(text: String): Pair<FloatArray, Boolean> {
         val tokenized = clipTokenizer.encodeWithWeights(text, padToken)
         val embedding = qnnBridge.runTextEncoder(tokenized.tokens)
+        SDDiagnostics.requireFinite(embedding, "The text encoder")
         if (PromptWeighting.needsWeighting(tokenized.weights)) {
             PromptWeighting.apply(embedding, tokenized.weights, emptyPromptEmbedding(), modelInfo.embedDim)
         }
@@ -236,16 +264,24 @@ class SDEngine(private val context: Context) {
         // 4. Denoising loop on the NPU
         val sampler = scheduler.sampler(request.sampler)
         val totalSteps = numSteps - startIndex
+        // adb shell setprop log.tag.SDEngine DEBUG: per-step statistics (prompt influence = cond/uncond RMS)
+        val debug = Log.isLoggable(TAG, Log.DEBUG)
         var lastStepTime = System.currentTimeMillis()
         for (i in startIndex until numSteps) {
             val sigma = sigmas[i]
             val input = scheduler.scaleModelInput(latents, sigma)
             val t = timesteps[i].toFloat()
             val cond = qnnBridge.runUnet(input, t, condEmbedding)
-            val output = if (uncondEmbedding != null) {
-                scheduler.guidance(qnnBridge.runUnet(input, t, uncondEmbedding), cond, request.cfgScale)
-            } else cond
+            SDDiagnostics.requireFinite(cond, "The UNet (t=${timesteps[i]})")
+            val uncond = uncondEmbedding?.let { qnnBridge.runUnet(input, t, it) }
+            uncond?.let { SDDiagnostics.requireFinite(it, "The UNet (t=${timesteps[i]})") }
+            val output = if (uncond != null) scheduler.guidance(uncond, cond, request.cfgScale) else cond
             val denoised = scheduler.denoised(latents, output, sigma, predictionType)
+            if (debug) {
+                Log.d(TAG, "step ${i + 1}/$numSteps t=${timesteps[i]} sigma=${"%.3f".format(Locale.ROOT, sigma)} " +
+                    "latent ${TensorStats.of(latents)} | x0 ${TensorStats.of(denoised)}" +
+                    (uncond?.let { " | cond-uncond rms ${"%.4f".format(Locale.ROOT, SDDiagnostics.rmsDifference(cond, it))}" } ?: ""))
+            }
             latents = sampler.step(latents, denoised, sigma, sigmas[i + 1])
 
             val now = System.currentTimeMillis()

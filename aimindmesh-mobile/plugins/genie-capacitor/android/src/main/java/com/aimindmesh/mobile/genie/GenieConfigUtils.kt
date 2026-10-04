@@ -19,40 +19,19 @@ object GenieConfigUtils {
     private const val TAG = "GenieConfigUtils"
 
     fun detectNpuCapabilities(): Map<String, Any> {
-        val hardware = Build.HARDWARE.lowercase()
-        val board = Build.BOARD.lowercase()
-        val soc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            Build.SOC_MODEL.lowercase()
-        } else {
-            ""
-        }
-
-        val isSnapdragon8Elite = hardware.contains("qcom") && (
-            board.contains("sun") || soc.contains("sm8750") || hardware.contains("sm8750")
-        )
-        val isSnapdragon8Gen3 = hardware.contains("qcom") && (
-            board.contains("pineapple") || soc.contains("sm8650") || hardware.contains("sm8650")
-        )
-        val hasNpu = isSnapdragon8Elite || isSnapdragon8Gen3 || hardware.contains("qcom")
-
-        val npuArch = when {
-            isSnapdragon8Elite -> "v79"
-            isSnapdragon8Gen3 -> "v75"
-            hardware.contains("qcom") -> "v73"
-            else -> "none"
-        }
-
-        val runtimes = mutableListOf("cpu")
-        if (hasNpu) {
-            runtimes.add("gpu")
-            runtimes.add("npu")
-        }
-
+        val soc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Build.SOC_MODEL else ""
+        val npuArch = HexagonSoc.arch(soc, Build.BOARD, Build.HARDWARE)
+        val hasNpu = npuArch != "none"
+        val runtimes = if (hasNpu) listOf("cpu", "gpu", "npu") else listOf("cpu")
         return mapOf(
             "hasNpu" to hasNpu,
             "npuArch" to npuArch,
             "supportedRuntimes" to runtimes,
-            "socModel" to if (soc.isNotEmpty()) soc else Build.HARDWARE
+            "socModel" to soc.ifEmpty { Build.HARDWARE },
+            "board" to Build.BOARD,
+            // GGUF files run on the NPU of any Hexagon v68+ (llama_cpp runtime); QAIRT bundles only on v79/v81
+            "ggufNpuSupported" to hasNpu,
+            "qairtSupported" to HexagonSoc.qairtSupported(npuArch)
         )
     }
 
@@ -230,6 +209,14 @@ object GenieConfigUtils {
                 "is_vision" to hasVision
             )
         }
+    }
+
+    /** Context the bundle was exported with (genie_config.json dialog.context.size), fixed for QAIRT */
+    fun bundleContextSize(modelDir: File): Int? = try {
+        JSONObject(File(modelDir, "genie_config.json").readText())
+            .optJSONObject("dialog")?.optJSONObject("context")?.optInt("size", 0)?.takeIf { it > 0 }
+    } catch (e: Exception) {
+        null
     }
 
     fun resolveGenieConfig(context: Context, modelDir: File): String {

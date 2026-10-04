@@ -6,6 +6,9 @@ import AdvancedAIFeatures from './AdvancedAIFeatures';
 import NativeModelSettings from './NativeModelSettings';
 import ServerModelSettings from './ServerModelSettings';
 import { triggerHaptic } from '../../../services/native';
+import { AIProviderGuide, TestAIButton } from '../AIProviderGuide';
+
+const KEY_PROVIDERS: LLMConfig['provider'][] = ['gemini', 'openrouter', 'claude', 'perplexity'];
 
 interface LLMSettingsProps {
     llmConfig: LLMConfig;
@@ -81,6 +84,18 @@ const LLMSettings: React.FC<LLMSettingsProps> = ({
                 isFetchingGeminiModels={isFetchingGeminiModels}
                 onRefreshGeminiModels={onRefreshGeminiModels}
             />
+
+            {/* Where to get the key, and a quick check so a wrong one shows up now */}
+            {KEY_PROVIDERS.includes(llmConfig.provider) && (
+                <div className="space-y-3">
+                    <AIProviderGuide provider={llmConfig.provider} />
+                    <TestAIButton
+                        config={{ ...llmConfig, openrouterApiKey: openrouterApiKey ?? llmConfig.openrouterApiKey }}
+                        keys={{ gemini: apiKey, claude: claudeApiKey, perplexity: perplexityApiKey }}
+                        serverSettings={serverSettings}
+                    />
+                </div>
+            )}
 
             {/* Advanced AI Features */}
             <AdvancedAIFeatures

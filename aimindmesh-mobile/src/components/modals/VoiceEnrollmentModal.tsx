@@ -3,6 +3,9 @@ import { MicrophoneIcon, CloseIcon } from '../../constants';
 // import { SpeakerEmbedding } from 'speaker-embedding-capacitor'; // Temporarily removed or mock if needed? No, user has this.
 import { SpeakerEmbedding } from 'speaker-embedding-capacitor';
 import { logger } from '../../services/logger';
+import { waitForBundledModels } from '../../services/model/bundledModels';
+import { OWNER_VOICE_STORAGE_KEY, saveOwnerVoice } from '../../services/speaker/voiceStorage';
+import { REENROLL_KEY } from '../../services/speaker/speakerCalibration';
 import { HighQualityAudioRecorder, pcmToBase64 } from '../../services/audio/highQualityAudioRecorder';
 
 interface VoiceEnrollmentModalProps {
@@ -51,6 +54,8 @@ const VoiceEnrollmentModal: React.FC<VoiceEnrollmentModalProps> = ({ isOpen, onC
                 const status = await SpeakerEmbedding.isModelLoaded();
                 if (!status.loaded) {
                     logger.log('info', 'VoiceEnrollment: Loading ONNX model...');
+                    // First launch: the bundled speaker model may still be unpacking
+                    await waitForBundledModels().catch(() => { });
                     await SpeakerEmbedding.loadModel({ modelPath: 'models/ecapa_tdnn.onnx' });
                 }
             } catch (e) {
@@ -131,8 +136,10 @@ const VoiceEnrollmentModal: React.FC<VoiceEnrollmentModalProps> = ({ isOpen, onC
             });
 
             if (result && result.embedding && result.embedding.length > 0) {
-                // Save profile
-                localStorage.setItem('user-voice-profile-onnx', JSON.stringify(result.embedding));
+                // Save profile: live speaker 0, and the owner among the known voices (named in meetings)
+                localStorage.setItem(OWNER_VOICE_STORAGE_KEY, JSON.stringify(result.embedding));
+                localStorage.removeItem(REENROLL_KEY);
+                await saveOwnerVoice('Me', result.embedding).catch(e => logger.log('warn', 'Could not save the owner voice', e));
                 logger.log('info', 'User voice profile saved');
                 setStep('success');
 

@@ -1,6 +1,7 @@
 import { Message, LLMConfig } from '../../../types';
 import { logger } from '../../logger';
 import { getEncoding } from 'js-tiktoken';
+import { onDeviceContextSize } from './contextSize';
 
 /**
  * Unified Context Manager for AI Mind Mesh
@@ -47,6 +48,19 @@ export function estimateTokens(text: string): number {
  * Tokens kept free for the answer. Never more than half the window: a response style
  * larger than the context (e.g. 4000 on a 2048 model) would otherwise leave no room for input.
  */
+/** Tokens on-device models get to reason (<thinking>) before the answer when no thinking budget is set */
+export const DEFAULT_REASONING_TOKENS = 512;
+
+/**
+ * Answer tokens plus room for the reasoning the prompt asks for (thinking mode, or the ReAct
+ * <thinking> steps of tool calling): with Atlas's 250 tokens the reasoning used them all and the
+ * answer never came (Fold7, Gemma 4 E4B).
+ */
+export function withReasoningAllowance(answerTokens: number, config: { enableThinking?: boolean; enableToolCalling?: boolean; thinkingBudget?: number }): number {
+    if (!config.enableThinking && !config.enableToolCalling) return answerTokens;
+    return answerTokens + (config.thinkingBudget && config.thinkingBudget > 0 ? config.thinkingBudget : DEFAULT_REASONING_TOKENS);
+}
+
 export function getResponseReserve(contextSize: number, maxResponseTokens: number): number {
     return Math.max(64, Math.min(maxResponseTokens, Math.floor(contextSize / 2)));
 }
@@ -79,7 +93,7 @@ export function refineContext(
     maxResponseTokens: number = 512,
     contextWindow?: number
 ): TruncationResult {
-    const contextSize = contextWindow || config.nCtx || config.contextSize || 2048;
+    const contextSize = contextWindow || onDeviceContextSize(config);
     const SAFETY_BUFFER = 100;
 
     // Calculate total allowed tokens for input
@@ -120,11 +134,11 @@ export function refineContext(
         }
     }
 
-    // Hard limit on system prompt: if it's STILL over budget, we must hard truncate
+    // Hard limit on system prompt: if it's STILL over budget, the middle goes (the profile); the
+    // persona at the start and the rules, tools and language rule at the end stay
     if (systemTokens > allowedInputTokens - 100) {
-        logger.log('warn', `[UnifiedContext] System prompt STILL too large (${systemTokens}). Hard truncating.`);
-        const maxSysChars = Math.floor((allowedInputTokens - 100) * CHARS_PER_TOKEN);
-        currentSystemPrompt = currentSystemPrompt.substring(0, maxSysChars) + "\n...[Hard Truncated]...";
+        logger.log('warn', `[UnifiedContext] System prompt STILL too large (${systemTokens}). Cutting its middle.`);
+        currentSystemPrompt = cutMiddle(currentSystemPrompt, Math.floor((allowedInputTokens - 100) * CHARS_PER_TOKEN));
         systemTokens = estimateTokens(currentSystemPrompt);
         truncated = true;
     }
@@ -145,12 +159,10 @@ export function refineContext(
             keptMessages.unshift(msg);
             messageTokens += msgLen;
         } else if (keptMessages.length === 0 && i === history.length - 1) {
-            // Always keep at least the last message, even if we have to truncate it
+            // Always keep at least the last message: its memory context shrinks first, the
+            // request itself is cut only when it alone is too long
             const allowedMsgChars = Math.max(200, Math.floor(messageBudget * CHARS_PER_TOKEN));
-            keptMessages.unshift({
-                ...msg,
-                text: msg.text.substring(0, allowedMsgChars) + "...[Truncated]"
-            });
+            keptMessages.unshift({ ...msg, text: fitTurnText(msg.text, allowedMsgChars) });
             messageTokens += Math.max(0, messageBudget);
             truncated = true;
             break;
@@ -170,4 +182,36 @@ export function refineContext(
             totalTokens: systemTokens + messageTokens
         }
     };
+}
+
+const CUT_MARK = '\n…\n';
+
+/** Keeps the first quarter and the end of a text within maxChars (the end holds the rules) */
+export function cutMiddle(text: string, maxChars: number): string {
+    if (text.length <= maxChars) return text;
+    const room = Math.max(0, maxChars - CUT_MARK.length);
+    const head = Math.floor(room / 4);
+    return text.slice(0, head) + CUT_MARK + text.slice(text.length - (room - head));
+}
+
+const TURN_CONTEXT = /^<context>\n([\s\S]*?)\n<\/context>\n\n/;
+
+/**
+ * A user turn within maxChars: the <context> block the on-device engines prepend (facts,
+ * memories, documents) is cut first, keeping its intro and its last paragraph (the recall
+ * instruction); then the request, from its end.
+ */
+export function fitTurnText(text: string, maxChars: number): string {
+    if (text.length <= maxChars) return text;
+    const m = TURN_CONTEXT.exec(text);
+    const request = m ? text.slice(m[0].length) : text;
+    if (!m || request.length + 80 >= maxChars) {
+        return request.substring(0, Math.max(0, maxChars - 15)) + '...[Truncated]';
+    }
+    const body = m[1];
+    const room = maxChars - request.length - '<context>\n\n</context>\n\n'.length;
+    const lastBreak = body.lastIndexOf('\n\n');
+    const tail = lastBreak > 0 && body.length - lastBreak < room / 2 ? body.slice(lastBreak) : '';
+    const head = body.slice(0, Math.max(0, room - tail.length - CUT_MARK.length));
+    return `<context>\n${head}${tail ? CUT_MARK.trimEnd() + tail : ''}\n</context>\n\n${request}`;
 }

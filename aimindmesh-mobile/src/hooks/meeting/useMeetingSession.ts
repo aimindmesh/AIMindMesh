@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
-import { SavedMeeting, TranscriptSegment } from '../../types/meeting';
-import { saveMeeting as saveMeetingToStorage, storeMeetingAudioFile } from '../../services/meeting/meetingStorage';
-import { guessAudioMimeType, toNativePath } from '../../services/meeting/audioPaths';
+import { App as CapApp } from '@capacitor/app';
+import { EMPTY_NOTES, MeetingNotes, SavedMeeting, TranscriptSegment } from '../../types/meeting';
+import { hasNotes } from '../../services/meeting/meetingNotes';
+import { saveMeeting as saveMeetingToStorage } from '../../services/meeting/meetingStorage';
 import { newMeetingId } from '../../services/meeting/meetingIds';
 import { isMeetingDeleted, MeetingDeletedError, onSegmentsDeleted } from '../../services/meeting/meetingDeletions';
 import { logger } from '../../services/logger';
 
 const AUTOSAVE_DELAY_MS = 1500;
 /** While recording the transcript is checkpointed, so a killed app keeps most of it */
-const RECORDING_CHECKPOINT_MS = 30000;
+const RECORDING_CHECKPOINT_MS = 10000;
 
 export interface MeetingMeta {
     id: string | null;
@@ -39,6 +40,15 @@ function useRefState<T>(initial: T): [T, Dispatch<SetStateAction<T>>, MutableRef
 
 const emptyMeta = (): MeetingMeta => ({ id: null, timestamp: 0, duration: 0, hasAudio: false });
 
+interface SavedSnapshot {
+    transcript: TranscriptSegment[];
+    names: Record<number, string>;
+    notes: MeetingNotes;
+}
+
+/** A snapshot equal to nothing on screen: the next change (or flush) saves. */
+const unsaved = (): SavedSnapshot => ({ transcript: [], names: {}, notes: { ...EMPTY_NOTES } });
+
 /**
  * The meeting being shown: its id is fixed when a recording starts (or a saved meeting is opened)
  * and every save goes to that id, serialized, with the latest transcript and names.
@@ -46,18 +56,16 @@ const emptyMeta = (): MeetingMeta => ({ id: null, timestamp: 0, duration: 0, has
 export function useMeetingSession(showToast: (message: string, type?: 'success' | 'error' | 'info') => void) {
     const [transcript, setTranscript, transcriptRef] = useRefState<TranscriptSegment[]>([]);
     const [speakerNames, setSpeakerNames, speakerNamesRef] = useRefState<Record<number, string>>({});
+    /** Title, bookmarks, AI notes and questions of the meeting on screen */
+    const [notes, setNotes, notesRef] = useRefState<MeetingNotes>(EMPTY_NOTES);
     const [meta, setMetaState] = useState<MeetingMeta>(emptyMeta);
     const metaRef = useRef<MeetingMeta>(meta);
 
-    /** Plain path of the meeting audio (for playback, reprocessing and native plugins) */
+    /** Plain path of the meeting audio (for playback, post-processing and native plugins) */
     const audioFilePathRef = useRef<string | null>(null);
-    /** Recording not moved into storage yet: retried at the next save */
-    const pendingAudioFileRef = useRef<string | null>(null);
-    /** In-memory WAV when the native file failed: written once */
-    const pcmAudioBlobRef = useRef<Blob | null>(null);
 
     const saveChainRef = useRef<Promise<void>>(Promise.resolve());
-    const savedRef = useRef<{ transcript: TranscriptSegment[]; names: Record<number, string> }>({ transcript: [], names: {} });
+    const savedRef = useRef<SavedSnapshot>({ transcript: [], names: {}, notes: EMPTY_NOTES });
     const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const lastSaveAtRef = useRef(0);
     const suspendedRef = useRef(0);
@@ -77,8 +85,9 @@ export function useMeetingSession(showToast: (message: string, type?: 'success' 
     }, []);
 
     const isDirty = useCallback(
-        () => transcriptRef.current !== savedRef.current.transcript || speakerNamesRef.current !== savedRef.current.names,
-        [transcriptRef, speakerNamesRef]
+        () => transcriptRef.current !== savedRef.current.transcript || speakerNamesRef.current !== savedRef.current.names
+            || notesRef.current !== savedRef.current.notes,
+        [transcriptRef, speakerNamesRef, notesRef]
     );
 
     /** Saves a snapshot taken now; saves run one after the other. */
@@ -87,13 +96,12 @@ export function useMeetingSession(showToast: (message: string, type?: 'success' 
         const current = metaRef.current;
         const transcriptSnapshot = transcriptRef.current;
         const namesSnapshot = speakerNamesRef.current;
-        if (!current.id || (transcriptSnapshot.length === 0 && !current.hasAudio)) return saveChainRef.current;
+        const notesSnapshot = notesRef.current;
+        if (!current.id || (transcriptSnapshot.length === 0 && !current.hasAudio && !hasNotes(notesSnapshot))) return saveChainRef.current;
         if (isMeetingDeleted(current.id)) return saveChainRef.current;
 
-        savedRef.current = { transcript: transcriptSnapshot, names: namesSnapshot };
+        savedRef.current = { transcript: transcriptSnapshot, names: namesSnapshot, notes: notesSnapshot };
         lastSaveAtRef.current = Date.now();
-        const pcmBlob = pcmAudioBlobRef.current;
-        const pendingFile = pendingAudioFileRef.current;
         const payload = {
             id: current.id,
             timestamp: current.timestamp,
@@ -101,27 +109,23 @@ export function useMeetingSession(showToast: (message: string, type?: 'success' 
             transcript: transcriptSnapshot,
             speakerNames: namesSnapshot,
             hasAudio: current.hasAudio,
-            audioMimeType: current.audioMimeType
+            audioMimeType: current.audioMimeType,
+            ...notesSnapshot
         };
 
+        // The audio is linked by the recorder (attachRecordingToMeeting): a save never moves files
         saveChainRef.current = saveChainRef.current
-            .then(() => saveMeetingToStorage(payload, { filePath: pendingFile, pcmBlob }))
-            .then((saved) => {
-                if (pcmBlob && pcmAudioBlobRef.current === pcmBlob) pcmAudioBlobRef.current = null;
-                if (pendingFile && saved.audioFilePath && pendingAudioFileRef.current === pendingFile) {
-                    pendingAudioFileRef.current = null;
-                    if (metaRef.current.id === payload.id) audioFilePathRef.current = saved.audioFilePath;
-                }
-            }, (error) => {
+            .then(() => saveMeetingToStorage(payload))
+            .then(() => { }, (error) => {
                 // Deleted meanwhile (History or sync): refusing the save is the point
                 if (error instanceof MeetingDeletedError) return;
                 logger.log('error', 'Failed to save meeting', error);
                 // Dirty again: the next change retries
-                if (savedRef.current.transcript === transcriptSnapshot) savedRef.current = { transcript: [], names: {} };
+                if (savedRef.current.transcript === transcriptSnapshot) savedRef.current = unsaved();
                 showToastRef.current('Could not save the meeting', 'error');
             });
         return saveChainRef.current;
-    }, [clearTimer, transcriptRef, speakerNamesRef]);
+    }, [clearTimer, transcriptRef, speakerNamesRef, notesRef]);
 
     /** Saves now if something is pending, then resolves when every save has finished. */
     const flush = useCallback((): Promise<void> => {
@@ -161,17 +165,21 @@ export function useMeetingSession(showToast: (message: string, type?: 'success' 
         };
     }, [clearTimer]);
 
-    /** Every recording is its own meeting: reusing the previous id overwrote that meeting's audio. */
-    const beginNewMeeting = useCallback(() => {
+    /**
+     * Every recording is its own meeting: reusing the previous id overwrote that meeting's audio.
+     * Returns the new meeting's id (null clears the screen instead).
+     */
+    const beginNewMeeting = useCallback((withId = true): string | null => {
         void flush();
-        updateMeta({ id: newMeetingId(), timestamp: Date.now(), duration: 0, hasAudio: false, audioMimeType: undefined });
+        const id = withId ? newMeetingId() : null;
+        updateMeta(id ? { id, timestamp: Date.now(), duration: 0, hasAudio: false, audioMimeType: undefined } : emptyMeta());
         audioFilePathRef.current = null;
-        pendingAudioFileRef.current = null;
-        pcmAudioBlobRef.current = null;
         setTranscript([]);
         setSpeakerNames({});
-        savedRef.current = { transcript: transcriptRef.current, names: speakerNamesRef.current };
-    }, [flush, updateMeta, setTranscript, setSpeakerNames, transcriptRef, speakerNamesRef]);
+        setNotes(EMPTY_NOTES);
+        savedRef.current = { transcript: transcriptRef.current, names: speakerNamesRef.current, notes: notesRef.current };
+        return id;
+    }, [flush, updateMeta, setTranscript, setSpeakerNames, setNotes, transcriptRef, speakerNamesRef, notesRef]);
 
     const openMeeting = useCallback((meeting: SavedMeeting, audioFilePath: string | null) => {
         void flush();
@@ -183,37 +191,16 @@ export function useMeetingSession(showToast: (message: string, type?: 'success' 
             audioMimeType: meeting.audioMimeType
         });
         audioFilePathRef.current = audioFilePath;
-        pendingAudioFileRef.current = null;
-        pcmAudioBlobRef.current = null;
         setTranscript(meeting.transcript || []);
         setSpeakerNames(meeting.speakerNames || {});
-        savedRef.current = { transcript: transcriptRef.current, names: speakerNamesRef.current };
-    }, [flush, updateMeta, setTranscript, setSpeakerNames, transcriptRef, speakerNamesRef]);
-
-    /**
-     * Attaches a finished recording to the current meeting and moves it into storage. Returns the
-     * plain path to play it from (null when only an in-memory WAV exists).
-     */
-    const attachRecording = useCallback(async (filePath: string | undefined, pcmBlob: Blob | null, durationMs: number): Promise<string | null> => {
-        if (durationMs > 0) updateMeta({ duration: durationMs / 1000 });
-        const id = metaRef.current.id;
-        if (filePath && id) {
-            const stored = await storeMeetingAudioFile(id, filePath);
-            if (stored) {
-                audioFilePathRef.current = stored.filePath;
-            } else {
-                audioFilePathRef.current = toNativePath(filePath);
-                pendingAudioFileRef.current = filePath;
-            }
-            updateMeta({ hasAudio: true, audioMimeType: stored?.mimeType ?? guessAudioMimeType(filePath) });
-            return audioFilePathRef.current;
-        }
-        if (pcmBlob && pcmBlob.size > 0) {
-            pcmAudioBlobRef.current = pcmBlob;
-            updateMeta({ hasAudio: true, audioMimeType: 'audio/wav' });
-        }
-        return null;
-    }, [updateMeta]);
+        setNotes({
+            title: meeting.title ?? '',
+            bookmarks: meeting.bookmarks ?? [],
+            analysis: meeting.analysis ?? null,
+            questions: meeting.questions ?? []
+        });
+        savedRef.current = { transcript: transcriptRef.current, names: speakerNamesRef.current, notes: notesRef.current };
+    }, [flush, updateMeta, setTranscript, setSpeakerNames, setNotes, transcriptRef, speakerNamesRef, notesRef]);
 
     /**
      * The open meeting was deleted (History or sync). A recording in progress continues as a new
@@ -225,18 +212,17 @@ export function useMeetingSession(showToast: (message: string, type?: 'success' 
         if (isRecording) {
             updateMeta({ id: newMeetingId() });
             // Dirty: the next checkpoint writes the transcript under the new id
-            savedRef.current = { transcript: [], names: {} };
+            savedRef.current = unsaved();
             return 'detached';
         }
         updateMeta(emptyMeta());
         audioFilePathRef.current = null;
-        pendingAudioFileRef.current = null;
-        pcmAudioBlobRef.current = null;
         setTranscript([]);
         setSpeakerNames({});
-        savedRef.current = { transcript: transcriptRef.current, names: speakerNamesRef.current };
+        setNotes(EMPTY_NOTES);
+        savedRef.current = { transcript: transcriptRef.current, names: speakerNamesRef.current, notes: notesRef.current };
         return 'reset';
-    }, [clearTimer, updateMeta, setTranscript, setSpeakerNames, transcriptRef, speakerNamesRef]);
+    }, [clearTimer, updateMeta, setTranscript, setSpeakerNames, setNotes, transcriptRef, speakerNamesRef, notesRef]);
 
     // Segments deleted on another device leave the open transcript too (else a save brings them back)
     useEffect(() => onSegmentsDeleted(ids => {
@@ -249,6 +235,14 @@ export function useMeetingSession(showToast: (message: string, type?: 'success' 
     const getMeetingTimestamp = useCallback(() => metaRef.current.timestamp || Date.now(), []);
     const getMeetingId = useCallback(() => metaRef.current.id, []);
 
+    // The app going to the background may be the last chance to save (Android can kill it there)
+    useEffect(() => {
+        const handle = CapApp.addListener('appStateChange', ({ isActive }) => {
+            if (!isActive) void flush();
+        });
+        return () => { handle.then(h => h.remove()).catch(() => { }); };
+    }, [flush]);
+
     // Leaving the screen saves what is pending (not during reprocessing: the previous version stays)
     useEffect(() => () => {
         if (suspendedRef.current === 0 && (timerRef.current || isDirty())) void save();
@@ -260,16 +254,20 @@ export function useMeetingSession(showToast: (message: string, type?: 'success' 
         setTranscript,
         speakerNames,
         setSpeakerNames,
+        notes,
+        setNotes,
+        notesRef,
         meta,
+        metaRef,
+        updateMeta,
+        transcriptRef,
         audioFilePathRef,
-        pcmAudioBlobRef,
         save,
         flush,
         scheduleAutosave,
         suspendAutosave,
         beginNewMeeting,
         openMeeting,
-        attachRecording,
         handleMeetingDeleted,
         getTranscript,
         getMeetingTimestamp,

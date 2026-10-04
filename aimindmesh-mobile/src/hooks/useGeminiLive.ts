@@ -1,10 +1,16 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { factStore } from '../services/memory/facts/factStore';
+import { buildProfile } from '../services/memory/context/memoryContext';
+
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { Personality, SpeechConfig } from '../types';
 import { createBlob, decode, decodeAudioData } from '../utils/audio';
 import { logger } from '../services/logger';
 import { AudioOutput } from 'audio-output-capacitor';
 import { requestMicrophonePermission } from '../utils/permissions';
+
+/** Profile size for the voice session instructions */
+const LIVE_PROFILE_CHARS = 1500;
 //import { Capacitor } from '@capacitor/core';
 
 
@@ -318,7 +324,7 @@ export const useGeminiLive = (personality: Personality, apiKey?: string, speechC
               const text = message.serverContent.outputTranscription.text;
               currentOutputTranscriptionRef.current += text;
               setOutputTranscript(currentOutputTranscriptionRef.current);
-              logger.log('debug', `🤖 AI output: ${text}`);
+              logger.log('debug', `🤖 AI output: ${text?.length ?? 0} chars`);
 
               // CRITICAL: Mute microphone when AI starts speaking to prevent echo/contamination
               if (!isAiSpeakingRef.current && inputGainNodeRef.current) {
@@ -330,7 +336,7 @@ export const useGeminiLive = (personality: Personality, apiKey?: string, speechC
               const text = message.serverContent.inputTranscription.text;
               currentInputTranscriptionRef.current += text;
               setInputTranscript(currentInputTranscriptionRef.current);
-              logger.log('debug', `🎤 User input: ${text}`);
+              logger.log('debug', `🎤 User input: ${text?.length ?? 0} chars`);
             }
 
             if (message.serverContent?.turnComplete) {
@@ -396,8 +402,10 @@ export const useGeminiLive = (personality: Personality, apiKey?: string, speechC
               ? 'Always respond in English.'
               : 'Rispondi sempre in italiano.',
             `You are ${personality.name}. ${personality.systemPrompt}.`,
-            'Your responses will be used in a real-time voice conversation, so keep them very short and conversational.'
-          ].join(' ')
+            'Your responses will be used in a real-time voice conversation, so keep them very short and conversational.',
+            // What the assistant knows about the user, as in the chat (fixed for the session)
+            buildProfile(factStore.isReady() ? factStore.active() : [], LIVE_PROFILE_CHARS).text
+          ].filter(Boolean).join(' ')
         },
       });
       // A failed connection (bad key, no network) rejects here, outside this try: report it

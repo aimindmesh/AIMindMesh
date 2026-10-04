@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useRef } from 'react';
 
 interface ToastProps {
     message: string;
@@ -15,14 +15,19 @@ const Toast: React.FC<ToastProps> = ({
     duration = 3000,
     type = 'success'
 }) => {
+    // Callers pass a new onClose on every render; depending on it would restart the timer at
+    // each re-render (several per second while recording) and the toast would never close.
+    const onCloseRef = useRef(onClose);
+    onCloseRef.current = onClose;
+
     useEffect(() => {
         if (isVisible) {
             const timer = setTimeout(() => {
-                onClose();
+                onCloseRef.current();
             }, duration);
             return () => clearTimeout(timer);
         }
-    }, [isVisible, duration, onClose]);
+    }, [isVisible, message, duration]);
 
     if (!isVisible) return null;
 

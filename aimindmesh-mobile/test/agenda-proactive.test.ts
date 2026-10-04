@@ -16,7 +16,7 @@ vi.mock('../src/services/proactive/ActionExecutor', () => ({
   actionExecutor: { execute: mocks.execute },
   onProactiveAction: vi.fn(() => () => {}),
 }));
-vi.mock('../src/services/proactive/ProactiveNotificationService', () => ({ proactiveNotificationService: { init: vi.fn(async () => {}) } }));
+vi.mock('../src/services/proactive/ProactiveNotificationService', () => ({ proactiveNotificationService: { init: vi.fn(async () => {}), updateSettings: vi.fn(async () => {}) } }));
 vi.mock('../src/services/proactive/ProactivePlugin', () => ({
   default: { updateSettings: mocks.updateSettings, startService: mocks.startService, stopService: mocks.stopService },
 }));

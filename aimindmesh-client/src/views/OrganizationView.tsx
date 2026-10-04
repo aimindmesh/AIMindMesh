@@ -1,6 +1,10 @@
 import { useEffect, useState } from 'react';
 import { useOrganizationStore } from '../store/organizationStore';
 import { organizationApi } from '../services/organizationApi';
+import { IdeaStatusBadge, RepoStatusBadge } from '../components/organization/StatusBadges';
+import { IdeaSources } from '../components/organization/IdeaSources';
+import { BuildSettingsPanel } from '../components/organization/BuildSettingsPanel';
+import { MilestoneProgress, VentureDecisionPanel } from '../components/organization/VentureProgress';
 
 type TabType = 'directives' | 'roles' | 'ideas' | 'repos' | 'audit';
 
@@ -9,7 +13,7 @@ export default function OrganizationView() {
     roles, directives, ideas, auditLogs, repositories, hrProposals, loading, error,
     fetchRoles, fetchDirectives, fetchIdeas, fetchAuditLogs, fetchRepositories, fetchHRProposals,
     createRole, updateRole, archiveRole, createDirective, cancelDirective, discoverIdeas, reviewIdea, approveIdea, deleteIdea, generateDirectivesFromIdea, transitionIdeaToDevelopment,
-    createRepository, bootstrapCiCd, runValidation, forceDevelop, analyzeRecruitment, materializeProposal, updateProposal, deleteProposal,
+    createRepository, bootstrapCiCd, runValidation, forceDevelop, cancelRun, decideVenture, analyzeRecruitment, materializeProposal, updateProposal, deleteProposal,
     discoveryConfig, fetchDiscoveryConfig, updateDiscoveryConfig, triggerDiscovery,
     updateIdea
   } = useOrganizationStore();
@@ -82,13 +86,15 @@ export default function OrganizationView() {
     setDiscoveryTopic('');
   };
 
+  // The council runs in the background: the idea turns `reviewing`, polling brings the verdict
   const handleReviewIdea = async (ideaId: string, feedback?: string) => {
     await reviewIdea(ideaId, feedback);
-    const updated = useOrganizationStore.getState().ideas.find(i => i.id === ideaId);
-    if (updated) {
-      setSelectedIdea(updated);
-    }
   };
+
+  // Keep the open idea in sync with the polled list (status, synthesis)
+  useEffect(() => {
+    setSelectedIdea((current: any) => (current ? ideas.find(i => i.id === current.id) ?? current : current));
+  }, [ideas]);
 
   useEffect(() => {
     if (selectedIdea) {
@@ -360,12 +366,7 @@ export default function OrganizationView() {
                     <div className="flex justify-between items-start">
                       <div>
                         <h3 className="text-sm font-bold text-white mb-1.5">{idea.title}</h3>
-                        <span className={`text-[9px] uppercase font-bold px-2 py-0.5 rounded ${
-                          idea.status === 'approved' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' :
-                          idea.status === 'rejected' ? 'bg-red-500/10 text-red-400 border border-red-500/20' :
-                          idea.status === 'reviewing' ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20 animate-pulse' :
-                          'bg-blue-500/10 text-blue-400 border border-blue-500/20'
-                        }`}>{idea.status}</span>
+                        <IdeaStatusBadge status={idea.status} />
                       </div>
                       <span className="text-lg font-black text-blue-400">{(idea.overallScore * 100).toFixed(0)}%</span>
                     </div>
@@ -506,38 +507,34 @@ export default function OrganizationView() {
                         <a href={repo.gitea_url} target="_blank" rel="noreferrer" className="text-[10px] text-blue-400 underline">{repo.gitea_url}</a>
                       </div>
                       <div className="text-right flex items-center gap-2">
-                        {(() => {
-                          const vs = repo.validation_status;
-                          const lastTrig = repo.agent_last_triggered_at;
-                          const staleMs = 90 * 60 * 1000;
-                          const isStale = lastTrig && (Date.now() - new Date(lastTrig).getTime() > staleMs);
-
-                          if (vs === 'evolving') {
-                            return isStale
-                              ? <span className="inline-block bg-amber-500/10 text-amber-400 text-[10px] px-2 py-0.5 rounded font-bold uppercase border border-amber-500/20" title={`Last triggered: ${lastTrig}`}>⚠ Stalled</span>
-                              : <span className="inline-block bg-blue-500/10 text-blue-400 text-[10px] px-2 py-0.5 rounded font-bold uppercase animate-pulse">⚡ Evolving</span>;
-                          }
-                          if (vs === 'healthy') return <span className="inline-block bg-emerald-500/10 text-emerald-400 text-[10px] px-2 py-0.5 rounded font-bold uppercase border border-emerald-500/20">✓ Built</span>;
-                          if (vs === 'broken') return <span className="inline-block bg-red-500/10 text-red-400 text-[10px] px-2 py-0.5 rounded font-bold uppercase border border-red-500/20">✗ Failed</span>;
-                          if (vs === 'needs_verification') return <span className="inline-block bg-purple-500/10 text-purple-400 text-[10px] px-2 py-0.5 rounded font-bold uppercase border border-purple-500/20">↻ Verifying</span>;
-                          return <span className={`text-[10px] px-2 py-0.5 rounded font-bold uppercase bg-slate-500/10 text-slate-400`}>{vs}</span>;
-                        })()}
+                        <RepoStatusBadge repo={repo} />
                       </div>
 
                     </div>
                     <div className="flex gap-4 text-[10px] text-slate-400">
                       <div>Template: <strong className="text-slate-200">{repo.bootstrap_template}</strong></div>
-                      <div>CI/CD: <strong className="text-slate-200">{repo.ci_cd_enabled ? 'Enabled' : 'Disabled'}</strong></div>
+                      <div>Attempts: <strong className="text-slate-200">{repo.retry_count ?? 0}</strong></div>
                     </div>
+                    {repo.validation_status === 'blocked' && repo.blocked_reason && (
+                      <p className="text-[10px] text-red-300 bg-red-500/5 border border-red-500/10 rounded-lg p-2">⛔ {repo.blocked_reason}</p>
+                    )}
+                    {repo.lastValidation && (
+                      <p className="text-[10px] text-slate-400">Last validation: <span className="text-slate-200">{repo.lastValidation}</span></p>
+                    )}
+                    <MilestoneProgress milestones={repo.milestones} />
                     <div className="flex gap-2 pt-2 border-t border-white/5">
-                      <button onClick={() => forceDevelop(repo.id)} className="flex-1 py-1.5 bg-orange-600/25 border border-orange-500/20 hover:bg-orange-600/45 text-orange-300 rounded-lg text-[10px] font-bold uppercase transition-all" title="Force trigger OpenClaw agent for this repo">Force Develop</button>
+                      {repo.isEvolving ? (
+                        <button onClick={() => cancelRun(repo.id)} className="flex-1 py-1.5 bg-red-600/25 border border-red-500/20 hover:bg-red-600/45 text-red-300 rounded-lg text-[10px] font-bold uppercase transition-all" title="Stop waiting for this run (the repository is then blocked)">Cancel Run</button>
+                      ) : (
+                        <button onClick={() => forceDevelop(repo.id)} className="flex-1 py-1.5 bg-orange-600/25 border border-orange-500/20 hover:bg-orange-600/45 text-orange-300 rounded-lg text-[10px] font-bold uppercase transition-all" title="Start a development run with a fresh attempt budget">{repo.validation_status === 'blocked' ? 'Unblock & Develop' : 'Develop'}</button>
+                      )}
                       <button onClick={() => bootstrapCiCd(repo.id)} className="flex-1 py-1.5 bg-blue-600/25 border border-blue-500/20 hover:bg-blue-600/45 text-blue-300 rounded-lg text-[10px] font-bold uppercase transition-all">Bootstrap CI/CD</button>
-                      <button onClick={() => runValidation(repo.id)} className="flex-1 py-1.5 bg-emerald-600/25 border border-emerald-500/20 hover:bg-emerald-600/45 text-emerald-300 rounded-lg text-[10px] font-bold uppercase transition-all">Run Kasm Validate</button>
+                      <button onClick={() => runValidation(repo.id)} className="flex-1 py-1.5 bg-emerald-600/25 border border-emerald-500/20 hover:bg-emerald-600/45 text-emerald-300 rounded-lg text-[10px] font-bold uppercase transition-all">Validate</button>
                       <button onClick={() => setSelectedRepoForLogs(repo)} className="flex-1 py-1.5 bg-indigo-600/25 border border-indigo-500/20 hover:bg-indigo-600/45 text-indigo-300 rounded-lg text-[10px] font-bold uppercase transition-all">Evolution Logs</button>
                     </div>
                     {repo.created_from_idea_id && (
                       <button 
-                        onClick={() => handleViewDesign(repo.created_from_idea_id)}
+                        onClick={() => handleViewDesign(repo.created_from_idea_id!)}
                         disabled={loadingDesign}
                         className="w-full mt-2 py-1.5 bg-emerald-600/20 hover:bg-emerald-600/40 border border-emerald-500/30 text-emerald-400 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all disabled:opacity-50"
                       >
@@ -548,6 +545,8 @@ export default function OrganizationView() {
                 ))
               )}
             </div>
+            <div className="space-y-4 h-fit">
+            <BuildSettingsPanel />
             <div className="bg-slate-900/20 border border-white/5 p-5 rounded-2xl space-y-4 h-fit">
               <h2 className="text-xs font-bold text-white uppercase tracking-wider">Create Gitea Repository</h2>
               <form onSubmit={(e) => { e.preventDefault(); createRepository(newRepo); setNewRepo({ namespace: 'aimindmesh-labs', repoName: '', description: '', visibility: 'private', bootstrapTemplate: 'node-webapp', enableCiCd: true }); }} className="space-y-3">
@@ -568,6 +567,7 @@ export default function OrganizationView() {
                 </label>
                 <button type="submit" className="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 rounded-xl text-xs uppercase tracking-wider">Create Repo</button>
               </form>
+            </div>
             </div>
           </div>
         )}
@@ -926,18 +926,19 @@ export default function OrganizationView() {
                 </div>
               )}
 
-              {selectedIdea.sourceSignals && selectedIdea.sourceSignals.length > 0 && (
+              <div>
+                <span className="block text-[10px] text-slate-500 uppercase font-bold mb-1.5">Sources</span>
+                <IdeaSources idea={selectedIdea} />
+              </div>
+
+              {selectedIdea.judgeRationale && (
                 <div>
-                  <span className="block text-[10px] text-slate-500 uppercase font-bold mb-1.5">Source Signals</span>
-                  <div className="flex flex-wrap gap-1.5">
-                    {selectedIdea.sourceSignals.map((sig: string, idx: number) => (
-                      <span key={idx} className="px-2 py-1 bg-slate-800 border border-white/5 rounded-lg text-[10px] text-slate-300">
-                        {sig}
-                      </span>
-                    ))}
-                  </div>
+                  <span className="block text-[10px] text-slate-500 uppercase font-bold mb-1.5">Why these scores</span>
+                  <p className="text-[11px] text-slate-300">{selectedIdea.judgeRationale}</p>
                 </div>
               )}
+
+              <VentureDecisionPanel idea={selectedIdea} busy={loading} onDecide={(decision, notes) => decideVenture(selectedIdea.id, decision, notes)} />
 
               <div className="grid grid-cols-2 gap-4 text-[10px] text-slate-400 pt-2 border-t border-white/5">
                 <div>Created: <strong>{new Date(selectedIdea.createdAt || Date.now()).toLocaleString()}</strong></div>
@@ -959,7 +960,7 @@ export default function OrganizationView() {
                 </h2>
                 <p className="text-[10px] text-slate-400 mt-0.5 font-mono flex items-center gap-1.5">
                   <span>Session: develop-{selectedRepoForLogs.repo_name}</span>
-                  {isAgentActive ? (
+                  {isAgentActive || repositories.find(r => r.id === selectedRepoForLogs.id)?.isEvolving ? (
                     <span className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-emerald-500/10 text-emerald-400 text-[8px] font-bold rounded uppercase tracking-wider animate-pulse">
                       <span className="w-1 h-1 bg-emerald-500 rounded-full animate-ping"></span>
                       Working

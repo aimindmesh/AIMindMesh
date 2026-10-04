@@ -1,24 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { registerPlugin } from '@capacitor/core';
-
-interface SystemStats {
-    ram: {
-        total: number;
-        available: number;
-        used: number;
-        threshold: number;
-        lowMemory: boolean;
-        appUsed: number;
-    };
-    cpu: number;
-    gpu: number;
-}
-
-interface SystemMonitorPlugin {
-    getStats(): Promise<SystemStats>;
-}
-
-const SystemMonitorPlugin = registerPlugin<SystemMonitorPlugin>('SystemMonitor');
+import { SystemMonitor as SystemMonitorPlugin, SystemStats } from '../../services/performance/systemMonitorPlugin';
 
 interface SystemMonitorProps {
     frequency: number;

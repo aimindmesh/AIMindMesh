@@ -29,6 +29,16 @@ public class VoskPlugin extends Plugin {
             call.reject("Model path is required");
             return;
         }
+        if (recognizer.isExternalActive()) {
+            // The meeting's model stays: asking for it again is fine, another one is not
+            String current = recognizer.getModelInfo()[0];
+            if (current != null && (current.equals(modelPath) || current.endsWith("/" + modelPath))) {
+                call.resolve();
+            } else {
+                rejectDuringMeeting(call);
+            }
+            return;
+        }
 
         new Thread(() -> {
             try {
@@ -50,6 +60,9 @@ public class VoskPlugin extends Plugin {
 
     @PluginMethod
     public void unloadModel(PluginCall call) {
+        if (rejectDuringMeeting(call)) {
+            return;
+        }
         recognizer.unloadModel();
         call.resolve();
     }
@@ -93,43 +106,55 @@ public class VoskPlugin extends Plugin {
         call.resolve(ret);
     }
 
+    /**
+     * Live recognition from the microphone, or with {@code externalAudio: true} on the audio of
+     * the app's meeting recorder (VoskAudioBridge). While a meeting owns recognition, microphone
+     * sessions and model changes are refused with code MEETING_RECORDING.
+     * Results carry {@code source}: "mic" or "external".
+     */
     @PluginMethod
     public void startRecognition(PluginCall call) {
+        boolean externalAudio = Boolean.TRUE.equals(call.getBoolean("externalAudio", false));
+        if (!externalAudio && rejectDuringMeeting(call)) {
+            return;
+        }
+        String source = externalAudio ? "external" : "mic";
+        VoskRecognizer.OnPartialResultListener onPartial = (text) -> {
+            JSObject ret = new JSObject();
+            ret.put("text", text);
+            ret.put("source", source);
+            notifyListeners("partialResult", ret);
+        };
+        VoskRecognizer.OnFinalResultListener onFinal = (text, speakerVector, startMs, endMs) -> {
+            JSObject ret = new JSObject();
+            ret.put("text", text);
+            ret.put("startMs", startMs);
+            ret.put("endMs", endMs);
+            ret.put("source", source);
+            if (speakerVector != null && speakerVector.length > 0) {
+                try {
+                    org.json.JSONArray spkArray = new org.json.JSONArray();
+                    for (float v : speakerVector) {
+                        spkArray.put(v);
+                    }
+                    ret.put("speakerVector", spkArray);
+                } catch (Exception e) {
+                    android.util.Log.w("VoskPlugin", "Failed to add speaker vector: " + e.getMessage());
+                }
+            }
+            notifyListeners("finalResult", ret);
+        };
         new Thread(() -> {
             try {
-                android.util.Log.i("VoskPlugin", "startRecognition thread started");
-                recognizer.startRecognition(
-                        // On partial result
-                        (text) -> {
-                            JSObject ret = new JSObject();
-                            ret.put("text", text);
-                            notifyListeners("partialResult", ret);
-                        },
-                        // On final result with optional speaker vector
-                        (text, speakerVector, startMs, endMs) -> {
-                            JSObject ret = new JSObject();
-                            ret.put("text", text);
-                            ret.put("startMs", startMs);
-                            ret.put("endMs", endMs);
-                            if (speakerVector != null && speakerVector.length > 0) {
-                                try {
-                                    org.json.JSONArray spkArray = new org.json.JSONArray();
-                                    for (float v : speakerVector) {
-                                        spkArray.put(v);
-                                    }
-                                    ret.put("speakerVector", spkArray);
-                                } catch (Exception e) {
-                                    android.util.Log.w("VoskPlugin", "Failed to add speaker vector: " + e.getMessage());
-                                }
-                            }
-                            notifyListeners("finalResult", ret);
-                        },
-                        // On error
-                        (error) -> {
-                            JSObject ret = new JSObject();
-                            ret.put("message", error);
-                            notifyListeners("error", ret);
-                        });
+                if (externalAudio) {
+                    recognizer.startExternalRecognition(onPartial, onFinal);
+                } else {
+                    recognizer.startRecognition(onPartial, onFinal, (error) -> {
+                        JSObject ret = new JSObject();
+                        ret.put("message", error);
+                        notifyListeners("error", ret);
+                    });
+                }
                 call.resolve();
             } catch (Exception e) {
                 android.util.Log.e("VoskPlugin", "Error starting recognition", e);
@@ -138,10 +163,23 @@ public class VoskPlugin extends Plugin {
         }).start(); // CRITICAL: Start the thread!
     }
 
+    /** Stops microphone recognition, or with {@code externalAudio: true} the meeting's (flushing its last words). */
     @PluginMethod
     public void stopRecognition(PluginCall call) {
-        recognizer.stopRecognition();
+        if (Boolean.TRUE.equals(call.getBoolean("externalAudio", false))) {
+            recognizer.stopExternalRecognition();
+        } else {
+            recognizer.stopRecognition();
+        }
         call.resolve();
+    }
+
+    private boolean rejectDuringMeeting(PluginCall call) {
+        if (!recognizer.isExternalActive()) {
+            return false;
+        }
+        call.reject("A meeting is being recorded: speech recognition is in use", "MEETING_RECORDING");
+        return true;
     }
 
     @PluginMethod

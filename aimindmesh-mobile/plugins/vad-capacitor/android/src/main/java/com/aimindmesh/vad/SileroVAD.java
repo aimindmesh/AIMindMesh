@@ -9,11 +9,8 @@ import ai.onnxruntime.OrtEnvironment;
 import ai.onnxruntime.OrtSession;
 import ai.onnxruntime.TensorInfo;
 
-import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -293,115 +290,109 @@ public class SileroVAD {
         }
     }
 
-    /**
-     * Process an audio file and extract speech segments
-     * 
-     * @param audioPath Path to WAV file (16kHz mono)
-     * @return List of speech segments
-     */
-    public synchronized List<SpeechSegment> processFile(String audioPath) throws IOException {
-        List<SpeechSegment> segments = new ArrayList<>();
-
-        // Reset state for file processing
-        reset();
-
-        // Read WAV file
-        File audioFile = new File(audioPath);
-        float[] samples = readWavFile(audioFile);
-
-        if (samples == null || samples.length == 0) {
-            return segments;
-        }
-
-        // Process in chunks
-        List<Float> probs = new ArrayList<>();
-        int numChunks = samples.length / WINDOW_SIZE;
-
-        for (int i = 0; i < numChunks; i++) {
-            float[] chunk = new float[WINDOW_SIZE];
-            System.arraycopy(samples, i * WINDOW_SIZE, chunk, 0, WINDOW_SIZE);
-
-            try {
-                float prob = runInference(chunk);
-                probs.add(prob);
-            } catch (Exception e) {
-                Log.e(TAG, "Inference error at chunk " + i, e);
-                probs.add(0f);
-            }
-        }
-
-        // Extract segments from probabilities
-        boolean inSegment = false;
-        int segmentStart = 0;
-        int silentCount = 0;
-        int silentThreshold = silenceDurationMs / (WINDOW_SIZE * 1000 / SAMPLE_RATE);
-
-        for (int i = 0; i < probs.size(); i++) {
-            boolean isSpeech = probs.get(i) >= speechThreshold;
-
-            if (isSpeech && !inSegment) {
-                inSegment = true;
-                segmentStart = i;
-                silentCount = 0;
-            } else if (!isSpeech && inSegment) {
-                silentCount++;
-                if (silentCount >= silentThreshold) {
-                    long startMs = (long) segmentStart * WINDOW_SIZE * 1000 / SAMPLE_RATE;
-                    long endMs = (long) (i - silentCount) * WINDOW_SIZE * 1000 / SAMPLE_RATE;
-
-                    if (endMs - startMs >= minSpeechDurationMs) {
-                        SpeechSegment seg = new SpeechSegment();
-                        seg.startMs = startMs;
-                        seg.endMs = endMs;
-                        segments.add(seg);
-                    }
-                    inSegment = false;
-                }
-            } else if (isSpeech && inSegment) {
-                silentCount = 0;
-            }
-        }
-
-        // Handle segment at end of file
-        if (inSegment) {
-            long startMs = (long) segmentStart * WINDOW_SIZE * 1000 / SAMPLE_RATE;
-            long endMs = (long) probs.size() * WINDOW_SIZE * 1000 / SAMPLE_RATE;
-
-            if (endMs - startMs >= minSpeechDurationMs) {
-                SpeechSegment seg = new SpeechSegment();
-                seg.startMs = startMs;
-                seg.endMs = endMs;
-                segments.add(seg);
-            }
-        }
-
-        return segments;
+    /** Speech found in part of a file; {@code openStartMs} >= 0 when speech is still going on at the end. */
+    public static class RangeResult {
+        public final List<SpeechSegment> segments = new ArrayList<>();
+        public long openStartMs = -1;
     }
 
     /**
-     * Read WAV file and return samples as float array
+     * Process an audio file and extract speech segments.
+     * The WAV is streamed window by window, so memory does not grow with the meeting length.
+     *
+     * @param audioPath Path to WAV file (16kHz mono PCM16, 44-byte header)
+     * @return List of speech segments
      */
-    private float[] readWavFile(File file) throws IOException {
-        try (FileInputStream fis = new FileInputStream(file)) {
-            // Skip WAV header (44 bytes for standard PCM WAV)
-            byte[] header = new byte[44];
-            fis.read(header);
+    public synchronized List<SpeechSegment> processFile(String audioPath) throws IOException {
+        // The end of the file closes the last segment
+        return processRange(audioPath, 0, Long.MAX_VALUE).segments;
+    }
 
-            // Read audio data
-            int dataSize = (int) file.length() - 44;
-            byte[] data = new byte[dataSize];
-            fis.read(data);
+    /**
+     * Speech segments between {@code startMs} and {@code endMs} (absolute times), reading only
+     * that part of the file. Works on a WAV that is still being written: the data available is
+     * taken from the file length, not the header. A segment still open at {@code endMs} is
+     * returned up to there and flagged in {@code openStartMs}, so a later call can redo it.
+     */
+    public synchronized RangeResult processRange(String audioPath, long startMs, long endMs) throws IOException {
+        RangeResult result = new RangeResult();
+        List<SpeechSegment> segments = result.segments;
+        reset();
 
-            // Convert to float
-            float[] samples = new float[dataSize / 2];
-            ByteBuffer bb = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN);
+        // As in Silero's reference get_speech_timestamps: speech starts above the threshold and
+        // only ends after silenceDurationMs below (threshold - 0.15).
+        float negThreshold = Math.max(0.01f, speechThreshold - 0.15f);
+        int windowMs = WINDOW_SIZE * 1000 / SAMPLE_RATE;
+        int silentWindowsToEnd = Math.max(1, silenceDurationMs / windowMs);
 
-            for (int i = 0; i < samples.length; i++) {
-                samples[i] = bb.getShort() / 32768.0f;
+        long firstWindow = Math.max(0, startMs) / windowMs;
+        long lastWindow = endMs == Long.MAX_VALUE ? Long.MAX_VALUE : endMs / windowMs;
+        boolean inSegment = false;
+        long segmentStart = 0;
+        long lastSpeechWindow = 0;
+        long window = firstWindow;
+
+        byte[] bytes = new byte[WINDOW_SIZE * 2];
+        float[] chunk = new float[WINDOW_SIZE];
+        try (java.io.InputStream in = new java.io.BufferedInputStream(new FileInputStream(audioPath), 1 << 16)) {
+            long toSkip = 44 + firstWindow * WINDOW_SIZE * 2L;
+            long skipped = 0;
+            while (skipped < toSkip) {
+                long n = in.skip(toSkip - skipped);
+                if (n <= 0) break;
+                skipped += n;
             }
+            while (window < lastWindow && readFully(in, bytes)) {
+                for (int i = 0; i < WINDOW_SIZE; i++) {
+                    short v = (short) ((bytes[2 * i] & 0xff) | (bytes[2 * i + 1] << 8));
+                    chunk[i] = v / 32768.0f;
+                }
+                float prob;
+                try {
+                    prob = runInference(chunk);
+                } catch (Exception e) {
+                    throw new IOException("VAD inference failed at window " + window, e);
+                }
 
-            return samples;
+                if (prob >= speechThreshold) {
+                    if (!inSegment) {
+                        inSegment = true;
+                        segmentStart = window;
+                    }
+                    lastSpeechWindow = window;
+                } else if (inSegment && prob < negThreshold && window - lastSpeechWindow >= silentWindowsToEnd) {
+                    addSegment(segments, segmentStart, lastSpeechWindow + 1, windowMs);
+                    inSegment = false;
+                }
+                window++;
+            }
         }
+        if (inSegment) {
+            result.openStartMs = segmentStart * windowMs;
+            addSegment(segments, segmentStart, lastSpeechWindow + 1, windowMs);
+        }
+        return result;
+    }
+
+    private void addSegment(List<SpeechSegment> segments, long startWindow, long endWindow, int windowMs) {
+        long startMs = startWindow * windowMs;
+        long endMs = endWindow * windowMs;
+        if (endMs - startMs >= minSpeechDurationMs) {
+            SpeechSegment seg = new SpeechSegment();
+            seg.startMs = startMs;
+            seg.endMs = endMs;
+            segments.add(seg);
+        }
+    }
+
+    private static boolean readFully(java.io.InputStream in, byte[] buffer) throws IOException {
+        int off = 0;
+        while (off < buffer.length) {
+            int n = in.read(buffer, off, buffer.length - off);
+            if (n < 0) return false;
+            off += n;
+        }
+        return true;
     }
 
     /**

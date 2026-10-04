@@ -25,6 +25,7 @@ if (!rootElement) {
 
 import { PersistenceService } from './services/config/persistenceService';
 import { initSecretStore } from './services/security/secretStore';
+import { migrateSpeakerCalibration } from './services/speaker/speakerCalibration';
 
 console.log('[AI Mind Mesh] Creating React root...');
 const root = createRoot(rootElement);
@@ -39,6 +40,13 @@ const root = createRoot(rootElement);
   }
   // API keys are read synchronously by the first render: load them first (never throws)
   await initSecretStore();
+  // New speaker features (ECAPA as WeSpeaker computes it): old thresholds and the enrolled voice go, once
+  migrateSpeakerCalibration();
+
+  // Test builds only: the on-device eval harness, driven from the PC through DevTools
+  if ((import.meta as unknown as { env: Record<string, string | undefined> }).env.VITE_AIMM_EVAL === '1') {
+    import('./services/eval/deviceEval').then(m => m.installDeviceEval()).catch(e => console.error('[AI Mind Mesh] Eval harness not installed', e));
+  }
 
   console.log('[AI Mind Mesh] React root created. Rendering App...');
   root.render(

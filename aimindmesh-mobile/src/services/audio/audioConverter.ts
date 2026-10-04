@@ -6,10 +6,17 @@ export interface AudioConverterPlugin {
         audioData: string;
         mimeType: string;
     }>;
-    startWriting(options: { sampleRate: number; channels: number }): Promise<void>;
-    writeChunk(options: { data: string }): Promise<void>;
-    finishWriting(): Promise<{ filePath: string; durationMs: number }>;
+    /** Decodes any audio file to a 16 kHz mono WAV in the cache; the caller deletes it when done */
     decodeM4AToWav(options: { filePath: string }): Promise<{ filePath: string }>;
+    /**
+     * Imports an audio file: 16 kHz mono WAV in the cache (deleted by the caller) and, with a
+     * meetingId, the meeting's AAC file meeting-audio/{id}.audio.
+     */
+    decodeAudioFile(options: { filePath: string; meetingId?: string }): Promise<{
+        wavPath: string;
+        m4aPath?: string;
+        durationMs: number;
+    }>;
 }
 
 const AudioConverter = registerPlugin<AudioConverterPlugin>('AudioConverter');

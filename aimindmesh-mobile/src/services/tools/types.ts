@@ -22,6 +22,8 @@ export interface ToolDefinition {
     confirmationMode?: ToolConfirmationMode;
     category: 'agenda' | 'calendar' | 'todo' | 'notification' | 'memory' | 'files' | 'system' | 'web' | 'media' | 'app' | 'communication' | 'device';
     handler?: (params: any) => Promise<string | any>;
+    /** Offered to the model only while this returns true (e.g. a server feature that is off) */
+    isAvailable?: () => boolean;
 }
 
 export interface ToolResult {
@@ -30,6 +32,8 @@ export interface ToolResult {
     error?: string;
     data?: any;
     message: string; // Made required
+    /** Web pages the result comes from, shown as sources under the answer */
+    sources?: { title: string; uri: string }[];
 }
 
 export interface ToolCall {
@@ -42,9 +46,7 @@ export interface ToolExecutorContext {
     llmConfig: any;
     userContext?: any;
     todos: any[];
-    memories: any[];
     addTodo: (text: string) => void;
     completeTodo: (id: string) => void;
-    addMemory: (content: string, category?: string) => void;
     confirmationMode: ToolConfirmationMode;
 }

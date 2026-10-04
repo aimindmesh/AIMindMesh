@@ -43,15 +43,51 @@ public class WhisperContext {
     private boolean busy = false;
     private boolean releasePending = false;
 
+    /** False when the CPU lacks the ARMv8.2 features the library is compiled for, or loading failed. */
+    private static final boolean nativeAvailable;
+
     // Static block to load native library
     static {
-        try {
-            // whisper and ggml are linked statically into this library (no libwhisper.so)
-            System.loadLibrary("whisper-capacitor");
-            Log.i(TAG, "Whisper native library loaded");
-        } catch (UnsatisfiedLinkError e) {
-            Log.e(TAG, "Failed to load whisper native library. " +
-                    "Make sure libwhisper-capacitor.so is packaged for this ABI", e);
+        boolean loaded = false;
+        if (!cpuSupportsArmV82()) {
+            Log.e(TAG, "This CPU lacks ARMv8.2 dotprod/fp16: Whisper is not available on this device");
+        } else {
+            try {
+                // whisper and ggml are linked statically into this library (no libwhisper.so)
+                System.loadLibrary("whisper-capacitor");
+                Log.i(TAG, "Whisper native library loaded");
+                loaded = true;
+            } catch (UnsatisfiedLinkError e) {
+                Log.e(TAG, "Failed to load whisper native library. " +
+                        "Make sure libwhisper-capacitor.so is packaged for this ABI", e);
+            }
+        }
+        nativeAvailable = loaded;
+    }
+
+    /** whisper.cpp is built for armv8.2-a+dotprod+fp16; running it elsewhere would crash with SIGILL. */
+    private static boolean cpuSupportsArmV82() {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader("/proc/cpuinfo"))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (line.startsWith("Features")) {
+                    return line.contains(" asimddp") && line.contains(" fphp") && line.contains(" asimdhp");
+                }
+            }
+        } catch (java.io.IOException e) {
+            Log.w(TAG, "Cannot read /proc/cpuinfo", e);
+        }
+        return false;
+    }
+
+    public static boolean isNativeAvailable() {
+        return nativeAvailable;
+    }
+
+    /** Asks a running transcription to stop as soon as possible (it then returns no text). */
+    public static void abort() {
+        if (nativeAvailable) {
+            nativeAbort();
         }
     }
 
@@ -66,6 +102,9 @@ public class WhisperContext {
      * @return true if successful
      */
     public boolean loadModel(String modelPath) {
+        if (!nativeAvailable) {
+            return false;
+        }
         synchronized (lock) {
             if (busy || releasePending) {
                 // Each load uses a fresh WhisperContext; reusing one mid-inference is a bug
@@ -187,6 +226,26 @@ public class WhisperContext {
             int speechPadMs,
             boolean conditionOnPreviousText,
             boolean wordTimestamps) {
+        return transcribeAudioOptimized(samples, language, nThreads, temperature, beamSize, bestOf,
+                initialPrompt, vadFilter, minSilenceDurationMs, speechPadMs, conditionOnPreviousText,
+                wordTimestamps, 0);
+    }
+
+    /** As above, with the encoder window in frames (1500 = 30 s; 0 = full window). */
+    public TranscriptResult transcribeAudioOptimized(
+            float[] samples,
+            String language,
+            int nThreads,
+            float temperature,
+            int beamSize,
+            int bestOf,
+            String initialPrompt,
+            boolean vadFilter,
+            int minSilenceDurationMs,
+            int speechPadMs,
+            boolean conditionOnPreviousText,
+            boolean wordTimestamps,
+            int audioCtx) {
         long ctx = beginCall();
         String resultJson;
         try {
@@ -204,7 +263,8 @@ public class WhisperContext {
                 minSilenceDurationMs,
                 speechPadMs,
                 conditionOnPreviousText,
-                wordTimestamps);
+                wordTimestamps,
+                audioCtx);
         } finally {
             endCall();
         }
@@ -245,6 +305,7 @@ public class WhisperContext {
             // indexOf-based parser cut the transcript at.
             JSONObject root = new JSONObject(json);
             result.text = root.optString("text", "");
+            result.language = root.optString("language", "");
 
             JSONArray segments = root.optJSONArray("segments");
             if (segments != null) {
@@ -268,6 +329,71 @@ public class WhisperContext {
         return result;
     }
 
+    /**
+     * Transcribes [startMs, endMs) of a 16 kHz mono PCM16 WAV file, reading only that range.
+     * Segment times are returned relative to the start of the file.
+     */
+    public TranscriptResult transcribeFileRange(
+            String wavPath,
+            long startMs,
+            long endMs,
+            String language,
+            int nThreads,
+            int beamSize,
+            String initialPrompt,
+            int audioCtx) throws java.io.IOException {
+        float[] samples = readWavRange(wavPath, startMs, endMs);
+        TranscriptResult result = transcribeAudioOptimized(samples, language, nThreads, 0.0f, beamSize, 1,
+                initialPrompt == null ? "" : initialPrompt, false, 0, 0, false, false, audioCtx);
+        for (Segment seg : result.segments) {
+            seg.startMs += startMs;
+            seg.endMs += startMs;
+        }
+        return result;
+    }
+
+    private static final int SAMPLE_RATE = 16000;
+
+    /**
+     * Reads [startMs, endMs) of a 16 kHz mono PCM16 WAV as floats. The file may still be growing
+     * (a recording in progress): only the samples written so far are read.
+     */
+    static float[] readWavRange(String wavPath, long startMs, long endMs) throws java.io.IOException {
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(wavPath, "r")) {
+            long dataOffset = findDataOffset(raf);
+            long totalSamples = Math.max(0, (raf.length() - dataOffset) / 2);
+            long from = Math.min(totalSamples, Math.max(0, startMs * SAMPLE_RATE / 1000));
+            long to = Math.min(totalSamples, Math.max(from, endMs * SAMPLE_RATE / 1000));
+            int n = (int) (to - from);
+            byte[] bytes = new byte[n * 2];
+            raf.seek(dataOffset + from * 2);
+            raf.readFully(bytes);
+            float[] samples = new float[n];
+            for (int i = 0; i < n; i++) {
+                short v = (short) ((bytes[2 * i] & 0xff) | (bytes[2 * i + 1] << 8));
+                samples[i] = v / 32768.0f;
+            }
+            return samples;
+        }
+    }
+
+    /** Offset of the PCM data: after the "data" chunk header, or 44 for a canonical header. */
+    static long findDataOffset(java.io.RandomAccessFile raf) throws java.io.IOException {
+        if (raf.length() < 44) return 44;
+        byte[] id = new byte[4];
+        long pos = 12; // after "RIFF" <size> "WAVE"
+        while (pos + 8 <= raf.length() && pos < 4096) {
+            raf.seek(pos);
+            raf.readFully(id);
+            int size = Integer.reverseBytes(raf.readInt());
+            if (id[0] == 'd' && id[1] == 'a' && id[2] == 't' && id[3] == 'a') {
+                return pos + 8;
+            }
+            pos += 8 + Math.max(0, size) + (size & 1);
+        }
+        return 44;
+    }
+
     // Native methods - to be implemented in JNI
     private static native long nativeLoadModel(String modelPath);
 
@@ -288,7 +414,8 @@ public class WhisperContext {
             int minSilenceDurationMs,
             int speechPadMs,
             boolean conditionOnPreviousText,
-            boolean wordTimestamps);
+            boolean wordTimestamps,
+            int audioCtx);
 
     /**
      * Native method for streaming transcription with real-time segment callback.
@@ -308,6 +435,8 @@ public class WhisperContext {
             SegmentCallback callback);
 
     private static native void nativeRelease(long ctx);
+
+    private static native void nativeAbort();
 
     /**
      * Callback interface for receiving transcription segments in real-time.
@@ -376,6 +505,8 @@ public class WhisperContext {
      */
     public static class TranscriptResult {
         public String text = "";
+        /** Language whisper detected or was given, e.g. "it" */
+        public String language = "";
         public List<Segment> segments = new ArrayList<>();
     }
 

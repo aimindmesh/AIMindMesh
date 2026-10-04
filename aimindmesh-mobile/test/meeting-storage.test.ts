@@ -126,7 +126,7 @@ describe('saveMeeting', () => {
 
 describe('transcript exports', () => {
   it('gives untimed segments a visible cue instead of a zero-length one', () => {
-    const srt = toSRT(meeting(), { includeSpeakerLabels: true, includeTimestamps: true, includeWordTimestamps: false });
+    const srt = toSRT(meeting(), { includeSpeakerLabels: true, includeTimestamps: true, includeWordTimestamps: false, includeNotes: true });
     expect(srt).toContain('00:00:01,000 --> 00:00:02,500');
     expect(srt).toContain('00:00:00,000 --> 00:00:03,000');
     expect(srt).toContain('Anna: Hello');
@@ -135,10 +135,10 @@ describe('transcript exports', () => {
 
   it('escapes user text in the PDF page and in VTT voices', () => {
     const m = meeting({ speakerNames: { 0: 'A<b>' }, transcript: [{ id: 's', speakerId: 0, text: '<script>x</script> & y', timestamp: 0 }] });
-    const html = toHTMLForPDF(m, { includeSpeakerLabels: true, includeTimestamps: false, includeWordTimestamps: false });
+    const html = toHTMLForPDF(m, { includeSpeakerLabels: true, includeTimestamps: false, includeWordTimestamps: false, includeNotes: true });
     expect(html).toContain('&lt;script&gt;x&lt;/script&gt; &amp; y');
     expect(html).not.toContain('<script>');
-    expect(toVTT(m, { includeSpeakerLabels: true, includeTimestamps: true, includeWordTimestamps: false })).toContain('<v A b >');
+    expect(toVTT(m, { includeSpeakerLabels: true, includeTimestamps: true, includeWordTimestamps: false, includeNotes: true })).toContain('<v A b >');
   });
 
   it('formats the duration in seconds', () => {

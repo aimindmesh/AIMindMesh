@@ -1,5 +1,6 @@
 package com.aimindmesh.mobile.sd
 
+import org.json.JSONObject
 import java.util.Random
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
@@ -15,6 +16,9 @@ enum class PredictionType(val id: String) {
             "v_prediction", "v-prediction", "v" -> V_PREDICTION
             else -> null
         }
+
+        /** "prediction_type" of a package's metadata.json, null when absent or unknown. */
+        fun fromMetadata(json: String): PredictionType? = parse(JSONObject(json).optString("prediction_type", ""))
     }
 }
 

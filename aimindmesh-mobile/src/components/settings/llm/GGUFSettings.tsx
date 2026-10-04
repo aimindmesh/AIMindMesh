@@ -1,4 +1,5 @@
 import React from 'react';
+import ContextWindowSetting from './ContextWindowSetting';
 import { LLMConfig } from '../../../types';
 import { RECOMMENDED_MODELS, ModelDownloadProgress } from '../../../services/model/modelDownloader';
 import { ModelSlot } from '../../../services/llm/nativeLLM';
@@ -111,45 +112,12 @@ const GGUFSettings: React.FC<GGUFSettingsProps> = ({
             </div>
 
             {/* Context Window Config */}
-            <div className="mb-4 pt-4 border-t border-white/5">
-                <div className="flex justify-between items-center mb-2">
-                    <label className="block text-sm font-medium text-text-primary">
-                        Context Window Size (nCtx)
-                    </label>
-                    <span className={`text-xs px-2 py-0.5 rounded border 
-                        ${(llmConfig.nCtx || 2048) > 4096 ? 'bg-amber-500/20 text-amber-600 dark:text-amber-400 border-amber-500/30' : 'bg-input text-text-secondary border-surface/30'}`}>
-                        {llmConfig.nCtx || 2048} tokens
-                    </span>
-                </div>
-                <input
-                    type="range"
-                    min="512"
-                    max="32768"
-                    step="512"
-                    value={llmConfig.nCtx || 2048}
-                    onChange={(e) => {
-                        triggerHaptic();
-                        onLlmConfigSave({ ...llmConfig, nCtx: parseInt(e.target.value) });
-                    }}
-                    className="w-full h-2 bg-surface rounded-lg appearance-none cursor-pointer accent-green-500"
-                />
-                <div className="flex justify-between text-[10px] text-text-tertiary mt-1 px-1">
-                    <span>512</span>
-                    <span>2048 (Default)</span>
-                    <span>8192</span>
-                    <span>32k</span>
-                </div>
-                <p className="text-xs text-text-secondary mt-2">
-                    Higher context allows for longer conversations but requires significantly more RAM.
-                    <br />
-                    <span className="text-yellow-400/80">⚠ You must reload the model for this to take effect.</span>
+            <div className="mb-4">
+                <ContextWindowSetting llmConfig={llmConfig} onLlmConfigSave={onLlmConfigSave}>
                     {llmConfig.useOpenCL && (
-                        <>
-                            <br />
-                            <span className="text-orange-400/80">⚠ OpenCL caps context to max 8192 tokens to prevent allocation crashes.</span>
-                        </>
+                        <p className="text-[10px] text-orange-400/80">⚠ OpenCL caps context to max 8192 tokens to prevent allocation crashes.</p>
                     )}
-                </p>
+                </ContextWindowSetting>
             </div>
 
             {/* Memory Mapping */}

@@ -1,6 +1,6 @@
 FROM node:22-slim
 
-# Install system dependencies for native modules (better-sqlite3) and docker client CLI
+# Install system dependencies for native modules (better-sqlite3), docker client CLI and git (venture workspaces)
 RUN apt-get update && apt-get install -y \
     python3 \
     make \
@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y \
     iproute2 \
     iptables \
     docker.io \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Add node user to docker group (GID 126 matches host docker socket GID)

@@ -144,16 +144,16 @@ export class VoskSpeechToTextService {
             logger.log('info', '[VoskSTT] Setting up event listeners...');
 
             // Setup event listeners
-            handles.push(await Vosk.addListener('partialResult', (result: { text: string }) => {
-                if (result.text && isCurrent()) {
-                    logger.log('info', `[VoskSTT] Partial result: ${result.text}`);
+            // Results of a meeting recording (source 'external') are not this session's
+            handles.push(await Vosk.addListener('partialResult', (result: { text: string; source?: string }) => {
+                if (result.text && result.source !== 'external' && isCurrent()) {
                     onUpdate((accumulated + ' ' + result.text).trim());
                 }
             }));
 
-            handles.push(await Vosk.addListener('finalResult', (result: { text: string }) => {
-                if (result.text && isCurrent()) {
-                    logger.log('info', `[VoskSTT] Final result: ${result.text}`);
+            handles.push(await Vosk.addListener('finalResult', (result: { text: string; source?: string }) => {
+                if (result.text && result.source !== 'external' && isCurrent()) {
+                    logger.log('info', `[VoskSTT] Final result: ${result.text.length} chars`);
                     accumulated = (accumulated + ' ' + result.text).trim();
                     onUpdate(accumulated);
                 }

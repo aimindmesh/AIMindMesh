@@ -43,7 +43,7 @@ Output your response strictly as a JSON object containing the following keys (do
 }
 Ensure the suggested role is highly detailed, professional, and has a very rich and robust suggestedPrompt. Output valid JSON only.`;
 
-    const responseText = await InferenceRouter.complete(prompt, 'AGENTIC_TASK', {
+    const responseText = await InferenceRouter.complete(prompt, 'ORGANIZATION_DESIGN', {
       taskName: 'Analyze organization recruitment needs'
     });
 

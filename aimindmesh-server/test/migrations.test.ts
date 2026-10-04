@@ -19,6 +19,7 @@ describe('schema migrations', () => {
     expect(getSchemaVersion(db)).toBe(LATEST_SCHEMA_VERSION);
     expect(columns(db, 'direct_chats')).toEqual(expect.arrayContaining(['conversation_id', 'device_id', 'received_at']));
     expect(columns(db, 'ingestion_jobs')).toEqual(expect.arrayContaining(['created_at', 'updated_at', 'content_hash']));
+    expect(columns(db, 'meetings')).toEqual(expect.arrayContaining(['title', 'bookmarks_json', 'analysis_json', 'questions_json']));
     expect(indexes(db)).toEqual(expect.arrayContaining([
       'idx_candidates_source_title', 'idx_system_logs_timestamp', 'idx_system_logs_module_ts', 'idx_direct_chats_received_at',
     ]));
@@ -47,6 +48,42 @@ describe('schema migrations', () => {
     expect(db.prepare(`SELECT COUNT(*) AS c FROM nodes WHERE id = 'server_local'`).get()).toEqual({ c: 0 });
     expect(indexes(db)).not.toContain('idx_candidates_source_title');
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('duplicate evolution candidate'));
+  });
+
+  it('v7 parks looping venture repos and switches autonomous discovery off', () => {
+    const db = new Database(':memory:');
+    runMigrations(db, MIGRATIONS.filter(m => m.version < 7));
+    db.prepare(`INSERT INTO organization_discovery_config (id, enabled, updated_at) VALUES ('singleton', 1, 'now')`).run();
+    const repo = db.prepare(`INSERT INTO organization_repositories (id, repo_name, namespace, gitea_url, bootstrap_template, validation_status, created_at) VALUES (?, ?, 'labs', 'u', 'node-webapp', ?, 'now')`);
+    repo.run('r1', 'looping', 'cooldown');
+    repo.run('r2', 'built', 'healthy');
+    repo.run('r3', 'fresh', 'pending');
+
+    runMigrations(db);
+
+    expect(db.prepare(`SELECT enabled FROM organization_discovery_config`).get()).toEqual({ enabled: 0 });
+    const status = db.prepare(`SELECT validation_status AS s, blocked_reason AS r FROM organization_repositories WHERE id = ?`);
+    expect(status.get('r1')).toEqual({ s: 'blocked', r: 'paused by upgrade' });
+    expect(status.get('r3')).toEqual({ s: 'blocked', r: 'paused by upgrade' });
+    expect(status.get('r2')).toEqual({ s: 'healthy', r: null });
+    expect(columns(db, 'organization_repositories')).toEqual(expect.arrayContaining(['active_run_id']));
+    expect(columns(db, 'evolution_proposals')).toEqual(expect.arrayContaining(['iteration_count', 'last_feedback_at']));
+  });
+
+  it('v8 scopes council directives to their idea', () => {
+    const db = new Database(':memory:');
+    runMigrations(db, MIGRATIONS.filter(m => m.version < 8));
+    const directive = db.prepare(`INSERT INTO organization_directives (id, title, description, goal_type, constraints, priority, created_by, created_at, updated_at)
+      VALUES (?, 't', 'd', 'build', '{}', 50, ?, 'now', 'now')`);
+    directive.run('d1', 'system:council-debate:idea-42');
+    directive.run('d2', 'director');
+
+    runMigrations(db);
+
+    const ideaOf = db.prepare(`SELECT idea_id AS i FROM organization_directives WHERE id = ?`);
+    expect(ideaOf.get('d1')).toEqual({ i: 'idea-42' });
+    expect(ideaOf.get('d2')).toEqual({ i: null });
+    expect(columns(db, 'organization_ideas')).toEqual(expect.arrayContaining(['sources_json']));
   });
 
   it('leaves the version untouched when a migration fails', () => {

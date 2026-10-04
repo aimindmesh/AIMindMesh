@@ -5,8 +5,8 @@ import db from '../../db/sqlite';
 import { VentureDiscoveryService } from './VentureDiscoveryService';
 import { SQLiteDirectiveRepository } from './DirectiveService';
 import { OrganizationAuditService } from './OrganizationAuditService';
-import * as FCMDispatcher from '../FCMDispatcher';
-import { NotificationService } from '../NotificationService';
+import { notifyOwner } from './venture/notify';
+import { saveDiscovered } from './venture/IdeaStore';
 
 export interface DiscoveryConfig {
   enabled: boolean;
@@ -67,14 +67,15 @@ export class AutonomousVentureEngine {
   private static ensureConfigRow(): void {
     const row = db.prepare('SELECT id FROM organization_discovery_config WHERE id = ?').get('singleton');
     if (!row) {
-      const orgCfg = (config as any).organization?.autonomousDiscovery;
+      // Off unless config.json explicitly opts in: discovery feeds the whole venture pipeline
+      const orgCfg = config.organization?.autonomousDiscovery;
       db.prepare(`
         INSERT INTO organization_discovery_config
           (id, enabled, cron_expression, max_topics_per_cycle, min_score_threshold,
            auto_council, min_auto_council_score, last_run_at, updated_at)
         VALUES ('singleton', ?, ?, ?, ?, ?, ?, NULL, ?)
       `).run(
-        orgCfg?.enabled !== false ? 1 : 0,
+        orgCfg?.enabled === true ? 1 : 0,
         orgCfg?.cronExpression || '0 */12 * * *',
         orgCfg?.maxTopicsPerCycle || 3,
         orgCfg?.minScoreThreshold || 0.55,
@@ -158,9 +159,9 @@ export class AutonomousVentureEngine {
     try {
       Logger.info('AutonomousVentureEngine', `Starting ${manual ? 'manual' : 'scheduled'} discovery cycle`);
 
-      // 1. Extract topics from active directives
+      // 1. Topics: organization-wide directives only (those derived from an idea guide its build, not discovery)
       const directiveRepo = new SQLiteDirectiveRepository();
-      const directives = await directiveRepo.findActive();
+      const directives = await directiveRepo.findActiveGlobal();
       let topics: string[] = directives.map(d => `${d.title}: ${d.description}`.substring(0, 200));
 
       // 2. Fallback: use recent insights if directives are insufficient
@@ -184,66 +185,25 @@ export class AutonomousVentureEngine {
 
       Logger.info('AutonomousVentureEngine', `Processing ${topics.length} topics`);
 
-      // 4. Pre-load existing idea titles for dedup
-      const existingTitles = new Set(
-        (db.prepare('SELECT title FROM organization_ideas').all() as Array<{ title: string }>)
-          .map(r => r.title.toLowerCase().trim())
-      );
-
       const discovery = new VentureDiscoveryService();
       const auditService = new OrganizationAuditService();
 
       for (const topic of topics) {
         try {
-          const ideas = await discovery.discoverIdeas(topic);
+          // 4-6. Generate, drop duplicates and low scores, persist
+          const { saved, skipped } = saveDiscovered(await discovery.discoverIdeas(topic), cfg.minScoreThreshold);
+          for (const s of skipped) Logger.debug('AutonomousVentureEngine', `Skipped idea (${s.reason}): ${s.title}`);
 
-          for (const idea of ideas) {
-            const normalizedTitle = idea.title.toLowerCase().trim();
-            if (existingTitles.has(normalizedTitle)) {
-              Logger.debug('AutonomousVentureEngine', `Skipping duplicate idea: ${idea.title}`);
-              continue;
-            }
-
-            // 5. Filter by score threshold
-            if (idea.overallScore < cfg.minScoreThreshold) {
-              Logger.debug('AutonomousVentureEngine', `Skipping low-score idea (${idea.overallScore.toFixed(2)}): ${idea.title}`);
-              continue;
-            }
-
-            // 6. Persist idea
-            db.prepare(`
-              INSERT INTO organization_ideas
-                (id, title, problem_statement, summary, source_signals,
-                 strategic_score, feasibility_score, novelty_score, overall_score,
-                 status, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `).run(
-              idea.id,
-              idea.title,
-              idea.problemStatement,
-              idea.summary,
-              JSON.stringify(idea.sourceSignals),
-              idea.strategicScore,
-              idea.feasibilityScore,
-              idea.noveltyScore,
-              idea.overallScore,
-              'proposed',
-              idea.createdAt,
-              idea.updatedAt
-            );
-
-            existingTitles.add(normalizedTitle);
+          for (const idea of saved) {
             ideasFound++;
-
             await auditService.log({
               eventType: 'idea:autonomous-discover',
               actorType: 'system',
               actorId: 'autonomous-venture-engine',
               targetType: 'idea',
               targetId: idea.id,
-              payload: { title: idea.title, overallScore: idea.overallScore, topic }
+              payload: { title: idea.title, overallScore: idea.overallScore, topic, sources: idea.sources.length }
             });
-
             Logger.info('AutonomousVentureEngine', `Saved new idea: "${idea.title}" (score: ${idea.overallScore.toFixed(2)})`);
 
             // 7. Auto Council if enabled and score is high enough
@@ -264,13 +224,10 @@ export class AutonomousVentureEngine {
 
       // 9. Notify if ideas were found
       if (ideasFound > 0) {
-        NotificationService.broadcast('new_ideas_discovered', { count: ideasFound });
-
-        await FCMDispatcher.sendToDevice(config.fcm?.testToken || '', {
+        await notifyOwner('new_ideas_discovered', { count: ideasFound }, {
           title: '💡 New venture ideas discovered',
           body: `${ideasFound} new project idea${ideasFound > 1 ? 's' : ''} found autonomously`,
-          data: { type: 'VENTURE_IDEAS', screen: 'OrganizationView', tab: 'ideas' }
-        }).catch(e => Logger.warn('AutonomousVentureEngine', `FCM notify failed: ${e.message}`));
+        });
       }
 
       Logger.info('AutonomousVentureEngine', `Cycle completed — ${ideasFound} new ideas found`);
@@ -286,80 +243,39 @@ export class AutonomousVentureEngine {
 
   private static async triggerAutoCouncil(ideaId: string, ideaTitle: string): Promise<void> {
     Logger.info('AutonomousVentureEngine', `Triggering auto council for idea: ${ideaTitle}`);
-    const { SQLiteOrganizationRoleRepository, OrganizationRegistry } = await import('./OrganizationRegistry');
-    const { RolePolicyService } = await import('./RolePolicyService');
-    const { CouncilOrchestrator } = await import('./CouncilOrchestrator');
+    const { transitionIdea, runCouncilReview, approveForBuild } = await import('./venture/IdeaLifecycle');
+    if (!transitionIdea(ideaId, ['proposed'], 'reviewing')) return;
+    const consensus = await runCouncilReview(ideaId, 'proposed');
 
-    const roleRepo = new SQLiteOrganizationRoleRepository();
-    const registry = new OrganizationRegistry(roleRepo);
-    const roles = await registry.listRoles();
-    const activeRoles = roles.filter(r => r.status === 'active');
-
-    const ideaRow = db.prepare('SELECT * FROM organization_ideas WHERE id = ?').get(ideaId) as any;
-    if (!ideaRow) return;
-
-    const idea = {
-      id: ideaRow.id,
-      title: ideaRow.title,
-      problemStatement: ideaRow.problem_statement,
-      summary: ideaRow.summary,
-      sourceSignals: JSON.parse(ideaRow.source_signals || '[]'),
-      strategicScore: ideaRow.strategic_score,
-      feasibilityScore: ideaRow.feasibility_score,
-      noveltyScore: ideaRow.novelty_score,
-      overallScore: ideaRow.overall_score,
-      status: ideaRow.status as any,
-      createdAt: ideaRow.created_at,
-      updatedAt: ideaRow.updated_at,
-    };
-
-    const policyService = new RolePolicyService();
-    const orchestrator = new CouncilOrchestrator(policyService);
-    const result = await orchestrator.reviewIdea('idea-review', idea, activeRoles);
-
-    const newStatus = result.consensus ? 'approved' : 'rejected';
-    db.prepare("UPDATE organization_ideas SET status = ?, analysis_synthesis = ?, updated_at = ? WHERE id = ?")
-      .run(newStatus, result.synthesis, new Date().toISOString(), ideaId);
-
-    // Characterization leads to Gitea repo creation and a development agent run:
-    // without explicit opt-in (organization.allowAutoRepoCreation) a human must confirm via /ideas/:id/approve
-    const autoRepoAllowed = (config as any).organization?.allowAutoRepoCreation === true;
+    // A build (repository + development agent) needs a human unless explicitly allowed
+    const autoRepoAllowed = config.organization?.allowAutoRepoCreation === true;
     const auditService = new OrganizationAuditService();
-
-    if (result.consensus && autoRepoAllowed) {
-      try {
-        const { DesignOrchestrator } = await import('./DesignOrchestrator');
-        await DesignOrchestrator.characterizeIdea(ideaId);
-      } catch (orr: any) {
-        Logger.error('AutonomousVentureEngine', `Auto-characterization failed on auto-council approval: ${orr.message}`);
-      }
-    } else if (result.consensus) {
-      await auditService.log({
-        eventType: 'idea:auto-council-awaiting-human',
-        actorType: 'system',
-        actorId: 'autonomous-venture-engine',
-        targetType: 'idea',
-        targetId: ideaId,
-        payload: { title: ideaTitle }
-      });
-      NotificationService.broadcast('idea_awaiting_approval', { ideaId, title: ideaTitle });
-      await FCMDispatcher.sendToDevice(config.fcm?.testToken || '', {
-        title: '🗳️ Idea approved by the AI council',
-        body: `"${ideaTitle}" is waiting for your confirmation before a repository is created`,
-        data: { type: 'VENTURE_IDEAS', screen: 'OrganizationView', tab: 'ideas' }
-      }).catch(e => Logger.warn('AutonomousVentureEngine', `FCM notify failed: ${e.message}`));
-      Logger.info('AutonomousVentureEngine', `Idea "${ideaTitle}" approved by council, awaiting human confirmation`);
-    }
-
     await auditService.log({
       eventType: 'idea:auto-council',
       actorType: 'system',
       actorId: 'autonomous-venture-engine',
       targetType: 'idea',
       targetId: ideaId,
-      payload: { consensus: result.consensus, synthesis: result.synthesis.substring(0, 500) }
+      payload: { consensus, autoRepoAllowed }
     });
+    if (!consensus) return;
 
-    Logger.info('AutonomousVentureEngine', `Auto council for "${ideaTitle}": ${newStatus}`);
+    if (autoRepoAllowed) {
+      await approveForBuild(ideaId, 'system', { wait: true });
+      return;
+    }
+    await auditService.log({
+      eventType: 'idea:auto-council-awaiting-human',
+      actorType: 'system',
+      actorId: 'autonomous-venture-engine',
+      targetType: 'idea',
+      targetId: ideaId,
+      payload: { title: ideaTitle }
+    });
+    await notifyOwner('idea_awaiting_approval', { ideaId, title: ideaTitle }, {
+      title: '🗳️ Idea approved by the AI council',
+      body: `"${ideaTitle}" is waiting for your confirmation before a repository is created`,
+    });
+    Logger.info('AutonomousVentureEngine', `Idea "${ideaTitle}" approved by council, awaiting human confirmation`);
   }
 }

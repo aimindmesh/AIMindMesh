@@ -53,4 +53,18 @@ class DeliveryClientTest {
         assertEquals(emptyList<PendingInsight>(), DeliveryClient.parsePending("""{"count":0}"""))
         assertEquals(emptyList<PendingInsight>(), DeliveryClient.parsePending("""{"items":[],"count":0}"""))
     }
+
+    @Test
+    fun neverPollsInQuietHours() {
+        assertFalse(DeliveryClient.shouldPoll(ready, 100, notificationsAllowed = true, quietHours = true))
+    }
+
+    @Test
+    fun sumsUpABurstOfInsights() {
+        val items = (1..5).map { PendingInsight("p$it", "i$it", "insight $it") }
+        val (shown, more) = DeliveryClient.planNotifications(items)
+        assertEquals(listOf("p1", "p2", "p3"), shown.map { it.id })
+        assertEquals(2, more)
+        assertEquals(0, DeliveryClient.planNotifications(items.take(2)).second)
+    }
 }

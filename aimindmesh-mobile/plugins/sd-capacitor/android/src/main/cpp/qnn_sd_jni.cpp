@@ -28,9 +28,10 @@ static jbyteArray toByteArray(JNIEnv* env, const std::vector<uint8_t>& v) {
 extern "C" {
 
 JNIEXPORT jboolean JNICALL
-Java_com_aimindmesh_mobile_sd_QnnNativeBridge_nativeInit(JNIEnv* env, jobject, jstring modelDir, jstring nativeLibDir) {
+Java_com_aimindmesh_mobile_sd_QnnNativeBridge_nativeInit(JNIEnv* env, jobject, jstring modelDir, jstring nativeLibDir,
+                                                       jstring htpArch) {
     if (!modelDir) return JNI_FALSE;
-    return g_engine.init(toString(env, modelDir), toString(env, nativeLibDir)) ? JNI_TRUE : JNI_FALSE;
+    return g_engine.init(toString(env, modelDir), toString(env, nativeLibDir), toString(env, htpArch)) ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL

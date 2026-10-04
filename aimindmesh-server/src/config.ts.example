@@ -98,6 +98,20 @@ export interface ServerConfig {
     maxFeedbackIterations?: number;     // default: 5
     feedbackAutoTrigger?: boolean;      // default: true
     giteaWebhookSecret?: string;
+    /** Where candidates come from: runtime evidence on by default, LLM insights (knowledge graph, wiki) off. */
+    sources?: {
+      runtimeErrors?: boolean;
+      inferenceFailures?: boolean;
+      insights?: boolean;
+    };
+    /** Error groups become candidates after minOccurrences over minDays distinct days (last 7 days). */
+    signals?: {
+      minOccurrences?: number;
+      minDays?: number;
+      maxCandidatesPerCycle?: number;
+    };
+    /** Run `vitest related` on the patched files after the type check (default: true). */
+    runRelatedTests?: boolean;
   };
   kasm?: {
     enabled: boolean;
@@ -124,6 +138,21 @@ export interface ServerConfig {
     defaultRepoVisibility: 'public' | 'private' | 'internal';
     searxngBaseUrl: string;
     kasmValidationWorkspaceId: string;
+    /** AI council of idea reviews: voting roles (in order of preference), size and rounds. */
+    council?: {
+      roles?: string[];
+      maxParticipants?: number;
+      rounds?: number;
+    };
+    /** Seeds the discovery row on first boot only: afterwards the DB row (Organization panel) decides. */
+    autonomousDiscovery?: {
+      enabled?: boolean;
+      cronExpression?: string;
+      maxTopicsPerCycle?: number;
+      minScoreThreshold?: number;
+      autoCouncil?: boolean;
+      minAutoCouncilScore?: number;
+    };
   };
 }
 

@@ -1,0 +1,7 @@
+[
+  { "id": "hygiene-joke", "category": "hygiene", "smoke": true, "user": "Raccontami una barzelletta breve", "expect": { "lang": "it" } },
+  { "id": "hygiene-explain", "category": "hygiene", "user": "Spiegami in breve cos'è la fotosintesi", "expect": { "lang": "it", "anyOf": ["luce", "clorofill", "piant"] } },
+  { "id": "hygiene-plan", "category": "hygiene", "user": "Aiutami a organizzare una giornata di studio per un esame", "expect": { "lang": "it" } },
+  { "id": "hygiene-english-user", "category": "hygiene", "user": "Tell me a short fun fact about octopuses", "expect": { "lang": "en" } },
+  { "id": "hygiene-short-answer", "category": "hygiene", "user": "Qual è la capitale del Portogallo?", "expect": { "mustInclude": ["Lisbona"], "lang": "it" } }
+]

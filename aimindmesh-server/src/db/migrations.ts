@@ -135,6 +135,95 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 5,
+    name: 'node_settings: upper-case device ids, quiet hours and time zone per device',
+    up: db => {
+      addColumnIfMissing(db, 'node_settings', 'quiet_enabled', 'INTEGER');
+      addColumnIfMissing(db, 'node_settings', 'quiet_start', 'TEXT');
+      addColumnIfMissing(db, 'node_settings', 'quiet_end', 'TEXT');
+      addColumnIfMissing(db, 'node_settings', 'timezone', 'TEXT');
+      // Rows were written from the raw x-device-id header (lower case) while nodes are upper case:
+      // the setting the user chose moves to the id the scheduler looks up
+      db.exec(`
+        INSERT OR REPLACE INTO node_settings (node_id, delivery_mode, quiet_enabled, quiet_start, quiet_end, timezone)
+          SELECT UPPER(node_id), delivery_mode, quiet_enabled, quiet_start, quiet_end, timezone
+          FROM node_settings WHERE node_id != UPPER(node_id);
+        DELETE FROM node_settings WHERE node_id != UPPER(node_id);
+      `);
+    },
+  },
+  {
+    version: 6,
+    name: 'meetings: notes synced between devices (title, bookmarks, AI analysis, questions)',
+    up: db => {
+      addColumnIfMissing(db, 'meetings', 'title', 'TEXT');
+      addColumnIfMissing(db, 'meetings', 'bookmarks_json', 'TEXT');
+      addColumnIfMissing(db, 'meetings', 'analysis_json', 'TEXT');
+      addColumnIfMissing(db, 'meetings', 'questions_json', 'TEXT');
+    },
+  },
+  {
+    version: 7,
+    name: 'venture factory kill switch: run lock and blocked reason, discovery off, PR feedback iteration columns',
+    up: db => {
+      addColumnIfMissing(db, 'organization_repositories', 'blocked_reason', 'TEXT');
+      addColumnIfMissing(db, 'organization_repositories', 'active_run_id', 'TEXT');
+      // Read and written by FeedbackService since the start, never created: the PR feedback loop failed on them
+      addColumnIfMissing(db, 'evolution_proposals', 'iteration_count', 'INTEGER NOT NULL DEFAULT 0');
+      addColumnIfMissing(db, 'evolution_proposals', 'last_feedback_at', 'INTEGER');
+      // The DB row, not config.json, decides whether discovery runs: switch it off until it is re-enabled by hand
+      db.exec(`UPDATE organization_discovery_config SET enabled = 0`);
+      // Repos the old watchdog would resume forever wait for a human "unblock"
+      db.exec(`
+        UPDATE organization_repositories
+        SET validation_status = 'blocked', blocked_reason = 'paused by upgrade'
+        WHERE validation_status IN ('pending', 'evolving', 'cooldown', 'verifying', 'needs_verification')
+      `);
+    },
+  },
+  {
+    version: 8,
+    name: 'venture factory: directives scoped to their idea, structured idea sources, last validation',
+    up: db => {
+      addColumnIfMissing(db, 'organization_directives', 'idea_id', 'TEXT');
+      addColumnIfMissing(db, 'organization_ideas', 'sources_json', 'TEXT');
+      // Outcome of the last server-side validation (JSON), fed to the next agent run
+      addColumnIfMissing(db, 'organization_repositories', 'last_validation', 'TEXT');
+      // Directives extracted from a council debate were global: they steered discovery and every other venture
+      db.exec(`
+        UPDATE organization_directives SET idea_id = substr(created_by, length('system:council-debate:') + 1)
+        WHERE idea_id IS NULL AND created_by LIKE 'system:council-debate:%';
+        CREATE INDEX IF NOT EXISTS idx_org_directives_idea ON organization_directives(idea_id, status);
+      `);
+    },
+  },
+  {
+    version: 9,
+    name: 'venture funnel: judge rationale and outcome notes, structured spec, milestones',
+    up: db => {
+      addColumnIfMissing(db, 'organization_ideas', 'judge_rationale', 'TEXT');
+      addColumnIfMissing(db, 'organization_ideas', 'outcome_notes', 'TEXT');
+      // Structured specification (features, interface, acceptance criteria, milestones) and the
+      // server-owned acceptance test files generated from it
+      addColumnIfMissing(db, 'organization_product_designs', 'spec_json', 'TEXT');
+      addColumnIfMissing(db, 'organization_product_designs', 'acceptance_json', 'TEXT');
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS organization_venture_milestones (
+          id TEXT PRIMARY KEY,
+          idea_id TEXT NOT NULL,
+          seq INTEGER NOT NULL,
+          title TEXT NOT NULL,
+          criteria_json TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          attempts INTEGER NOT NULL DEFAULT 0,
+          passed_json TEXT,
+          updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_venture_milestones_idea_seq ON organization_venture_milestones(idea_id, seq);
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

@@ -32,11 +32,12 @@ class LoggerService {
     }
   }
 
-  public enable() {
+  /** persist=false: on for this session only (test builds' eval harness), the setting stays */
+  public enable(persist = true) {
     if (!this.isEnabled) {
       this.isEnabled = true;
       try {
-        if (typeof window !== 'undefined' && window.localStorage) {
+        if (persist && typeof window !== 'undefined' && window.localStorage) {
           window.localStorage.setItem('logging-enabled', 'true');
         }
       } catch (e) {

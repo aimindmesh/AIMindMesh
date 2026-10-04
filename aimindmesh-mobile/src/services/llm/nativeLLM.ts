@@ -47,6 +47,10 @@ export interface NativeGenerateOptions {
     maxTokens?: number;
     stop?: string[];
     signal?: AbortSignal;
+    /** Tool declarations (JSON array, OpenAI style) rendered by the model's chat template */
+    tools?: string;
+    /** The chat template's thinking flag (common_chat defaults it to on) */
+    enableThinking?: boolean;
 }
 
 // Model slot types
@@ -57,6 +61,7 @@ interface ModelContext {
     contextId: number;
     modelPath: string;
     multimodalProj?: string;
+    nCtx?: number;
 }
 
 const modelContexts: Map<ModelSlot, ModelContext> = new Map();
@@ -130,6 +135,7 @@ export async function initNativeModel(config: NativeLLMConfig, slot: ModelSlot =
                         contextId: contextId,
                         modelPath: config.modelPath,
                         multimodalProj: config.multimodalProj,
+                        nCtx: config.nCtx,
                     });
 
                     // CRITICAL FIX: Release the lock before returning!
@@ -256,7 +262,8 @@ export async function initNativeModel(config: NativeLLMConfig, slot: ModelSlot =
         modelContexts.set(slot, {
             contextId: contextId,
             modelPath: config.modelPath,
-            multimodalProj: config.multimodalProj
+            multimodalProj: config.multimodalProj,
+            nCtx: config.nCtx,
         });
 
         logger.log('debug', `[NativeLLM] ${slot} model initialized with context ID:`, contextId);
@@ -382,7 +389,9 @@ export async function* generateNativeStream(
                 const formatResult = await LlamaCpp.getFormattedChat({
                     contextId: context.contextId,
                     messages: JSON.stringify(options.messages),
-                    chatTemplate: "" // Empty uses model's default
+                    chatTemplate: "", // Empty uses model's default
+                    tools: options.tools ?? '',
+                    enableThinking: !!options.enableThinking,
                 });
                 if (formatResult && formatResult.prompt) {
                     finalPrompt = formatResult.prompt;
@@ -610,6 +619,7 @@ export function getSlotModelInfo(slot: ModelSlot) {
         contextId: context?.contextId ?? null,
         modelPath: context?.modelPath ?? null,
         multimodalProj: context?.multimodalProj ?? null,
+        nCtx: context?.nCtx,
     };
 }
 

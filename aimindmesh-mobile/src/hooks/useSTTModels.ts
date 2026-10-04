@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { waitForBundledModels } from '../services/model/bundledModels';
 import { triggerHaptic } from '../services/native';
 import { VOSK_MODELS, downloadVoskModel, deleteVoskModel, voskModelExists } from '../services/stt/voskModelDownloader';
 import { WHISPER_MODELS, downloadWhisperModel, deleteWhisperModel, whisperModelExists } from '../services/stt/whisperModelDownloader';
@@ -115,6 +116,10 @@ export const useSTTModels = (
 
     useEffect(() => {
         checkDownloadedModels();
+        // First launch: the models bundled in the APK appear once they are unpacked
+        let cancelled = false;
+        waitForBundledModels().then(() => { if (!cancelled) void checkDownloadedModels(); }).catch(() => { });
+        return () => { cancelled = true; };
     }, [externalVoskModels, externalWhisperModels, externalVADModels, externalVoxtralModels]);
 
     const handleDownloadVoskModel = async (model: typeof VOSK_MODELS[0]) => {

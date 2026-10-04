@@ -12,12 +12,12 @@ import { blobToFloat32Array, cosineSimilarity, float32ToHex } from './embeddingC
 export { blobToFloat32Array };
 
 /**
- * Extracted facts and summaries never age out of retrieval; chat turns (user/model) do,
- * and are pruned after RAW_RETENTION_DAYS.
+ * Summaries never age out of retrieval; chat turns (user/model) do, and are pruned after
+ * RAW_RETENTION_DAYS. Rows of role 'extracted' (facts of older versions) moved to the facts
+ * store: retrieval ignores them.
  */
-const LONG_LIVED_ROLES_SQL = `role IN ('extracted', 'system')`;
+const LONG_LIVED_ROLES_SQL = `role = 'system'`;
 export const RAW_RETENTION_DAYS = 90;
-const SUMMARY_PREFIX = '[MEMORY SUMMARY]';
 
 // Schema with category support. embedding_model: key of the model that produced the vector
 const SCHEMA = `
@@ -187,14 +187,14 @@ export async function saveMemoryToDb(
  * either both happen or neither, even if the caller gives up waiting.
  */
 export async function replaceMemoriesAtomically(
-    row: { id: string; sessionId: string; role: string; content: string; embedding: Float32Array; modelKey: string },
+    row: { id: string; sessionId: string; role: string; content: string; embedding: Float32Array; modelKey: string; timestamp?: number },
     replacedIds: string[]
 ): Promise<void> {
     const database = await getMemoryDatabase();
     const set = [{
         statement: `INSERT INTO memories (id, session_id, timestamp, role, content, embedding, embedding_model)
                     VALUES (?, ?, ?, ?, ?, X'${float32ToHex(row.embedding)}', ?)`,
-        values: [row.id, row.sessionId, Date.now(), row.role, row.content, row.modelKey],
+        values: [row.id, row.sessionId, row.timestamp ?? Date.now(), row.role, row.content, row.modelKey],
     }];
     if (replacedIds.length > 0) {
         set.push({ statement: `DELETE FROM memories WHERE id IN (${replacedIds.map(() => '?').join(',')})`, values: replacedIds });
@@ -263,29 +263,29 @@ export async function getRecentMemories(
 }
 
 /**
- * id, session and embedding (no text) of every memory of `modelKey` that retrieval may use:
- * chat turns of the last `maxAgeDays`, extracted facts and summaries of any age. Read in
+ * id, session, time and embedding (no text) of every memory of `modelKey` that retrieval may
+ * use: chat turns of the last `maxAgeDays`, summaries of any age. Read in
  * pages so a single bridge call never carries thousands of vectors.
  */
 export async function getMemoryEmbeddings(
     maxAgeDays: number,
     modelKey: string,
     pageSize: number = 250
-): Promise<Array<{ id: string; sessionId: string; embedding: Float32Array }>> {
+): Promise<Array<{ id: string; sessionId: string; timestamp: number; embedding: Float32Array }>> {
     const database = await getMemoryDatabase();
     const minTimestamp = Date.now() - (maxAgeDays * 24 * 60 * 60 * 1000);
-    const rows: Array<{ id: string; sessionId: string; embedding: Float32Array }> = [];
+    const rows: Array<{ id: string; sessionId: string; timestamp: number; embedding: Float32Array }> = [];
 
     for (let offset = 0; ; offset += pageSize) {
         const result = await withTimeout(database.query(
-            `SELECT id, session_id, hex(embedding) AS embedding FROM memories
-             WHERE embedding_model = ? AND (timestamp > ? OR ${LONG_LIVED_ROLES_SQL})
+            `SELECT id, session_id, timestamp, hex(embedding) AS embedding FROM memories
+             WHERE embedding_model = ? AND role != 'extracted' AND (timestamp > ? OR ${LONG_LIVED_ROLES_SQL})
              ORDER BY timestamp DESC, id LIMIT ? OFFSET ?`,
             [modelKey, minTimestamp, pageSize, offset]
         ), 'getMemoryEmbeddings');
         const page = result.values || [];
         for (const row of page) {
-            rows.push({ id: row.id, sessionId: row.session_id, embedding: blobToFloat32Array(row.embedding) });
+            rows.push({ id: row.id, sessionId: row.session_id, timestamp: row.timestamp, embedding: blobToFloat32Array(row.embedding) });
         }
         if (page.length < pageSize) return rows;
     }
@@ -346,6 +346,25 @@ export async function pruneOldMemories(maxAgeDays: number = RAW_RETENTION_DAYS):
     }
 }
 
+/** Raw chat turns (user/model rows) stored before conversations were summarized instead */
+export async function countRawMemories(): Promise<number> {
+    const database = await getMemoryDatabase();
+    try {
+        const result = await database.query(`SELECT COUNT(*) as count FROM memories WHERE role IN ('user', 'model')`);
+        return result.values?.[0]?.count || 0;
+    } catch (error) {
+        logger.log('error', 'Failed to count raw memories', error);
+        return 0;
+    }
+}
+
+/** Deletes the raw chat turns, on the user's request (summaries and facts stay) */
+export async function deleteRawMemories(): Promise<number> {
+    const database = await getMemoryDatabase();
+    const result = await database.run(`DELETE FROM memories WHERE role IN ('user', 'model')`);
+    return result.changes?.changes || 0;
+}
+
 /**
  * Get memory count
  */
@@ -377,65 +396,6 @@ export async function updateSemanticMemoryCategory(id: string, category: string)
         logger.log('error', 'Failed to update memory category', error);
         throw error;
     }
-}
-
-/**
- * The most recent `maxRows` memories of one embedding model, with embeddings, oldest first,
- * for clustering. Bounded and paged: consolidation is O(n²) and the table keeps growing.
- */
-export async function getAllSemanticMemoriesWithEmbeddings(modelKey: string, maxRows: number = 500): Promise<Array<{
-    id: string;
-    sessionId: string;
-    timestamp: number;
-    role: string;
-    content: string;
-    embedding: Float32Array;
-    category: string;
-}>> {
-    const database = await getMemoryDatabase();
-    const rows: any[] = [];
-    const pageSize = 125;
-
-    try {
-        while (rows.length < maxRows) {
-            const result = await withTimeout(database.query(
-                `SELECT id, session_id, timestamp, role, content, hex(embedding) AS embedding, category
-                 FROM memories WHERE embedding_model = ?
-                 ORDER BY timestamp DESC, id LIMIT ? OFFSET ?`,
-                [modelKey, Math.min(pageSize, maxRows - rows.length), rows.length]
-            ), 'getAllSemanticMemoriesWithEmbeddings');
-            const page = result.values || [];
-            rows.push(...page);
-            if (page.length < pageSize) break;
-        }
-
-        return rows.reverse().map((row: any) => ({ // Oldest first
-            id: row.id,
-            sessionId: row.session_id,
-            timestamp: row.timestamp,
-            role: row.role,
-            content: row.content,
-            embedding: blobToFloat32Array(row.embedding),
-            category: row.category || 'semantic',
-        }));
-    } catch (error) {
-        logger.log('error', 'Failed to get all semantic memories with embeddings', error);
-        return [];
-    }
-}
-
-/** The oldest memories that are not summaries already: the next ones to compress. */
-export async function getOldestMemoriesForSummary(count: number): Promise<Array<{
-    id: string; timestamp: number; role: string; content: string;
-}>> {
-    const database = await getMemoryDatabase();
-    const result = await withTimeout(database.query(
-        `SELECT id, timestamp, role, content FROM memories
-         WHERE content NOT LIKE '${SUMMARY_PREFIX}%'
-         ORDER BY timestamp ASC, id LIMIT ?`,
-        [count]
-    ), 'getOldestMemoriesForSummary');
-    return (result.values || []).map((row: any) => ({ id: row.id, timestamp: row.timestamp, role: row.role, content: row.content }));
 }
 
 /**
@@ -506,19 +466,19 @@ export async function clearAllSemanticMemories(): Promise<number> {
 
 /**
  * Cleanup function to remove semantically duplicate memories.
- * Call at app startup or periodically to reduce DB bloat.
- * Only vectors of the same embedding model are compared (others are not comparable).
- * @param similarityThreshold Similarity above which to consider duplicates (default 0.90)
+ * Only rows of the same role and embedding model are compared: a fact is never dropped
+ * because a chat turn says the same thing (the turn is pruned later, the fact would be lost).
+ * @param similarityThreshold Similarity above which to consider duplicates (default 0.95)
  * @returns Number of duplicates removed
  */
-export async function deduplicateExistingMemories(similarityThreshold: number = 0.90): Promise<number> {
+export async function deduplicateExistingMemories(similarityThreshold: number = 0.95): Promise<number> {
     const database = await getMemoryDatabase();
     logger.log('info', `[MemoryDB] Starting deduplication (threshold: ${similarityThreshold})...`);
 
     try {
         // Get recent memories ordered by timestamp DESC (newer first)
         const result = await database.query(
-            `SELECT id, hex(embedding) AS embedding, embedding_model FROM memories
+            `SELECT id, role, hex(embedding) AS embedding, embedding_model FROM memories
              WHERE embedding_model IS NOT NULL ORDER BY timestamp DESC LIMIT 200`
         );
 
@@ -529,6 +489,7 @@ export async function deduplicateExistingMemories(similarityThreshold: number = 
 
         const memories = result.values.map((row: any) => ({
             id: row.id,
+            role: row.role,
             model: row.embedding_model,
             embedding: blobToFloat32Array(row.embedding),
         }));
@@ -541,7 +502,7 @@ export async function deduplicateExistingMemories(similarityThreshold: number = 
             if (seen.has(i)) continue;
 
             for (let j = i + 1; j < memories.length; j++) {
-                if (seen.has(j) || memories[j].model !== memories[i].model) continue;
+                if (seen.has(j) || memories[j].model !== memories[i].model || memories[j].role !== memories[i].role) continue;
 
                 const similarity = cosineSimilarity(memories[i].embedding, memories[j].embedding);
                 if (similarity >= similarityThreshold) {

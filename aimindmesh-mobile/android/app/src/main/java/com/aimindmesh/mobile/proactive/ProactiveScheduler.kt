@@ -31,11 +31,11 @@ object ProactiveScheduler {
 
     fun schedule(context: Context) {
         cancelLegacyAlarm(context)
-        // Network only matters when the worker polls the server (CONTEXTUAL mode)
+        // No network constraint: the local checks (agenda, briefings, memory work) must run offline
+        // too; the server polling of CONTEXTUAL mode simply fails fast without a connection. This
+        // also keeps the Keystore (server API key) out of the startup path on the main thread.
         val constraints = Constraints.Builder()
-            .setRequiredNetworkType(
-                if (NativeServerConfig.load(context).isContextual) NetworkType.CONNECTED else NetworkType.NOT_REQUIRED
-            )
+            .setRequiredNetworkType(NetworkType.NOT_REQUIRED)
             .build()
         val request = PeriodicWorkRequestBuilder<ProactiveWorker>(15, TimeUnit.MINUTES)
             .setConstraints(constraints)

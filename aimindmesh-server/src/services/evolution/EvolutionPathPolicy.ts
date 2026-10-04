@@ -41,6 +41,11 @@ const SECRET_PATTERNS = [
 // Never written, whatever .noautoedit or the DB say: the guardrails themselves, auth, build & deploy
 const PROTECTED_BASELINE = [
   `${S}/src/services/evolution/**`,
+  // The venture factory runs agents and pushes code: its safety rules are not for the pipeline to rewrite
+  `${S}/src/services/organization/**`,
+  `${S}/src/services/openclaw/**`,
+  `${S}/src/services/OpenClawBridge.ts`,
+  `${S}/templates/ventures/**`,
   `${S}/src/services/{AutoEvolutionPipeline,GiteaEvolutionService,ImprovementDetector,InferenceRouter,AiTaskScheduler,ProactiveEngine,DebateEngine,ValidationLayer,CodeGenerationTask,MultiFileContextBuilder,FeedbackService}.ts`,
   `${S}/src/middleware/**`,
   `${S}/src/utils/{configRedaction,shell,lenientJsonParser}.ts`,

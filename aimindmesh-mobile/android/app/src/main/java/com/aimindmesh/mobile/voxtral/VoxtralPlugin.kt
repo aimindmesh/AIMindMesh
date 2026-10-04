@@ -16,6 +16,8 @@ class VoxtralPlugin : Plugin() {
 
     private var inferenceEngine: VoxtralInferenceEngine? = null
     private var audioProcessor: AudioStreamProcessor? = null
+    // Meeting recordings: the recorder's audio instead of a second microphone
+    private var externalFeeder: ExternalAudioFeeder? = null
     @Volatile
     private var isStreaming = false
     private var currentModelPath: String? = null  // Track loaded model path
@@ -123,12 +125,15 @@ class VoxtralPlugin : Plugin() {
 
     /**
      * Start real-time streaming transcription
-     * Microphone → Voxtral → Token stream events
+     * Microphone → Voxtral → Token stream events.
+     * With externalAudio: true, the meeting recorder's audio (MeetingRecorder) instead of the
+     * microphone, and token times are positions in that recording.
      */
     @PluginMethod
     fun startRealtimeTranscription(call: PluginCall) {
         android.util.Log.i("VoxtralPlugin", "startRealtimeTranscription called")
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
+        val externalAudio = call.getBoolean("externalAudio", false) == true
+        if (!externalAudio && ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED) {
             return call.reject("Microphone permission (RECORD_AUDIO) not granted")
         }
@@ -148,6 +153,11 @@ class VoxtralPlugin : Plugin() {
 
                     // Reset context for clean transcription session
                     engine.resetContext()
+                    if (externalAudio) {
+                        startExternalLocked(engine)
+                        call.resolve(JSObject().apply { put("streaming", true) })
+                        return@withLock
+                    }
                     val sessionStartTimeMs = System.currentTimeMillis()
                     val processor = AudioStreamProcessor(sampleRate = 16000, channels = 1)
 
@@ -205,10 +215,43 @@ class VoxtralPlugin : Plugin() {
         }
     }
 
-    /** Stops the microphone and waits for the chunk in flight; caller holds [lifecycle] */
+    /** Streams the recorder's audio: token times come from sample positions in the recording */
+    private fun startExternalLocked(engine: VoxtralInferenceEngine) {
+        var pendingStartMs = -1L // start of the text not emitted yet
+        val feeder = ExternalAudioFeeder(onLagging = {
+            notifyListeners("voxtralLagging", JSObject().apply {
+                put("message", "Live transcription is behind the recording: some live text is skipped")
+            })
+        })
+        feeder.start { audioChunk, startSample ->
+            val chunkStartMs = startSample / 16
+            val chunkEndMs = (startSample + audioChunk.size) / 16
+            if (pendingStartMs < 0) pendingStartMs = chunkStartMs
+            val numTokens = engine.processAudioChunk(audioChunk)
+            if (numTokens > 0) {
+                val tokens = engine.drainTokens()
+                if (tokens.isNotEmpty()) {
+                    val now = System.currentTimeMillis()
+                    notifyTokens(tokens.map { TokenResult(it, now, 1.0f, pendingStartMs, chunkEndMs) })
+                    pendingStartMs = chunkEndMs
+                }
+            } else if (numTokens < 0) {
+                notifyListeners("voxtralError", JSObject().apply {
+                    put("code", numTokens)
+                    put("message", VoxtralInferenceEngine.errorCodeToString(numTokens))
+                })
+            }
+        }
+        externalFeeder = feeder
+        isStreaming = true
+    }
+
+    /** Stops the audio source and waits for the chunk in flight; caller holds [lifecycle] */
     private fun stopStreamingLocked() {
         audioProcessor?.stopCapture()
         audioProcessor = null
+        externalFeeder?.stop()
+        externalFeeder = null
         isStreaming = false
     }
 
@@ -370,13 +413,16 @@ class VoxtralPlugin : Plugin() {
         super.handleOnDestroy()
         scope.cancel()
         val processor = audioProcessor
+        val feeder = externalFeeder
         val engine = inferenceEngine
         audioProcessor = null
+        externalFeeder = null
         inferenceEngine = null
         isStreaming = false
         // stopCapture waits for the chunk in flight: not on the main thread
         Thread({
             processor?.stopCapture()
+            feeder?.stop(0)
             engine?.release()
         }, "Voxtral-Teardown").start()
     }

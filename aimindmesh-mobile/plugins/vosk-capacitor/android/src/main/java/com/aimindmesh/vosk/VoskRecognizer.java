@@ -24,6 +24,9 @@ public class VoskRecognizer {
     // For manual processing
     private Recognizer processingRecognizer;
 
+    // Live recognition fed by the app's meeting recorder (VoskAudioBridge)
+    private final ExternalRecognition external = new ExternalRecognition();
+
     public VoskRecognizer(Context context, VoskPlugin plugin) {
         this.context = context;
         this.plugin = plugin;
@@ -164,6 +167,9 @@ public class VoskRecognizer {
             Log.e(TAG, "startRecognition called but no model loaded!");
             throw new Exception("No model loaded. Call loadModel() first.");
         }
+        if (external.isActive()) {
+            throw new IllegalStateException("A meeting is being recorded");
+        }
 
         Log.i(TAG, "Starting recognition... Speaker model loaded: " + (spkModel != null));
         stopRecognition();
@@ -265,13 +271,12 @@ public class VoskRecognizer {
 
                         if (recognizer.acceptWaveForm(buffer, read)) {
                             String result = recognizer.getResult();
-                            Log.d(TAG, "Final result: " + result);
                             String text = parseHypothesis(result);
                             long[] boundaries = parseBoundaries(result);
                             float[] speakerVector = parseSpeakerVector(result);
                             if (onFinal != null && !text.isEmpty()) {
                                 Log.i(TAG,
-                                        "Emitting final result: " + text
+                                        "Emitting final result: " + text.length() + " chars"
                                                 + (speakerVector != null
                                                         ? " with speaker vector (" + speakerVector.length + "d)"
                                                         : ""));
@@ -282,7 +287,7 @@ public class VoskRecognizer {
                             String text = parseHypothesis(partial);
                             if (onPartial != null && !text.isEmpty()) {
                                 if (loopCount % 50 == 0) {
-                                    Log.d(TAG, "Partial result: " + text);
+                                    Log.d(TAG, "Partial result: " + text.length() + " chars");
                                 }
                                 onPartial.onResult(text);
                             }
@@ -396,6 +401,29 @@ public class VoskRecognizer {
         Log.d(TAG, "Recognition stopped");
     }
 
+    /**
+     * Starts live recognition on audio pushed through {@link VoskAudioBridge} instead of opening
+     * the microphone (meeting recording). A microphone session in progress is stopped first.
+     */
+    public void startExternalRecognition(OnPartialResultListener onPartial, OnFinalResultListener onFinal) throws Exception {
+        if (model == null) {
+            throw new Exception("No model loaded. Call loadModel() first.");
+        }
+        stopRecognition();
+        external.start(spkModel != null ? new Recognizer(model, SAMPLE_RATE, spkModel) : new Recognizer(model, SAMPLE_RATE),
+                onPartial, onFinal);
+    }
+
+    /** Flushes the last utterance of the meeting recognizer and releases it. */
+    public void stopExternalRecognition() {
+        external.stop();
+    }
+
+    /** True while a meeting recording owns live recognition. */
+    public boolean isExternalActive() {
+        return external.isActive();
+    }
+
     public boolean isModelLoaded() {
         return model != null;
     }
@@ -410,10 +438,11 @@ public class VoskRecognizer {
     }
 
     public void cleanup() {
+        external.stop();
         unloadModel();
     }
 
-    private String parseHypothesis(String hypothesis) {
+    static String parseHypothesis(String hypothesis) {
         // Vosk returns JSON like: {"text": "hello world"} or {"partial": "hello"}
         try {
             org.json.JSONObject json = new org.json.JSONObject(hypothesis);
@@ -425,12 +454,12 @@ public class VoskRecognizer {
             }
             return "";
         } catch (Exception e) {
-            Log.e(TAG, "Failed to parse hypothesis: " + hypothesis, e);
+            Log.e(TAG, "Failed to parse hypothesis", e);
             return "";
         }
     }
 
-    private long[] parseBoundaries(String result) {
+    static long[] parseBoundaries(String result) {
         // Vosk returns words array if words are enabled: {"result": [{"conf": 1.0,
         // "end": 1.5, "start": 0.5, "word": "hello"}...]}
         long startMs = 0;
@@ -452,7 +481,7 @@ public class VoskRecognizer {
         return new long[] { startMs, endMs };
     }
 
-    private float[] parseSpeakerVector(String result) {
+    static float[] parseSpeakerVector(String result) {
         // Vosk returns speaker vector as: {"spk": [0.1, 0.2, ...], "spk_frames": 123,
         // "text": "..."}
         try {

@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from 'react';
 import { Capacitor, PluginListenerHandle } from '@capacitor/core';
 import { App as CapApp } from '@capacitor/app';
 import { StatusBar, Style } from '@capacitor/status-bar';
-import { LocalNotifications } from '@capacitor/local-notifications';
 import BackgroundService from 'background-service-capacitor';
 import { logger } from '../services/logger';
 import { stopSpeaking } from '../services/tts/speech';
@@ -12,7 +11,6 @@ import { reopenCalendarDatabase } from '../services/calendar/calendarDatabase';
 import Performance from '../services/performancePlugin';
 import { thermalThrottlingService } from '../services/performance/thermalThrottlingService';
 import { memoryPressureService } from '../services/performance/memoryPressureService';
-import { isMeetingRecording } from '../services/meeting/meetingForegroundService';
 
 /**
  * Manages application lifecycle events, native initialization, and background services.
@@ -37,8 +35,8 @@ export const useAppLifecycle = (keepAlive: boolean, isVoiceMode = false) => {
                         body: 'Assistant is active in background'
                     });
                     logger.log('info', 'Background service started');
-                } else if (!keepAlive && running && !isMeetingRecording()) {
-                    // A meeting in progress owns the service (microphone in background): it stops it itself
+                } else if (!keepAlive && running) {
+                    // Meetings have their own recording service: this one is keep-alive only
                     await BackgroundService.stopService();
                     logger.log('info', 'Background service stopped');
                 }
@@ -96,15 +94,8 @@ export const useAppLifecycle = (keepAlive: boolean, isVoiceMode = false) => {
                         }
                     });
 
-                    // Create notification channel for Android
-                    await LocalNotifications.createChannel({
-                        id: 'proactive-messages',
-                        name: 'Proactive Messages',
-                        description: 'Messages initiated by your AI companion',
-                        importance: 4, // high
-                        visibility: 1, // public
-                        vibration: true,
-                    });
+                    // The proactive notification channel is created by ProactiveNotificationService
+                    // (from the user's notification settings)
                 } catch (error) {
                     logger.log('error', 'Failed to initialize Capacitor plugins.', error);
                 }

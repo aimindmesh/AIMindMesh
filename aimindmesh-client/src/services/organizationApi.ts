@@ -1,8 +1,11 @@
 import { serverApi } from './serverApi';
-import type { Directive, OrgRole, IdeaProposal, AuditLogEntry, DiscoveryConfig } from '@aimindmesh/api-types';
+import type {
+  Directive, OrgRole, IdeaProposal, AuditLogEntry, DiscoveryConfig, VentureRepository, VentureBuildConfig, SourceRef,
+  VentureMilestone, VentureDecision,
+} from '@aimindmesh/api-types';
 
 // Organization types come from the server contract (aimindmesh-server/src/types/api.ts)
-export type { Directive, OrgRole, IdeaProposal, AuditLogEntry, DiscoveryConfig };
+export type { Directive, OrgRole, IdeaProposal, AuditLogEntry, DiscoveryConfig, VentureRepository, VentureBuildConfig, SourceRef, VentureMilestone, VentureDecision };
 
 export const organizationApi = {
   getRoles: () =>
@@ -41,8 +44,9 @@ export const organizationApi = {
   updateIdea: (ideaId: string, update: { title: string; problemStatement: string; summary: string }) =>
     serverApi.put<{ success: boolean }>(`/api/organization/ideas/${ideaId}`, update),
 
+  // 202: the council runs in the background (status `reviewing`), the result arrives with GET /ideas
   reviewIdea: (ideaId: string, humanFeedback?: string) =>
-    serverApi.post<{ success: boolean; consensus: boolean; synthesis: string }>(`/api/organization/ideas/${ideaId}/review`, { humanFeedback }),
+    serverApi.post<{ success: boolean }>(`/api/organization/ideas/${ideaId}/review`, { humanFeedback }),
 
   approveIdea: (ideaId: string) =>
     serverApi.post<{ success: boolean }>(`/api/organization/ideas/${ideaId}/approve`),
@@ -53,6 +57,9 @@ export const organizationApi = {
   generateDirectivesFromIdea: (ideaId: string) =>
     serverApi.post<{ success: boolean; directives: Directive[] }>(`/api/organization/ideas/${ideaId}/generate-directives`),
 
+  decideVenture: (ideaId: string, decision: VentureDecision, notes: string) =>
+    serverApi.post<{ success: boolean }>(`/api/organization/ideas/${ideaId}/decision`, { decision, notes }),
+
   transitionIdeaToDevelopment: (ideaId: string) =>
     serverApi.post<{ success: boolean }>(`/api/organization/ideas/${ideaId}/transition`),
 
@@ -60,7 +67,7 @@ export const organizationApi = {
     serverApi.get<any>(`/api/organization/ideas/${ideaId}/design`),
 
   getRepositories: () =>
-    serverApi.get<{ success: boolean; repositories: any[] }>('/api/organization/repositories'),
+    serverApi.get<{ success: boolean; repositories: VentureRepository[] }>('/api/organization/repositories'),
 
   createRepository: (repo: { namespace?: string; repoName: string; description?: string; visibility?: string; bootstrapTemplate?: string; enableCiCd?: boolean; createdFromIdeaId?: string }) =>
     serverApi.post<{ success: boolean; repository: { id: string; url: string; repoName: string } }>('/api/organization/repositories', repo),
@@ -71,8 +78,18 @@ export const organizationApi = {
   runValidation: (repoId: string) =>
     serverApi.post<{ success: boolean; result: { status: string; summary: string; logs: string[] } }>(`/api/organization/repositories/${repoId}/validate`),
 
+  // Starts a development run; on a blocked repository it also unblocks it (fresh attempt budget)
   forceDevelop: (repoId: string) =>
-    serverApi.post<{ success: boolean }>(`/api/organization/repositories/${repoId}/force-develop`),
+    serverApi.post<{ success: boolean; runId?: string }>(`/api/organization/repositories/${repoId}/force-develop`),
+
+  cancelRun: (repoId: string) =>
+    serverApi.post<{ success: boolean }>(`/api/organization/repositories/${repoId}/cancel`),
+
+  getBuildConfig: () =>
+    serverApi.get<{ success: boolean; config: VentureBuildConfig }>('/api/organization/build-config'),
+
+  updateBuildConfig: (patch: Partial<VentureBuildConfig>) =>
+    serverApi.patch<{ success: boolean; config: VentureBuildConfig }>('/api/organization/build-config', patch),
 
   getHRProposals: () =>
     serverApi.get<{ success: boolean; proposals: any[] }>('/api/organization/hr/proposals'),

@@ -1,360 +1,236 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { CloseIcon, PlayIcon, PauseIcon, SaveIcon } from '../../constants';
+import React, { useEffect, useMemo, useState } from 'react';
+import { CloseIcon, FlagIcon, SearchIcon, SparklesIcon, TrashIcon } from '../../constants';
 import { logger } from '../../services/logger';
-
-import { deleteMeeting as deleteMeetingFromStorage, loadMeetingsAsync, resolveMeetingAudio } from '../../services/meeting/meetingStorage';
-import { SavedMeeting } from '../../types/meeting';
-import ExportBottomSheet from './ExportBottomSheet';
+import { deleteMeeting } from '../../services/meeting/meetingStorage';
+import { listMeetings, searchTranscripts, SegmentMatch } from '../../services/meeting/meetingRecords';
+import { displayTitle, formatMeetingDate } from '../../services/meeting/meetingNotes';
+import { findMatch, notesText, snippetAround, Snippet } from '../../services/meeting/meetingSearch';
+import { formatClock } from '../../services/llm/meetingPrompts';
+import { MeetingSummary } from '../../types/meeting';
+import { askConfirm } from '../../services/ui/dialogs';
 
 interface MeetingHistoryProps {
     isOpen: boolean;
     onClose: () => void;
-    onReprocess?: (meeting: SavedMeeting) => void;
+    /** Opens a meeting, scrolled to `segmentId` when given (a search result). */
+    onOpenMeeting: (meetingId: string, segmentId?: string) => void;
+    /** The meeting on screen was deleted. */
+    onDeleted: (meetingId: string) => void;
+    currentMeetingId: string | null;
+    /** The meeting being recorded, which can't be deleted now. */
+    recordingMeetingId: string | null;
 }
 
-const MeetingHistory: React.FC<MeetingHistoryProps> = ({ isOpen, onClose, onReprocess }) => {
-    const [meetings, setMeetings] = useState<SavedMeeting[]>([]);
-    const [selectedMeeting, setSelectedMeeting] = useState<SavedMeeting | null>(null);
-    const [isLoadingAudio, setIsLoadingAudio] = useState(false);
-    const [isPlayingAudio, setIsPlayingAudio] = useState(false);
-    const [currentTime, setCurrentTime] = useState(0);
-    const audioRef = useRef<HTMLAudioElement | null>(null);
-    const [audioUrl, setAudioUrl] = useState<string | null>(null);
-    const [isExportSheetOpen, setIsExportSheetOpen] = useState(false);
+/** How many transcript passages a search shows per meeting. */
+const SNIPPETS_PER_MEETING = 3;
+
+function formatDuration(seconds: number): string {
+    if (!isFinite(seconds) || seconds <= 0) return '';
+    const total = Math.round(seconds);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    if (h > 0) return `${h} h ${m} min`;
+    if (m > 0) return `${m} min${s ? ` ${s} s` : ''}`;
+    return `${s} s`;
+}
+
+const Highlighted: React.FC<{ snippet: Snippet }> = ({ snippet }) => (
+    <>
+        {snippet.before}
+        <mark className="bg-amber-400/30 text-white rounded px-0.5">{snippet.match}</mark>
+        {snippet.after}
+    </>
+);
+
+const MeetingHistory: React.FC<MeetingHistoryProps> = ({ isOpen, onClose, onOpenMeeting, onDeleted, currentMeetingId, recordingMeetingId }) => {
+    const [meetings, setMeetings] = useState<MeetingSummary[] | null>(null);
+    const [query, setQuery] = useState('');
+    const [transcriptMatches, setTranscriptMatches] = useState<Map<string, SegmentMatch[]>>(new Map());
+    const [isSearching, setIsSearching] = useState(false);
 
     useEffect(() => {
-        if (isOpen) {
-            loadMeetingsData();
-        }
+        if (!isOpen) return;
+        listMeetings()
+            .then(setMeetings)
+            .catch(error => {
+                logger.log('error', 'Failed to load meetings', error);
+                setMeetings([]);
+            });
     }, [isOpen]);
 
-    // Load meeting audio and create URL when meeting is selected
+    // Transcript search, debounced while typing
     useEffect(() => {
-        const loadAudio = async () => {
-            if (selectedMeeting?.hasAudio) {
-                setIsLoadingAudio(true);
-                try {
-                    // Also decodes legacy recordings stored as base64 inside JSON
-                    const audio = await resolveMeetingAudio(selectedMeeting);
-                    if (audio) {
-                        setAudioUrl(audio.url);
-                    } else {
-                        logger.log('warn', `Audio file not found for meeting ${selectedMeeting.id}`);
-                        setAudioUrl(null);
-                    }
-                } catch (error) {
-                    logger.log('error', 'Failed to load meeting audio URL', error);
-                    setAudioUrl(null);
-                } finally {
-                    setIsLoadingAudio(false);
-                }
-            } else {
-                setAudioUrl(null);
-                setIsLoadingAudio(false);
-            }
-        };
-
-        if (selectedMeeting) {
-            setAudioUrl(null);
-            setCurrentTime(0);
-            setIsPlayingAudio(false);
-            loadAudio();
+        const q = query.trim();
+        if (!isOpen || q.length < 2) {
+            setTranscriptMatches(new Map());
+            setIsSearching(false);
+            return;
         }
-
+        setIsSearching(true);
+        let cancelled = false;
+        const timer = setTimeout(() => {
+            searchTranscripts(q)
+                .then(matches => { if (!cancelled) setTranscriptMatches(matches); })
+                .catch(error => logger.log('error', 'Search failed', error))
+                .finally(() => { if (!cancelled) setIsSearching(false); });
+        }, 250);
         return () => {
-            setAudioUrl(null);
+            cancelled = true;
+            clearTimeout(timer);
         };
-    }, [selectedMeeting?.id]); // Only reload if ID changes
+    }, [query, isOpen]);
 
-    const loadMeetingsData = async () => {
-        try {
-            const savedMeetings = await loadMeetingsAsync();
-            setMeetings(savedMeetings);
-            logger.log('info', `Loaded ${savedMeetings.length} meetings`);
-        } catch (error) {
-            logger.log('error', 'Failed to load meetings', error);
-        }
-    };
+    const q = query.trim();
+    const searching = q.length >= 2;
 
-    const deleteMeeting = async (id: string) => {
-        if (!window.confirm('Are you sure you want to delete this meeting? This cannot be undone.')) return;
+    const results = useMemo(() => {
+        if (!meetings) return [];
+        if (!searching) return meetings.map(meeting => ({ meeting, notesSnippet: null, matches: [] as SegmentMatch[] }));
+        return meetings
+            .map(meeting => {
+                const notes = notesText(meeting);
+                const dateMatch = findMatch(formatMeetingDate(meeting.timestamp), q);
+                return {
+                    meeting,
+                    notesSnippet: snippetAround(notes, q, 50),
+                    dateMatch: !!dateMatch,
+                    matches: transcriptMatches.get(meeting.id) ?? []
+                };
+            })
+            .filter(r => r.notesSnippet || r.dateMatch || r.matches.length > 0);
+    }, [meetings, searching, q, transcriptMatches]);
 
-        try {
-            const success = await deleteMeetingFromStorage(id);
-            if (success) {
-                const updatedMeetings = meetings.filter(m => m.id !== id);
-                setMeetings(updatedMeetings);
-                if (selectedMeeting?.id === id) {
-                    setSelectedMeeting(null);
-                }
-                logger.log('info', `Deleted meeting ${id}`);
-            }
-        } catch (error) {
-            logger.log('error', 'Failed to delete meeting', error);
-        }
-    };
-
-    const formatDate = (timestamp: number) => {
-        const date = new Date(timestamp);
-        return date.toLocaleString('en-US', {
-            day: '2-digit',
-            month: '2-digit',
-            year: 'numeric',
-            hour: '2-digit',
-            minute: '2-digit'
+    const handleDelete = async (meeting: MeetingSummary) => {
+        const ok = await askConfirm({
+            title: `Delete "${displayTitle(meeting)}"?`,
+            message: 'The transcript, the notes and the recording are deleted. This cannot be undone.',
+            confirmLabel: 'Delete',
+            danger: true
         });
-    };
-
-    const formatDuration = (seconds: number) => {
-        if (!isFinite(seconds) || isNaN(seconds) || seconds === 0) {
-            return 'N/A';
+        if (!ok) return;
+        if (await deleteMeeting(meeting.id)) {
+            setMeetings(list => list?.filter(m => m.id !== meeting.id) ?? null);
+            onDeleted(meeting.id);
         }
-        const mins = Math.floor(seconds / 60);
-        const secs = Math.floor(seconds % 60);
-        return `${mins}:${secs.toString().padStart(2, '0')}`;
-    };
-
-    const togglePlayback = () => {
-        if (!audioRef.current || !audioUrl) return;
-
-        if (isPlayingAudio) {
-            audioRef.current.pause();
-            setIsPlayingAudio(false);
-        } else {
-            audioRef.current.play().catch(e => logger.log('error', 'Audio playback failed', e));
-            setIsPlayingAudio(true);
-        }
-    };
-
-    const handleTimeUpdate = () => {
-        if (audioRef.current) {
-            setCurrentTime(audioRef.current.currentTime);
-        }
-    };
-
-    const handleAudioEnded = () => {
-        setIsPlayingAudio(false);
-        setCurrentTime(0);
-    };
-
-    const exportAudio = async () => {
-        if (!selectedMeeting) return;
-        setIsExportSheetOpen(true);
     };
 
     if (!isOpen) return null;
 
     return (
-        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-            <div className="bg-surface rounded-lg shadow-2xl max-w-6xl w-full max-h-[90vh] flex flex-col">
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-stretch md:items-center justify-center md:p-6" onClick={onClose}>
+            <div
+                className="bg-surface md:rounded-2xl shadow-2xl w-full md:max-w-2xl md:max-h-[90vh] flex flex-col pt-safe md:pt-0"
+                onClick={e => e.stopPropagation()}
+            >
                 {/* Header */}
-                <div className="p-4 border-b border-white/10 flex justify-between items-center">
-                    <h2 className="text-xl font-bold text-white">Meeting History</h2>
-                    <button
-                        onClick={onClose}
-                        className="text-text-secondary hover:text-white transition-colors"
-                    >
-                        <CloseIcon className="w-6 h-6" />
-                    </button>
+                <div className="px-4 pt-4 pb-3 border-b border-white/10 space-y-3">
+                    <div className="flex justify-between items-center">
+                        <h2 className="text-lg font-bold text-white">Meetings</h2>
+                        <button onClick={onClose} className="p-1 text-text-secondary hover:text-white" aria-label={'Close'}>
+                            <CloseIcon className="w-6 h-6" />
+                        </button>
+                    </div>
+                    <div className="relative">
+                        <SearchIcon className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-text-secondary" />
+                        <input
+                            type="search"
+                            value={query}
+                            onChange={e => setQuery(e.target.value)}
+                            placeholder={'Search titles, notes and transcripts'}
+                            className="w-full pl-9 pr-3 py-2.5 bg-background border border-white/10 rounded-xl text-sm text-white placeholder-text-secondary/60 focus:border-primary focus:outline-none"
+                        />
+                    </div>
                 </div>
 
-                {/* Hidden audio element */}
-                {audioUrl && (
-                    <audio
-                        ref={audioRef}
-                        src={audioUrl}
-                        onTimeUpdate={handleTimeUpdate}
-                        onEnded={handleAudioEnded}
-                    />
-                )}
-
-                {/* Content */}
-                <div className="flex-1 overflow-hidden flex">
-                    {/* Meeting List */}
-                    <div className="w-1/3 border-r border-white/10 overflow-y-auto">
-                        {meetings.length === 0 ? (
-                            <div className="p-8 text-center text-text-secondary">
-                                <p>No saved meetings</p>
-                            </div>
-                        ) : (
-                            <div className="divide-y divide-white/10">
-                                {meetings.map((meeting) => (
-                                    <div
-                                        key={meeting.id}
-                                        onClick={() => setSelectedMeeting(meeting)}
-                                        className={`p-4 cursor-pointer transition-colors hover:bg-white/5 ${selectedMeeting?.id === meeting.id ? 'bg-primary/20' : ''
-                                            }`}
-                                    >
-                                        <div className="flex justify-between items-start mb-2">
-                                            <div className="flex-1">
-                                                <p className="text-sm font-medium text-white">
-                                                    {formatDate(meeting.timestamp)}
-                                                </p>
-                                                <p className="text-xs text-text-secondary mt-1">
-                                                    {meeting.transcript.length > 0
-                                                        ? `${meeting.transcript.length} segments`
-                                                        : 'Audio only'} • {formatDuration(meeting.duration)}
-                                                </p>
-                                            </div>
+                {/* List */}
+                <div className="flex-1 overflow-y-auto pb-safe">
+                    {meetings === null ? (
+                        <div className="p-8 flex justify-center">
+                            <div className="animate-spin rounded-full h-6 w-6 border-2 border-primary border-t-transparent" />
+                        </div>
+                    ) : results.length === 0 ? (
+                        <p className="p-8 text-center text-text-secondary text-sm">
+                            {searching ? (isSearching ? 'Searching…' : `Nothing found for "${q}"`) : 'No saved meetings yet'}
+                        </p>
+                    ) : (
+                        <ul className="divide-y divide-white/5">
+                            {results.map(({ meeting, notesSnippet, matches }) => {
+                                // An untitled meeting is already titled by its date
+                                const titled = !!(meeting.title || meeting.analysis?.title);
+                                const details = [
+                                    titled ? formatMeetingDate(meeting.timestamp) : '',
+                                    formatDuration(meeting.duration),
+                                    meeting.speakerCount > 1 ? `${meeting.speakerCount} speakers` : '',
+                                    meeting.segmentCount === 0 ? (meeting.hasAudio ? 'not transcribed' : 'empty') : '',
+                                ].filter(Boolean).join(' · ');
+                                const shown = matches.slice(0, SNIPPETS_PER_MEETING);
+                                return (
+                                    <li key={meeting.id} className={meeting.id === currentMeetingId ? 'bg-primary/10' : ''}>
+                                        <div className="flex items-start gap-2 px-4 py-3">
                                             <button
-                                                onClick={(e) => {
-                                                    e.stopPropagation();
-                                                    deleteMeeting(meeting.id);
-                                                }}
-                                                className="text-text-secondary hover:text-red-400 transition-colors ml-2"
+                                                onClick={() => onOpenMeeting(meeting.id)}
+                                                className="flex-1 min-w-0 text-left"
                                             >
-                                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                                                </svg>
+                                                <p className="text-sm font-semibold text-white truncate">{displayTitle(meeting)}</p>
+                                                <p className="text-xs text-text-secondary mt-0.5 flex flex-wrap items-center gap-x-1.5">
+                                                    <span>{details}</span>
+                                                    {meeting.bookmarks.length > 0 && (
+                                                        <span className="inline-flex items-center gap-0.5 text-amber-300">
+                                                            <FlagIcon className="w-3 h-3" />{meeting.bookmarks.length}
+                                                        </span>
+                                                    )}
+                                                    {meeting.analysis && <SparklesIcon className="w-3 h-3 text-yellow-400" />}
+                                                </p>
+                                                {notesSnippet ? (
+                                                    <p className="text-xs text-text-secondary mt-1 line-clamp-2"><Highlighted snippet={notesSnippet} /></p>
+                                                ) : !searching && (meeting.analysis?.summary || meeting.preview) ? (
+                                                    <p className="text-xs text-text-secondary mt-1 line-clamp-2">
+                                                        {meeting.analysis?.summary || `“${meeting.preview}”`}
+                                                    </p>
+                                                ) : null}
+                                            </button>
+                                            <button
+                                                onClick={() => handleDelete(meeting)}
+                                                disabled={meeting.id === recordingMeetingId}
+                                                className="p-2 -mr-2 text-text-secondary enabled:hover:text-red-400 disabled:opacity-30"
+                                                title={'Delete meeting'}
+                                                aria-label={'Delete meeting'}
+                                            >
+                                                <TrashIcon className="w-4 h-4" />
                                             </button>
                                         </div>
-                                        {meeting.hasAudio && (
-                                            <span className="text-xs text-primary">● Audio available</span>
-                                        )}
-                                    </div>
-                                ))}
-                            </div>
-                        )}
-                    </div>
 
-                    {/* Meeting Detail */}
-                    <div className="flex-1 overflow-y-auto p-6">
-                        {selectedMeeting ? (
-                            <div>
-                                <div className="mb-6">
-                                    <h3 className="text-lg font-bold text-white mb-2">
-                                        Meeting of {formatDate(selectedMeeting.timestamp)}
-                                    </h3>
-                                    <div className="flex gap-4 text-sm text-text-secondary">
-                                        <span>
-                                            {selectedMeeting.transcript.length > 0
-                                                ? `${selectedMeeting.transcript.length} segments`
-                                                : 'Audio only (transcript not done)'}
-                                        </span>
-                                        <span>Duration: {formatDuration(selectedMeeting.duration)}</span>
-                                        {selectedMeeting.transcript.length > 0 && (
-                                            <span>
-                                                {Object.keys(selectedMeeting.speakerNames).length ||
-                                                    new Set(selectedMeeting.transcript.map(t => t.speakerId)).size} speakers
-                                            </span>
-                                        )}
-                                    </div>
-                                </div>
-
-                                {/* Audio Player (if audio available) */}
-                                {selectedMeeting.hasAudio && (
-                                    <div className="mb-6 p-4 bg-surface-hover rounded-lg border border-white/10">
-                                        {isLoadingAudio ? (
-                                            <div className="flex items-center justify-center gap-3 py-2">
-                                                <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-primary"></div>
-                                                <span className="text-sm text-text-secondary">Loading audio...</span>
-                                            </div>
-                                        ) : audioUrl ? (
-                                            <div className="flex items-center gap-4">
-                                                <button
-                                                    onClick={togglePlayback}
-                                                    className="p-3 bg-primary rounded-full text-white hover:bg-primary-dark transition-colors"
-                                                >
-                                                    {isPlayingAudio ? (
-                                                        <PauseIcon className="w-5 h-5" />
-                                                    ) : (
-                                                        <PlayIcon className="w-5 h-5" />
-                                                    )}
-                                                </button>
-                                                <div className="flex-1">
-                                                    <div className="h-2 bg-surface rounded-full overflow-hidden">
-                                                        <div
-                                                            className="h-full bg-primary transition-all"
-                                                            style={{ width: selectedMeeting.duration > 0 ? `${(currentTime / selectedMeeting.duration) * 100}%` : '0%' }}
-                                                        />
-                                                    </div>
-                                                    <div className="flex justify-between text-xs text-text-secondary mt-1">
-                                                        <span>{formatDuration(currentTime)}</span>
-                                                        <span>{formatDuration(selectedMeeting.duration)}</span>
-                                                    </div>
-                                                </div>
-                                                <button
-                                                    onClick={exportAudio}
-                                                    className="p-2 text-text-secondary hover:text-primary transition-colors"
-                                                    title="Export audio"
-                                                >
-                                                    <SaveIcon className="w-5 h-5" />
-                                                </button>
-                                                {onReprocess && (
-                                                    <button
-                                                        onClick={() => onReprocess(selectedMeeting)}
-                                                        className="p-2 text-text-secondary hover:text-primary transition-colors"
-                                                        title="Reprocess audio"
-                                                    >
-                                                        <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                                                        </svg>
-                                                    </button>
+                                        {shown.length > 0 && (
+                                            <ul className="pb-2 pl-4 pr-4 space-y-1">
+                                                {shown.map(match => {
+                                                    const snippet = snippetAround(match.text, q, 50);
+                                                    return (
+                                                        <li key={match.segmentId}>
+                                                            <button
+                                                                onClick={() => onOpenMeeting(meeting.id, match.segmentId)}
+                                                                className="w-full text-left text-xs text-text-secondary hover:bg-white/5 rounded-lg px-2 py-1.5 flex gap-2"
+                                                            >
+                                                                <span className="font-mono text-primary shrink-0">{formatClock(match.startMs)}</span>
+                                                                <span className="min-w-0">{snippet ? <Highlighted snippet={snippet} /> : match.text}</span>
+                                                            </button>
+                                                        </li>
+                                                    );
+                                                })}
+                                                {matches.length > shown.length && (
+                                                    <li className="text-[11px] text-text-secondary px-2">
+                                                        {`+${matches.length - shown.length} more in this meeting`}
+                                                    </li>
                                                 )}
-                                            </div>
-                                        ) : (
-                                            <div className="text-center py-2 text-sm text-red-400">
-                                                Audio file not found or corrupted.
-                                            </div>
+                                            </ul>
                                         )}
-                                    </div>
-                                )}
-
-                                {/* Transcript or Audio-only message */}
-                                <div className="space-y-4">
-                                    <h4 className="font-semibold text-white">Transcript</h4>
-                                    {selectedMeeting.transcript.length > 0 ? (
-                                        selectedMeeting.transcript.map((segment) => {
-                                            const speakerName = selectedMeeting.speakerNames[segment.speakerId] ||
-                                                `Speaker ${segment.speakerId + 1}`;
-                                            return (
-                                                <div key={segment.id} className="flex flex-col gap-1">
-                                                    <div className="flex items-center gap-2">
-                                                        <span className="text-xs font-bold text-primary bg-primary/10 px-2 py-0.5 rounded-full">
-                                                            {speakerName}
-                                                        </span>
-                                                        <span className="text-xs text-text-secondary">
-                                                            {new Date(segment.timestamp).toLocaleTimeString()}
-                                                        </span>
-                                                    </div>
-                                                    <p className="text-white pl-2 border-l-2 border-surface">
-                                                        {segment.text}
-                                                    </p>
-                                                </div>
-                                            );
-                                        })
-                                    ) : (
-                                        <div className="p-4 bg-gray-800/50 rounded-lg border border-gray-600/30 text-center">
-                                            <p className="text-gray-400 text-sm">
-                                                This meeting was recorded in battery saver mode.
-                                            </p>
-                                            <p className="text-gray-500 text-xs mt-2">
-                                                Transcript is unavailable. You can export the audio to reprocess it.
-                                            </p>
-                                        </div>
-                                    )}
-                                </div>
-                            </div>
-                        ) : (
-                            <div className="h-full flex items-center justify-center text-text-secondary">
-                                <p>Select a meeting to view details</p>
-                            </div>
-                        )}
-                    </div>
+                                    </li>
+                                );
+                            })}
+                        </ul>
+                    )}
                 </div>
             </div>
-
-            {/* Mounted on open, so it starts on the audio format */}
-            {selectedMeeting && isExportSheetOpen && (
-                <ExportBottomSheet
-                    isOpen={isExportSheetOpen}
-                    onClose={() => setIsExportSheetOpen(false)}
-                    transcript={selectedMeeting.transcript || []}
-                    speakerNames={selectedMeeting.speakerNames || {}}
-                    meeting={selectedMeeting}
-                    initialFormat="audio"
-                />
-            )}
         </div>
     );
 };

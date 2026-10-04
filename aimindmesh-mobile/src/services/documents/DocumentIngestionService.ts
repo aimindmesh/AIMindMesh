@@ -1,4 +1,5 @@
 import { DocumentParser } from './DocumentParser';
+import { readStoredLlmConfig, resolveEffectiveProvider, storedApiKeyFor } from '../llm/providerKeys';
 import { DocumentChunker, Chunk } from './DocumentChunker';
 import { getKnowledgeDatabase, INGESTING_CHUNK_COUNT } from '../database/knowledgeDatabase';
 import { FileSystemAdapter as Filesystem } from '../../utils/fileSystemAdapter';
@@ -45,13 +46,11 @@ function readServerSettings(): AIMindMeshServerSettings | null {
     return settings && settings.enabled && settings.serverUrl ? settings : null;
 }
 
-/** Chat model settings and the API key of their provider */
+/** Chat model settings and the API key of the provider that answers (never another vendor's key) */
 function readLlmSettings(): { config: LLMConfig | null; apiKey?: string } {
-    const config = readSetting<LLMConfig | null>('llm-config', null);
+    const config = readStoredLlmConfig();
     if (!config) return { config: null };
-    const keyName = config.provider === 'perplexity' ? 'perplexity-api-key'
-        : config.provider === 'claude' ? 'claude-api-key' : 'gemini-api-key';
-    return { config, apiKey: readSetting<string>(keyName, '') || undefined };
+    return { config, apiKey: storedApiKeyFor(resolveEffectiveProvider(config, readServerSettings() ?? undefined), config) };
 }
 
 export class DocumentIngestionService {
@@ -333,7 +332,7 @@ export class DocumentIngestionService {
             let fullResponse = '';
             const history = [{ role: 'user' as const, text: prompt, id: 'ext-' + Date.now().toString(), timestamp: new Date() }];
             // generateTextResponseStream handles provider abstraction (LiteRT/GGUF/etc)
-            for await (const chunk of generateTextResponseStream(history, dummyPersonality, memoryTaskConfig(config), [], apiKey, undefined, 256, undefined)) {
+            for await (const chunk of generateTextResponseStream(history, dummyPersonality, memoryTaskConfig(config), apiKey, undefined, 256, readServerSettings() ?? undefined)) {
                 if (typeof chunk === 'string') fullResponse += chunk;
                 else if (chunk.type === 'text') fullResponse += chunk.content;
             }

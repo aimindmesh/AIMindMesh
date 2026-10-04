@@ -1,11 +1,9 @@
-import { Message, Memory, ImageAttachment } from '../../types';
+import { Message, ImageAttachment } from '../../types';
 
 export interface ChatContext {
     todos: any[];
     addTodo: (text: string) => void;
     completeTodo: (id: string) => void;
-    memories: Memory[];
-    addMemory: (content: string, category?: string) => void;
     showToast: (message: string, type?: 'success' | 'error' | 'info') => void;
 }
 
@@ -45,4 +43,8 @@ export interface AgentContext {
     batchModelText: string;
     /** Images tools produced in this run (generate_image), shown in the answer bubble */
     generatedImages?: ImageAttachment[];
+    /** Signatures of the calls already run (a repeated call is not run again) */
+    executed?: string[];
+    /** Calls of the batch being run (paired with batchResults) */
+    batchCalls?: ToolCall[];
 }

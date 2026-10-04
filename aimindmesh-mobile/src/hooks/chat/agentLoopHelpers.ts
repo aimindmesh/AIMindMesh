@@ -5,15 +5,13 @@
 import { Message, LLMConfig, AIMindMeshServerSettings } from '../../types';
 import { ApiKeys, ToolCall, ToolRunResult } from './types';
 import { getResponseReserve } from '../../services/llm/context/unifiedContextManager';
-
-/** On-device engines: small context windows, history compressed before each step */
-const LOCAL_ENGINES = ['native-gguf', 'litert', 'genie-npu'];
+import { isOnDeviceProvider, resolveEffectiveProvider } from '../../services/llm/providerKeys';
+import { INLINE_MEMORY_PLACEHOLDER } from '../../services/llm/promptBuilder';
+import { onDeviceContextSize } from '../../services/llm/context/contextSize';
 
 /** Provider that actually answers: the server's fallback when the server is the provider. */
 export function effectiveProvider(llmConfig: LLMConfig, serverSettings?: AIMindMeshServerSettings): string {
-    return llmConfig.provider === 'aimindmesh-server'
-        ? (serverSettings?.fallbackProvider ?? 'none')
-        : llmConfig.provider;
+    return resolveEffectiveProvider(llmConfig, serverSettings);
 }
 
 /** API key of that provider only: a key is never sent to another vendor's API. */
@@ -32,8 +30,9 @@ export function apiKeyForProvider(provider: string, apiKeys: ApiKeys, llmConfig:
  * prunes against its own (large) window. On-device models keep the old 1500 floor.
  */
 export function compressionBudget(provider: string, llmConfig: LLMConfig, maxResponseTokens: number): number {
-    if (!LOCAL_ENGINES.includes(provider)) return Infinity;
-    const contextSize = llmConfig.nCtx || llmConfig.contextSize || 2048;
+    // On-device engines: small context windows, history compressed before each step
+    if (!isOnDeviceProvider(provider)) return Infinity;
+    const contextSize = onDeviceContextSize(llmConfig);
     // ~1000 tokens for the system prompt and tool instructions
     return Math.max(1500, contextSize - getResponseReserve(contextSize, maxResponseTokens) - 1000);
 }
@@ -112,7 +111,8 @@ export function extractInlineMemories(text: string): string[] {
     const matches = text.match(/<save_memory>([\s\S]*?)(?:<\/save_memory>|$)/ig) || [];
     return matches
         .map(m => m.replace(/<\/?save_memory>/ig, '').trim())
-        .filter(Boolean);
+        // A small model may copy the format placeholder of the prompt instead of a fact
+        .filter(m => m && m.toLowerCase() !== INLINE_MEMORY_PLACEHOLDER);
 }
 
 /** Final answer: tags, status lines and the "Answer:" prefix removed. */
@@ -148,4 +148,37 @@ export function shouldNudgeModel(response: string, thinking: string, iteration: 
         thinking.length > 5 &&
         thinking.length < 80 &&
         iteration < maxIterations - 1;
+}
+
+type Source = { title: string; uri: string };
+/** Sources shown under one answer at most */
+const MAX_SOURCES = 10;
+
+/** Sources of the answer: earlier ones first, each URL once. */
+export function mergeSources(current: Source[], incoming?: Source[]): Source[] {
+    if (!incoming || incoming.length === 0) return current;
+    const merged = [...current];
+    for (const source of incoming) {
+        if (merged.length >= MAX_SOURCES) break;
+        if (source?.uri && !merged.some(s => s.uri === source.uri)) merged.push({ title: source.title || source.uri, uri: source.uri });
+    }
+    return merged;
+}
+
+/** The request this run answers: the last user message that is not a tool observation or a nudge. */
+export function findUserRequest(history: Message[]): string {
+    for (let i = history.length - 1; i >= 0; i--) {
+        const message = history[i];
+        if (message.role !== 'user' || message.id.startsWith('tool_') || message.id.startsWith('nudge_')) continue;
+        return message.text.trim();
+    }
+    return '';
+}
+
+/** Prompt that shrinks a long tool output to what the user's request needs. */
+export function buildToolSummaryPrompt(output: string, request: string): string {
+    const focus = request
+        ? `The user asked: "${request.slice(0, 500)}"\nKeep only the facts, figures, dates and URLs needed to answer that request.`
+        : 'Keep only the facts relevant to answer a user request.';
+    return `Summarize this tool output. ${focus} Do not add information.\n\nOutput:\n${output.substring(0, 15000)}`;
 }

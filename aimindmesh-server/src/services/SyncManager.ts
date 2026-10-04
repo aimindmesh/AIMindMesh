@@ -26,6 +26,24 @@ export interface SyncDeletion {
 
 const DELETION_TYPES = new Set(['meeting', 'segment']);
 
+/** Meeting notes synced between devices (each one a JSON document, except the title). */
+export const MEETING_NOTES_COLUMNS = ['title', 'bookmarks_json', 'analysis_json', 'questions_json'] as const;
+/** A larger notes field is ignored (kept as stored) rather than bloating every pull */
+const MAX_NOTES_FIELD_CHARS = 256 * 1024;
+
+/** Values and "sent" flags of the notes columns of a pushed meeting. */
+function meetingNotesParams(m: Record<string, unknown>): Record<string, unknown> {
+  const params: Record<string, unknown> = {};
+  for (const column of MEETING_NOTES_COLUMNS) {
+    const value = m[column];
+    const valid = value === null || (typeof value === 'string' && value.length <= MAX_NOTES_FIELD_CHARS);
+    if (column in m && !valid) Logger.warn('SyncManager', `Meeting ${String(m.id)}: ${column} ignored (not a string or too large)`);
+    params[column] = valid ? value : null;
+    params[`has_${column}`] = column in m && valid ? 1 : 0;
+  }
+  return params;
+}
+
 export interface PullResult extends SyncPayload {
   /** Titles of the conversations the pulled chat messages belong to */
   conversations: { id: string; title: string; created_at: number; last_message_at: number | null }[];
@@ -111,26 +129,34 @@ export class SyncManager {
         updated_at = excluded.updated_at
     `).run(deviceId, timestamp, now);
 
-    // Meetings: the last device that changed one owns it, so the others pull the change
+    // Meetings: the last device that changed one owns it, so the others pull the change.
+    // Notes columns are written only when the device sent them: an app version without notes
+    // must not erase the ones written by another device.
     const upsertMeeting = db.prepare(`
       INSERT INTO meetings (
-        id, device_id, timestamp, duration, has_audio, audio_file_path, audio_mime_type, speaker_names_json, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        id, device_id, timestamp, duration, has_audio, audio_file_path, audio_mime_type, speaker_names_json, created_at, updated_at,
+        ${MEETING_NOTES_COLUMNS.join(', ')}
+      ) VALUES (
+        @id, @device_id, @timestamp, @duration, @has_audio, @audio_file_path, @audio_mime_type, @speaker_names_json, @created_at, @updated_at,
+        ${MEETING_NOTES_COLUMNS.map(c => `@${c}`).join(', ')}
+      )
       ON CONFLICT(id) DO UPDATE SET
         device_id = excluded.device_id, timestamp = excluded.timestamp, duration = excluded.duration,
         has_audio = excluded.has_audio, audio_file_path = excluded.audio_file_path,
         audio_mime_type = excluded.audio_mime_type, speaker_names_json = excluded.speaker_names_json,
-        updated_at = excluded.updated_at
+        updated_at = excluded.updated_at,
+        ${MEETING_NOTES_COLUMNS.map(c => `${c} = CASE WHEN @has_${c} THEN excluded.${c} ELSE meetings.${c} END`).join(',\n        ')}
     `);
     // Deletion is final: a device that has not pulled it yet must not bring the row back
     const tombstoned = db.prepare(`SELECT 1 FROM sync_tombstones WHERE entity_type = ? AND entity_id = ?`);
     for (const m of payload.meetings ?? []) {
       if (tombstoned.get('meeting', m.id)) continue;
-      upsertMeeting.run(
-        m.id, deviceId, m.timestamp, m.duration, m.has_audio ? 1 : 0,
-        m.audio_file_path ?? null, m.audio_mime_type ?? null, m.speaker_names_json ?? null,
-        m.created_at || now, now
-      );
+      upsertMeeting.run({
+        id: m.id, device_id: deviceId, timestamp: m.timestamp, duration: m.duration, has_audio: m.has_audio ? 1 : 0,
+        audio_file_path: m.audio_file_path ?? null, audio_mime_type: m.audio_mime_type ?? null,
+        speaker_names_json: m.speaker_names_json ?? null, created_at: m.created_at || now, updated_at: now,
+        ...meetingNotesParams(m),
+      });
     }
 
     // Segments: an edited segment makes its meeting "changed" for the other devices
@@ -242,7 +268,9 @@ export class SyncManager {
    * Send a silent FCM notification to all mobile devices except the sender.
    */
   private static async broadcastSync(senderDeviceId: string): Promise<void> {
-    const mobileNodes = db.prepare("SELECT id, fcm_token FROM nodes WHERE type = 'mobile' AND id != ?").all(senderDeviceId) as any[];
+    // Node ids are upper case, the sender's id comes raw from the phone: compare case-insensitively,
+    // or the sender gets its own SYNC_REQUEST and syncs (and pushes) again
+    const mobileNodes = db.prepare("SELECT id, fcm_token FROM nodes WHERE type = 'mobile' AND UPPER(id) != UPPER(?)").all(senderDeviceId) as any[];
 
     const sentTokens = new Set<string>();
     for (const node of mobileNodes) {

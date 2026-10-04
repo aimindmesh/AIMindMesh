@@ -1,3 +1,4 @@
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defineConfig, type Plugin } from 'vitest/config';
@@ -39,6 +40,9 @@ export default defineConfig({
       OPENCLAW_URL: '',
       OPENCLAW_GATEWAY_TOKEN: '',
       HERMES_API_KEY: '',
+      // Venture git dirs and work trees: never under the server folder
+      VENTURE_GIT_DIR: path.join(os.tmpdir(), 'aimindmesh-tests', 'ventures-git'),
+      VENTURE_WORKSPACES_DIR: path.join(os.tmpdir(), 'aimindmesh-tests', 'ventures-work'),
       GIT_AUTHOR_NAME: 'aimindmesh-tests',
       GIT_AUTHOR_EMAIL: 'tests@aimindmesh.local',
       GIT_COMMITTER_NAME: 'aimindmesh-tests',

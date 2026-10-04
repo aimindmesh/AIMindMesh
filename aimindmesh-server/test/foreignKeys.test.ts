@@ -16,7 +16,8 @@ function insight(id: string, createdAt: number, nodes = '["n1"]') {
     .run(id, `content ${id}`, nodes, createdAt);
 }
 function pendingDelivery(insightId: string) {
-  db.prepare(`INSERT INTO pending_delivery (id, insight_id, device_id, created_at) VALUES (?, ?, 'phone', 0)`)
+  // Queued under the node id (upper case, as DeliveryScheduler.deliver does)
+  db.prepare(`INSERT INTO pending_delivery (id, insight_id, device_id, created_at) VALUES (?, ?, 'PHONE', 0)`)
     .run(`pd-${insightId}`, insightId);
 }
 function thread(id: string, insightId: string) {
@@ -76,8 +77,9 @@ describe('contextual delivery', () => {
     const { DeliveryScheduler } = await import('../src/services/DeliveryScheduler');
     insight('i1', 1);
     pendingDelivery('i1');
+    // The phone asks with its raw (lower-case) id
     expect(DeliveryScheduler.getPendingForDevice('phone')).toEqual([
-      { id: 'pd-i1', insightId: 'i1', deviceId: 'phone', createdAt: 0, content: 'content i1' },
+      { id: 'pd-i1', insightId: 'i1', deviceId: 'PHONE', createdAt: 0, content: 'content i1' },
     ]);
   });
 });

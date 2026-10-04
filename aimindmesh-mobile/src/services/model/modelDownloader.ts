@@ -59,41 +59,45 @@ export const RECOMMENDED_MODELS = [
     },
 ];
 
-// Recommended Qualcomm NPU Models (Genie / QAIRT for Snapdragon 8 Elite & 8 Gen 3)
+/**
+ * GGUF models for the Hexagon NPU (Qualcomm GenieX, llama_cpp runtime): Q4_0 weights, the format the
+ * NPU kernels run, on the Fold5 (8 Gen 2) and the Fold7 (8 Elite). Files and sizes checked on the
+ * Hugging Face API (none is gated). The id is the file name: GenieX reads the weight format from it.
+ */
 export const RECOMMENDED_GENIE_MODELS = [
     {
-        name: 'Qwen 3.5 2B (Qualcomm Genie) ⚡',
-        id: 'qwen3.5-2b-npu',
+        name: 'Qwen3.5 4B · Q4_0 ⚡',
+        id: 'Qwen3.5-4B-Q4_0',
+        url: 'https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_0.gguf',
+        size: 2583221408,
+        description: 'Best quality under 5B. Hybrid attention: every turn re-reads the conversation (fast on the NPU).',
+        category: 'chat',
+        engine: 'genie',
+    },
+    {
+        name: 'Qwen3.5 2B · Q4_0 ⚡',
+        id: 'Qwen3.5-2B-Q4_0',
         url: 'https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_0.gguf',
-        size: 1400000000, // ~1.4GB
-        description: 'Ultra-fast Qwen 3.5 on Snapdragon Hexagon NPU (60+ tok/s)',
+        size: 1214873856,
+        description: 'The lightest: quick answers and background memory work with little battery.',
         category: 'chat',
         engine: 'genie',
     },
     {
-        name: 'Qwen 3 4B (Qualcomm AI Hub NPU) ⚡',
-        id: 'qwen3-4b-npu',
-        url: 'https://huggingface.co/unsloth/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_0.gguf',
-        size: 2600000000, // ~2.6GB
-        description: 'Official Qualcomm AI Hub Qwen3 compiled for SM8750 HTP v79',
+        name: 'Gemma 4 E2B · QAT Q4_0 ⚡',
+        id: 'gemma-4-E2B_q4_0-it',
+        url: 'https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/main/gemma-4-E2B_q4_0-it.gguf',
+        size: 3349516256,
+        description: 'Google quantization-aware Q4_0, ~2B effective. Reuses the conversation already read between turns.',
         category: 'chat',
         engine: 'genie',
     },
     {
-        name: 'Qwen 2.5-VL 7B Vision (Qualcomm NPU) 👁️⚡',
-        id: 'qwen2.5-vl-7b-npu',
-        url: 'https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/qwen2.5-vl-7b-instruct-q4_k_m.gguf',
-        size: 4700000000, // ~4.7GB
-        description: 'Multimodal Vision-Language model on Hexagon NPU',
-        category: 'multimodal',
-        engine: 'genie',
-    },
-    {
-        name: 'Gemma 2 2B (Qualcomm NPU) ⚡',
-        id: 'gemma2-2b-npu',
-        url: 'https://huggingface.co/google/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf',
-        size: 1600000000, // ~1.6GB
-        description: 'Optimized Google Gemma model for mobile NPU',
+        name: 'Gemma 4 E4B · QAT Q4_0 ⚡',
+        id: 'gemma-4-E4B_q4_0-it',
+        url: 'https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/resolve/main/gemma-4-E4B_q4_0-it.gguf',
+        size: 5154941280,
+        description: 'Google QAT Q4_0, ~4B effective: the strongest, but heavy for 12 GB phones. Check it with the benchmark.',
         category: 'chat',
         engine: 'genie',
     },

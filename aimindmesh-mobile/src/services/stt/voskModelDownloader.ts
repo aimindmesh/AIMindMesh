@@ -11,6 +11,8 @@ export interface VoskModel {
     url: string;
     description: string;
     quality: 'small' | 'medium' | 'large';
+    /** Shipped in the APK (unpacked at first launch): it can't be deleted */
+    bundled?: boolean;
 }
 
 export interface ModelDownloadProgress {
@@ -26,13 +28,24 @@ export interface ModelDownloadProgress {
 export const VOSK_MODELS: VoskModel[] = [
     // English Models
     {
+        id: 'vosk-model-small-en-us-0.15',
+        name: 'English (US) - Small',
+        language: 'en',
+        size: 41205931,
+        url: 'https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip',
+        description: 'Bundled. Light and fast, for live meeting text',
+        quality: 'small',
+        bundled: true
+    },
+    {
         id: 'vosk-model-en-us-0.22-lgraph',
         name: 'English (US) - Standard',
         language: 'en',
         size: 128000000, // ~128MB  
         url: 'https://alphacephei.com/vosk/models/vosk-model-en-us-0.22-lgraph.zip',
-        description: 'Good balance of speed and accuracy',
-        quality: 'medium'
+        description: 'Bundled. Good balance of speed and accuracy',
+        quality: 'medium',
+        bundled: true
     },
     {
         id: 'vosk-model-en-us-0.22',
@@ -45,6 +58,16 @@ export const VOSK_MODELS: VoskModel[] = [
     },
 
     // Italian Models
+    {
+        id: 'vosk-model-small-it-0.22',
+        name: 'Italian - Small',
+        language: 'it',
+        size: 49665141,
+        url: 'https://alphacephei.com/vosk/models/vosk-model-small-it-0.22.zip',
+        description: 'Bundled. Light and fast, for live meeting text',
+        quality: 'small',
+        bundled: true
+    },
     {
         id: 'vosk-model-it-0.22',
         name: 'Italian - Standard',
@@ -188,9 +211,10 @@ export async function listLocalVoskModels(): Promise<string[]> {
 
         const models: string[] = [];
 
-        // Check each item in vosk-models directory
+        // Check each item in vosk-models directory: the speaker model is not a recognition model,
+        // and *.tmp directories are models still being unpacked
         for (const file of result.files) {
-            if (file.type === 'directory') {
+            if (file.type === 'directory' && !file.name.startsWith('vosk-model-spk') && !file.name.endsWith('.tmp')) {
                 // Check if this directory contains a nested model directory
                 try {
                     const subResult = await Filesystem.readdir({

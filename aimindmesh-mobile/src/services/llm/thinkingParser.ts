@@ -21,6 +21,10 @@ export function createThinkingParser() {
         isInThinking: false,
         isInTool: false
     };
+    /** The block was opened by an explicit tag (<think>, <|channel>thought): only its close ends it */
+    let explicitBlock = false;
+    /** The last character already flushed: "Answer:" ends an implicit block only at a real line start */
+    let flushedEndsLine = true;
 
     /**
      * Strip tool tags from text (they should not be visible to user)
@@ -123,6 +127,8 @@ export function createThinkingParser() {
                     }
                     state.buffer = state.buffer.substring(startInfo.index + startInfo.length);
                     state.isInThinking = true;
+                    explicitBlock = !/^(Thinking Process:|Thought:)$/i.test(startInfo.tag);
+                    flushedEndsLine = true;
                     continue;
                 } else {
                     // No opening tag found - check for partial
@@ -158,8 +164,10 @@ export function createThinkingParser() {
                     closeLen = 0; // Don't consume the tool tag!
                 }
 
-                // Check for "Answer:" or "Final Answer:" pattern to terminate thinking
-                const answerMatch = state.buffer.match(/(?:^|\n)(?:Final )?Answer:\s*/i);
+                // "Answer:" / "Final Answer:" at a line start ends an implicit block ("Thinking
+                // Process: … Answer: …"); never one opened by a tag: Gemma 4 writes "**Formulate the
+                // Answer:**" inside its thought channel, and the buffer start is not a line start
+                const answerMatch = explicitBlock ? null : state.buffer.match(flushedEndsLine ? /(?:^|\n)(?:Final )?Answer:\s*/i : /\n(?:Final )?Answer:\s*/i);
                 if (answerMatch && answerMatch.index !== undefined) {
                     const answerIdx = answerMatch.index;
                     // If answer starts before other closers
@@ -189,6 +197,7 @@ export function createThinkingParser() {
 
                         if (safeContent) {
                             yield { type: 'thinking', content: safeContent };
+                            flushedEndsLine = safeContent.endsWith('\n');
                             state.buffer = state.buffer.substring(splitIndex);
                         }
                     }

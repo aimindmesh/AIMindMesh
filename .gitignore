@@ -181,3 +181,6 @@ aimindmesh-admin-mobile/release/
 
 # Private deployment notes for AI assistants (VPS host, container map)
 GEMINI.local.md
+
+# Claude Code personal settings
+.claude/settings.local.json

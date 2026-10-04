@@ -1,7 +1,7 @@
 import { GoogleGenAI } from "@google/genai";
-import { Message, Personality, LLMConfig, Memory } from "../../../types";
+import { Message, Personality, LLMConfig } from "../../../types";
 import { logger } from "../../logger";
-import { buildSystemPrompt } from "../promptBuilder";
+import { buildPromptContext, systemPromptWithContext } from "../promptContext";
 import { getGeminiFunctionDeclarations } from "../../toolDefinitions";
 import { StreamChunk } from "../llmService";
 import { toGeminiRole } from "../roles";
@@ -152,7 +152,6 @@ export async function* generateGeminiStreamWithTools(
     history: Message[],
     personality: Personality,
     llmConfig: LLMConfig,
-    memories?: Memory[],
     apiKey?: string,
     signal?: AbortSignal,
     maxResponseLength?: number
@@ -165,29 +164,8 @@ export async function* generateGeminiStreamWithTools(
     const llmParams = personality.llmParams || {};
     const geminiModel = llmConfig.geminiModel || 'gemini-3.5-flash';
 
-    // Retrieve semantically relevant memories if enabled
-    let semanticMemoryContext = '';
-    if (llmConfig.enableSemanticMemory && llmConfig.embeddingModelId) {
-        try {
-            const { getOrInitializeSemanticMemoryRetriever } = await import('../../memory/semanticMemoryRetriever');
-            const retriever = await getOrInitializeSemanticMemoryRetriever(llmConfig);
-            if (retriever) {
-                const relevantMemories = await retriever.retrieveRelevantMemories(
-                    userMessage.text,
-                    undefined, // sessionId - could use thread ID in the future
-                    llmConfig.semanticMemoryMaxResults || 3,
-                    llmConfig.semanticMemorySimilarityThreshold || 0.75
-                );
-                if (relevantMemories.length > 0) {
-                    const truncated = retriever.truncateToTokenLimit(relevantMemories, 400);
-                    semanticMemoryContext = retriever.formatForContext(truncated);
-                    logger.log('info', `Injected ${truncated.length} semantic memories into context`);
-                }
-            }
-        } catch (error) {
-            logger.log('warn', 'Failed to retrieve semantic memories', error);
-        }
-    }
+    // Persona, what is known about the user, related memories and workspace documents
+    const promptContext = await buildPromptContext({ personality, llmConfig, history });
 
     // Build history for the API with potential image support
     const historyForApi = await Promise.all(history.slice(0, -1).map(async m => ({
@@ -212,23 +190,7 @@ export async function* generateGeminiStreamWithTools(
             : {})
     } : undefined;
 
-    // Build system prompt
-    // precise behavior: 
-    // - If semantic memory is ENABLED, we do NOT pass 'memories' to buildSystemPrompt (to avoid dumping all of them).
-    //   Instead, we append the specific 'semanticMemoryContext' we retrieved above.
-    // - If semantic memory is DISABLED, we pass 'memories' to buildSystemPrompt so it dumps all of them (legacy behavior).
-    let systemPrompt = buildSystemPrompt(personality, llmConfig.enableSemanticMemory ? undefined : memories);
-    if (semanticMemoryContext) {
-        systemPrompt += '\n\n' + semanticMemoryContext;
-    }
-
-    // Inject Workspace Documents Context
-    try {
-        const { contextInjector } = await import('../contextInjector');
-        systemPrompt = await contextInjector.buildSystemPromptWithContext(userMessage.text, systemPrompt);
-    } catch (e) {
-        logger.log('warn', 'Failed to inject workspace context', e);
-    }
+    const systemPrompt = systemPromptWithContext(promptContext);
 
     logger.log('info', 'Generating Gemini stream', {
         model: geminiModel,
@@ -236,7 +198,7 @@ export async function* generateGeminiStreamWithTools(
         tools: tools.length,
         thinking: !!thinkingConfig,
         search: !!llmConfig.enableSearch,
-        semanticMemories: !!semanticMemoryContext
+        turnContext: promptContext.turnContext.length
     });
 
     const userParts = await buildMessageParts(userMessage);

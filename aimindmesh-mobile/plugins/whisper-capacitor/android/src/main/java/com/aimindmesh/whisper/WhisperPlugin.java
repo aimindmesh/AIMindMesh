@@ -15,15 +15,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Capacitor plugin for Whisper.cpp speech recognition.
- * 
- * Note: This plugin requires the whisper.cpp native library to be compiled
- * and placed in the libs folder (libwhisper.so for arm64-v8a/armeabi-v7a).
- * 
- * Pre-built libraries can be obtained from:
- * https://github.com/ggerganov/whisper.cpp/releases
- * 
- * Or build from source using Android NDK.
+ * Capacitor plugin for whisper.cpp speech recognition (built from plugins/whisper-capacitor/cpp).
  */
 @CapacitorPlugin(name = "Whisper")
 public class WhisperPlugin extends Plugin {
@@ -34,13 +26,8 @@ public class WhisperPlugin extends Plugin {
     // Loads take seconds: running them on Capacitor's single plugin thread stalled every other
     // plugin call. One executor also keeps load/unload ordered as JS issued them.
     private final ExecutorService modelExecutor = Executors.newSingleThreadExecutor();
-
-    @Override
-    public void load() {
-        super.load();
-        // Native library loading will be done in loadModel to avoid startup crashes
-        // if the library is not yet installed
-    }
+    // Range transcriptions (meeting post-processing) run one at a time, in the order requested
+    private final ExecutorService rangeExecutor = Executors.newSingleThreadExecutor();
 
     @PluginMethod
     public void loadModel(PluginCall call) {
@@ -48,6 +35,10 @@ public class WhisperPlugin extends Plugin {
 
         if (modelPath == null || modelPath.isEmpty()) {
             call.reject("Model path is required");
+            return;
+        }
+        if (!WhisperContext.isNativeAvailable()) {
+            call.reject("Whisper is not supported on this device (requires an ARMv8.2 CPU)", "UNSUPPORTED");
             return;
         }
 
@@ -112,6 +103,19 @@ public class WhisperPlugin extends Plugin {
                 call.reject("Failed to unload model: " + e.getMessage());
             }
         });
+    }
+
+    /** Transcribes [startMs, endMs) of a 16 kHz mono WAV file (see WhisperRangeCall). */
+    @PluginMethod
+    public void transcribeRange(PluginCall call) {
+        WhisperRangeCall.run(call, isModelLoaded ? whisperContext : null, rangeExecutor);
+    }
+
+    /** Stops the running transcription as soon as possible. */
+    @PluginMethod
+    public void abort(PluginCall call) {
+        WhisperContext.abort();
+        call.resolve();
     }
 
     @PluginMethod
@@ -341,7 +345,7 @@ public class WhisperPlugin extends Plugin {
                     // Notify TypeScript listeners in real-time
                     notifyListeners("transcriptionSegment", segmentData);
 
-                    Log.d(TAG, "Segment " + segmentIndex + ": " + text);
+                    Log.d(TAG, "Segment " + segmentIndex + ": " + text.length() + " chars");
                 };
 
                 // Perform streaming transcription

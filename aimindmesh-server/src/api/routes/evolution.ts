@@ -22,6 +22,24 @@ export default async function evolutionRoutes(fastify: FastifyInstance, options:
     return rows;
   });
 
+  // Outcome per candidate source: which kind of evidence produces proposals that get merged
+  fastify.get('/stats', async () => {
+    const sources = db.prepare(`
+      SELECT c.source AS source,
+             COUNT(DISTINCT c.id) AS candidates,
+             COUNT(DISTINCT CASE WHEN c.status = 'failed' THEN c.id END) AS failed,
+             COUNT(DISTINCT CASE WHEN c.status = 'rejected' THEN c.id END) AS skipped,
+             COUNT(DISTINCT p.id) AS proposals,
+             COUNT(DISTINCT CASE WHEN p.status = 'merged' THEN p.id END) AS merged,
+             COUNT(DISTINCT CASE WHEN p.status = 'rejected' THEN p.id END) AS rejected
+      FROM evolution_candidates c
+      LEFT JOIN evolution_proposals p ON p.candidate_id = c.id
+      GROUP BY c.source
+      ORDER BY candidates DESC
+    `).all();
+    return { success: true, sources };
+  });
+
   // List all pending candidates
   fastify.get('/candidates', async (request, reply) => {
     const rows = db.prepare(`

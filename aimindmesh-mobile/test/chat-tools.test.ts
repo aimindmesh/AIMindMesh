@@ -11,7 +11,7 @@ vi.mock('../src/services/documents/DocumentRetriever', () => ({ DocumentRetrieve
 vi.mock('../src/services/documents/DocumentChunker', () => ({ DocumentChunker: class { } }));
 vi.mock('../src/services/database/knowledgeDatabase', () => ({ getKnowledgeDatabase: vi.fn() }));
 vi.mock('../src/services/image/imageGenService', () => ({ imageGenService: {} }));
-vi.mock('../src/services/webSearch', () => ({ searchWeb: vi.fn(), formatSearchResultsForContext: vi.fn() }));
+vi.mock('../src/services/web/webSearch', async importOriginal => ({ ...(await importOriginal<object>()), searchWeb: vi.fn() }));
 vi.mock('../src/services/calendar', () => ({ createCalendarEvent: vi.fn(), listCalendarEvents: vi.fn() }));
 vi.mock('../src/services/calendar/calendarService', () => ({}));
 vi.mock('../src/services/calendar/taskDatabase', () => ({}));
@@ -84,6 +84,14 @@ describe('tool catalog', () => {
     for (const decl of getGeminiFunctionDeclarations()) {
       if (decl.parameters) expect(Object.keys((decl.parameters as any).properties).length).toBeGreaterThan(0);
     }
+  });
+
+  it('offers analyze_web only when the server does the web analysis', () => {
+    const offered = () => getGeminiFunctionDeclarations().map(d => d.name);
+    expect(offered()).toContain('search_web');
+    expect(offered()).not.toContain('analyze_web');
+    localStorage.setItem('aimindmesh-server-settings', JSON.stringify({ enabled: true, serverUrl: 'http://s', delegateWebAnalysis: true }));
+    expect(offered()).toContain('analyze_web');
   });
 
   it('runs tools implemented by their definition handler instead of reporting them unknown', async () => {

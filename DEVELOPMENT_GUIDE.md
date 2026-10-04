@@ -39,9 +39,11 @@ Sleek desktop control center built with React and Tailwind CSS.
 Hybrid Capacitor app running on Android.
 *   **Build & Sync**:
     ```bash
+    ./scripts/fetch-bundled-models.sh   # meeting models shipped in the APK (once; SHA-256 checked)
     npm run build
     npx cap sync android
     ```
+*   **Bundled models**: `scripts/fetch-bundled-models.sh` fills `android/app/src/main/assets/bundled_models/` (git-ignored) from `MODELS_SRC` (default: the standalone Meeting Assistant's `Models/` folder) or the official URLs. Without it the build still works and the app downloads those models as before. The APK grows to about 530 MB.
 *   **Launch Local Server**:
     ```bash
     npm run dev
@@ -99,8 +101,8 @@ The server stack (`aimindmesh-server/docker-compose.yml`) publishes its ports on
 | :--- | :--- | :--- |
 | `aimindmesh-server` | `127.0.0.1:3030`, `10.2.0.1:3030` | Core Node API & orchestration router. API key on every route (`x-api-key`, `?token=` for WebSockets). |
 | `aimindmesh-neo4j` | `127.0.0.1` / `10.2.0.1` : `7474`, `7687` | Knowledge Graph store. |
-| `aimindmesh-openclaw-gateway` | `127.0.0.1:18789`, `10.2.0.1:18789` | OpenClaw agent gateway. |
-| `hermes-agent` | `127.0.0.1` / `10.2.0.1` : `9119`, `8642` | NousResearch Hermes agent. |
+| `aimindmesh-openclaw-gateway` | `127.0.0.1:18789`, `10.2.0.1:18789` | OpenClaw agent gateway. No `env_file`, no `GITEA_TOKEN`, no git credential helper: the agent shell sees only the variables listed in the compose file. |
+| `hermes-agent` | `127.0.0.1` / `10.2.0.1` : `9119`, `8642` | NousResearch Hermes agent. No `GITEA_TOKEN`, no CORS: only the server calls its API. |
 | `aimindmesh-freellmapi` | internal only (`10.2.0.54:3001`, not published) | OpenAI-compatible LLM gateway, reached through the server proxy with the caller's own key. |
 | `gitea` | `222->22`, `3001->3000` (see `infrastructure/docker/services/gitea`) | Local Git VCS hosting + Actions. |
 | `kasm` | `3000`, `3031->8443` | Headless sandbox workspace manager. |
@@ -111,6 +113,14 @@ The server stack (`aimindmesh-server/docker-compose.yml`) publishes its ports on
 *   **Secrets at runtime**: `config.json`, `.env` and `firebase-service-account.json` are mounted as volumes and excluded from the image (`.dockerignore`). `firebase-service-account.json` must exist next to `docker-compose.yml` before `docker compose up`, otherwise Docker creates a directory in its place.
 *   **Gitea webhooks**: the auto-evolution PR webhook (`/api/evolution/gitea/webhook`) and the project CI webhooks (`/api/organization/webhooks/gitea`) must use `autoEvolution.giteaWebhookSecret` as their *Secret*. CI webhooks created by the server set it automatically.
 *   **Check after deploy**: `ss -tlnp | grep -E ':(3030|7474|7687)\b'` must show only `127.0.0.1` and `10.2.0.1`.
+*   **Agent secrets**: never add `env_file` or a token to `openclaw-gateway`/`hermes`. Venture repositories are pushed by the server; builds are off until enabled in the organization build settings (`PATCH /api/organization/build-config`). After upgrading from a version that put the Gitea token in agent prompts, rotate `GITEA_TOKEN` and run once `docker exec aimindmesh-server node dist/scripts/purgeVentureSessions.js` to delete the old `develop-*` transcripts.
+*   **Venture builds** (§4.11.5 of the technical specification):
+    *   `./venture-workspaces` is mounted in the server (`/app/venture-workspaces`) and in OpenClaw (`/home/node/.openclaw/workspace/ventures`): work trees only. Git dirs stay in `./data/ventures` (server only). Override with `VENTURE_WORKSPACES_DIR`, `VENTURE_GIT_DIR`, `VENTURE_AGENT_UID`/`GID` (default 1000, the OpenClaw `node` user).
+    *   Validation runs sibling containers through the Docker socket of the server: the image (`node:22-bookworm-slim` by default, pin a digest in the build settings for reproducibility) is pulled on first use. Leftovers carry the label `aimindmesh.venture=1` and are removed at boot.
+    *   A build model (build settings `model`) needs an OpenClaw provider named `aimindmesh-builder` in `openclaw-config/openclaw.json` (`models.providers`): copy the existing FreeLLMAPI provider entry, set `baseUrl` to `http://aimindmesh-server:3030/api/freellmapi-proxy/builder/v1` and list the model id in its `models`. With `model` empty the agent's default model is used and no provider is needed.
+    *   `ghcr.io/openclaw/openclaw:latest` is unpinned and recent versions require `agents.entries` instead of `agents.list` (`openclaw doctor --fix`): pin the tag once a working version is found.
+    *   Scaffold templates live in `aimindmesh-server/templates/ventures/<template>/` (`node-library`, `node-api`); `test/ventureSpec.test.ts` builds and tests each one with the server's own TypeScript and vitest. They are protected from auto-evolution.
+    *   **Residual risk**: the development agent shares the OpenClaw `main` agent, which can read `openclaw.json` (gateway token with admin scope, Telegram token) and use every skill. Recommended hardening, not applied automatically: a separate OpenClaw container (or agent entry) for venture builds with `skills: []`, no channel tokens and only the FreeLLMAPI provider, or OpenClaw's per-agent sandbox (`sandbox.mode: "all"`, which needs the Docker socket in the OpenClaw container).
 
 ### 3.2 Backups and Restore
 *   **Content**: `POST /api/admin/backups` archives a consistent SQLite snapshot (`VACUUM INTO`), `config.json`, `firebase-service-account.json`, the wiki and `openclaw-config/` (models excluded). **Neo4j is not included** (live store of another container, `data/neo4j`): back it up separately, e.g. `neo4j-admin database dump` into `./backups/neo4j`. FreeLLMAPI data and release downloads are excluded too.
@@ -165,3 +175,20 @@ When testing NPU-accelerated models (Qwen 3.5, Gemma 2, Whisper NPU, Stable Diff
    npm run build
    npx cap sync android
    ```
+
+5. **Stable Diffusion: images that ignore the prompt**:
+   *   At load `SDEngine` logs `Text encoder check: empty prompt mean … std …`; `text_encoder.bin looks untrained` means the binary was compiled without its weights (every token normalized to mean 0 / std 1).
+   *   Per-step statistics (latent, denoised estimate, `cond-uncond rms` = how much the prompt moves the UNet):
+       ```bash
+       adb shell setprop log.tag.SDEngine DEBUG
+       adb logcat -s SDEngine QnnSdEngineNative QnnGraphIO
+       ```
+   *   I/O of a context binary on the PC (QAIRT x86 tools need the NDK `libc++.so.1`):
+       ```bash
+       export LD_LIBRARY_PATH=$ANDROID_SDK/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/lib:/opt/qcom/aistack/qairt/2.31.0.250130/lib/x86_64-linux-clang
+       /opt/qcom/aistack/qairt/2.31.0.250130/bin/x86_64-linux-clang/qnn-context-binary-utility --context_binary unet.bin --json_file unet.json
+       ```
+   *   Custom checkpoints (local, not versioned): `aimindmesh-mobile/scripts/export_uberrealistic.py` in the `scripts/qai_venv314` venv. `--check-only --reference --preview out.png` loads the checkpoint strictly, compares the text encoder with SD 2.1's, measures the prediction type and renders a CPU image before anything is sent to AI Hub; the export uploads each component as a torch.export program (`.pt2`; AI Hub's TorchScript path fails on the >2 GB UNet), compiles it to a QNN DLC and links it into a context binary (`--qairt 2.45` by default: never newer than the QNN libs in the APK), validates the text encoder and UNet on an AI Hub device against the CPU output and writes `metadata.json` (with `prediction_type`). `--reuse component=ID` retries without uploading again, or links an existing DLC for another `--device` (e.g. `--device "Samsung Galaxy S23 (Family)"` for the Fold5's Hexagon v73).
+   *   w8a16 builds (half the memory, for the v73 NPU of the Z Fold5): `scripts/quantize_sd_w8a16.py --device "Samsung Galaxy S23 (Family)" --copy-from Models/sd2.1lora_v73 --out Models/sd2.1lora_v73_w8a16` calibrates on CPU with the app's own sampling loop (Euler, trailing timesteps, CFG 7.5), runs AI Hub quantize jobs (int8 weights, int16 activations, `--range_scheme min_max`), optionally (`--preview`) renders a CPU image with the quantized ONNX models (onnxruntime; GBs to download) and compiles, links and validates them like the FP16 export.
+   *   Other NPUs in the APK: GenieX ships the QNN HTP runtime for V79/V81 only. `aimindmesh-mobile/scripts/fetch-qnn-htp-libs.sh <QAIRT SDK zip or folder> [v73 ...]` copies the stub/skel of other versions into the SD plugin's `jniLibs` (not versioned), after checking they come from the same QAIRT build as GenieX's `libQnnHtp.so`; rebuild the APK afterwards.
+   *   Device tests without touching the phone: `scripts/push-sd-package.sh [-s serial] Models/<package>` copies a package into the app (md5-verified), `python3 scripts/sd_device_test.py --serial <serial> --model <package> --out <dir>` generates through the SD plugin over DevTools on the debug WebView (the app must be open; two phones in parallel with different `--port`) and writes `report.html`.

@@ -4,18 +4,21 @@
  */
 
 import { logger } from '../../logger';
-import { Message, Personality, LLMConfig, Memory } from '../../../types';
+import { Message, Personality, LLMConfig } from '../../../types';
 import { StreamChunk } from '../llmService';
 import { buildMessageTextForGGUF } from '../promptFormatters';
 import { createThinkingParser } from '../thinkingParser';
 import { FileSystemAdapter as Filesystem, Directory } from '../../../utils/fileSystemAdapter';
 import { getReActSystemPromptCompact } from '../../toolDefinitions';
 import { parseReActToolCalls } from '../../tools';
-import { buildSystemPrompt } from '../promptBuilder';
+import { buildPromptContext, historyWithTurnContext } from '../promptContext';
 
 // Modular imports
 import { LiteRT, initLiteRTModel, stopLiteRTGeneration, releaseLiteRTSession, restoreLiteRTKvCache, getLiteRTMessageCount, registerLiteRTTools } from './liteRT/plugin';
 import { syncNativeContext } from './liteRT/context';
+import { withLanguageRule } from '../prompt/onDevicePrompt';
+import { detectDeviceContext, onDeviceContextSize } from '../context/contextSize';
+import { routedTools } from '../background/taskFlags';
 
 // Re-export core functions for external use
 export * from './liteRT/types';
@@ -38,7 +41,6 @@ export async function* generateLiteRTStream(
     history: Message[],
     personality: Personality,
     llmConfig: LLMConfig,
-    _memories?: Memory[],
     _signal?: AbortSignal
 ): AsyncGenerator<StreamChunk> {
     const modelFilename = llmConfig.liteRTModelPath;
@@ -66,8 +68,10 @@ export async function* generateLiteRTStream(
     try {
         await previousLock;
         releaseLock = currentLockResolve!;
+        // Stopped while waiting for the lock (e.g. a background task the chat preempted): never start
+        if (_signal?.aborted) return;
         // Delegate to the inner generator for the actual work
-        yield* innerGenerateStream(history, personality, llmConfig, _memories, _signal);
+        yield* innerGenerateStream(history, personality, llmConfig, _signal);
     } catch (error: any) {
         // Only throw if it's not a cancellation
         if (error.name !== 'AbortError') {
@@ -83,7 +87,6 @@ async function* innerGenerateStream(
     history: Message[],
     personality: Personality,
     llmConfig: LLMConfig,
-    _memories?: Memory[],
     _signal?: AbortSignal
 ): AsyncGenerator<StreamChunk> {
     const modelFilename = llmConfig.liteRTModelPath;
@@ -96,59 +99,22 @@ async function* innerGenerateStream(
         throw new Error(`Model file not found: ${modelFilename}`);
     }
 
-    const activeMemories = [...(_memories || [])];
-    let effectiveHistory = [...history];
-
-    if (llmConfig.enableSemanticMemory && llmConfig.embeddingModelId && effectiveHistory.length > 0) {
-        try {
-            const lastMessage = effectiveHistory[effectiveHistory.length - 1];
-            if (lastMessage.role === 'user') {
-                const { getOrInitializeSemanticMemoryRetriever } = await import('../../memory/semanticMemoryRetriever');
-                const retriever = await getOrInitializeSemanticMemoryRetriever(llmConfig);
-                if (retriever) {
-                    const results = await retriever.retrieveRelevantMemories(lastMessage.text);
-                    if (results.length > 0) {
-                        const mergedMemory = results.map(r => r.content).join('\n');
-                        // Inject directly into the user's message using standard XML context tags
-                        // Small models like Gemma 2B respect <context> blocks much better than conversational notes.
-                        effectiveHistory[effectiveHistory.length - 1] = {
-                            ...lastMessage,
-                            text: `<context>\nHere is some factual context about the user from past conversations. You MUST use this information to answer the user's query:\n${mergedMemory}\n</context>\n\n${lastMessage.text}`
-                        };
-                        logger.log('info', `[LiteRT] Injected ${results.length} semantic memories into current user message`);
-                    }
-                }
-            }
-        } catch (e) {
-            logger.log('warn', '[LiteRT] Failed to retrieve semantic memories', e);
-        }
-    }
-
-    // System Prompt Construction
-    let systemPrompt = buildSystemPrompt(personality, activeMemories, undefined, true);
-    
-    // Inject Workspace Documents Context directly into user message to avoid system prompt mutation (preserves KV Cache)
-    try {
-        const { contextInjector } = await import('../contextInjector');
-        // Use history instead of effectiveHistory to avoid embedding the injected semantic facts (causes OOM)
-        const workspaceContext = await contextInjector.buildSystemPromptWithContext(history[history.length - 1].text, "");
-        if (workspaceContext && workspaceContext.trim().length > 0) {
-            effectiveHistory[effectiveHistory.length - 1] = {
-                ...effectiveHistory[effectiveHistory.length - 1],
-                text: `${workspaceContext.trim()}\n\n${effectiveHistory[effectiveHistory.length - 1].text}`
-            };
-            logger.log('info', '[LiteRT] Workspace context injected into user message.');
-        }
-    } catch (e) {
-        logger.log('warn', 'Failed to inject workspace context', e);
-    }
+    // Persona and the user profile in the system prompt; related memories and workspace documents
+    // go into the user turn, so the system prompt (and the native session) stays stable
+    const promptContext = await buildPromptContext({
+        personality, llmConfig, history,
+        onDevice: true, // compact prompt in the assistant's language
+    });
+    const effectiveHistory = historyWithTurnContext(history, promptContext);
+    let systemPrompt = promptContext.systemPrompt;
 
     // Thinking & Tools injection
     if (llmConfig.enableToolCalling) {
-        systemPrompt += "\n" + getReActSystemPromptCompact(llmConfig.toolRules);
+        systemPrompt += "\n" + getReActSystemPromptCompact(llmConfig.toolRules, routedTools(llmConfig));
     } else if (llmConfig.enableThinking) {
         systemPrompt += `\nIMPORTANT: Before answering, reason step-by-step. Show your thinking process enclosed in <thinking> and </thinking> tags.\nYour final answer goes AFTER the thinking tags.`;
     }
+    systemPrompt = withLanguageRule(systemPrompt, promptContext.language ?? 'it');
 
     // Sync context with native layer
     const { messagesToFormat, systemPromptToUse, appendMode } = await syncNativeContext(effectiveHistory, llmConfig, absoluteModelPath, systemPrompt);
@@ -161,9 +127,10 @@ async function* innerGenerateStream(
     }
 
     // Always call init to ensure the latest backend config is applied (Java layer handles caching)
+    await detectDeviceContext();
     const success = await initLiteRTModel({
         modelPath: absoluteModelPath,
-        maxTokens: llmConfig.contextSize || llmConfig.nCtx || 8192,
+        maxTokens: onDeviceContextSize(llmConfig),
         temperature: personality.llmParams?.temperature || 0.8,
         topK: 40,
         backend: llmConfig.liteRTBackend || 'CPU',
@@ -175,7 +142,7 @@ async function* innerGenerateStream(
     if (!success) throw new Error('Failed to initialize LiteRT model');
 
     // Register tools for native function calling (LiteRT v0.14+); disabled tools clear the native list
-    await registerLiteRTTools(llmConfig.toolRules as Record<string, string> | undefined, !!llmConfig.enableToolCalling);
+    await registerLiteRTTools(llmConfig.toolRules as Record<string, string> | undefined, !!llmConfig.enableToolCalling, routedTools(llmConfig));
 
     // [KV CACHE] Restore session if current native context is empty and setting is enabled
     const currentCount = await getLiteRTMessageCount();
@@ -280,7 +247,7 @@ async function* innerGenerateStream(
                     // Re-initialize the model from scratch
                     const success = await initLiteRTModel({
                         modelPath: absoluteModelPath,
-                        maxTokens: llmConfig.contextSize || llmConfig.nCtx || 8192,
+                        maxTokens: onDeviceContextSize(llmConfig),
                         temperature: personality.llmParams?.temperature || 0.8,
                         topK: 40,
                         backend: llmConfig.liteRTBackend || 'CPU',
@@ -345,9 +312,12 @@ async function* innerGenerateStream(
                 if (chunk.done) break;
             } else {
                 if (_signal?.aborted) { await stopLiteRTGeneration(); break; }
+                // addEventListener, not onabort: assigning onabort would replace the caller's handler
+                let onAbort: (() => void) | undefined;
                 await new Promise<void>((resolve, reject) => {
                     resolveQueue = resolve;
-                    if (_signal) _signal.onabort = () => resolve();
+                    onAbort = () => resolve();
+                    _signal?.addEventListener('abort', onAbort, { once: true });
 
                     // Failsafe: if we wait more than 60 seconds for a chunk, stop generation and release lock
                     setTimeout(async () => {
@@ -356,7 +326,7 @@ async function* innerGenerateStream(
                             reject(new Error('LiteRT streaming timeout'));
                         }
                     }, 60000);
-                });
+                }).finally(() => { if (onAbort) _signal?.removeEventListener('abort', onAbort); });
             }
         }
 

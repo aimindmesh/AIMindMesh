@@ -24,10 +24,20 @@ object DeliveryClient {
     const val AVAILABILITY_THRESHOLD = 70
     private const val TIMEOUT_MS = 10_000
 
-    /** Pure decision, unit tested. */
-    fun shouldPoll(config: ServerConfig, availabilityScore: Int, notificationsAllowed: Boolean): Boolean =
+    /** Most notifications posted at once: the rest are summed up in one (a burst after Doze) */
+    const val MAX_NOTIFICATIONS = 3
+
+    /**
+     * Pure decision, unit tested. Nothing is fetched in quiet hours: the server marks items as
+     * delivered when it returns them, so they would be shown in the middle of the night.
+     */
+    fun shouldPoll(config: ServerConfig, availabilityScore: Int, notificationsAllowed: Boolean, quietHours: Boolean = false): Boolean =
         config.enabled && config.isContextual && config.serverUrl.isNotBlank() && config.deviceId.isNotBlank() &&
-            config.apiKey.isNotBlank() && notificationsAllowed && availabilityScore >= AVAILABILITY_THRESHOLD
+            config.apiKey.isNotBlank() && notificationsAllowed && !quietHours && availabilityScore >= AVAILABILITY_THRESHOLD
+
+    /** Insights shown one by one, and how many more are summed up in a single notification. */
+    fun planNotifications(insights: List<PendingInsight>, max: Int = MAX_NOTIFICATIONS): Pair<List<PendingInsight>, Int> =
+        insights.take(max) to (insights.size - max).coerceAtLeast(0)
 
     /** `{ items: [{ id, insightId, deviceId, createdAt, content? }], count }` */
     fun parsePending(body: String): List<PendingInsight> {
@@ -42,7 +52,11 @@ object DeliveryClient {
     }
 
     fun notificationsAllowed(context: Context): Boolean {
-        if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) return false
+        val manager = NotificationManagerCompat.from(context)
+        if (!manager.areNotificationsEnabled()) return false
+        // The user may have blocked just this channel: fetching would consume the items unseen
+        val channel = manager.getNotificationChannel(ProactiveNotificationHelper.CHANNEL_ID)
+        if (channel != null && channel.importance == NotificationManagerCompat.IMPORTANCE_NONE) return false
         return Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
     }
@@ -69,13 +83,19 @@ object DeliveryClient {
     fun notify(context: Context, insights: List<PendingInsight>) {
         val helper = ProactiveNotificationHelper(context)
         val manager = NotificationManagerCompat.from(context)
-        for (insight in insights) {
-            val message = insight.content?.take(300) ?: "You have a new AI insight."
-            try {
+        val (shown, more) = planNotifications(insights)
+        try {
+            for (insight in shown) {
+                val message = insight.content?.take(300) ?: "You have a new AI insight."
                 manager.notify(insight.id.hashCode(), helper.createActionNotification("AI Insight", message))
-            } catch (e: SecurityException) {
-                Log.w(TAG, "Notification permission revoked meanwhile", e)
             }
+            if (more > 0) {
+                manager.notify(MORE_NOTIFICATION_ID, helper.createActionNotification("AI Insights", "$more more insights are waiting in the Feed."))
+            }
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Notification permission revoked meanwhile", e)
         }
     }
+
+    private const val MORE_NOTIFICATION_ID = 0x41494d
 }

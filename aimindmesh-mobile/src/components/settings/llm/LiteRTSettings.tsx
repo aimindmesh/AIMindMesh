@@ -1,4 +1,5 @@
 import React from 'react';
+import ContextWindowSetting from './ContextWindowSetting';
 import { LLMConfig } from '../../../types';
 import { ModelDownloadProgress, downloadModel } from '../../../services/model/modelDownloader';
 import { getCleanModelName } from '../../../utils/stringUtils';
@@ -190,31 +191,8 @@ const LiteRTSettings: React.FC<LiteRTSettingsProps> = ({
             </div>
 
             {/* Context Window */}
-            <div className="mt-4 pt-4 border-t border-white/5">
-                <label className="block text-sm font-medium text-text-primary mb-1">
-                    📐 Context Window (nCtx)
-                    <span className="ml-2 text-primary font-bold">{llmConfig.nCtx ?? 4096}</span>
-                </label>
-                <input
-                    type="range"
-                    id="litert-nctx"
-                    min={512}
-                    max={32768}
-                    step={512}
-                    value={llmConfig.nCtx ?? 4096}
-                    onChange={(e) => {
-                        triggerHaptic();
-                        onLlmConfigSave({ ...llmConfig, nCtx: parseInt(e.target.value) });
-                    }}
-                    className="w-full accent-blue-500"
-                />
-                <div className="flex justify-between text-xs text-text-secondary mt-1">
-                    <span>512</span>
-                    <span>32 768</span>
-                </div>
-                <p className="text-xs text-text-secondary mt-1">
-                    Larger context = more conversation history remembered, but higher RAM usage. Reload model after changing.
-                </p>
+            <div className="mt-4">
+                <ContextWindowSetting llmConfig={llmConfig} onLlmConfigSave={onLlmConfigSave} />
             </div>
 
             {/* LiteRT Models Section */}

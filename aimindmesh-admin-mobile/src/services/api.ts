@@ -50,6 +50,7 @@ export const wikiApi = {
 export const evolutionApi = {
   getProposals: () => api.get('/api/evolution/proposals'),
   getCandidates: () => api.get('/api/evolution/candidates'),
+  getStats: () => api.get('/api/evolution/stats'),
   approveProposal: (id: string) => api.post(`/api/evolution/proposals/${id}/approve`),
   rejectProposal: (id: string) => api.post(`/api/evolution/proposals/${id}/reject`),
   runCycle: () => api.post('/api/evolution/cycle/run'),

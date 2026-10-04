@@ -28,6 +28,8 @@ services:
       - ./backups:/app/backups
       - ./openclaw-config:/app/openclaw-config
       - ./openclaw-workspace:/app/openclaw-workspace
+      # Venture work trees, shared with the agent; their git dirs stay in ./data/ventures (server only)
+      - ./venture-workspaces:/app/venture-workspaces
       - ./hermes-data:/app/hermes-data
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
@@ -60,7 +62,7 @@ services:
     image: aimindmesh-openclaw-gateway:latest
     container_name: aimindmesh-openclaw-gateway
     restart: unless-stopped
-    env_file: .env
+    # No env_file: the agent's shell would see every server secret. Only what openclaw.json and its skills need.
     ports:
       - "127.0.0.1:18789:18789"
       - "10.2.0.1:18789:18789"
@@ -76,13 +78,15 @@ services:
       - OPENAI_API_KEY=${FREELLMAPI_API_KEY}
       - OPENAI_BASE_URL=http://aimindmesh-server:3030/api/freellmapi-proxy/v1
       - GITEA_URL=${GITEA_URL:-http://gitea:3000}
-      - GITEA_TOKEN=${GITEA_TOKEN}
+      # No GITEA_TOKEN: venture repositories are fetched and pushed by the server, never by the agent
       - SEARXNG_BASE_URL=http://10.2.0.52:8080
       - LOG_LEVEL=info
       - PATH=/home/node/.openclaw/tools/sherpa-onnx-tts/runtime/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     volumes:
       - ./openclaw-config:/home/node/.openclaw
       - ./openclaw-workspace:/home/node/.openclaw/workspace
+      # A mount point the agent cannot rename or replace with a symlink (see VentureWorkspace)
+      - ./venture-workspaces:/home/node/.openclaw/workspace/ventures
 
   openclaw-cli:
     image: aimindmesh-openclaw-gateway:latest
@@ -134,13 +138,12 @@ services:
       - API_SERVER_ENABLED=true
       - API_SERVER_HOST=0.0.0.0
       - API_SERVER_KEY=${HERMES_API_KEY}
-      - API_SERVER_CORS_ORIGINS=*
+      # No API_SERVER_CORS_ORIGINS: only the server calls this API (it runs a terminal), never a browser
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - OPENAI_API_KEY=${FREELLMAPI_API_KEY}
       - OPENAI_BASE_URL=http://aimindmesh-server:3030/api/freellmapi-proxy/v1
       - GITEA_URL=${GITEA_URL:-http://gitea:3000}
-      - GITEA_TOKEN=${GITEA_TOKEN}
       - SEARXNG_URL=http://10.2.0.52:8080
       - OLLAMA_URL=http://host.docker.internal:11434
       - NEO4J_URI=bolt://neo4j:7687

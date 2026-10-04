@@ -20,6 +20,14 @@ function getClient(timeoutMs?: number) {
   });
 }
 
+/**
+ * Hermes keeps a conversation per X-Hermes-Session-Id (needs API_SERVER_KEY); the OpenAI `user`
+ * field is ignored, and without the header the session is derived from the first message.
+ */
+function sessionHeaders(sessionKey: string): Record<string, string> {
+  return { 'X-Hermes-Session-Id': sessionKey };
+}
+
 export class HermesBridge {
   public static async isReachable(): Promise<boolean> {
     const url = getHermesBase();
@@ -43,9 +51,8 @@ export class HermesBridge {
       const response = await client.post('/chat/completions', {
         model: 'hermes',
         messages: [{ role: 'user', content: prompt }],
-        user: sessionKey,
         stream: false
-      });
+      }, { headers: sessionHeaders(sessionKey) });
 
       const reply = (response.data as any).choices?.[0]?.message?.content || '';
       return {
@@ -67,10 +74,10 @@ export class HermesBridge {
       const response = await client.post('/chat/completions', {
         model: 'hermes',
         messages: [{ role: 'user', content: prompt }],
-        user: sessionKey,
         stream: true
       }, {
-        responseType: 'stream'
+        responseType: 'stream',
+        headers: sessionHeaders(sessionKey),
       });
 
       const stream = response.data as any;

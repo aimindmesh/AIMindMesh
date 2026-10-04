@@ -14,7 +14,7 @@ AI Mind Mesh is a privacy-focused, local-first personal assistant designed for A
 1.  **Local First**: Core intelligence (LLM, STT, TTS, Vector DB) runs on-device using optimized inference engines (llama.cpp, LiteRT, Vosk/Piper). Cloud fallback (Gemini/Perplexity) is optional.
 2.  **Agentic Architecture**: The AI is not just a chatbot; it is an agent with a "body" (the device). It can execute shell commands, manage files, control hardware, and interact with other apps.
 3.  **Hybrid Intelligence**: Seamlessly switches between lightweight local models for privacy/speed (Gemma 3, Llama 3) and powerful cloud models for complex reasoning (Gemini 3.1 Flash Lite, Sonar Pro).
-4.  **Semantic Memory**: Features a vector-based long-term memory system that retrieves relevant context from past conversations based on meaning, not just keywords.
+4.  **Memory**: The assistant keeps what it learns about the user as facts (profile, people, goals, open loops), updated while the chat is quiet, and can search past conversations by meaning.
 5.  **Context Saturation Protection**: Advanced multi-layered context management combining LLM-based summarization (cloud or local) with a robust "rolling context" fallback to ensure coherence in long conversations while protecting critical system anchors.
 
 ---
@@ -143,39 +143,70 @@ LLMConfig.liteRTUseNPU (TS)
 **Device Requirements**: Snapdragon 8 Gen 2 or later. Falls back gracefully to selected CPU/GPU backend if `libQnnHtp.so` is not present on the device.
 
 ### 3.4 Qualcomm Genie NPU LLM Subsystem (`genie-capacitor`)
-The `genie-capacitor` plugin provides dedicated native hardware execution for frontier generative models (including **Qwen 3.5**, **Qwen 2.5**, and **Gemma 2**) on Qualcomm Hexagon NPU.
+The `genie-capacitor` plugin runs LLMs on the Qualcomm Hexagon NPU through the **GenieX SDK** (`com.qualcomm.qti:geniex-android:0.8.0`, Maven Central; also used by `sd-capacitor` for its QNN libraries — QNN 2.45.0.260326154327 in both 0.3.5 and 0.8.0). It has two runtimes, chosen by the model file:
 
-*   **Runtime Stack**: Interfaces directly with Qualcomm GenieX / QAIRT SDK (`com.qualcomm.qti:geniex-android` and `libGenie.so` + `libQnnHtp.so`).
-*   **Hardware Architecture & SoC Tuning**:
-    *   **Snapdragon 8 Elite (SM8750 / SoC 69 / Hexagon v79)** on Z Fold 7:
-        *   `perf_profile: "burst"`: Turbo clocking on HTP tensor processing units during token decoding.
-        *   `mem_type: "shared_buffer"`: Zero-copy DMA-BUF/ION buffer sharing between CPU and Hexagon NPU.
-        *   `rpc_control_latency: 100`: Microsecond target for FastRPC inter-process dispatch.
-        *   `cpu-mask: "0xe0"`: Pins FastRPC helper threads to Oryon/Kryo Prime + Gold performance cores (cores 5, 6, 7).
-        *   `poll: true`: Polling mode on FastRPC completion queues to eliminate Linux context switch overhead and minimize TTFT (Time To First Token).
-        *   `share_resources: true`: Shared group context for multi-part binary context graphs (`part_1_of_3`, etc.).
-*   **Model Package Lifecycle & Bundle Architecture**:
-    *   **Qualcomm AI Hub Archives (`.zip`)**: Models downloaded from Qualcomm AI Hub (e.g. `qwen3_vl_4b_instruct-geniex_qairt-w4a16-qualcomm_snapdragon_8_elite.zip`) are structured multi-file packages.
-    *   **Automatic Unpacking**: The native `GenieEngine` automatically extracts `.zip` bundles to `models/genie/<model_name>/` and detects internal directory trees.
-    *   **Dynamic Path Resolution**: Parses `genie_config.json` and dynamically resolves relative file references into absolute device filesystem paths for:
-        *   `dialog.tokenizer.path` -> `tokenizer.json`
-        *   `dialog.engine.model.binary.ctx-bins` -> `part1_of_N.bin`, `part2_of_N.bin`, ...
-        *   `dialog.embedding.lut-path` -> `embedding_weights.raw`
-        *   `dialog.engine.backend.extensions` -> `htp_backend_ext_config.json` / generated `htp_config.json`
-    *   **Multimodal Vision Support**: Automatically detects `vision_encoder.bin` or `visual.bin` in `metadata.json` for VL models (such as Qwen3-VL 4B Instruct), binding to `com.geniex.sdk.VlmWrapper` for zero-overhead multimodal projection on Hexagon HTP0 (`runtime_id: "qairt"`). Standard text models bind to `com.geniex.sdk.LlmWrapper`.
-    *   **UI Model Management**: `GenieSettings.tsx` provides single-tap ZIP file import, live hardware throughput stats, and memory management.
-*   **Energy & Throughput**: Delivers ~45–65 tok/s at ~1.5–2.5W power draw, preventing CPU thermal throttling during prolonged reasoning sessions.
+| Runtime | Model | NPU support | Prompt |
+| :--- | :--- | :--- | :--- |
+| **`llama_cpp`** | One **`.gguf` file** (downloaded or imported, in the app's files dir) | Any Hexagon **v68+**: GenieX ships `libggml-htp-v68…v81.so` → **Fold5 (SM8550, v73) and Fold7 (SM8750, v79)**, same file | The GGUF's own chat template (`Genie.formatChat` → `LlmWrapper.applyChatTemplate`) |
+| **`qairt`** | A Qualcomm AI Hub bundle (`.zip` → `models/genie/<name>/`, `genie_config.json` + context binaries) | Compiled for one NPU generation; GenieX ships the QNN HTP libraries for **v79/v81 only** → Fold7 | Formatted in JS (`genieSupport.formatBundlePrompt`: ChatML for Qwen, turns for Gemma) |
+
+*   **SoC detection** (`HexagonSoc.kt`, unit tested): `SOC_MODEL`/board → Hexagon arch (`sm8550`/`kalama` → v73, `sm8650`/`pineapple` → v75, `sm8750`/`sun` → v79, `sm8850` → v81). `getCapabilities()` returns `npuArch`, `socModel`, `ggufNpuSupported` and `qairtSupported`; the UI shows only what the phone can run.
+*   **GGUF loading** (`GenieEngine.loadGguf`, pure decisions in `GgufSupport.kt`, unit tested): `LlmCreateInput(runtime_id = "llama_cpp", compute_unit = …, ModelConfig(nCtx = contextLength ?: 4096, nGpuLayers = 999 | 0 on CPU))`. `LLMConfig.genieRuntime`: `auto` (default) tries **NPU → GPU → CPU** (a failed create moves to the next unit), or a fixed `npu`/`gpu`/`cpu`. Weights without NPU kernels (K-quants) start from the **GPU** under `auto`: on the NPU they load, but almost all of them run on the CPU (Gemma 4 E2B Q4_K_M on SM8750: 14.5 tok/s "on NPU" vs 23.4 on GPU). The unit actually used is returned (`computeUnit`) and shown in the settings, with a warning when `auto` fell back from the NPU and a note for formats without NPU kernels. Loads and unloads are serialized (`loadMutex`): two activity instances loading the same 4B model together doubled the RAM and the low-memory killer closed the app. The model is reloaded when the configured unit or context changes (`genieLoadMatches`). `nCtx` is always the configured window: 0 would mean the GGUF's training window (far too much RAM).
+*   **Weights on the NPU**: the Hexagon kernels of GenieX (also in `libggml-htp-v73.so`) run **Q4_0, Q4_1, IQ4_NL, MXFP4 and Q8_0** weights — matmul and flash attention on the HMX tensor unit, `gated_delta_net`/`ssm_conv` (Qwen3.5), GELU/GEGLU (Gemma), RoPE, softmax. K-quants (Q4_K_M…) fall back to GPU/CPU: `npuReady` (from the file name) marks the models with an NPU badge. GenieX's llama.cpp knows the `qwen35`, `gemma4` and `gemma3n` architectures.
+*   **Recommended GGUFs for the NPU** (`RECOMMENDED_GENIE_MODELS`, files and sizes checked on the Hugging Face API, none gated; saved as `<id>.gguf` by the GGUF downloader, so the weight format stays in the name):
+
+| Model | Repository · file | Size | Notes |
+| :--- | :--- | :--- | :--- |
+| Qwen3.5 4B | `unsloth/Qwen3.5-4B-GGUF` · `Qwen3.5-4B-Q4_0.gguf` | 2.58 GB | Best quality under 5B. Hybrid (Gated DeltaNet): no prefix reuse, every turn re-reads the conversation |
+| Qwen3.5 2B | `unsloth/Qwen3.5-2B-GGUF` · `Qwen3.5-2B-Q4_0.gguf` | 1.21 GB | Lightest, same caveat |
+| Gemma 4 E2B | `google/gemma-4-E2B-it-qat-q4_0-gguf` · `gemma-4-E2B_q4_0-it.gguf` | 3.35 GB | Google QAT Q4_0, ~2B effective, standard attention → prefix reuse |
+| Gemma 4 E4B | `google/gemma-4-E4B-it-qat-q4_0-gguf` · `gemma-4-E4B_q4_0-it.gguf` | 5.15 GB | ~4B effective; above the ~3.5 GB of one NPU session and heavy for 12 GB: the benchmark decides |
+
+    Qwen 3.6/3.8 have no small models. On the Fold7 the AI Hub QAIRT bundles remain importable (e.g. Qwen3-VL-4B, Qwen3-4B-Instruct-2507, **Gemma-4-E4B-it** with vision). Gemma 4 bundles need **GenieX ≥ 0.8.0** (0.3.5 had no factory: `dispatch: no VLM factory matches model_id 'gemma_4_e4b_it'`). Bundle prompts come from the bundle's own chat template (`VlmWrapper`/`LlmWrapper.applyChatTemplate`, e.g. Gemma 4: `<bos><|turn>role … <turn|>`); `formatBundlePrompt` (ChatML, Gemma 4 and Gemma 2/3 turns) is only the fallback. Vision projectors (`mmproj`) of GGUFs are not used by this engine yet.
+*   **Gemma-4-E4B-it bundle (w4a16, 9.2 GB on disk)**: 6.5 GB are the embedding tables stored as **uncompressed int16 lookup tables** (`embed_token_int16_lut.bin` 5.25 GB with the 42×256 per-layer embeddings, `embedding_int16_lut.bin` 1.25 GB), 2.25 GB the 4-bit NPU context binaries (`part1…4_of_4.bin`: `prompt_ar128_cl4096` and `token_ar1_cl4096` graphs, context 4096), 0.45 GB the vision encoder. The tables are read from the file (the per-layer embedding provider looks rows up), not loaded: with the bundle loaded the phone had **more** free RAM (4.88 GB) than with Gemma 4 E2B GGUF (4.80 GB). The equivalent GGUF keeps the same tables quantized (q4/q6) in CPU RAM.
+*   **Vision (QAIRT VLM bundles)**: `formatChat` messages take `imageCount`, which puts the template's image slots (Gemma 4: `<|image|>`/`<__image__>`) before that message's text; `generateStream` takes `images` (data URLs), written to `cache/genie_images/` (`GenieChat.writeImages`, unit tested) and passed as `GenerationConfig.imagePaths` in the same order. `genieProvider` sends only the images of the user message being answered (older ones would be re-encoded every turn), and only when the loaded model reports `isVision`; without a chat template the images are dropped with a warning. Measured on the Fold7: one 640×480 JPEG → 256 vision tokens spliced into the prompt, first token 2.3 s, then 11.3 tok/s; shapes, colours and text read correctly.
+*   **Generation**: `generateStream` passes `SamplerConfig` (temperature, top-p, top-k 40, min-p 0.05, a fresh seed) to GGUFs; QAIRT bundles sample as their `genie_config.json` says. The whole conversation is sent every turn: GenieX's llama_cpp keeps the KV of the longest common prefix (measured: the second chat turn processes only its new tokens). **GenieX 0.3.5 cache bug**: after a partial rollback (a prompt that diverges from the cached one, e.g. a background memory task between two chat turns) its token list keeps growing and every later call fails with "Context length exceeded" until the model is reloaded. `GenieEngine` therefore resets the cache (`LlmWrapper.reset()`) unless the new prompt continues the last completed one, or when the last generation failed or was stopped (`GgufSupport.mustResetBefore`), and on a context overflow before any token it resets and runs the prompt once more. The last chunk carries GenieX's **profile** (`ttftMs`, `promptTokens`, `prefillSpeed`, `generatedTokens`, `decodingSpeed`, `computeUnit`), recorded by `npuStats.ts`, logged and shown in the settings ("Last answer: NPU · first token … · prompt … tok/s · answer … tok/s").
+*   **Native tools and reasoning** (Gemma 4, Qwen 3): `Genie.formatChat({ messages, enableThinking, tools })` passes the tool declarations (JSON array, OpenAI style, from `nativeToolDeclarations.ts`) and the agent's tool turns — assistant `toolCalls` (`GenieChat.toChatMessages`/`toVlmMessages` → GenieX `ChatMessage(role, content, toolCalls, toolCallId, toolName)`, unit tested) and `tool` results — to the model's own template, which writes them as the model was trained (Gemma 4: `<|tool>declaration:…` in the system turn, `<|tool_call>call:name{…}<tool_call|>`, `<|tool_response>response:name{value:…}<tool_response|>`). Whether a template renders tools is checked once per model (`nativeToolSupport.ts`: a probe declaration): `template` → native format; `ignored` → the ReAct prompt (the Gemma-4-E4B QAIRT bundle's VLM template drops the tools; with ReAct it called the right tool 10/11 times on the Fold7, with the app-written native format 0/11: JSON in markdown, and the VLM pipeline refused the pre-formatted prompts as too long); `none` (a Gemma 4 bundle without a template) → `gemma4Format.ts` writes the same prompt in JS (checked against llama.cpp's `/apply-template` in `test/fixtures/gemma4-template-golden.json`). Generation stops at `<|tool_response>` (Qwen: `<tool_response>`); the call is parsed at the end (`parseToolCalls`: Gemma 4 `<|"|>` strings, objects, arrays, numbers, the bare `call:name{…}` form; Qwen JSON in `<tool_call>`) and never shown in the bubble (`visibleText`); a call written inside the thought channel is ignored. The model gets short localized tool rules instead of the ReAct instructions (use a tool only when needed; never claim an action without its call; the user's life from memory, not the web) and reasons natively with tools on too. A tool-free final step keeps the earlier tool turns in the native format.
+*   **Grammar**: `generateStream({ grammar })` sets `SamplerConfig.grammarString` on GGUFs (memory extraction, §4.2.2); QAIRT bundles ignore it.
+*   **QAIRT sampling**: bundles get the app's `SamplerConfig` (temperature, top-p, top-k 40, min-p 0.05) too; if GenieX refuses it before the first token, the bundle falls back to its `genie_config.json` sampling for as long as it stays loaded (`qairtSampler`).
+*   **Assistant quality on the phones** (on-device eval, `npm run eval:device`, Atlas, auto context; % of scenarios passed):
+
+| Phone · model (NPU) | Reasoning | Recall | Tools | Hygiene | Extraction | Answer time (median: recall / tool turn) |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: |
+| Fold7 · Gemma 4 E2B Q4_0 | on | 91 | 95 | 100 | 69 (3×) | 14.9 s / 24.6 s |
+| Fold7 · Gemma 4 E2B Q4_0 | **off** | 91 | 95 | 100 | — | **1.5 s / 2.7 s** |
+| Fold5 · Gemma 4 E2B Q4_0 | on | 100 | 94 | 100 | 83 | — |
+| Fold7 · Gemma 4 E4B Q4_0 | on | 100 | 100 | 100 | 83 | 31.8 s / 39.3 s |
+| Fold7 · Gemma 4 E4B Q4_0 | off | 100 | 86 | 100 | — | 2.8 s / 5.2 s |
+
+    The reasoning costs ten times the time for the same scores on E2B: off is the right default. E4B without reasoning asked for details instead of acting ("which brightness level?", "which date is Thursday?"); the tool descriptions now say that dates and times may be the user's words and give typical values (brightness, default time). Long series heat the phone (§ device eval: thermal pause).
+*   **Checked on the phones** (2026-10-04, GenieX 0.8.0, Gemma 4 E2B Q4_0 on the NPU of the Fold7 v79 and the Fold5 v73): the GGUF template renders the tool declarations (probe `template`); special tokens reach the stream as text (`<|channel>thought`, `<|tool_call>`), so the parsers see them; prefill 760–830 tok/s and decode 21 tok/s on both phones. GenieX's native library logs every prompt and output at VERBOSE level under the tag `GenieXSdk` (no API to lower it): readable only through adb or system apps.
+*   **Context**: GGUFs follow the app's context (§4.1.4: auto 8192 on v79/v81, 4096 otherwise); a QAIRT bundle reports the context it was exported with (`genie_config.json` `dialog.context.size` → `contextLength`), which the budgets use.
+*   **QAIRT bundle lifecycle**: `.zip` bundles (e.g. `qwen3_vl_4b_instruct-geniex_qairt-w4a16-qualcomm_snapdragon_8_elite.zip`) are extracted to `models/genie/<model_name>/`; `resolveGenieConfig` rewrites the relative paths of `genie_config.json` (tokenizer, `ctx-bins`, embedding LUT, HTP backend extensions with `perf_profile: burst`, shared buffers, FastRPC tuning); `vision_encoder.bin`/`visual.bin` binds `VlmWrapper`, text models `LlmWrapper`.
+*   **UI** (`GenieSettings.tsx` + `GenieGgufSection`, `GenieQairtSection`, `GenieModelRow`, hook `useGenieModels`): what the phone supports, the active model and the unit it runs on, the compute-unit selector (Auto/NPU/GPU/CPU), GGUFs on disk (NPU badge, Load, Delete), recommended downloads with progress (resumed after the screen closes), and the AI Hub import (only where QAIRT runs, otherwise an explanation). Loading goes through `initGenieModel`, so the model orchestrator frees the other LLM engines first.
+*   **Measured, not assumed**: the speed and energy of each engine/unit come from the benchmark (§6.1, "Speed & battery benchmark"); background memory work uses the chat model, so choosing the NPU there moves it to the NPU too. Measured on the Fold7 (SM8750, 2026-10-04, on USB power, so no energy; GenieX 0.3.5 unless noted):
+
+| Model · engine/unit | Load | Prompt (short / ~1.2–1.7k tok) | Answer |
+| :--- | ---: | ---: | ---: |
+| Gemma 4 E2B Q4_0 · GenieX **NPU** (36/36 layers on HTP0, ~1 GB weights; per-layer embeddings in CPU RAM) | 2.8–3.2 s | 393 / 895–955 tok/s | **25.5 tok/s** |
+| Gemma 4 E2B Q4_0 · GenieX GPU | 15.6 s | 196 tok/s | 19.2 tok/s |
+| Gemma 4 E2B Q4_0 · GenieX CPU | 4.9 s | 102 tok/s | 16.6 tok/s |
+| Gemma 4 E2B Q4_0 · llama.cpp engine (CPU) | 11.7 s | ~261 tok/s | 7.2 tok/s |
+| Gemma 4 E4B QAT Q4_0 · GenieX NPU (43/43 layers, 2.1 GB on HTP0; ~5.4 GB RAM in all) | 5.5 s | 228 tok/s | 14.9 tok/s |
+| Qwen3.5 2B Q4_0 · GenieX NPU (good speed, poor Italian) | 2.4 s | 398 tok/s | 27.6 tok/s |
+| Qwen3-VL 4B · QAIRT bundle (NPU) | — | 398 tok/s | 20.9 tok/s |
+| **Gemma-4-E4B-it · QAIRT bundle (NPU, GenieX 0.8.0)** | 7.8 s | 303 / 550–681 tok/s | 11.2 tok/s |
+| Gemma 4 E2B Q4_0 · GenieX NPU, **GenieX 0.8.0** | — | 664 tok/s (short) | 28.0 tok/s |
+
 *   **Data Flow**:
 ```
-User imports .zip / content:// URI
-  └─> filePicker / useNativeModels.ts
-        └─> Genie.loadModel({ modelPath })
-              └─> GenieEngine.kt / GenieConfigUtils.kt
-                    ├─> extractZipStream() (handles content:// and file:// URIs)
-                    ├─> resolveGenieConfig() (replaces relative paths with absolute)
-                    ├─> parseModelMetadata() (extracts w4a16, vision flags)
-                    └─> Builds VlmWrapper / LlmWrapper on Qualcomm Hexagon NPU (HTP0 / v79)
-                          └─> generateStreamFlow() token emission -> GeniePlugin.kt -> React Web UI
+Settings / chat (genieProvider.ts)
+  └─> initGenieModel(path, {genieRuntime, contextSize}) ── ensureResident('genie')
+        └─> Genie.loadModel ─> GenieEngine.kt
+              ├─ .gguf ─> GgufSupport.resolve / unitsFor ─> LlmWrapper (llama_cpp, npu → gpu → cpu)
+              └─ bundle ─> extractZipStream / resolveGenieConfig ─> Llm/VlmWrapper (qairt, NPU v79/v81)
+  └─> prompt: Genie.formatChat (GGUF template) | formatBundlePrompt (bundle)
+  └─> Genie.generateStream ─> tokens … last chunk {done, profile} ─> npuStats ─> settings
 ```
 
 ### 3.5 Whisper STT NPU Hardware Optimization & Model Bundle Management
@@ -201,11 +232,15 @@ The `sd-capacitor` plugin implements the high-performance on-device Stable Diffu
     *   `DiffusionScheduler.kt`: scaled-linear schedule in the sigma formulation, "trailing" timestep spacing capped at the UNet's calibrated maximum (951 for the quantized Qualcomm package, whose timestep input cannot carry more), samplers **Euler** (default) and **DPM++ 2M** working on the denoised estimate for both epsilon and v-prediction models, CFG, img2img start step = `steps × strength` as in diffusers.
     *   `SDImageOps.kt`: decodes data URLs, base64, file paths, `content://` and Capacitor web paths with EXIF orientation and high-quality downscaling; fits the image to edit into the square without distortion (mirrored margins, cropped away after decoding); upscales the whole square with Real-ESRGAN and only then crops; returns PNG up to 1024 px and JPEG (q95) above.
     *   `SDEngine.kt`: text conditioning (the negative prompt is the unconditional CFG branch; CFG ≤ 1 runs one UNet pass per step), denoising loop, decoding, cropping and upscaling; returns the seed actually used (random seeds included), sampler, prediction type and whether the prompt was truncated.
-*   **Prediction type**: `metadata.json` `"prediction_type"` when present; otherwise one UNet call on a blank latent at t=900 at load time decides it (an epsilon model returns the input noise, a v model a nearly uncorrelated output) and the result is cached per `unet.bin`; undetermined → v-prediction for SD 2.x (768-v), epsilon for SD 1.x. The Qualcomm AI Hub SD 2.1 package derives from SD 2.1 768-v and runs at 512×512 (`v_prediction`).
+    *   `SDDiagnostics.kt`: tensor statistics, NaN/Inf guard on every text encoder and UNet output (an FP16 overflow in an exported graph fails with an explicit error instead of a broken image), untrained text encoder signature.
+*   **Prediction type**: `metadata.json` `"prediction_type"` when present; otherwise one UNet call on a blank latent at t=900 at load time decides it (an epsilon model returns the input noise, correlation > 0.85; a v model a weakly correlated output, < 0.7: UberRealistic measures 0.21 at 512 px and 0.41 at 768 px) and the result is cached per `unet.bin`; undetermined → v-prediction for SD 2.x (768-v), epsilon for SD 1.x. The Qualcomm AI Hub SD 2.1 package derives from SD 2.1 768-v and runs at 512×512 (`v_prediction`).
+*   **NPU versions**: a QNN context binary runs only on the Hexagon version it was compiled for, so each package targets one NPU (`metadata.json` `"hexagon"`, or `chipset_attributes.htp_version` in Qualcomm packages): `sd2.1lora` / `sd2.1lora768` for v79 (Snapdragon 8 Elite, Z Fold7), `sd2.1lora_v73` for v73 (Snapdragon 8 Gen 2, Z Fold5). `SDEngine` maps the phone's SoC to its Hexagon version (SM8550 v73, SM8650 v75, SM8750 v79, SM8850 v81), refuses a package built for another one with an explicit error before touching the NPU, and passes the version to the native engine, which preloads the matching `libQnnHtpVxxStub.so`. The NPU counts as available only when the APK ships that stub: GenieX's AAR brings the V79/V81 runtime, `scripts/fetch-qnn-htp-libs.sh` adds V73 (stub, skel, `libQnnHtpV73.so`) from the QAIRT SDK of the same build as GenieX's `libQnnHtp.so` (2.45.0.260326154327; the script refuses any other).
+*   **Custom packages**: UberRealistic (SD 2.1 768-v fine-tune, `v_prediction`) ships as `sd2.1lora` (512 px: FP16 text encoder and UNet, Qualcomm VAE) and `sd2.1lora768` (768 px: all graphs FP16, UNet ~0.5 s per call on the Snapdragon 8 Elite vs ~0.16 s at 512, about 3× slower per image, noticeably better anatomy and detail) and `sd2.1lora_v73` (512 px for the Z Fold5), plus `sd2.1lora_v73_w8a16` (same with a w8a16 UNet: 0.88 GB instead of 1.74 GB, 20 MB spill-fill buffer instead of 181 MB, ~0.16 s per UNet call on an AI Hub S23 against ~0.8 s for FP16; the text encoder stays FP16 because min_max int16 ranges break it). Measured on 2026-10-04 (25 Euler steps, CFG 7.5): Z Fold7 ~12 s at 512 and ~38 s at 768, Z Fold5 ~41 s at 512; on the Fold5 the FP16 graphs fill the v73 NPU's address space, so Real-ESRGAN does not load (context error 0x3ea, upscaling falls back to bilinear). Both are built and validated by `scripts/export_uberrealistic.py` (DEVELOPMENT_GUIDE §4.3).
+*   **Sanity checks**: at load the empty-prompt embedding is logged; if every token is normalized to mean 0 / std 1 (a final LayerNorm still at its initial weights, i.e. a `text_encoder.bin` compiled without its weights) an error is logged, because images would ignore the prompt. With `log.tag.SDEngine` at DEBUG each step logs latent and denoised-estimate statistics and the RMS of the conditional minus unconditional UNet output (how much the prompt steers the step).
 *   **Editing (img2img)**: needs `vae_encoder.bin`; without it, or when the source cannot be read, the request fails with an explicit error (no black canvas, no zero latents). The result keeps the source's proportions. SD 2.1 cannot follow instructions: the prompt must describe the final picture.
 *   **Super-Resolution & Aspect Ratio**:
-    *   **Real-ESRGAN x4plus** on the NPU (`realesrgan_x4plus.bin`): the full 512×512 image becomes 2048×2048, then the aspect crop is taken; 2x halves it with high-quality filtering. Without the model, bilinear scaling (the image screen says so).
-    *   **Aspect ratios** are centered crops of the square (the graphs are fixed at 512×512): `16:9` → 512×288 / 1024×576 / 2048×1152, `9:16`, `4:3`, `3:4` likewise.
+    *   **Real-ESRGAN x4plus** on the NPU (`realesrgan_x4plus.bin`): the full 512×512 image becomes 2048×2048, then the aspect crop is taken; 2x halves it with high-quality filtering. Without the model, bilinear scaling (the image screen says so). The bundled model takes 512×512 input, so the engine disables it for 768 px packages (bilinear 2x/4x).
+    *   **Aspect ratios** are centered crops of the square (each package's graphs have a fixed square size, read from the binaries: 512×512, or 768×768 for `sd2.1lora768`): `16:9` → 512×288 / 1024×576 / 2048×1152 at 512 px, `9:16`, `4:3`, `3:4` likewise.
 *   **Model Bundle Management**:
     *   `sdModelDownloader.ts` and `SDFileUtils.kt` provide complete model package import, streaming ZIP extraction, macOS metadata filtering (`__MACOSX`, `.DS_Store`), and automatic directory flattening into `sd-models/<modelName>/`.
     *   Full model manager in **Settings > Vision & Image Creation** (`StableDiffusionSection.tsx`) with active model selection, model directory listing, and recursive deletion.
@@ -263,6 +298,15 @@ The assistant can automatically execute tools based on user intent:
 6.  **Observation**: Tool returns result formatted as "Observation: [result]".
 7.  **Reasoning & Integration**: LLM performs a new thinking cycle to evaluate the observation and determine the next step (another tool or final answer).
 
+**Agent runner (`src/services/agent/agentRunner.ts`, `loopControl.ts`)**: the loop runs without React, driven by callbacks (`generate`, `runTool`, `isDenied`, `needsConfirmation`, `compress`, `update`). `useAgenticLoop.ts` is a thin adapter (chat bubble, toasts, confirmations, TTS) and the eval harness (`eval/`) runs the same runner. Rules:
+*   On-device models get at most 3 tool steps (`maxToolSteps`); a call identical to one already run (`callSignature`: name plus sorted, normalized arguments) is not run again and the model is asked for the answer; a call repeated within the same output runs once (the QAIRT bundle wrote each call twice: two shopping items).
+*   When the steps run out, a hidden `final_…` user turn asks for the answer with the tools off (localized `finalAnswer`).
+*   A step whose reasoning plans one of the offered tools ("I should use `add_shopping_item`") but answers without the call ("Ho aggiunto il latte") is dropped once, and a hidden turn asks for the call (`plannedTool`, localized `callNow`): measured on Gemma 4 E2B with native reasoning on.
+*   A recall question ("ricordi dove abito?") is answered with the tools off; a web call for one becomes `search_memory`.
+*   Each step's reasoning is shown on its own (it no longer piles up into the next step); the final text goes through `cleanAnswerText` (`prompt/answerHygiene.ts`: stray `<tool_code>`, `<observation>`, channel blocks, template tokens, "Answer:", "In Italian:").
+*   Long tool results are summarized with `memoryTaskConfig` (an internal task, not the chat configuration).
+*   A confirmation pauses the run (`AgentRunState` kept in the hook) and resumes it with the user's decision.
+
 **Example Flow**:
 ```
 User: "What's the weather in Tokyo?"
@@ -272,7 +316,14 @@ Observation: "Currently 18°C, partly cloudy..."
 LLM Response: "The weather in Tokyo is currently 18°C and partly cloudy."
 ```
 
+**Tool routing** (`tools/routing/toolRouter.ts`, on-device models only): 0–4 tools per turn by intent (Italian and English regexes: current information → `search_web`/`read_web_page`; a URL → `read_web_page`; calendar, reminders, tasks, shopping list, alarm, apps, brightness, volume, shell/files, "ricordati che…" → `save_memory`, "dimentica…" → `search_memory`/`forget_memory`), no LLM call. Small talk, recall questions and requests no rule matches get **no tools** (the turn runs with tool calling off). The set is sticky per conversation (the union of the tools routed so far, fixed order, reset above 6): declarations sit in the system turn, so a set changing every turn would make the engine read the whole prompt again. The choice travels as a runtime flag (`withRoutedTools`) to the providers (native declarations, the compact ReAct list, LiteRT's registered tools).
+
+**Argument checks** (`tools/routing/toolArgs.ts`): before a call runs, its arguments are checked against the tool's schema and repaired when the intent is clear — numbers written as text, times as "7"/"7.30" → `HH:MM`, dates as words ("domani", "venerdì") → `YYYY-MM-DD` through `dateResolver`. What cannot be repaired (missing required argument, unknown enum value, unreadable date) goes back to the model as a localized error (`toolError`); a second failure of the same tool ends the tools for the turn.
+
+**Other on-device engines**: the llama.cpp engine passes `tools` and `enableThinking` to `LLMInference::getFormattedChat` (`common_chat_templates_apply`: OpenAI messages with `tool_calls` and `tool` results; the thinking flag used to default to on, so Gemma 4 reasoned on every turn whatever the setting) and follows the same native path when the GGUF template renders tools (`ggufToolSupport.ts`). LiteRT registers only the on-device (routed) tools, not all 58 (~3k tokens). The compact ReAct prompt, still used by models without native tools, lost its off-topic examples ("Find gemma weights", copied by small models) and gained the rule "never claim an action without its call".
+
 #### 4.1.3 Thinking Mode
+Off by default for new installs (`enableThinking: false`); the user turns it on in Settings → Advanced AI Features. The stream parser (`thinkingParser.ts`) ends a block opened by a tag (`<think>`, `<|channel>thought`) only at its closing tag; the "Answer:" heuristic applies only to implicit blocks ("Thinking Process:"), at a real line start — streamed a few characters at a time, Gemma 4's "**Formulate the Answer:**" inside its thought ended the block and the rest of the thought became the answer (seen on the Fold5). When the reasoning uses the whole budget without an answer, the agent repeats the step without reasoning (§4.1.2). On Genie, Gemma 4 and Qwen 3 reason natively through their chat template's thinking flag (`formatChat({ enableThinking })`) when tools are off; other models get the `<thinking>` instruction. The answer budget gets `thinkingBudget` (or 512) tokens on top for the reasoning (`withReasoningAllowance`).
 When enabled, displays internal reasoning process before final answer:
 *   **Visual Distinction**: Thinking block shown in muted color with "thought bubble" icon
 *   **Token Budget**: Configurable limit (default: unlimited)
@@ -281,7 +332,7 @@ When enabled, displays internal reasoning process before final answer:
 
 #### 4.1.4 Message Persistence & Context
 *   **Auto-Save**: New messages are persisted immediately to WebView `localStorage` (`threadManager.ts`); a streamed answer is saved once its text stops changing (no write per token). A full storage shows a warning, and threads that cannot be parsed are copied to `conversation-threads-unreadable` instead of being overwritten.
-*   **Context Window**: Configurable via `nCtx` (default: 2048 tokens). In Dual-Model Tool Calling (GGUF), `nCtx` is automatically synchronized across both Chat and Extraction models. **Update**: Introduced Intelligent Context Summarization for extraction. If the extraction prompt exceeds the tool model's limit (e.g., 2048 tokens), the main model automatically generates a concise summary of the relevant history to ensure accurate tool selection without context overflow.
+*   **Context Window** (`src/services/llm/context/contextSize.ts`): `contextMode` `auto` (default) picks it from the phone — 8192 on Hexagon v79/v81 (Fold7), 4096 elsewhere (Fold5) — after reading the NPU once (`Genie.getCapabilities`, cached in `aimm-npu-arch`). Gemma 4 shares most of its KV cache (f16 per token: E2B ~18 KB, E4B ~56 KB), so RAM is not the limit; re-reading the whole prompt after a cache reset is (650–950 tok/s on the NPU, ~7 s for 6k tokens). Moving the slider (one `ContextWindowSetting` for GGUF, LiteRT and Genie) switches to `manual` and uses `nCtx`. QAIRT bundles keep the context they were exported with (`genie_config.json` `dialog.context.size`, reported as `contextLength`). Every reader (load, trimming, compression, summarization, task checks) goes through `onDeviceContextSize`; a GGUF reloads when its context changes. In Dual-Model Tool Calling (GGUF), `nCtx` is automatically synchronized across both Chat and Extraction models. **Update**: Introduced Intelligent Context Summarization for extraction. If the extraction prompt exceeds the tool model's limit (e.g., 2048 tokens), the main model automatically generates a concise summary of the relevant history to ensure accurate tool selection without context overflow.
 *   **Native Statefulness**:
     *   **GGUF (PocketPal Engine)**: Uses native C++ Jinja2 templates (via `llama.rn` matching) instead of manual TypeScript formatters. Resolves formatting errors by passing OpenAI-compatible `messages` arrays directly to the C++ backend. Employs a Mutex locked `initContext` pattern with Memory-Pressure batch constraints to prevent initialisation race conditions. Uses KV Cache reuse (~95% hit rate via System Prompt Optimization) and token diffing to avoid re-processing the entire prompt history on every turn. Only new tokens are computed.
     *   **LiteRT**: Maintains `Conversation` state object in native memory, syncing message counts with frontend to ensure consistency. 
@@ -294,12 +345,12 @@ When enabled, displays internal reasoning process before final answer:
 
 #### 4.1.5 Context Management & VRAM Optimization
 To prevent OOM (Out Of Memory) kills on Android and Adreno GPU crashes, the system implements a multi-layered context protection strategy:
+*   **Turn Budget** (`context/turnBudget.ts`): `budgetFor(config, persona, style, context)` gives the answer tokens (the persona's limit, else the response style), the answer plus reasoning the trimming keeps free, and the generation cap (≤ half the window). Genie and GGUF use the same numbers for trimming and generation (GGUF used to reserve the answer without the reasoning, then generate with it).
+*   **Trimming Order** (`refineContext`): older history goes first; then the `<context>` block of the last user turn (facts, memories, documents) shrinks, keeping its intro and its last paragraph (the recall instruction); the user's request is cut only when it alone is too long. A system prompt still too large loses its middle (the profile), never the persona at the start or the rules, tools and language rule at the end (`cutMiddle`, `fitTurnText`).
 *   **Real Tokenization (BPE)**: Uses `js-tiktoken` (`cl100k_base`) for accurate token estimation. Replaces character-based heuristics to ensure the LLM never receives a prompt exceeding its hardware-allocated context window.
 *   **Model Residency (`modelOrchestrator.ts`)**: RAM holds one heavy model at a time: an LLM engine (GGUF chat+tool, LiteRT or Genie), Stable Diffusion, Voxtral or a medium/large Whisper (a tiny/base/small Whisper may stay next to the LLM). At startup only the configured LLM loads (`useModelLoader`); STT loads with a call or a meeting, TTS with the first spoken reply. Opening the image screen (or `/image`, `/edit`, `generate_image`) unloads the LLM and loads Stable Diffusion; closing it frees SD and reloads the LLM. Meetings and calls free their speech models on exit. A recording pins its speech model; a voice call refuses a heavy STT with an on-device LLM. Android memory pressure unloads the heavy models the current feature does not need (critical, foreground) or every unpinned one (app about to be killed).
-*   **Tool Output Pruning**: Large tool results (e.g., web searches > 800 tokens) are automatically summarized by a fast cloud or local model before being injected into the conversation, preserving reasoning space.
-*   **GGUF Context Sync (Append Mode)**: Synchronizes the UI message count with the native `llama.cpp` KV cache. 
-    *   **Append Mode**: If counts match, only the newest message is sent, enabling incremental KV cache reuse (~90% speedup).
-    *   **Hard Reset**: If history diverges, the native context is explicitly reset to prevent "inconsistent sequence position" errors.
+*   **Tool Output Pruning**: Large tool results (> 800 tokens) are automatically summarized by a fast cloud or local model before being injected into the conversation, preserving reasoning space. The summary prompt carries the user's request, so the facts needed to answer it are kept. Web tools bound their own output below this threshold (§4.1.7).
+*   **GGUF Context Reuse (no reset between turns)**: every turn sends the system prompt and the whole (refined) conversation; the native layer (`LLMInference.cpp`) keeps the KV cache and decodes only the tokens after the longest common prefix with the previous prompt. `contextSync.ts` resets the native context only for prompts with images (that path does not track the prefix). The prefix logic is hardened: an identical prompt ("regenerate") re-decodes its last token so the logits are fresh; the reused prefix never exceeds what the KV really holds (`llama_memory_seq_pos_max`); models that cannot drop a suffix of their state (hybrid/recurrent: Qwen3.5, LFM2) clear the memory and decode the whole prompt. The prompt only changes at the top when the hour in `CURRENT CONTEXT`, the profile (new facts) or the context window moves.
 *   **Template De-Duplication**: Strips outer chat wrappers from formatted prompts when passing to native engines (GGUF/LiteRT) to prevent "Double-Wrapping" (e.g., nested `<|user|>` tags), which otherwise causes infinite loops or truncated responses.
 
 #### 4.1.6 Persistent KV Cache
@@ -309,69 +360,173 @@ To eliminate redundant "Prefill" times (the time taken to process the conversati
     *   **Auto-Restore**: Upon engine initialization, if the native context is empty, the system automatically re-loads and re-submits the persisted history. This efficiently rebuilds the LiteRT-LM KV cache state, ensuring the next generation starts from the previous state without reprocessing everything from scratch.
     *   **Invalidation**: The cache is automatically cleared when a "Hard Reset" or "New Chat" is initiated.
 *   **LlamaCpp (GGUF)**:
+    *   **In-session prefix reuse**: between turns the native KV cache is kept and only the new tokens are decoded (§4.1.5). GenieX's `llama_cpp` runtime does the same for GGUFs on the NPU (§3.4).
     *   **Slot-Based Persistence**: Utilizes the `/slots/{id}?action=save/restore` REST API for persistent KV management. 
     *   **Server-Side State**: If running `llama-server`, binary KV state is flushed to disk (e.g., in the `--slot-save-path` directory) ensuring instant resumption after app backgrounding or server restart.
 *   **Lifecycle Synchronization**: Integrated with the Android application lifecycle. The `NodeWorker` and native plugins automatically flush the active KV state to disk when the application transitions to the background (`appStateChange: inactive`).
 
-### 4.2 Semantic Memory (Long-Term RAG)
-Vector-based memory system that enables the AI to recall relevant context from past conversations.
+#### 4.1.7 Web Search & Page Reading (`src/services/web/`)
+`search_web` finds pages, `read_web_page` reads one, `analyze_web` asks the server for a sourced synthesis. No API key is needed: the phone parses the result pages of keyless engines, or delegates to the AIMindMesh Server (SearXNG) when the user enables it (§6.13, *Web tools*).
 
-#### 4.2.1 Ingestion Pipeline
-*   **Auto-Capture**: Messages exceeding 20 characters automatically saved
-*   **Embedding Model**: `all-MiniLM-L6-v2` by default (384-dim, ONNX, up to 512 tokens); E5 models get their `query:`/`passage:` prefixes and `multilingual-e5-small` uses a SentencePiece (Unigram) tokenizer. Every vector records the model that produced it: rows of another model are ignored by search and re-embedded in the background after a model change.
-*   **Storage**: SQLite (`memories` database) with embeddings stored as BLOBs; retrieval is a brute-force cosine scan over every memory of the age window (ids and embeddings only, read in pages), then the text of the top K is loaded (`semanticMemoryRetriever.ts`)
-*   **Metadata**: Each memory stores timestamp, category, embedding (with its model), and original text. Extracted facts and summaries never age out of retrieval; plain chat turns are searched for 30 days and deleted after 90.
+```
+ search_web({query, num_results?, time_range?})
+        │
+        ├─ delegateWebSearch on ──► POST /api/web/search (SearXNG, standard mode, 20 s) ──┐ results
+        │                                   │ error / no results                            │
+        ▼                                   ▼                                               │
+ html.duckduckgo.com ──► lite.duckduckgo.com ──► search.brave.com     (first engine with    │
+   (HTTP 202 / bot check / no results → next engine)                     results wins)      │
+        │                                                                                   │
+        ▼                                                                                   │
+ dedupe by URL ──► re-rank (engine order ⊕ embedding similarity, RRF) ──► top N ◄────────────┘
+        │
+        ▼
+ Observation: "[1] title / URL / snippet …" + hint to read pages   ─── sources → chips under the answer
 
-#### 4.2.2 Categorization System
-**Auto-Categorization** (optional):
-*   Uses LLM to classify memories into categories (Facts, Tasks, Preferences, Events, Knowledge)
-*   Triggered on save or via batch processing
-*   Improves retrieval precision by category filtering
+ read_web_page({url, query?, chunk_index?})
+        │  public http(s) only (localhost, LAN, VPN, link-local, .local refused)
+        ├─ cache (8 pages, 10 min) ──────────────────────────────────────────────┐
+        ├─ delegateWebScraping on ──► POST /api/web/read {url} ─────────────────┤ title + text
+        └─ CapacitorHttp GET (10 s connect / 20 s read) ──► pageExtractor ──────┘
+                                                            │
+             query given ──► 650-char passages ──► top 3 (BM25 ⊕ embeddings) in page order
+             otherwise   ──► 2200-char parts ──► part `chunk_index` + "Part i of n, next: …"
+```
 
-**Manual Categories**:
-*   User can create custom categories (e.g., "Work", "Family", "Hobbies")
-*   Manually assign memories to categories via Memory Browser
-*   Filter retrieval by category for context-specific queries
+| Component | File | Responsibility |
+| :--- | :--- | :--- |
+| Search orchestration | `web/webSearch.ts` | Server delegation, engine fallback chain, region (`kl` from the device locale, e.g. `it-it`), time range (`df=d/w/m/y` for DuckDuckGo, `tf=pd/pw/pm/py` for Brave), deduplication (URL without fragment, `utm_*`, trailing slash), result count clamp (default 5, max 6). Never throws: failures return `success: false` with each engine's error. |
+| Result parsers | `web/searchParsers.ts` | DuckDuckGo html (`result__a` / `result__snippet`), DuckDuckGo lite (`result-link` / `result-snippet`), Brave (`div.snippet[data-type=web]`). Each result is read as a unit (title link, then its own snippet): ads (`duckduckgo.com/y.js`) and results without a snippet never shift the others. Snippets are cut at 320 chars. Bot check page detected (`anomaly-modal`). |
+| Ranking | `web/ranking.ts` | BM25 keyword scores (Italian + English stopwords, accents folded), cosine similarity through `embedText` (E5 `query:`/`passage:` prefixes) **only when the embedding model is already loaded** (a search never loads a model), reciprocal rank fusion with the semantic list weighted 1.2. At most 30 passages per page are embedded (the best keyword matches). |
+| Page reader | `web/pageReader.ts` | URL safety check, server delegation, local GET with a mobile browser User-Agent, redirect target re-checked, binary types refused (`application/pdf`, images, archives → "use download_file"), JSON/plain text passed through, part/passage slicing, per-page cache. |
+| Text extraction | `web/pageExtractor.ts` | Quote-aware tag scanner (attribute values may contain `>`, e.g. Wikipedia `data-mw`): drops script/style/svg/head…, hidden elements (`hidden`, `display:none`), ARIA chrome roles, class/id chrome (cookie, consent, share, social, dropdown, sidebar, navbox, toc… only when shorter than 4000 chars, so a content wrapper is never removed) and lists that are only links (≥ 5 items, 80% link-only). Takes `<main>`, else the longest `<article>` (≥ 400 chars), else the body without nav/header/footer/aside/form. Output keeps paragraphs, `## ` headings, `- ` list items and `| ` table cells. |
+| URL safety | `web/urlSafety.ts` | Refuses non-http(s) schemes, `localhost`, `*.local`, `*.internal`, single-label hosts, private/loopback/link-local/CGNAT IPv4 and IPv6 (incl. IPv4-mapped). |
+| Delegation settings | `web/webDelegation.ts` | Reads `aimindmesh-server-settings` through `readSetting` (API key from the Keystore secret store) and posts JSON with `x-api-key`. |
 
-#### 4.2.3 Retrieval & Ranking
-**Query-Time Process**:
-1.  User query vectorized using same embedding model
-2.  Cosine similarity computed against all stored memories
-3.  Top N memories (default: 3) with similarity > 0.75 retrieved
-4.  Results ranked by similarity score
-5.  Injected into system prompt as context
+**Model-facing contract**:
+*   **What the model sees** is the tool's `message` only (the agent loop never forwards `data`): search results, page text and the analysis are all in `message`. `ToolResult.sources` (title + URL) feeds the *Sources* chips of the answer (merged with Gemini grounding sources, each URL once, max 10).
+*   **Bounded outputs**: a page part is ≤ 2200 chars and a query answer is 3 passages of ≤ 650 chars, so web results stay under the 800-token tool-output summarization threshold (§4.1.5). When a summary is still needed it is focused on the user's request (`buildToolSummaryPrompt`).
+*   **Prompt rule (ReAct compact prompt)**: answer from snippets only when they clearly contain the answer; otherwise read the most relevant page; cite URLs; say so when the results do not contain the answer.
+*   **`analyze_web`** is offered to the model only while *Web analysis* is enabled for the server (`ToolDefinition.isAvailable`, honored by Gemini declarations, the GGUF tool list and LiteRT tool specs).
 
-**Deduplication**:
-*   Periodic cleanup removes semantically identical memories (similarity > 0.90)
-*   See Proactive Assistant → Memory Maintenance (4.6.4)
+**Security**: `read_web_page` is **GET-only** (the former `method`, `headers` and `body` parameters were removed): a page read by the model may contain instructions (prompt injection), so the tool must not be able to POST data elsewhere. Local and private addresses are refused on the phone and, independently, on the server (`aimindmesh-server/src/utils/safeHttp.ts`: the resolved IPs of every connection and every redirect are checked).
 
-#### 4.2.4 Memory Management UI
-**Memory Browser** (Settings → Memory):
-*   View all stored memories with timestamps
-*   Search by text or category
-*   Manually add/edit/delete memories
-*   Bulk export/import as JSON
-*   View similarity scores for debugging
+#### 4.1.8 On-Device Prompt & Language (`src/services/llm/prompt/`)
+Genie, GGUF and LiteRT get a compact system prompt in the assistant's language (`onDevicePrompt.ts`, texts in `promptTexts.ts`) instead of the long English companion prompt of the remote models (truncated on a 2048 context, it made 2–4B models switch to English):
+*   persona (name, the personality's own prompt, traits), the profile with localized headers, two rules (use what you know, and say "you haven't told me" instead of "I have no memory"; use tools for current information) — no rule about *how to answer*: on turns with tools, "Rispondi in modo naturale e diretto" plus any other rule made Gemma 4 E2B answer instead of calling (5/12 calls on action requests vs 12/12 without, 0/6 spurious calls either way), a length rule when the answer budget is short (≤ 300 tokens: two or three sentences; ≤ 600: concise) — only on turns without tools: with it Gemma 4 E2B answered instead of calling the tool (0/4 calls, 4/4 without), and the token budget bounds the answer anyway, and the date with the part of the day — no hour, so the prompt and its KV cache last;
+*   the tool instructions (native tools: "to do what the user asks — lists, alarms, events, reminders, searches — call the right tool", never claim an action without its call, the user's life from memory, dates as the user's words), then the language rule last (`withLanguageRule`, written in that language: "Scrivi sempre e solo in italiano, anche se le istruzioni sono in inglese." — "Scrivi", not "Rispondi", for the same reason);
+*   the turn context (related facts, past-conversation memories, documents, the recall instruction) is localized too;
+*   no inline `<save_memory>` rule: facts come from the background consolidation.
+
+**Language** (`languageRule.ts`): setting `assistantLanguage` `auto | it | en` (Settings → Advanced AI Features). `auto` follows the user's last messages (function-word ratio), then the device locale.
+
+### 4.2 Memory (What the Assistant Knows)
+Two layers: **facts** (what the assistant knows about the user, always in the prompt) and **conversation memory** (semantic search over past chats, optional). Facts work with every provider, on-device engines included, and on the web build.
+
+```
+ Chat ──(answer done)──► ConsolidationScheduler ──(chat quiet ≥3 min / proactive check)──► runBackgroundTask
+   │                                                                                           │ JSON ops
+   │  save_memory · update_memory tools ──► factGate ◄── JSON ops (add / update / done) ◄────┘
+   │  Settings → Memory ─────────────────────────────┐   │                 └──► episode summary
+   ▼                                                 ▼   ▼                              │
+ buildPromptContext ◄── profile (pinned · important · coming up) ◄── factStore          │
+   │               ◄── related facts (embeddings, else keyword stems) ◄─┘               │
+   │               ◄── conversation memories (dated) ◄── `memories` table ◄────────────┘
+   ▼
+ Provider: system prompt (remote) · <context> on the user turn (on-device)
+```
+
+#### 4.2.1 Facts (`src/services/memory/facts/`)
+| Field | Description |
+| :--- | :--- |
+| `kind` | `identity`, `person`, `preference`, `goal`, `project`, `routine`, `commitment` (something to do), `event` (something on a date), `other` |
+| `content` | One statement, third person, in the user's language (max 400 characters) |
+| `subject` | Person the fact is about, when it is not the user |
+| `importance` | `1` (trivia) – `5` (core to who the user is) |
+| `confidence` | `0`–`1` (`1` = said or confirmed by the user) |
+| `source` | `manual`, `extracted` (consolidation), `inline`, `tool`, `imported`, `migrated` |
+| `dueAt` | Date of a commitment or an event |
+| `status` | `active`, `done`, `superseded` (replaced, kept as history), `expired`, `review` (stored before the fact gate and refused by it now: out of the prompt until the user keeps or deletes it) |
+| `pinned` | Always in the profile |
+| `category` | Optional user label (the memory categories of the settings) |
+| `lastUsedAt` / `useCount` | Retrieval usage (never used to order the profile) |
+
+*   **Storage**: SQLite table `memory_facts` (plus `memory_meta` for markers and cursors) in the `memory` database on Android, written through the `DatabaseManager` write queue; `localStorage` (`memory-facts`) on the web build. `factStore` caches them in memory and announces every change (`subscribe`, `onChange`).
+*   **Nothing is merged away**: a fact said again is *reinforced* (importance, confidence, date) instead of duplicated; a fact that changes is *superseded* (the old one stays as history); facts are never summarized.
+*   **Open loops**: active commitments and events. Two days past their date they become `expired` (kept for the follow-ups of the next phase).
+*   **Embeddings**: with conversation memory on, `embeddingReindexer` gives facts their vector (rows whose `embedding_model` differs from the active model: new and edited facts too).
+*   **Migration** (once, marker `facts-migration-v1` in `memory_meta`, deterministic ids): the manual memories (`companion-memories`) become pinned facts (`m:<id>`, kind from the category); the `extracted` rows of older versions become facts (`x:<id>`, vector copied). Nothing is deleted.
+*   **Review** (once, marker `facts-review-v1`, `factReview.ts`): active facts that the gate would refuse now — questions, notes of the model, a relative date with no day, trivia of no kind — become `review`; pinned facts and what the user typed are never flagged. Settings → Memory → *To review* keeps or deletes them; nothing is deleted automatically.
+
+#### 4.2.1a Fact Gate (`factGate.ts`)
+Every writer — consolidation, `save_memory`, `update_memory` — goes through `gateFact(candidate, { userMessages?, now, known })`:
+1.  **Quality** (`factQuality.rejectFact`): empty, too short/long, questions, notes of the model, text about the assistant.
+2.  **Grounding** (consolidation only, `factGrounding.groundingMessage`): the quoted `evidence` must cover ≥ 80 % of its words in one message **the user** wrote and share a meaning word with the fact; without a usable quote, that message must contain at least half of the fact's meaning words (two for facts of three or more). The assistant's lines and the prompt are never a source. The message also gives the reference time for dates.
+3.  **Dates** (`dateResolver.resolveWhen`, Italian and English): from the `when` words — ignored when the user did not write them (today's date copied from the prompt header) — else from the fact itself, else from the evidence (only for what may be dated: a beagle named Pepe is not an event because the same sentence says "tomorrow"), else a tool's `due_date`. Recurring words ("ogni", "il sabato", "every") mean a routine with no date; a relative date that cannot be resolved, or a day already past, refuses the fact.
+4.  **Kind**: the model's, unless missing or `other` (rules: `guessKind`); a recurring event becomes `routine`; a dated fact must be an `event`/`commitment` (a dated `person` or `identity` fact keeps no date); "lives/works…" called a preference becomes `identity`.
+5.  **Importance**: clamped 1–5, at most 2 for `other`; 1 (trivia) is refused.
+6.  **Duplicates**: same normalized text, or ≥ 80 % shared meaning stems on the same day, against the active facts and the operations already accepted in the same answer.
+
+#### 4.2.2 Consolidation (`factConsolidator.ts`, `consolidationScheduler.ts`)
+*   **When**: after an answer the conversation is queued and read once the chat has been quiet for **3 minutes** (for every provider: the user's choice for on-device models), at every proactive check, and — after a restart — for the active conversation. Never while a generation runs; it runs through `runBackgroundTask` (§4.7.7), so the chat always interrupts it.
+*   **What**: the messages after the conversation's cursor (hidden system turns, tool turns and errors excluded), in batches of 2,500 characters (on-device) or 6,000 (remote). The prompt (`consolidationPrompt.ts`) is in the assistant's language (setting, else the user's messages) and carries today's date, the date of each message, the related known facts and the open loops as `F1..Fn`, and the user's categories when **AI Auto-Categorization** is on.
+*   **Operations**: the model answers `{"ops":[...]}` (max 5 valid ones): `add` (new fact), `update` (`Fn` superseded by the new text), `done` (an open loop is closed). Each carries `evidence` (the user's words, copied) and, for dates, `when` (the date words as said: the app computes the day). One fact per operation.
+*   **Grammar**: on GenieX GGUFs the answer is sampled under `FACT_OPS_GRAMMAR` (GBNF: an object with an `ops` array of flat objects with known keys; one blank at most between tokens), passed as a runtime task flag (`withGrammar`) to `Genie.generateStream({ grammar })` → `SamplerConfig.grammarString`. Other engines rely on the tolerant `parseOps`.
+*   **Validation** (`validateOps`): every `add` and `update` through the fact gate (§4.2.1a) with the batch's user messages; refs must exist; an `update` must change the text and keeps the target's kind; `done` only on open loops and only when the user's words support it; an operation on a fact edited meanwhile (e.g. by the user) is skipped. Rejections are logged with their reason.
+*   **Cursor**: per conversation in `memory_meta`, moved only after a batch is applied: a busy model, a missing key or an active chat leave it in place for a later run.
+
+#### 4.2.3 Prompt Context (`src/services/llm/promptContext.ts`, `memory/context/memoryContext.ts`)
+One builder for every provider (Gemini, Claude, Perplexity, OpenRouter, Ollama/local, GGUF, LiteRT, Genie):
+*   **Profile** (system prompt): pinned facts, then by importance, kind and age — never by usage, so the system prompt (and the on-device KV cache) only changes when a fact does — plus the dates "coming up" in the next 14 days, as absolute dates. Budget: 900 characters for context windows ≤4k tokens, 1,800 up to 16k, 3,000 above. The first turn after a cold start waits up to 1.5 s for the facts.
+*   **Turn context** (built for the real user turn, never for tool observations, nudges or the final-answer turn): up to 3 related facts outside the profile (cosine similarity with the model's threshold when an embedding model is active, otherwise keyword stems with Italian and English stopwords), conversation memories (dated; the messages of the current thread already in the context and the legacy `extracted` rows are excluded), workspace documents. Facts and memories share one budget of **400 tokens** (memories fill what the facts leave, the last one cut to fit). Remote providers append it to the system prompt; on-device engines prepend it to the user turn as a `<context>` block.
+*   **Once per turn** (`turnContextCache.ts`): while the agent runner holds the cache, every step of the same turn gets the same context (no new memory search per tool step, and the user turn — hence the engine's KV cache — does not change between steps).
+*   **Recall questions** (`recallQuestion.ts`, Italian and English: "ricordi…", "ti ho detto…", "sai dove/come/chi…", "dove abito", "come si chiama mia…", "do you remember…", "where do I live", "what's my…"): up to 10 facts outside the profile (the related ones first, then by pin and importance, so a question with no word in common still sees what is known), conversation memories with a looser search (the model's recall threshold, ≥ 5 results), and an instruction closing the turn context: answer from what is known; if it is not there, say the user has not told you yet, mention what is related and ask; never claim to have no memory, never search the web for personal facts. Small on-device models ignored the profile and the system-prompt rule (Fold7 test: "Ricordi dove abito?" → "I have no memories", then a web search). The compact tool prompt has the same rule: personal questions → `search_memory`, never `search_web`; since the model still searched the web, a web tool called on a recall turn is run as `search_memory` with the user's question (`redirectRecallToolCall`). `search_memory` with no matching fact returns the most important known facts, marked as not about the question, so the answer can be "you have not told me, but I know…".
+*   **Internal tasks** (memory work, mesh tasks): only their own instructions — no persona, profile, documents, inline memory rule or web search. **Background texts** (proactive messages, briefings): persona and profile, with the context they retrieved themselves.
+*   **Gemini Live**: the profile is part of the session instructions. **AIMindMesh Server provider**: the profile is sent as a system message only with *Share What I Know With the Server* on (§6.13).
+
+#### 4.2.4 Conversation Memory (episodic, `memories` table)
+*   **Capture** (`episodes/episodeSummary.ts`): raw chat messages are no longer stored (questions and small talk crowded the search out). After the consolidation of a conversation, the stretch not summarized yet (cursor `episode-cursor:<thread>`, at least 2 user messages and 60 characters) becomes one or two sentences in the assistant's language ("L'utente…", with names, places and dates), stored as a `[MEMORY SUMMARY]` row of role `system`; "NIENTE"/"NOTHING" stores nothing. An internal task through `runBackgroundTask`: no autonomous permission needed. Requires an embedding model: `multilingual-e5-small` is the recommended one (the other models are English-only). Every vector records its model; vectors of another model are re-embedded in the background.
+*   **Retrieval**: brute-force cosine scan over the active model's vectors (turns of the last 30 days, summaries of any age), top `semanticMemoryMaxResults` (default `3`). Thresholds per embedding model family (`memoryThresholds.ts`), unless `semanticMemorySimilarityThreshold` is set by hand: **E5 0.82 / recall 0.81**, measured on the Fold7 (`eval/calibrate.eval.ts`: 25 Italian question/memory pairs vs 850 non-matching ones; matching median 0.845, non-matching median 0.785 and 95th percentile 0.82; ranking AUC 0.965 with the query/passage prefixes, 0.955 without); MiniLM 0.5 / 0.45 and BGE 0.7 / 0.65 not calibrated; unknown 0.75 / 0.6.
+*   **Imported models** (`modelSources.ts`): the family is read from the model's `config.json` `_name_or_path` as well as its folder name — the multilingual-e5-small imported as `memories3` got no query/passage prefixes before. An E5 recognized only by its config gets its own vector key (`…#v2-e5`), so the rows embedded without prefixes are re-embedded in the background. No graph neighbours and no recency fallback (no query, no model or an error give no memories): rows below the threshold confused small models.
+*   **Raw rows of older versions**: still searchable under the threshold until summarized or pruned; Settings → Memory → *To review* shows their count and deletes them on request.
+*   **Maintenance** (§4.7.4): near-identical rows of the same role are removed (≥0.95); turns older than 30 days are summarized per conversation and day (`[MEMORY SUMMARY] 2026-09-12: …`, dated like the conversation) before the 90-day pruning.
+*   **Memory graph**: `follows`, `similar_to` and `mentioned_with` (shared keyword stems, Unicode-aware) links between rows.
+
+#### 4.2.5 Who Writes Facts
+| Source | How |
+| :--- | :--- |
+| Settings → Memory | *Tell me something about you*: pinned, confidence 1 |
+| Chat models | No inline rule any more: "ricordati che…" is read by the consolidation. A `<save_memory>` tag a model still writes is removed from the answer, not stored |
+| Agent tools | `save_memory`, `update_memory` through the fact gate (dates from the words at the time of the call; a refusal tells the model why), `forget_memory` (§5) |
+| Consolidation | §4.2.2, through the fact gate with grounding in the user's messages |
+| Backup restore | v2 files (facts) and v1 files (old manual list) |
+
+#### 4.2.6 Memory Management UI
+See §6.9.
 
 ### 4.3 Meeting Mode & Diarization
-*   **Real-time Transcription**: Uses Vosk for immediate text stream.
-*   **Tap-to-Play & Interactive Transcripts**:
-    *   **Timestamp Sync**: Native STT plugins (Vosk, Whisper, Voxtral) emit microsecond-accurate relative `start_ms` and `end_ms` boundaries for each word/segment.
-    *   **Audio Storage Architecture**: Live PCM buffers are continuously encoded and appended to a native `.m4a` file in the device `Data` directory, eliminating `localStorage` RAM exhaustion and OOM crashes during long (>2hr) recordings.
-    *   **Segment Replay**: Custom `AudioPlaybackPlugin` loops targeted sub-segments and respects the active microphone's AEC state to prevent echo or degradation of ongoing live recordings.
-    *   **Transcript Editing & Metadata**: Long-pressing a paragraph enables inline text editing. Both the revised and original texts are persistently managed in the SQLite `meetingDatabase`.
-    *   **Export**: Full transcripts can be exported to Markdown, PDF (via WebView Print Adapter), SRT, and VTT with accurate timestamping, and the audio recording can be shared. **Safe recording**: each recording is a new meeting with its own id; edits autosave (one SQLite transaction per save), Back/X ask before stopping and save first, Pause really cuts the audio and text, and a foreground service keeps the microphone alive with the screen off. Meetings are never deleted automatically; a recording interrupted by the app being killed is recovered (audio + last checkpoint) the next time Meeting mode opens.
-*   **Speaker Separation**:
-    *   **Real-time**: ECAPA-TDNN embedding-based identification with **Periodic Mini-Clustering** — every 30s (or 10 segments), `IncrementalStrategy` re-clusters all session embeddings to refine speaker centroids and correct prior greedy assignments, bringing post-processing quality to live transcription.
-    *   **Post-Process (Reprocessing)**: Robust **3-Pass Diarization**:
-        1.  **Profiling**: Global clustering of sliding-window ECAPA-TDNN embeddings to create stable Speaker Profiles. Windows are filtered to exclude silence using **VAD-gated filtering** (Silero VAD when `enableVAD` is on and model is loaded) or **RMS energy gating** (fallback, threshold: 0.01).
-        2.  **Classification**: Re-assigns transcript segments by averaging embeddings in each segment's time window and matching to the closest global centroid.
-        3.  **Smoothing**: Configurable temporal smoothing:
-            *   **HMM Viterbi Decoder** (Recommended): Eliminates rapid speaker changes using hidden Markov model transition probabilities.
-            *   **Median Filter**: Simple 5-segment sliding window to eliminate spurious single-segment oscillations (e.g., `[0,1,0,0,0]` → `[0,0,0,0,0]`).
-*   **ONNX Runtime Safety**: VAD and ECAPA plugins share a single process-global `OrtEnvironment` singleton. VAD's `release()` only closes its `OrtSession`, not the shared environment.
-*   **Memory Optimization**: Voxtral and medium/large Whisper models go through the model orchestrator (§4.1.5): loading them unloads any LLM engine (GGUF, LiteRT, Genie); leaving the meeting frees them and reloads the configured LLM.
-*   **Post-Process**: Can use Whisper for high-quality final transcript cleanup.
+Ported from the standalone Meeting Assistant app (same formats: backups go both ways).
+
+*   **Native recording** (`android/.../recording/`): `RecordingEngine` owns one `AudioRecord` (16 kHz mono) and writes a WAV that is valid at every moment, plus a JSON sidecar (`RecordingStore`). A consumer thread feeds live Vosk (`VoskAudioBridge`) and the other taps (`RecordingAudioTaps`, e.g. Voxtral) from the same microphone. `RecordingService` is a `microphone` foreground service with a wake lock and a "Mark moment" notification action. Pause really cuts audio and text. `MeetingRecorderPlugin` (`start/pause/resume/stop/finalizeRecording/getStatus/listRecoverable/discard/addBookmark`) finalizes to AAC `.m4a` in `meeting-audio/`.
+*   **Screen lifecycle**: closing Meeting mode while recording or transcribing keeps it mounted but hidden (`MeetingStatusChip` reopens it); the UI re-attaches to a running session after the Activity or WebView is recreated (`getStatus`).
+*   **One microphone**: while a meeting records (`meetingCapture.ts`) the wake word is off and voice mode is refused with a toast. Vosk `startRecognition({externalAudio})` runs the external recognizer; starting the microphone or loading/unloading a Vosk model meanwhile is rejected with `MEETING_RECORDING`. Events carry `source: 'mic' | 'external'`.
+*   **Live modes** (`TranscriptionMode = 'off' | 'vosk' | 'voxtral'`; old `whisper`/`hybrid` settings migrate to `vosk`):
+    *   **Vosk** (Italian / English models): immediate text, times from the recording clock.
+    *   **Voxtral**: fed by the native recorder through `ExternalAudioFeeder` (bounded 60 s queue, own inference thread, `voxtralLagging` event, token times from sample offsets, stop drains for at most 10 s). The model is loaded and pinned by the meeting; it is unloaded before post-processing.
+    *   **Transcribe while recording** (`liveTranscriber.ts`, not in Voxtral mode): Whisper transcribes finished speech in the background, so the accurate text is ready a few seconds after Stop.
+*   **Post-processing on the phone** (`services/meeting/postProcessing/`, automatic after Stop, cancellable, `ProcessingService` keeps it alive in the background): Silero VAD (`processRange`, streamed with hysteresis) → speech windows → ECAPA embeddings (`extractEmbeddingsFromFile`) → AHC → one-speaker chunks ≤ 28 s → Whisper `transcribeRange` (`audio_ctx`, abort, language lock) → cleanup. Whisper is loaded through the model orchestrator (`pin('whisper')`, re-checked before each chunk), so voice chat can still run meanwhile. Model "Auto" prefers `small-q8_0 > small-q5_1 > small > base-q8_0 > base > tiny`.
+*   **Whisper native** (`whisper-capacitor`): `-O3 -DNDEBUG` in every build type, `armv8.2-a+dotprod+fp16`; a CPU check before loading the library (ARMv8.0 devices get a clear `UNSUPPORTED` error), abort callback, detected language in the result.
+*   **Speakers**: ECAPA features are Kaldi fbank + CMN (`FeatureExtractor.java`), thresholds 0.60 (same speaker) / 0.35 (new speaker). A one-time `migrateSpeakerCalibration` resets old thresholds and asks to enroll the owner voice again. Known voices (`voice_profiles` table, `services/speaker/voiceProfiles.ts`) name speakers across meetings and learn when a speaker is named; the owner voice is the reserved profile `voice_owner` ("You"). Profiles with another embedding size are ignored.
+*   **Bundled models** (`ModelAssetManager`, `scripts/fetch-bundled-models.sh`, SHA-256 pinned): Vosk small-it / small-en / en-us-lgraph / spk, Silero VAD v6.2, ECAPA, Whisper `base-q8_0` ship in the APK and are copied on first launch, never overwriting or deleting existing files. Settings show them as "Bundled" without a delete button.
+*   **Notes and bookmarks**: title, bookmarks, AI notes (summary, decisions, action items with times) and questions are saved with the meeting and synced with the AIMindMesh server (server migration v6). `voices_json` and `search_text` never leave the phone. A save without notes never clears them; the sync push uses explicit columns and the pull/server upsert write notes only when present.
+*   **AI notes adapter** (`services/llm/taskCompletion.ts`): Gemini (streaming, JSON mode, Files API above 14 MB of audio), OpenRouter / local OpenAI-compatible, and every other provider through `generateTextResponseStream` as an internal task (no persona, memories or tools). The prompt is checked against the context window first (readable error instead of silent truncation); `<think>` blocks are stripped and JSON is parsed leniently with a Markdown fallback.
+*   **History, search and playback**: history with accent-insensitive search over transcripts (`search_text`), one `<audio>` element with seek and 1×–2× speed, the transcript follows playback; bookmarks and note times seek.
+*   **Editing**: titles, segment text, renaming a speaker or moving a segment to another (or a new) speaker, in-app dialogs (`DialogHost`) instead of `prompt()`/`confirm()`.
+*   **Recovery**: automatic. Interrupted native sessions are finalized into their meeting (bookmarks included); if that meeting was deleted or tombstoned the audio goes to a `recovered_<ts>` meeting. Old `.pcm` orphans are still recovered for one release. `RecoveryBanner` appears only when a finalization fails (Retry / Discard).
+*   **Export**: Markdown, PDF (WebView print adapter), SRT, VTT and the audio, optionally with notes and bookmarks.
+*   **Backup** (Settings → App): one zip with `meetings.json` + `audio/{id}.audio` (format `meeting-assistant-backup` v1, shared with the standalone app). Restore skips meetings already present, deleted or tombstoned, never restores the owner voice, and is refused while recording; restored meetings are pushed at the next sync.
+*   **ONNX Runtime Safety**: VAD and ECAPA plugins share a single process-global `OrtEnvironment`; neither closes it. ECAPA runs on CPU with 2 threads.
+*   **Memory Optimization**: Voxtral and Whisper go through the model orchestrator (§4.1.5): loading them unloads any LLM engine (GGUF, LiteRT, Genie); leaving the meeting frees them and reloads the configured LLM.
 
 ### 4.4 Agenda & Kanban
 Comprehensive productivity system combining calendar events, tasks, and notes.
@@ -451,7 +606,9 @@ When `aimindmeshServer.enabled = true`, the `ProactiveService` enters **Server M
 
 #### 4.7.1 Action Categories & Types
 
-The Proactive Assistant operates through **5 action categories**, each with specific behaviors and user interaction patterns:
+The Proactive Assistant operates through **5 action categories**, each with specific behaviors and user interaction patterns. Every action type has a fixed category (`ACTION_CATEGORY` in `types/proactive.ts`).
+
+> **Implemented today**: Low Battery (Optimization card), Overdue Tasks (Task Review card), Meeting Briefing, Spontaneous Message, Memory Maintenance, Context Summarization. The other actions below are planned.
 
 ##### Silent Actions (Background)
 Execute without any user notification. Used for performance optimization and maintenance.
@@ -484,6 +641,7 @@ Proactive messages sent to the chat interface, initiating conversation.
 *   **Follow-up Question**: Asks clarifying questions about incomplete tasks or vague notes
 *   **Curiosity**: Initiates conversation based on detected patterns (e.g., "You've been researching X, would you like me to summarize?")
 *   **Daily Review**: Summarizes the day and asks questions to consolidate memory
+*   **Spontaneous Message**: the personality timer (Settings → Personality → Proactive Frequency) starts a conversation. It follows the rules of every proactive chat message (`CHAT_CURIOSITY`: master switch, interactive permission, quiet hours, hourly limit, daily chat-message limit), only after 10 minutes of quiet chat, and runs as a background generation (§4.7.7). With *Allow Autonomous Calls* it may start a call instead (same rules).
 
 ##### Autonomous Actions (Direct Modifications)
 ⚠️ **Requires explicit permission**. Directly modifies user data without confirmation.
@@ -501,6 +659,7 @@ The system continuously evaluates **context** to determine when and what actions
 **Device Context:**
 *   Battery level and charging state
 *   Network connectivity (WiFi, cellular, offline)
+*   Screen on/off and system Do Not Disturb, measured by the native worker at each check (DND counts as focus mode)
 *   Storage availability
 *   CPU/thermal state
 
@@ -510,7 +669,7 @@ The system continuously evaluates **context** to determine when and what actions
 *   Time since last user interaction
 
 **User Context:**
-*   Activity state: Active, Idle (30+ min), Focus
+*   Activity state: Active, Idle (30+ min without chat activity, or 3+ min with the screen off), Focus (system DND)
 *   Recent chat history (last 10 messages)
 *   Upcoming events (today)
 *   Overdue tasks
@@ -525,23 +684,26 @@ The system continuously evaluates **context** to determine when and what actions
 #### 4.7.3 Architecture & Privacy
 *   **Local Processing**: All context analysis happens strictly on-device. No sensor data is sent to the cloud.
 *   **Action Engine**: Executes Silent, Informative, Suggestive, Interactive, and Autonomous actions based on a priority queue.
-*   **Permission System**: Granular controls per action category and rate limiting ensure the assistant remains helpful, not intrusive.
-*   **Background Checks**: A periodic WorkManager job (`ProactiveWorker`, every 15 min, Doze-aware) runs contextual delivery and sends a `proactiveCheck` event to the app when it is alive. `ProactivePlugin` schedules/cancels it with the user's preference; `syncServerConfig` gives it the server settings (the API key comes from the Keystore). Real intervals depend on Doze and standby buckets.
+*   **Permission System** (`PermissionManager`): master switch, per-action toggle, category permission (*Context Summarization* follows its own toggle), then:
+    *   **Quiet hours and focus mode** hold back only what reaches the user (informative, suggestive, interactive): silent and autonomous work (memory maintenance, summaries) runs at night.
+    *   **Low battery** (<20%, not charging) blocks silent and autonomous work.
+    *   **Respect Data Usage**: on cellular, memory maintenance and data sync wait for Wi-Fi.
+    *   **Limits**: *Max Actions Per Hour* counts only what reached the user; *Max Autonomous Actions Per Day* and *Max Chat Messages Per Day* are daily budgets (from local midnight). Priority ≥9 bypasses the limits.
+*   **Background Checks**: A periodic WorkManager job (`ProactiveWorker`, every 15 min, Doze-aware, no network constraint so the local checks run offline too) delivers the server's queued insights (CONTEXTUAL mode, outside quiet hours) and sends a `proactiveCheck` event to the app when it is alive, with `{checkId, screenOn, charging, dnd, score}`. The worker then **waits up to 120 s for the app's acknowledgement** (`ProactivePlugin.checkDone`), so the process stays awake while the JS checks and the memory consolidation run. `ProactivePlugin` schedules/cancels it with the user's preference; `syncServerConfig` gives it the server settings (the API key comes from the Keystore). Real intervals depend on Doze and standby buckets.
 *   **Persistence**: Automatically starts `KeepAliveService` on app mount and synchronizes settings with native layer to prevent OS from unloading the mission-critical LLM state.
 *   **Activity Logging**: All actions logged locally for transparency and learning (dismiss rates, interaction patterns).
 
 #### 4.7.4 Memory Maintenance (Autonomous)
-*   **Purpose**: Automatically deduplicate and summarize long-term memories to prevent database bloat and maintain optimal retrieval performance.
+*   **Purpose**: keep the conversation memory (§4.2.4) compact without losing anything. Facts (§4.2.1) are never touched: they are updated by consolidation, not merged.
 *   **Trigger Conditions**:
     *   Memory count exceeds 50 entries
-    *   Device is idle (30+ min since last interaction) OR charging
-    *   Autonomous permissions enabled
+    *   User idle (or charging and not active), autonomous permission on, Wi-Fi when *Respect Data Usage* is on
     *   Minimum 24-hour cooldown since last maintenance
-*   **Two-Phase Process**:
-    1.  **Deduplication**: Removes semantically similar memories using vector cosine similarity (threshold: 0.90)
-    2.  **Summarization**: If count still > 50 after dedup, uses LLM to consolidate oldest 20 memories into a single dense summary
-*   **Requirements**: Valid LLM configuration and API key (for summarization phase)
-*   **User Control**: Toggle "Autonomous Memory Maintenance" in Settings → Proactive → Context Awareness
+*   **Steps** (`episodicMaintenance.ts`):
+    1.  **Deduplication**: near-identical rows of the **same role** and embedding model (cosine ≥0.95) are removed; a fact is never dropped for a chat turn that says the same thing.
+    2.  **Day summaries**: chat turns older than 30 days (already outside retrieval, pruned at 90) are summarized per conversation and day, up to 3 groups per run, with any provider through `runBackgroundTask` (§4.7.7); the summary keeps the date and thread of the conversation and replaces its turns in one transaction.
+*   **Manual run**: Settings → Memory → *Compress & Summarize* runs the same steps (no quiet time required).
+*   **User Control**: *Autonomous Memory Maintenance* in Settings → Proactive → Context Awareness (the autonomous permission).
 
 #### 4.7.5 Automatic Context Summarization (Autonomous)
 *   **Purpose**: Maintain optimal model performance by preventing context window overflow through automatic compression of older chat messages.
@@ -559,7 +721,7 @@ The system continuously evaluates **context** to determine when and what actions
     2.  **Split**: When threshold reached, dynamically splits messages:
         *   Older messages (calculated based on threshold) → Summarized.
         *   Recent messages (60-80%) → Kept verbatim for continuity.
-    3.  **Summarize**: Uses active provider (Cloud, GGUF, or LiteRT) to generate concise summary. Supports local models like Gemma 4 QAT per estrazione e offline summarization a basso consumo.
+    3.  **Summarize**: Uses the active provider through `runBackgroundTask` (§4.7.7): any provider with its own key, an on-device model only when it is loaded and the chat has been quiet for 3 minutes.
     4.  **Store**: Saves the summary per thread (`context-summaries`, `contextSummaryStore.ts`) with the id of the last message it covers; a later summary folds the earlier one in.
     5.  **Apply**: Only the history sent to the model is `[Context Summary] + messages after it`; the chat and the saved thread keep every original message.
 *   **Context Safety Fallback (Rolling Context)**: If summarization is disabled or reaches its limits, the system employs **Anchor Protection** during history pruning:
@@ -588,8 +750,16 @@ The system continuously evaluates **context** to determine when and what actions
 *   **Implementation**:
     *   **Background Execution**: The native `ProactiveWorker` runs under WorkManager, which holds the wake lock for the job; it never retries with backoff (the next periodic run is the retry).
     *   **Main Thread Yielding**: Heavy $O(N^2)$ computations in the JS layer (e.g., vector similarity clustering) include intentional yield points to the event loop (`setTimeout(0)`) to remain responsive to system signals.
-    *   **Concurrency Guards**: `ActionExecutor` implements an execution lock to prevent multiple autonomous heavy tasks from running simultaneously, avoiding CPU and RAM thrashing.
+    *   **Concurrency Guards**: `ActionExecutor` runs one autonomous task at a time (the lock is released in `finally`, also when a task fails); LLM work goes through the arbiter of §4.7.7.
     *   **Resource Throttling**: Automatically skips non-critical maintenance if the user is currently "active" in the app, prioritizing foreground interface smoothness.
+
+#### 4.7.7 Background Generations (Arbiter)
+On-device engines hold one conversation at a time (GGUF chat slot, LiteRT session, Genie stream): a background generation running when the user writes would break the answer.
+*   **Chat activity** (`llm/background/chatActivity.ts`): every foreground generation and every sent message is counted; background work needs `isChatIdleFor(ms)`.
+*   **Arbiter** (`llmArbiter.ts`): one background generation at a time. Every foreground generation first calls `yieldToChat()`: the background task is aborted **and awaited** (Genie gets a short grace for its native stop); "the chat always wins".
+*   **Runner** (`backgroundLlm.ts`, `runBackgroundTask`): reads the stored settings, uses the API key of the provider that answers (`providerKeys.ts`, never another vendor's key), routes through the server when it is the provider (with a local fallback only if the device engine may run). On-device engines are used only if the model is **already loaded**, no other feature (image, meeting, voice) holds the device, and the chat has been quiet for 3 minutes. Partial text of an aborted run is discarded.
+*   **Engine safety**: GGUF forgets the chat prompt after a background request (the next chat turn rebuilds its context); LiteRT and Genie listen to the abort signal with `addEventListener` and never start once aborted; Genie's delayed native stop only stops the generation it was meant for.
+*   **Users**: memory consolidation, episodic maintenance, context summarization, spontaneous messages, meeting briefings, mesh tasks (§4.13.7).
 
 ### 4.8 Voice & Call Modes
 
@@ -733,30 +903,79 @@ The AI Mind Mesh heavily utilizes the LiteRT engine for on-device inference. To 
 To manage scale-out operations, code generation, and team structure, the platform implements a centralized server-side Organization Layer with client-side controls.
 
 #### 4.11.1 AI Council Orchestrator
-The governance body uses a live sequential debate loop involving active agent personas.
-*   **Sequential Multi-Agent Debate**: Uses the `InferenceRouter.complete` service to run reasoning cycles across active roles.
-*   **Consensus Evaluation**: Roles analyze proposals and yield vote choices. The Council evaluates consensus and generates synthesis records.
-*   **Decision Memory**: Synthetic debate logs and final decisions are persistently stored in the SQLite graph database.
+The governance body reviews a venture idea in a short structured debate; the verdict comes from votes, never from the wording of a summary.
+*   **Participants**: the active roles preferred for the mode (`organization.council.roles`, default Researcher, Developer, Reviewer, Security, QA), then other voting roles, up to `organization.council.maxParticipants` (default 6). The Director (the human operator) and the Meeting Analyst never vote.
+*   **Rounds**: `organization.council.rounds` (default 2). Each round sees only the previous one; in the last round every role answers with JSON `{vote: approve|reject, confidence, conditions[], argument}`.
+*   **Consensus**: approved when approvals are at least two thirds of the valid votes, with at least 3 valid votes (`tallyVotes`). The Markdown synthesis summarizes the debate and ends with the computed verdict and the votes; votes are stored in the `idea:review` audit entry.
+*   **Asynchronous**: `POST /ideas/:id/review` answers `202` and moves the idea to `reviewing`; the council runs in the background and sets `approved` or `rejected` (back to the previous status on error). Clients poll `GET /ideas`.
 
-#### 4.11.2 Gitea VCS & Repository Provisioning
-The platform automates workspace setup when new ideas are approved.
-*   **Automated Provisioning**: Programmatically creates repositories under specified Gitea organizations.
-*   **CI/CD Bootstrapping**: Automatically generates and commits GitHub Actions / Gitea Actions YAML workflows based on templates.
+#### 4.11.2 Idea Lifecycle & Human Gate
+| Status | Set by | Next |
+| :--- | :--- | :--- |
+| `proposed` | discovery, manual creation | review, approve |
+| `reviewing` | `/review`, auto-council | `approved` / `rejected` |
+| `approved` | council consensus, `/approve` | `/transition` or `/approve` (build) |
+| `characterized` | specification generated | repository provisioned |
+| `development` | repository exists | development runs, milestone by milestone |
+| `mvp_ready` | every milestone passes its acceptance tests | decision: continue, pivot, kill |
+| `killed` | owner closed the venture | none (the reason feeds discovery) |
+*   **Single gate** (`venture/IdeaLifecycle.ts`): only `POST /ideas/:id/approve` or `/transition` (human), or the auto-council when `organization.allowAutoRepoCreation` is `true`, start characterization, repository and development runs. Transitions are compare-and-set updates; an invalid one answers `409`, a duplicate click starts nothing.
+*   **Characterization** (`DesignOrchestrator`, task type `ORGANIZATION_DESIGN`, never the tool-using agent): one design per idea (reused on retry). A specialist suggested by the HR assessment becomes a role *proposal* for the HR panel unless `organization.allowAutoRoleMaterialization` is `true`.
+*   **Directives**: council recommendations become directives scoped to their idea (`organization_directives.idea_id`, `DirectiveExtractor`); they guide that idea's agent only. Discovery uses organization-wide directives (`idea_id IS NULL`).
+*   **Decisions** (`POST /ideas/:id/decision {decision, notes}`): `continue` (from `mvp_ready`) extends the spec with new criteria and up to 3 milestones from the notes and resumes the builds; `pivot` (from `mvp_ready` or `development`) deletes spec and milestones and returns the idea to `approved` with the notes, so the next approval writes a new spec for the same repository; `kill` closes the venture, blocks its repository and stores the reason in `outcome_notes`.
+*   **Delete**: an idea with a run in progress cannot be deleted (`409`).
 
-#### 4.11.3 Kasm Sandbox Validation
-Code checkouts are validated in dynamic virtual environments.
-*   **Isolated Testing**: Connects to the Kasm Workspaces API to spawn headless developer workspaces.
-*   **Validation Runner**: Clones repositories, runs smoke tests, and extracts validation outputs before destroying the workspace.
+#### 4.11.3 Venture Discovery
+*   **Evidence**: a planner writes 3 searches per topic (pain points, alternatives, communities; `QUERY_EXPANSION`), run through SearXNG (`deep: false`), deduplicated by URL and numbered (up to 12 results).
+*   **Generator** (`PROACTIVE_INSIGHT`): proposes up to 2 products buildable as a Node.js library or HTTP API; each must cite at least 2 result numbers, otherwise it is dropped. The prompt shows the schema only (a concrete example used to be copied verbatim) and lists the last 30 `rejected`/`killed` ideas with their reasons so they are not proposed again. The generator never scores.
+*   **Judge** (`ORGANIZATION_DESIGN`): a separate call scores each idea from its evidence (strategic, feasibility, novelty, privacy, maintenance, 0..1) with a rationale (`organization_ideas.judge_rationale`, `judgeRationale` in `GET /ideas`); an idea without a verdict is dropped. Weights: `OpportunityScoringService`.
+*   **Sources**: the cited pages are stored as `sources` (`sources_json`, `{title, url}`), with a text copy in `sourceSignals` for older apps.
+*   **No fallback**: an unparsable answer yields no idea. One-element JSON arrays are read with `Parser.parseLLMJsonArray` (`parseLLMJson` returns the object inside them).
+*   **Persistence** (`IdeaStore.saveDiscovered`, shared by the autonomous engine and `POST /ideas/discover`): ideas whose title equals or overlaps (word Jaccard ≥ 0.8) an existing idea are skipped, as are ideas under `min_score_threshold`; the route returns the skipped ones.
 
-#### 4.11.4 HR Recruitment Service
-Agent personnel needs are calculated semantically.
-*   **Role Proposing**: Analyzes ecosystem and repository signals to identify operational gaps (e.g. missing DevRel, QA).
-*   **Materialization**: Creates and registers new LLM system prompts and tool permissions as live executable Agent roles.
+#### 4.11.4 Gitea Repository Provisioning
+*   **Server-side**: the server creates the repository in `organization.defaultGiteaNamespace` and commits `TECHNICAL_SPECIFICATION.md`. No Gitea Actions workflow nor webhook is bootstrapped for ventures (validation is server-side); `POST /repositories/:id/bootstrap-ci` still adds a Node 22 workflow on demand. A CI webhook only records `last_ci_status`/`last_ci_at`.
 
-#### 4.11.5 Meeting-to-Organization Bridge
+#### 4.11.5 Venture Build Loop
+```
+VentureScheduler.requestRun ──lock (active_run_id, CAS)──► VentureWorkspace.prepare (fetch main, reset work tree)
+        │                                                        │
+        │                                       OpenClaw run (runStrict, session develop-<repo>, no credentials)
+        │                                                        │
+        └── finish: healthy → push │ failed → attempt++ ◄── snapshot (server commit) ──► ContainerValidationService
+```
+*   **Kill switch & budget** (`organization.build` in `system_settings`, `GET/PATCH /api/organization/build-config`): `enabled` (off by default), `model`, `maxAttempts` (4), `dailyRunLimit` (6), `maxConcurrentBuilds` (1), `maxRunsPerVenture` (12), `agentRunTimeoutMs` (45 min), `validationImage` (`node:22-bookworm-slim`), `validationTimeoutMs` (20 min).
+*   **Workspace** (`VentureWorkspace`): the git dir stays on the server (`data/ventures/<repo>.git`), the files in the agent mount `venture-workspaces/<repo>` (agent path `ventures/<repo>`, a mount point the agent cannot replace). Git runs with hooks, fsmonitor and system/global config disabled; fetch and push authenticate with an `http.extraHeader` passed through the environment, sent only to the Gitea host. A work tree that resolves elsewhere (symlink) is refused.
+*   **Agent run** (`openclaw/agentRun.ts`): the prompt has no URL or credential; it carries the spec location, the directives and, after a failure, the last validation report. The gateway gets the time budget (`timeout`) and a `chat.abort` when the server stops waiting. A chosen `model` goes through the OpenClaw provider `aimindmesh-builder` → `/api/freellmapi-proxy/builder/v1`.
+*   **Outcome**: the server commits what the agent wrote (`node_modules`, `dist`, `.env`… excluded). A validation that passes is pushed to `main` and resets the attempt counter (`healthy`); a failure or a run that changed nothing costs an attempt (`cooldown` 5→60 min); at `maxAttempts` the repository is `blocked` with `blocked_reason` until a human presses *Develop/Unblock* (`POST /repositories/:id/force-develop`, fresh budget). `POST /repositories/:id/cancel` stops a run (repository blocked). The outcome summary is kept in `last_validation` and shown as `lastValidation`.
+*   **Ownership**: `VentureScheduler` (started after `InferenceRouter.init`) is the only resumer: at boot it closes interrupted runs as a failed attempt and removes leftover validation containers; every 10 min it starts `pending` repositories and expired cooldowns, one at a time. Runs are listed in the activity queue as external tasks: never zombie-killed, re-queued or re-routed; cancel and the infrastructure brake abort them.
+
+#### 4.11.6 Specification, Milestones & Acceptance Tests
+*   **Structured spec** (`venture/VentureSpec.ts`): the model returns JSON (audience, problem, ≤5 MVP features, out of scope, template `node-library` | `node-api`, public interface with exact signatures/routes, ≤15 acceptance criteria `AC-n` given/when/then, ≤4 milestones covering every criterion once). It is validated in code (one retry with the problems found) and `TECHNICAL_SPECIFICATION.md` is rendered from it (`spec_json` in `organization_product_designs`).
+*   **Acceptance tests** (`venture/VentureScaffold.ts`): one vitest file per criterion, `acceptance/AC-n.test.ts`, written by a non-agentic call against the public interface before the code exists (`acceptance_json`). They belong to the server: before every run and before every snapshot the server rewrites `acceptance/` and `vitest.config.ts` from the database (files the agent changed or added there are discarded and reported to the next run). Writes never follow a symlink.
+*   **Scaffold**: on the first run the server copies `aimindmesh-server/templates/ventures/<template>/` (package.json with vitest and typescript, tsconfig on `src`, smoke test, README) into the work tree.
+*   **Milestones** (`organization_venture_milestones`): a run works on the first milestone not done. It is done when the build passes, every test outside `acceptance/` passes, and the acceptance files of this and earlier milestones pass (later ones may fail: `milestoneVerdict.ts`). A done milestone is pushed and the repository returns to `pending` for the next one; after the last, the idea becomes `mvp_ready` and the owner is notified. Each venture may use `maxRunsPerVenture` runs (default 12), then it is `blocked`.
+*   **Repositories**: `GET /repositories` adds `milestones` (`seq`, `title`, `criteria`, `status`, `attempts`, `passed`).
+
+#### 4.11.7 Container Validation
+*   **Container** (`ContainerValidationService`): `docker run -d --rm` of the validation image, labelled `aimindmesh.venture=1`, `--cap-drop ALL`, `no-new-privileges`, 2 GB / 2 CPU / 512 pids, user `1000:1000`, no volume. The snapshot is streamed in with `git archive` (symlinks kept as links).
+*   **Steps**: inspect `package.json` → `npm ci` (or `npm install`) `--ignore-scripts` → **network disconnected** → `npm run build` (if defined) → vitest (`--reporter=json`) or jest (`--json`). The test runner must be a registry version range (no `file:`, git or URL dependency).
+*   **Pass**: at least one test and no failure; the result maps to `healthy`/`broken` in one place (`toRepoStatus`). `POST /repositories/:id/validate` runs the same check on the published `main` in the background (`202`). Kasm stays available for manual workspaces only.
+
+#### 4.11.8 HR Recruitment Service
+*   **Role Proposing**: analyzes roles, directives and ideas to propose a missing role (`organization_role_proposals`).
+*   **Materialization**: a human materializes a proposal into an active role (`POST /hr/proposals/:id/materialize`); only then it can join the council.
+
+#### 4.11.9 Meeting-to-Organization Bridge
 A client-side pipeline routes physical meeting discussions to organizational actions.
-*   **Action Candidate Extraction**: Scans meeting transcripts for intent indicators (verbs, goals).
+*   **Action Candidate Extraction**: Uses the meeting's AI notes when present (action items become tasks, decisions directives); otherwise scans the transcript for intent indicators (verbs, goals).
 *   **Selective Submission**: Provides interactive UI selectors to submit approved candidates to the server as Directives or Ideas.
+
+#### 4.11.10 Safety Notes
+*   **Autonomous Discovery**: off by default. The row `organization_discovery_config` decides (schema v7 switched existing rows off); `config.json` `organization.autonomousDiscovery.enabled: true` only seeds a new database.
+*   **No Credentials for the Agent**: the OpenClaw container gets no `.env`, no `GITEA_TOKEN` and no git credential helper. Old `develop-<repo>` transcripts held the token: `node dist/scripts/purgeVentureSessions.js` deletes them.
+*   **Restarts**: an agent task interrupted by a restart ends as `FAILED 'Interrupted by restart'`; the admin retry and restore-all refuse agent tasks.
+*   **Parked Repositories**: schema v7 moved repositories left `pending`, `evolving`, `cooldown`, `verifying` or `needs_verification` to `blocked` (`blocked_reason = 'paused by upgrade'`).
 
 ### 4.12 Neural Wiki
 The Neural Wiki is a structured, collaborative-style knowledge base automatically compiled from the Knowledge Graph on the AIMindMesh Server.
@@ -788,8 +1007,9 @@ AI Mind Mesh introduces optional integration with the **AIMindMesh Server** — 
 #### 4.13.2 Feed Screen
 *   **Purpose**: Displays AI-generated insights, connection summaries, and document ingestion results from the server KG.
 *   **Architecture**: Bottom-nav tab (💬 Chat | ✨ Feed). Uses `IntersectionObserver` for infinite scroll.
-*   **Live Updates**: FCM `NEW_INSIGHT` messages dispatch to `onFCMFeedEvent` event bus → `FeedView` re-fetches top of list without full reload.
-*   **Thread View**: Each insight opens a `FeedThreadView` with a chat-bubble reply interface, streaming server responses via WebSocket.
+*   **Live Updates**: FCM insight messages (`INSIGHT_DELIVERY`, `INSIGHT_FALLBACK`, and `NEW_INSIGHT` of older servers) dispatch to the `onFCMFeedEvent` event bus → `FeedView` re-fetches the top of the list without a full reload.
+*   **Thread View**: Each insight opens a `FeedThreadView` with a chat-bubble reply interface, streaming server responses via WebSocket. A `DEBATE_UPDATE` push for the open insight reloads its thread (not while a reply is streaming).
+*   **Notification Tap**: opens the app on the Feed (also from a cold start: the request is kept by `MainActivity` as the pending launch action until JS reads it) without recreating the activity, so a running generation and the worker link survive.
 *   **Unread Badge**: Bottom nav badge count reflects unread insights; resets on feed tab open.
 #### 4.13.3 AIMindMesh Server LLM Provider
 *   **Provider ID**: `'aimindmesh-server'` in `LLMConfig.provider`.
@@ -805,15 +1025,26 @@ AI Mind Mesh introduces optional integration with the **AIMindMesh Server** — 
 *   **Local Fallback**: When server not configured, files are queued to local `DocumentIngestionService`.
 
 #### 4.13.5 Memory KG Sync
-*   **Auto-Sync**: When `autoSyncNewMemories = true`, each `addMemory()` call fires a fire-and-forget `POST /api/kg/memories`.
-*   **Bulk Sync**: `bulkSyncMemoriesToServer()` in `memorySyncService.ts` iterates all local memories with `setTimeout(0)` yield points between each POST (ANR prevention).
-*   **Payload**: `{content, category, source: 'aimindmesh_android', createdAt}` (the server currently ignores `createdAt` and timestamps on arrival).
+*   **Auto-Sync** (`autoSyncNewMemories = true`, `memorySyncService.ts`): every fact change is mirrored on the server KG — an active fact is upserted with `POST /api/kg/memories` `{id, content, category: kind, source: 'aimindmesh_android', createdAt}` (the server keys it `syncId = fact:<id>`, so it is updated, never duplicated), a deleted, replaced, done or expired fact is removed with `DELETE /api/kg/memories/:id`. Requests are sequential with `setTimeout(0)` yields (ANR prevention).
+*   **Not mirrored**: *Delete All Memories* (the server copies stay; delete them from the server admin). Facts are not part of `GlobalSyncService` (which syncs the conversation memory rows).
+*   **Profile in prompts**: separate opt-in, §6.13.
 
 #### 4.13.6 FCM Push Notification Architecture
 *   **Plugin**: `fcm-capacitor` (Kotlin). Registers `FCMCapacitorPlugin` with Capacitor bridge.
 *   **Services**: `FCMMessagingService` (extends `FirebaseMessagingService`), `FCMActionReceiver` (handles inline actions).
 *   **Token Lifecycle**: On init → request permission → `getFCMToken()` → `POST /api/nodes/register`. On rotate → re-register via `tokenRefresh` listener.
-*   **Message Types**: `NEW_INSIGHT`, `INGESTION_COMPLETE`, `NODE_STATUS`, `SYSTEM_ALERT`, `MARK_READ_ACTION`.
+*   **Message Types**:
+    | Type | Sent by | App |
+    | :--- | :--- | :--- |
+    | `INSIGHT_DELIVERY` | `DeliveryScheduler.deliver` (PUSH mode, outside quiet hours) | Feed refresh |
+    | `INSIGHT_FALLBACK` | Fallback cycle (pending > 6 h, outside quiet hours) | Feed refresh |
+    | `NEW_INSIGHT` | Older servers | Feed refresh |
+    | `DEBATE_UPDATE` | `DebateEngine` (PUSH mode, outside quiet hours) | Thread refresh |
+    | `WAKE_FOR_INFERENCE` | `InferenceRouter` (data-only) | `nodeWorker.wake()` |
+    | `SYNC_REQUEST` | `SyncManager` (data-only, never to the sender) | `GlobalSyncService.performSync` |
+    | `MARK_READ_ACTION` | Notification action | `POST /api/feed/:id/read` + Feed update |
+*   **Delivery Preferences** (`PUT /api/delivery/settings`, partial): `{deliveryMode?, quietHours?: {enabled, start, end}, timezone?}`, sent by `useServerMode` when the server comes online and when the mode or the proactive quiet hours change. The server normalizes the device id to the node id (upper case) and checks quiet hours **in the device's time zone** (the container runs in UTC); devices that never sent theirs follow the server-wide quiet hours in `proactive.timezone`.
+*   **Notification Channel**: SDK-rendered pushes use `aimindmesh_feed` (`default_notification_channel_id` in the manifest).
 *   **Data Flow**:
 ```
 Firebase Cloud Messaging
@@ -828,33 +1059,41 @@ Firebase Cloud Messaging
 *   **Purpose**: Allows the mobile device to act as an active inference worker for the entire mesh cluster.
 *   **Mechanism**: The app establishes a dedicated bidirectional WebSocket neural link to `/ws/nodes?id=<deviceId>&name=<deviceName>&token=<apiKey>` on the server. The device ID (`Device.getId()`) identifies the node.
 *   **Task Ownership**: The server accepts `token`, `thinking` and `result` messages for a task only from the node it was dispatched to; messages for other nodes' tasks are discarded.
-*   **Configuration Injection**: Unlike standard chat sessions, the `NodeWorker` dynamically inherits the active `LLMConfig` (model paths, thread counts) and `Personality` (traits, instructions) from the app's local state. This ensures that tasks dispatched from the mesh are executed with the exact same persona and hardware optimizations configured by the user.
+*   **Configuration Injection**: the `NodeWorker` inherits the active `LLMConfig` (model paths, thread counts) and the personality's instructions. Tasks run as **internal tasks**: none of the owner's facts, conversation memories or workspace documents reach requests that may come from other people through the mesh.
+*   **Owner First**: tasks run as background generations (§4.7.7). While the owner chats, or when the owner starts chatting during a task, the task ends with a `WORKER_BUSY` error result so the server routes it elsewhere instead of waiting.
 *   **Execution Flow**:
     1.  Server dispatches task via WebSocket.
     2.  `NodeWorker.ts` receives payload (prompt + task ID).
     3.  Worker retrieves active configuration and triggers `generateTextResponseStream`.
     4.  Response is streamed back to the server in real-time.
 *   **Robust Error Reporting**: Any exception during local inference (e.g., model not found, OOM) is caught and reported back to the server as a `WORKER_EXECUTION_FAILED` result. This prevents tasks from hanging in `PROCESSING` state and allows for automatic server-side retries or routing fallback.
-*   **Wakeup Layer**: If the WebSocket is closed, the server dispatches a `WAKE_FOR_INFERENCE` FCM message. The mobile app's background service intercepts this and automatically re-activates the `NodeWorker` connection to receive the task.
+*   **Wakeup Layer**: If the WebSocket is closed, the server dispatches a `WAKE_FOR_INFERENCE` FCM message. With the app alive, `nodeWorker.wake()` reconnects with the last settings — also after the heartbeat stopped the worker (e.g. Doze cut the network). With the app closed only a notification can be shown (inference without the WebView is planned).
 *   **Lifecycle & UI Sync**: The worker's status is synchronized with the "AIMindMesh Server" settings panel. A dedicated listener pattern ensures the "READY FOR TASKS" badge reflects the real-time connectivity of the WebSocket link.
 *   **Controls**: Users can enable/disable this feature via "Participate as Worker Node" in AIMindMesh Server settings.
 
 ### 4.14 Auto-Evolution Engine (Server)
 The Auto-Evolution Engine is a server-side pipeline that lets the ecosystem propose changes to its own codebase. It never merges nor deploys by itself: every change is a Gitea Pull Request that a human reviews.
 
-*   **Improvement Detection**: Monitors the Knowledge Graph for high-severity `open_question` / `observation` insights, `DebateEngine` conclusions and wiki "Open Questions", and asks an LLM to map them to a target file.
+*   **Improvement Detection** — evidence first (`services/evolution/signals/`):
+    *   **Runtime errors**: `ERROR` lines of `system_logs` from the last 7 days, grouped by module and normalized message (ids, numbers, quoted values and URLs removed). A group becomes a candidate after `autoEvolution.signals.minOccurrences` (5) occurrences on `minDays` (2) distinct days; environment failures (timeouts, connection errors, rate limits, cancellations) never do.
+    *   **Inference failures**: `FAILED` rows of `inference_queue`, grouped by task type and normalized error, same thresholds.
+    *   **Target**: from a stack trace (`dist/x.js` → `src/x.ts`) or the file emitting the module tag; otherwise the model picks among the files that log it. The model writes title, description and approach, or `skip` when the code should not change.
+    *   **Severity** comes from frequency and persistence (5–10), not from words. One candidate per error group (`id = <kind>-<fingerprint>`); deleting it lets the group be proposed again. At most `signals.maxCandidatesPerCycle` (3) per cycle.
+    *   **Insights** (Knowledge Graph `open_question`/`observation`, `DebateEngine` conclusions, wiki "Open Questions") are off unless `autoEvolution.sources.insights` is `true`: they are reflections on the user's notes, not evidence about the code. A debate concludes on code only when a `DEVELOPER` participant spoke. `sources.runtimeErrors` / `sources.inferenceFailures` can switch the evidence sources off.
 *   **Contextual Code Generation**: `MultiFileContextBuilder` assembles the target plus related files (imports, callers, shared types, DB schema, `ServerConfig` interface) and routes an `EVOLUTION` task to Gemini, then OpenRouter. Chat requests classified as development intents (`injectUserRequest`) follow the same pipeline.
+*   **Edit-based Output** (`services/evolution/EditApplier.ts`): the model returns `edits` (`{path, search, replace}`) and `newFiles`, never whole files. Each search text must occur exactly once in the current file (after the previous edits of that file); otherwise the candidate fails with the reason. The resulting full contents go through the usual checks and commit. Feedback iterations still regenerate the whole target from the branch content.
 *   **Path Policy** (`services/evolution/EvolutionPathPolicy.ts`), enforced at every entry point and again right before each Gitea commit:
     *   **Secrets** are never read, sent to an LLM, nor committed: `config.json`, `.env*`, Firebase service accounts, `openclaw-config/`, `openclaw-workspace/`, `hermes-data/`, server `data/` and `backups/`, databases and keys, the deployment `src/config.ts`.
     *   **Protected paths** are never written: a built-in baseline that cannot be disabled (the evolution services themselves, auth middleware, `index.ts`, DB layer, Dockerfile/compose, every `package.json`/`package-lock.json`/`tsconfig*.json`/`vite.config.*`, CI workflows, shell scripts, the server test suite, the mobile `MainActivity`/manifest and the Tauri backend), plus `.noautoedit` and the `protected_paths` registry.
     *   Paths are normalized (no absolute paths, no `..`, no URL-breaking characters) and repository names validated before reaching the Gitea API.
-*   **Validation** (`ValidationLayer` + `PatchTypeChecker`): the patched files (target, additional files and generated tests) are laid over a temporary copy of the server sources and checked with a real `tsc --noEmit`; errors already present without the patch are not counted. A change that cannot be type-checked for a server TypeScript file is rejected.
+*   **Validation** (`ValidationLayer` + `PatchTypeChecker` + `PatchTestRunner`): the patched files (target, additional files and generated tests) are laid over a temporary copy of the server sources and checked with a real `tsc --noEmit`; then `vitest related` runs the server tests that import them (`autoEvolution.runRelatedTests`, default on; the image ships the `test/` folder for this). In both steps failures already present without the patch are not counted. A change that cannot be type-checked for a server TypeScript file is rejected.
+*   **Outcome Stats**: `GET /api/evolution/stats` returns, per candidate source, candidates, failures, skips, proposals, merged and rejected; shown in the Evolution views (PC and admin mobile).
 *   **Rate Limits**: `autoEvolution.maxProposalsPerDay` covers proposals created today plus candidates in flight, and applies to chat requests as well as the cron cycle.
 *   **Human-in-the-loop (Gitea Integration)**:
     *   Automated creation of `feature/auto-*` branches and Pull Requests in the local Gitea instance.
     *   PR comments (Gitea webhook, HMAC-signed — see §9.6) feed an iterative regeneration loop; the bot's own comments are ignored to prevent loops.
     *   Requires manual review and approval via the Evolution API or Admin Cockpit before merging.
-*   **Autonomous Organization**: the AI council may approve ideas on its own, but repository creation and development agents start only after a human confirmation (`/ideas/:id/approve`) unless `organization.allowAutoRepoCreation` is explicitly `true`.
+*   **Autonomous Organization**: the AI council only votes (`/ideas/:id/review` and the auto-council set `approved`/`rejected`); repository creation and development agents start only after a human confirmation (`/ideas/:id/approve` or `/ideas/:id/transition`) unless `organization.allowAutoRepoCreation` is explicitly `true`, and never while venture builds are disabled (§4.11.5). The organization code (`src/services/organization/**`, `OpenClawBridge.ts`, `src/services/openclaw/**`, `templates/ventures/**`) is protected from auto-evolution.
 *   **Developer Controls**: The Admin Panel (PC/Mobile) provides full visibility into proposals, allowing for approval, rejection, and manual triggering of evolution cycles.
 
 ### 4.15 Server-Side Knowledge Import
@@ -878,6 +1117,15 @@ See §4.13.4 for the import sheet UI. The server-side pipeline (`DocumentIngeste
 | `get_clipboard` | - | Read system clipboard text. |
 | `set_clipboard` | `text` (str) | Write text to clipboard. |
 | `launch_app` | `app_name` (str) | Open another Android application. |
+
+### Category: Web
+| Tool Name | Parameters | Description |
+| :--- | :--- | :--- |
+| `search_web` | `query`, `num_results?` (default 5, max 6), `time_range?` (`day`/`week`/`month`/`year`) | Web results (title, URL, snippet) from the server's SearXNG or DuckDuckGo/Brave; re-ranked; shown as sources. |
+| `read_web_page` | `url`, `query?`, `chunk_index?` | Readable text of a public page: relevant passages for `query`, or part `chunk_index` (0-based) of the page. GET-only, no local addresses. |
+| `analyze_web` | `query` | Server-side search + page reading + LLM synthesis with citations. Offered only when *Web analysis* is enabled in the server settings. |
+| `open_browser` | `url` | Open a URL in the system browser. Requires confirmation. |
+| `search_maps` | `query`, `navigate_to?` | Open Google Maps on a search or directions. |
 
 ### Category: Productivity & Organization
 | Tool Name | Parameters | Description |
@@ -911,7 +1159,10 @@ See §4.13.4 for the import sheet UI. The server-side pipeline (`DocumentIngeste
 ### Category: Memory
 | Tool Name | Parameters | Description |
 | :--- | :--- | :--- |
-| `save_memory` | `content`, `category` | Explicitly save a fact to long-term memory. |
+| `save_memory` | `content`, `kind?`, `importance?`, `due_date?`, `about?` | Remembers a lasting fact about the user (a fact said again is reinforced, not duplicated). |
+| `search_memory` | `query` | What the assistant knows on a topic, with fact ids. |
+| `update_memory` | `memory_id`, `content` | Replaces a fact that changed (the old one is kept as history). |
+| `forget_memory` | `memory_id` | Deletes a fact. Requires confirmation. |
 
 ### Category: Knowledge & Workspaces
 | Tool Name | Parameters | Description |
@@ -955,6 +1206,8 @@ Located in **Settings -> Model**.
 | **LiteRT Model** | `File` | Path to selected `.litertlm` file (e.g., `gemma-2b-it-cpu.litertlm`). |
 | **Context Size** | `Slider` | Global context window (tokens). Default: `2048`. Adjustable via unified slider in Advanced Settings to synchronize `nCtx` across both GGUF and LiteRT engines. |
 | **Engine** | `Toggle` | **GGUF** (via llama.cpp) vs **LiteRT** (via Google AI Edge). |
+| **Genie compute unit** (`genieRuntime`) | `Auto / NPU / GPU / CPU` | GGUF models on the Genie NPU engine (GenieX `llama_cpp`). **Auto** (default) tries the NPU, then the GPU, then the CPU; the unit in use is shown under the active model. Ignored by AI Hub bundles (always NPU). |
+| **Speed & battery benchmark** | `Panel` | Below the engine settings. Runs fixed workloads — a long prompt (~1500 tokens, like the memory consolidation, 64-token answer) and a long answer (256 tokens) — on the chosen targets: each GGUF on GenieX NPU/GPU/CPU and on llama.cpp (with the GGUF engine settings), AI Hub bundles where QAIRT runs. Per target: load time, first token, prompt and answer tok/s (GenieX profile; llama.cpp from JS timings, prompt tokens estimated "~"), mean battery power and **J per 1000 tokens** (battery energy above a 3 s idle baseline, sampled every 250 ms via `SystemMonitor.getPowerSample()`; not measured while charging). A nonce at the start of the prompt defeats prefix reuse; a warm-up runs first. Runs as a background task (the chat stops it). Results are kept per SoC (`llm-benchmark-results`); **Use this** makes a target the chat model (and so the background model). |
 | **Always Keep Loaded** | `Toggle` | **CRITICAL**. If ON, model stays in RAM in background. Consumes battery but instant response. |
 | **Use Mmap** | `Toggle` | Memory mapping. OFF = Faster load, ON = Lower RAM pressure. |
 | **Use GPU (Vulkan)** | `Toggle` | Offloads inference to device GPU via Vulkan. Auto-disables if thermal throttling triggered. **On Qualcomm Adreno, prefer OpenCL below.** |
@@ -1076,15 +1329,17 @@ Located in **Settings → Memory**.
 
 | Option | Type | Description |
 | :--- | :--- | :--- |
-| **Enable Auto-Categorization** | `Toggle` | Uses LLM to automatically categorize new memories into Facts, Tasks, Preferences, Events, Knowledge. |
-| **Similarity Threshold** | `Slider` | Cosine similarity threshold for retrieval (0.0-1.0). Default: `0.75`. Higher = stricter matching. |
-| **Max Memories Retrieved** | `Number` | Number of memories injected into context per query. Default: `3`. Range: `1-10`. |
-| **Memory Browser** | `List` | View, search, edit, and delete stored memories. Shows timestamp and category. |
-| **Add Memory** | `Button` | Manually create a new long-term memory entry. |
-| **Manage Categories** | `List` | Create, rename, delete custom memory categories. |
-| **Export Memories** | `Button` | Export all memories as JSON file for backup. |
-| **Import Memories** | `File` | Restore memories from JSON backup file. |
-| **Clear All Memories** | `Button` | ⚠️ **DANGEROUS**. Permanently deletes all stored memories. |
+| **AI Auto-Categorization** | `Toggle` | Consolidation files the facts it learns under the user's categories. Default: `OFF`. |
+| **Backup / Restore** | `Button` | JSON file in Documents: v2 (facts and categories); v1 backups of older versions are accepted. |
+| **Open loops** | `List` | Active commitments and events, soonest first: *Done* or delete. |
+| **To review** | `List` | Facts older versions stored without checks and the fact gate refuses now (status `review`, out of the prompt): *Keep* or delete. Plus the count of raw chat rows in the conversation memory, with *Delete* (after confirmation). Hidden when empty. |
+| **What I know about you** | `List` | Facts by kind, with search and *History* (replaced, done, expired). Tap a text to correct it; change kind or category; 📌 pins it in the profile; 🗑 forgets it. Badges: *You* (told or migrated), *Learned*, *Backup*. |
+| **Categories** | `List` | Create and delete labels; filter the list. Deleting a label keeps its facts. |
+| **Tell me something about you** | `Form` | Adds a pinned fact with kind, optional label and, for to-dos and dates, a date. |
+| **Conversation Memory** | `Toggle` | Semantic search over past chats and fact matching by meaning. Needs an embedding model. Default: `OFF`. |
+| **Conversation memories** | `List` | Stored chat memories (latest 100) with *Compress & Summarize* (§4.7.4). |
+| **Embedding Model** | `Select` | `multilingual-e5-small` recommended (others are English-only); vectors are re-embedded on change. The similarity threshold follows the model unless moved by hand. |
+| **Delete All Memories** | `Button` | ⚠️ **DANGEROUS**. After confirmation erases the facts and the conversation memory (with its graph links). Server copies of synced facts stay. |
 
 ### 6.10 Personality Settings
 Located in **Settings → Personality**.
@@ -1109,22 +1364,20 @@ Located in **Settings → Performance**.
 | :--- | :--- | :--- |
 | **Disable Battery Optimization** | `Button` | Requests Android exemption to allow background model loading and proactive features. **Recommended**. |
 | **Keep Screen On** | `Toggle` | Prevents screen from sleeping during inference. Useful for long-running tasks. |
+| **LLM benchmark** | `Info` | Speed and energy per engine/compute unit: **Settings → Model**, "Speed & battery benchmark" (§6.1). |
 | **Thermal Awareness** | `Info` | Displays current device temperature. App automatically throttles at >45°C. |
 | **Low Power Mode** | `Toggle` | Reduces thread count, disables vision, and limits context size to conserve battery. |
 | **Clear Cache** | `Button` | Removes temporary files (model cache, image cache, logs). Frees storage. |
 | **Reset to Defaults** | `Button` | ⚠️ Resets ALL settings to factory defaults. Does NOT delete memories or documents. |
 
-### 6.12 AIMindMesh Support Server
-Located `Settings -> App Settings -> Support Server`.
-This feature delegates heavy data extraction (like web search scraping) to an external companion server (AIMindMesh Server) to drastically reduce RAM usage and prevent context length explosions on the mobile device.
+### 6.12 Web Tools Delegation
+The web tools can run on the AIMindMesh Server instead of the phone (saving mobile data, RAM and battery). The switches are in **Settings → AIMindMesh Server → Web tools** (§6.13) and need the server enabled. Every delegated call falls back to the on-device implementation when the server fails or returns nothing.
 
 | Option | Type | Description |
 | :--- | :--- | :--- |
-| **Enable Support Server** | `Toggle` | Master switch for the support server capabilities. |
-| **Server URL** | `Text` | The endpoint of the AIMindMesh Server over the VPN (e.g. `http://10.2.0.1:3030`). |
-| **Delegate Web Search** | `Toggle` | Offloads DuckDuckGo web scraping. Calls `POST /api/web/search` with `{query, num_results}`. |
-| **Delegate Web Scraping** | `Toggle` | Offloads full web page parsing. Calls `POST /api/web/read` with `{url, query?, method?, headers?, body?}` (`headers` as a JSON object). |
-| **Delegate Web Analysis** | `Toggle` | Offloads Search + AI Synth loop to containerized Ollama. Calls `POST /api/web/analyze` with `{query}`. |
+| **Web search on the server** (`delegateWebSearch`) | `Toggle` | `search_web` calls `POST /api/web/search` with `{query, num_results, time_range?, lang}` (standard SearXNG search, 20 s timeout; snippets cut at 320 chars on the phone). |
+| **Page reading on the server** (`delegateWebScraping`) | `Toggle` | `read_web_page` calls `POST /api/web/read` with `{url}` (GET-only on the server too; private addresses refused) and receives `{title, url, data}`; the phone then slices parts/passages as in §4.1.7. |
+| **Web analysis** (`delegateWebAnalysis`) | `Toggle` | Offers `analyze_web` to the model: `POST /api/web/analyze` with `{query}` (deep search + synthesis by the server's InferenceRouter, 120 s timeout). |
 
 ### 6.13 AIMindMesh Server Settings
 Located **Settings → AIMindMesh Server**.
@@ -1136,10 +1389,12 @@ Located **Settings → AIMindMesh Server**.
 | **API Key** | `Password` | Sent as the `x-api-key` header on REST requests and as the `token` query parameter on WebSockets (`/ws/chat`, `/ws/nodes`). Stored in the Keystore-backed secret store (see §9.1). |
 | **Fallback Provider** | `Select` | LLM provider to use if server is unreachable (default: `gemini`). |
 | **Participate as Worker** | `Toggle` | Allows the server to route inference tasks to this device. Activates the `NodeWorker` WebSocket. |
+| **Web tools** | `Toggles` | Web search, page reading and web analysis on the server (§6.12, §4.1.7). |
 | **Mesh Activity** | `Indicator` | Real-time status card showing if the device is currently executing a distributed task. |
 | **Test Connection** | `Button` | Fires `GET /api/health` and displays server version, uptime, and KG node count. |
-| **Auto-Sync New Memories** | `Toggle` | Auto-POSTs each new local memory to `/api/kg/memories` (fire-and-forget). |
-| **Bulk Sync Memories** | `Button` | Syncs all existing local memories to server KG with progress indicator. |
+| **Auto-Sync New Memories** | `Toggle` | Mirrors the facts on the server KG: upserted by id, deleted when forgotten or replaced (§4.13.5). |
+| **Share What I Know With the Server** | `Toggle` | When the server answers (provider `aimindmesh-server`), the user profile is sent as a system message. Default: `OFF` (the server may route the request to other mesh nodes). |
+| **Delivery Mode** | `Select` | `PUSH` or `CONTEXTUAL` (queued, fetched by the native worker when the user is available). Sent with the proactive quiet hours and the time zone (§4.13.6). |
 
 ---
 
@@ -1254,7 +1509,11 @@ This section describes the **current** state. Items marked *(planned)* are known
     ... >
 ```
 *   There is no `network_security_config.xml`: cleartext is allowed for all hosts *(planned: restrict cleartext to the VPN/LAN ranges)*.
-*   Capacitor serves the app from `http://localhost` (`androidScheme: 'http'`, `allowNavigation: ['*']`, `allowMixedContent: true`).
+*   Capacitor serves the app from `http://localhost` (`androidScheme: 'http'`, `cleartext: true` for the plain-HTTP LAN servers). There is no `allowNavigation` and no `allowMixedContent`: the WebView never navigates away from the app, and external links open in the system browser (`window.open(url, '_system')`).
+
+#### App Lock
+*   Settings → App → Privacy: `AppLockPlugin` asks for the fingerprint, face or screen lock (BiometricPrompt `BIOMETRIC_WEAK | DEVICE_CREDENTIAL`) at launch and after more than 60 s in the background (`shouldRelock`). Recordings keep going while locked; the wake word is off behind the lock screen.
+*   With the lock on, `FLAG_SECURE` hides the app from screenshots and the recent apps view. The flag is saved in SharedPreferences and applied in `MainActivity.onCreate`, before the first frame.
 
 #### Permissions Rationale
 | Permission | Reason |
@@ -1263,7 +1522,9 @@ This section describes the **current** state. Items marked *(planned)* are known
 | `RECORD_AUDIO`, `MODIFY_AUDIO_SETTINGS` | STT, Meeting Mode, Voice/Call Mode, wake word |
 | `READ_EXTERNAL_STORAGE`, `WRITE_EXTERNAL_STORAGE`, `READ_MEDIA_IMAGES/VIDEO/AUDIO` | Model files, document import, media for vision features |
 | `POST_NOTIFICATIONS` | FCM insights, proactive suggestions |
-| `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MICROPHONE`, `FOREGROUND_SERVICE_MEDIA_PLAYBACK`, `FOREGROUND_SERVICE_SPECIAL_USE` | Wake word service, KeepAlive (always-loaded model) |
+| `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MICROPHONE`, `FOREGROUND_SERVICE_MEDIA_PLAYBACK`, `FOREGROUND_SERVICE_SPECIAL_USE` | Wake word service, KeepAlive (always-loaded model), meeting recording (`RecordingService`) |
+| `FOREGROUND_SERVICE_DATA_SYNC`, `FOREGROUND_SERVICE_MEDIA_PROCESSING` | Meeting transcription after Stop running in the background (`ProcessingService`) |
+| `USE_BIOMETRIC` (from `androidx.biometric`) | App lock |
 | `WAKE_LOCK` | Long inference and recordings |
 | `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` | Heavy on-device compute (Performance plugin) |
 | `READ_CALENDAR`, `WRITE_CALENDAR` | Agenda integration |
@@ -1280,8 +1541,8 @@ Processing is based on **Art. 6(1)(b) GDPR** (performance of a contract/service 
 #### Data Subject Rights
 | Right | Implementation |
 |---|---|
-| Right to Access (Art. 15) | Memory Browser exports all memories as JSON; Chat export available |
-| Right to Erasure (Art. 17) | "Clear All Memories", "Clear Chat History", per-meeting audio delete |
+| Right to Access (Art. 15) | Settings → Memory shows every fact (with history) and *Backup* exports them as JSON; Chat export available |
+| Right to Erasure (Art. 17) | "Delete All Memories" (facts and conversation memory), per-fact forget (also on the server when synced), "Clear Chat History", per-meeting audio delete |
 | Right to Portability (Art. 20) | JSON export for memories, personalities, tasks |
 | Right to Object (Art. 21) | All cloud features are opt-in; local-only mode available |
 

@@ -1,5 +1,5 @@
 import { WebPlugin } from '@capacitor/core';
-import type { GeniePlugin, GenieCapabilities, GenieLoadOptions, GenieGenerateOptions, GenieStreamResult, GenieModelInfo } from './definitions';
+import type { GeniePlugin, GenieCapabilities, GenieLoadOptions, GenieGenerateOptions, GenieStreamResult, GenieModelInfo, GenieLoadedModel } from './definitions';
 
 export class GenieWeb extends WebPlugin implements GeniePlugin {
   async getCapabilities(): Promise<GenieCapabilities> {
@@ -10,7 +10,7 @@ export class GenieWeb extends WebPlugin implements GeniePlugin {
     };
   }
 
-  async loadModel(_options: GenieLoadOptions): Promise<{ success: boolean; modelName?: string; isVision?: boolean; error?: string }> {
+  async loadModel(_options: GenieLoadOptions): Promise<{ success: boolean; error?: string } & GenieLoadedModel> {
     return { success: false, error: 'Genie Qualcomm NPU engine is only supported natively on Android Snapdragon devices' };
   }
 
@@ -18,12 +18,16 @@ export class GenieWeb extends WebPlugin implements GeniePlugin {
     return { success: true };
   }
 
-  async isLoaded(): Promise<{ loaded: boolean; modelPath?: string; modelName?: string; isVision?: boolean }> {
+  async isLoaded(): Promise<{ loaded: boolean; modelPath?: string } & GenieLoadedModel> {
     return { loaded: false };
   }
 
   async listLocalModels(): Promise<{ models: GenieModelInfo[] }> {
     return { models: [] };
+  }
+
+  async formatChat(): Promise<{ prompt: string }> {
+    throw this.unavailable('Genie NPU not available on web');
   }
 
   async generateStream(

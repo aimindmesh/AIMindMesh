@@ -1,6 +1,10 @@
 import { FastifyInstance } from 'fastify';
 import { KGManager } from '../../services/KGManager';
+import { deleteMemoryBySyncId } from '../../services/KGMemories';
 import { InferenceRouter } from '../../services/InferenceRouter';
+
+/** Neo4j syncId of a phone fact (distinct from GlobalSync's `<deviceId>:<rowId>` memories) */
+export const memoryFactSyncId = (id: string) => `fact:${id.trim()}`;
 
 export default async function (fastify: FastifyInstance) {
   fastify.post('/concepts', async (request, reply) => {
@@ -40,10 +44,28 @@ export default async function (fastify: FastifyInstance) {
     return results;
   });
 
+  /**
+   * Body: { content, category?, source?, id?, createdAt? }. With `id` (a fact of the phone) the
+   * same memory is updated on every sync instead of being duplicated.
+   */
   fastify.post('/memories', async (request, reply) => {
-    const { content, category, source } = request.body as any;
+    const { content, category, source, id: memoryId, createdAt } = (request.body ?? {}) as any;
+    if (typeof content !== 'string' || !content.trim()) {
+      reply.status(400).send({ error: 'content is required' });
+      return;
+    }
     const embedding = await InferenceRouter.getEmbeddings(content);
-    const id = await KGManager.upsertMemory(content, embedding, category, source);
+    const created = typeof createdAt === 'number' ? createdAt
+      : typeof createdAt === 'string' && Number.isFinite(Date.parse(createdAt)) ? Date.parse(createdAt) : undefined;
+    const syncId = typeof memoryId === 'string' && memoryId.trim() ? memoryFactSyncId(memoryId) : undefined;
+    const id = await KGManager.upsertMemory(content, embedding, category ?? 'other', source ?? 'unknown', syncId, created);
     return { id };
+  });
+
+  /** The user deleted (or replaced) the memory on the phone */
+  fastify.delete('/memories/:id', async (request) => {
+    const { id } = request.params as { id: string };
+    const deleted = await deleteMemoryBySyncId(memoryFactSyncId(id));
+    return { ok: true, deleted };
   });
 }

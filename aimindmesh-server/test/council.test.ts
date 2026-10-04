@@ -5,6 +5,7 @@ import db from '../src/db/sqlite';
 const mocks = vi.hoisted(() => ({ characterizeIdea: vi.fn(), audit: vi.fn(), broadcast: vi.fn() }));
 
 vi.mock('../src/services/FCMDispatcher', () => ({ sendToDevice: vi.fn(async () => {}) }));
+vi.mock('../src/services/OpenClawBridge', () => ({ runAgentTask: vi.fn() }));
 vi.mock('../src/services/NotificationService', () => ({ NotificationService: { broadcast: mocks.broadcast } }));
 vi.mock('../src/services/organization/VentureDiscoveryService', () => ({ VentureDiscoveryService: class {} }));
 vi.mock('../src/services/organization/DirectiveService', () => ({ SQLiteDirectiveRepository: class {}, DirectiveService: class {} }));

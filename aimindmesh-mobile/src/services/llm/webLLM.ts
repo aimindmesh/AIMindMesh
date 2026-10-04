@@ -1,5 +1,5 @@
 import { CreateMLCEngine, MLCEngine, InitProgressReport, prebuiltAppConfig } from "@mlc-ai/web-llm";
-import { Message, Personality, Memory } from "../../types";
+import { Message, Personality } from "../../types";
 import { buildSystemPrompt } from "./promptBuilder";
 import { logger } from "../logger";
 
@@ -139,14 +139,14 @@ export function isReady(): boolean {
     return !!engine;
 }
 
-export async function* generateStream(history: Message[], personality: Personality, memories?: Memory[], signal?: AbortSignal): AsyncGenerator<string> {
+export async function* generateStream(history: Message[], personality: Personality, signal?: AbortSignal): AsyncGenerator<string> {
     if (!engine) {
         const err = new Error("WebLLM engine is not initialized. Please select and load a model in settings.");
         logger.log('error', err.message);
         throw err;
     }
 
-    const systemPrompt = buildSystemPrompt(personality, memories);
+    const systemPrompt = buildSystemPrompt(personality);
 
     const messagesPayload: any[] = [
         { role: 'system', content: systemPrompt },

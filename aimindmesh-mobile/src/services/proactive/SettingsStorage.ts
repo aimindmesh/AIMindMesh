@@ -1,5 +1,6 @@
 import { ProactiveSettings, DEFAULT_PROACTIVE_SETTINGS } from '../../types/index';
 import { syncNativeProactiveSettings } from './nativeProactiveSync';
+import { mergeProactiveSettings } from './proactiveSettings';
 
 class ProactiveSettingsStorage {
     private STORAGE_KEY = 'proactive-settings';
@@ -21,7 +22,7 @@ class ProactiveSettingsStorage {
             if (value) {
                 const parsed = JSON.parse(value);
                 // Merge with defaults to handle new settings
-                this.cachedSettings = this.mergeWithDefaults(parsed);
+                this.cachedSettings = mergeProactiveSettings(parsed);
             } else {
                 this.cachedSettings = DEFAULT_PROACTIVE_SETTINGS;
             }
@@ -76,43 +77,6 @@ class ProactiveSettingsStorage {
 
     private notifyListeners(settings: ProactiveSettings) {
         this.listeners.forEach(cb => cb(settings));
-    }
-
-    private mergeWithDefaults(
-        loaded: Partial<ProactiveSettings>
-    ): ProactiveSettings {
-        return {
-            ...DEFAULT_PROACTIVE_SETTINGS,
-            ...loaded,
-            quietHours: {
-                ...DEFAULT_PROACTIVE_SETTINGS.quietHours,
-                ...(loaded.quietHours || {}),
-            },
-            permissions: {
-                ...DEFAULT_PROACTIVE_SETTINGS.permissions,
-                ...(loaded.permissions || {}),
-            },
-            actionControls: {
-                ...DEFAULT_PROACTIVE_SETTINGS.actionControls,
-                ...(loaded.actionControls || {})
-            },
-            contextAwareness: {
-                ...DEFAULT_PROACTIVE_SETTINGS.contextAwareness,
-                ...(loaded.contextAwareness || {}),
-            },
-            notifications: {
-                ...DEFAULT_PROACTIVE_SETTINGS.notifications,
-                ...(loaded.notifications || {}),
-            },
-            learning: {
-                ...DEFAULT_PROACTIVE_SETTINGS.learning,
-                ...(loaded.learning || {}),
-            },
-            limits: {
-                ...DEFAULT_PROACTIVE_SETTINGS.limits,
-                ...(loaded.limits || {}),
-            },
-        };
     }
 }
 

@@ -3,109 +3,53 @@
  * Prefix: /api/web
  *
  * Mirrors the mobile client's web tool capabilities:
- *  - POST /api/web/search  — DuckDuckGo/SearXNG search with RAG re-ranking
- *  - POST /api/web/read    — Fetch and clean a web page's text content
+ *  - POST /api/web/search  — SearXNG search (standard, not deep: the phone waits for it)
+ *  - POST /api/web/read    — GET a public page and return its readable text
  *  - POST /api/web/analyze — Search + LLM synthesis via InferenceRouter
  */
 
 import { FastifyInstance } from 'fastify';
-import { SearchService } from '../../services/SearchService';
+import { SearchService, SearchOptions } from '../../services/SearchService';
+import { WebScraperService } from '../../services/WebScraperService';
 import { InferenceRouter } from '../../services/InferenceRouter';
 import { Logger } from '../../utils/Logger';
-import { config } from '../../config';
-import https from 'https';
-import http from 'http';
-import { URL } from 'url';
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/**
- * Fetch a URL and return its raw text body.
- */
-async function fetchPageText(
-  targetUrl: string,
-  method: string = 'GET',
-  customHeaders?: Record<string, string>,
-  body?: string,
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const parsed = new URL(targetUrl);
-    const transport = parsed.protocol === 'https:' ? https : http;
-
-    const reqOptions: http.RequestOptions = {
-      hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-      path: parsed.pathname + parsed.search,
-      method: method.toUpperCase(),
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; AIMindMesh/1.0; +https://aimindmesh.app)',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        ...customHeaders,
-      },
-    };
-
-    const req = transport.request(reqOptions, (res) => {
-      let data = '';
-      res.setEncoding('utf8');
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => resolve(data));
-    });
-
-    req.setTimeout(20000, () => {
-      req.destroy();
-      reject(new Error('Page fetch timed out after 20s'));
-    });
-
-    req.on('error', reject);
-
-    if (body) req.write(body);
-    req.end();
-  });
-}
-
-/**
- * Strip HTML tags and collapse whitespace for clean text extraction.
- */
-function stripHtml(html: string): string {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, ' ')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
-}
+const MAX_RESULTS = 10;
+const MAX_SNIPPET_CHARS = 500;
+/** Text returned by /read (the phone splits it into parts) */
+const MAX_PAGE_CHARS = 200_000;
+const TIME_RANGES = ['day', 'week', 'month', 'year'];
 
 // ── Route plugin ──────────────────────────────────────────────────────────────
 
 export default async function webRoutes(fastify: FastifyInstance) {
 
   // ── POST /api/web/search ─────────────────────────────────────────────────
-  // Perform a web search via SearXNG and return structured results.
-  // Falls back to DuckDuckGo HTML scraping if SearXNG is unavailable.
+  // Standard SearXNG search (no query expansion or page scraping: those take longer than
+  // the phone's timeout). Snippets are bounded; the phone reads pages with /read.
   fastify.post<{
-    Body: { query: string; num_results?: number };
+    Body: { query: string; num_results?: number; time_range?: string; lang?: string };
   }>('/search', async (req, reply) => {
-    const { query, num_results = 5 } = req.body;
-    if (!query?.trim()) {
+    const { query, num_results, time_range, lang } = req.body || ({} as any);
+    if (typeof query !== 'string' || !query.trim()) {
       return reply.code(400).send({ success: false, error: 'query is required' });
     }
+    const count = Math.min(Math.max(Math.round(Number(num_results)) || 5, 1), MAX_RESULTS);
+    const options: SearchOptions = {
+      numResults: count,
+      deep: false,
+      ...(typeof lang === 'string' && /^[a-z]{2}(-[A-Za-z]{2})?$/.test(lang) ? { lang } : {}),
+      ...(TIME_RANGES.includes(String(time_range)) ? { timeRange: time_range as SearchOptions['timeRange'] } : {}),
+    };
 
     try {
-      Logger.info('WebRoutes', `[search] query="${query}" num_results=${num_results}`);
-
-      const rawResults = await SearchService.search(query);
-      const results = rawResults
-        .slice(0, Math.min(num_results, 10))
+      Logger.info('WebRoutes', `[search] query="${query}" num_results=${count} time_range=${options.timeRange ?? '-'}`);
+      const results = (await SearchService.search(query.trim(), options))
+        .slice(0, count)
         .map(r => ({
           title: r.title,
           url: r.url,
-          snippet: r.content,
+          snippet: (r.content || '').replace(/\s+/g, ' ').trim().slice(0, MAX_SNIPPET_CHARS),
         }));
 
       return reply.send({ success: true, query, results });
@@ -116,49 +60,29 @@ export default async function webRoutes(fastify: FastifyInstance) {
   });
 
   // ── POST /api/web/read ───────────────────────────────────────────────────
-  // Fetch and clean a web page, returning its text content.
-  // If `query` is provided, returns a relevant excerpt (simple keyword match).
+  // GET a public page (no private addresses, redirects re-checked) and return its readable
+  // text. With `query`, only the passages sharing most words with it.
   fastify.post<{
-    Body: {
-      url: string;
-      query?: string;
-      method?: string;
-      headers?: Record<string, string>;
-      body?: string;
-    };
+    Body: { url: string; query?: string };
   }>('/read', async (req, reply) => {
-    const { url, query, method = 'GET', headers: customHeaders, body } = req.body;
-
-    if (!url?.startsWith('http')) {
+    const { url, query } = req.body || ({} as any);
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
       return reply.code(400).send({ success: false, error: 'url must start with http:// or https://' });
     }
 
     try {
       Logger.info('WebRoutes', `[read] url="${url}"`);
-      const rawHtml = await fetchPageText(url, method, customHeaders, body);
-      const text = stripHtml(rawHtml);
-
-      // If a query is provided, do a simple excerpt extraction (keyword context)
-      if (query) {
-        const lowerText = text.toLowerCase();
-        const lowerQuery = query.toLowerCase();
-        const idx = lowerText.indexOf(lowerQuery.split(/\s+/)[0]);
-        if (idx !== -1) {
-          const start = Math.max(0, idx - 200);
-          const end = Math.min(text.length, idx + 2000);
-          const excerpt = text.slice(start, end);
-          Logger.info('WebRoutes', `[read] Returning excerpt (${excerpt.length} chars) for query "${query}"`);
-          return reply.send({ success: true, data: excerpt });
-        }
+      const page = await WebScraperService.fetchPage(url);
+      let text = page.text.slice(0, MAX_PAGE_CHARS);
+      if (typeof query === 'string' && query.trim()) {
+        text = WebScraperService.relevantPassages(text, query, 3).join('\n\n[…]\n\n');
       }
-
-      // Return full text capped at 50 KB
-      const truncated = text.slice(0, 50000);
-      Logger.info('WebRoutes', `[read] Returning ${truncated.length} chars of page content`);
-      return reply.send({ success: true, data: truncated });
+      Logger.info('WebRoutes', `[read] Returning ${text.length} chars of ${page.url}`);
+      return reply.send({ success: true, url: page.url, title: page.title, data: text });
     } catch (err: any) {
-      Logger.error('WebRoutes', `[read] failed: ${err.message}`);
-      return reply.code(500).send({ success: false, error: err.message });
+      Logger.warn('WebRoutes', `[read] failed: ${err.message}`);
+      const blocked = /private|not allowed|Only http/i.test(err.message);
+      return reply.code(blocked ? 400 : 502).send({ success: false, error: err.message });
     }
   });
 

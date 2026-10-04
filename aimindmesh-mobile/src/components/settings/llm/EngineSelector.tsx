@@ -52,12 +52,12 @@ const EngineSelector: React.FC<EngineSelectorProps> = ({
                 >
                     <span className="text-xl">⚡</span>
                     <span className="text-xs font-medium">Genie NPU</span>
-                    <span className="text-[9px] opacity-70">Hexagon v79</span>
+                    <span className="text-[9px] opacity-70">Hexagon NPU</span>
                 </button>
             </div>
             <p className="text-xs text-text-tertiary mt-2">
                 {llmConfig.engine === 'genie' || llmConfig.provider === 'genie-npu'
-                    ? 'Qualcomm Genie: Hardware accelerated on Snapdragon Hexagon NPU (50+ tok/s at 2W).'
+                    ? 'Qualcomm GenieX: GGUF models on the Hexagon NPU (falling back to GPU/CPU), AI Hub bundles on Snapdragon 8 Elite. Measure the speed with the benchmark.'
                     : (llmConfig.engine || 'gguf') === 'gguf'
                     ? 'llama.cpp: Runs GGUF models locally on CPU/GPU.'
                     : 'LiteRT: Google AI Edge with Gemma models. Native multimodal support.'}

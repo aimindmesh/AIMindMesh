@@ -505,8 +505,13 @@ public class LlamaCppInference {
      * Get formatted chat string directly from the LLM model using its template engine.
      */
     public String getFormattedChat(String messages, String chatTemplate) {
+        return getFormattedChat(messages, chatTemplate, "", false);
+    }
+
+    /** tools: JSON array of OpenAI-style declarations ("" for none); enableThinking: the template's thinking flag */
+    public String getFormattedChat(String messages, String chatTemplate, String tools, boolean enableThinking) {
         verifyHandle();
-        return getFormattedChatNative(nativePtr, messages, chatTemplate);
+        return getFormattedChatNative(nativePtr, messages, chatTemplate, tools, enableThinking);
     }
 
     private void verifyHandle() {
@@ -549,7 +554,7 @@ public class LlamaCppInference {
 
     private native void resetContextNative(long modelPtr);
 
-    private native String getFormattedChatNative(long modelPtr, String messages, String chatTemplate);
+    private native String getFormattedChatNative(long modelPtr, String messages, String chatTemplate, String tools, boolean enableThinking);
 
     private native boolean saveStateNative(long modelPtr, String filepath, int seqId);
 

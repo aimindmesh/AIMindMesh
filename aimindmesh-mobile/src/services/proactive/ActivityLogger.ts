@@ -1,10 +1,12 @@
 
-import { ProactiveAction } from '../../types/proactive';
+import { ProactiveAction, ProactiveCategory, categoryOf } from '../../types/proactive';
 
 
 export interface ActivityLogEntry {
     actionId: string;
     actionType: string;
+    /** Missing in entries written before categories were logged: derived from the type */
+    category?: ProactiveCategory;
     timestamp: number;
     status: string;
     dismissed: boolean;
@@ -12,17 +14,30 @@ export interface ActivityLogEntry {
     interactionType?: 'clicked' | 'dismissed' | 'snoozed' | 'completed';
 }
 
+const entryCategory = (entry: ActivityLogEntry): ProactiveCategory => entry.category ?? categoryOf(entry.actionType);
+
 /**
  * Actions that reached the user or ran since `since`, each counted once: an action writes
  * several rows (pending, executing, completed...), and blocked ones ('ignored') never count,
  * otherwise a blocked action would keep the hourly limit full forever.
+ * `categories`: only actions of these categories (all when omitted).
  */
-export function countDeliveredActions(log: ActivityLogEntry[], since: number): number {
+export function countDeliveredActions(log: ActivityLogEntry[], since: number, categories?: ProactiveCategory[]): number {
     const delivered = new Set<string>();
     for (const entry of log) {
-        if (entry.timestamp > since && entry.status !== 'ignored') delivered.add(entry.actionId);
+        if (entry.timestamp > since && entry.status !== 'ignored'
+            && (!categories || categories.includes(entryCategory(entry)))) {
+            delivered.add(entry.actionId);
+        }
     }
     return delivered.size;
+}
+
+/** Local midnight of the day of `now` */
+export function startOfDay(now: number = Date.now()): number {
+    const day = new Date(now);
+    day.setHours(0, 0, 0, 0);
+    return day.getTime();
 }
 
 class ActivityLogger {
@@ -33,6 +48,7 @@ class ActivityLogger {
         const entry: ActivityLogEntry = {
             actionId: action.id,
             actionType: action.type,
+            category: action.category,
             timestamp: action.triggeredAt,
             status: action.status,
             dismissed: false,
@@ -95,9 +111,14 @@ class ActivityLogger {
         return stats;
     }
 
-    /** Distinct delivered actions in the last `hours` (rate limiting) */
-    async countDelivered(hours: number): Promise<number> {
-        return countDeliveredActions(await this.getLog(), Date.now() - hours * 60 * 60 * 1000);
+    /** Distinct delivered actions in the last `hours` (rate limiting), optionally of some categories */
+    async countDelivered(hours: number, categories?: ProactiveCategory[]): Promise<number> {
+        return countDeliveredActions(await this.getLog(), Date.now() - hours * 60 * 60 * 1000, categories);
+    }
+
+    /** Distinct delivered actions of `category` since local midnight (daily limits) */
+    async countToday(category: ProactiveCategory): Promise<number> {
+        return countDeliveredActions(await this.getLog(), startOfDay() - 1, [category]);
     }
 
     async getLog(): Promise<ActivityLogEntry[]> {

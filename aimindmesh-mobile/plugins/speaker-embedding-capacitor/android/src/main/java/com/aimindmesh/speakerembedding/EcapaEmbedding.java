@@ -60,13 +60,9 @@ public class EcapaEmbedding {
             OrtSession.SessionOptions options = new OrtSession.SessionOptions();
             options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
 
-            // Enable NNAPI on Android for hardware acceleration
-            try {
-                options.addNnapi();
-                Log.i(TAG, "NNAPI execution provider enabled");
-            } catch (Exception e) {
-                Log.w(TAG, "NNAPI not available, using CPU: " + e.getMessage());
-            }
+            // CPU only: NNAPI can't compile a graph with a dynamic frame count (and is
+            // deprecated). Two threads leave cores for live recognition running alongside.
+            options.setIntraOpNumThreads(2);
 
             // Lazy initialize OrtEnvironment (to avoid loading native libs at plugin
             // startup)
@@ -213,14 +209,7 @@ public class EcapaEmbedding {
      * Cleanup resources.
      */
     public synchronized void cleanup() {
+        // Don't close env: OrtEnvironment is a process-wide singleton shared with Silero VAD.
         unloadModel();
-        if (env != null) {
-            try {
-                env.close();
-            } catch (Exception e) {
-                Log.e(TAG, "Error closing ORT environment", e);
-            }
-            env = null;
-        }
     }
 }

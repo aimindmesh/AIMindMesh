@@ -1,25 +1,29 @@
 import { Type } from '@google/genai';
 import { ToolDefinition, ToolResult } from './types';
-import { searchWeb, formatSearchResultsForContext } from '../webSearch';
+import { searchWeb, formatSearchResultsForContext, parseTimeRange, DEFAULT_RESULTS, MAX_RESULTS } from '../web/webSearch';
+import { readWebPage } from '../web/pageReader';
+import { getWebDelegation, postToServer } from '../web/webDelegation';
 import { logger } from '../logger';
-import { TextEmbedding } from 'text-embedding-capacitor';
-import { embedText } from '../model/embedding/embeddingRuntime';
-import { DocumentChunker } from '../documents/DocumentChunker';
 
 export const webTools: ToolDefinition[] = [
     {
         name: 'search_web',
-        description: 'Searches the web for information using DuckDuckGo and returns results with titles, snippets, and URLs. Use these results to answer questions and provide source links. Returns up to 5 results. If you need to read full page content, use read_web_page with one of the returned URLs.',
+        description: `Searches the web and returns results with title, URL and snippet (up to ${MAX_RESULTS}). Use it for current events, prices, schedules, facts you are not sure about. Answer from the snippets only when they clearly contain the answer; otherwise call read_web_page on the most relevant URL. Cite the URLs you use.`,
         parameters: {
             type: Type.OBJECT,
             properties: {
                 query: {
                     type: Type.STRING,
-                    description: 'The search query (e.g., "download link for model X", "latest news about Y")'
+                    description: 'The search query, a few keywords in the language of the expected results (e.g., "prezzo benzina oggi", "Gemma 3 release notes")'
                 },
                 num_results: {
                     type: Type.NUMBER,
-                    description: 'Number of results to return (default: 3, max: 5)'
+                    description: `Number of results (default: ${DEFAULT_RESULTS}, max: ${MAX_RESULTS})`
+                },
+                time_range: {
+                    type: Type.STRING,
+                    description: 'Optional: only results from the last day, week, month or year. Use it for news, prices and "today"/"latest" questions.',
+                    enum: ['day', 'week', 'month', 'year']
                 }
             },
             required: ['query']
@@ -29,34 +33,21 @@ export const webTools: ToolDefinition[] = [
     },
     {
         name: 'read_web_page',
-        description: 'Reads the text content of a web page. Use this for reading articles or documentation. Do NOT use for downloading files.',
+        description: 'Reads the text of a public web page (articles, documentation, results found with search_web). Long pages come in parts: pass query to get only the passages relevant to it, or chunk_index to read a given part. Do NOT use it to download files.',
         parameters: {
             type: Type.OBJECT,
             properties: {
                 url: {
                     type: Type.STRING,
-                    description: 'The URL to fetch (must start with http:// or https://)'
+                    description: 'The URL to read (must start with http:// or https://)'
                 },
                 query: {
                     type: Type.STRING,
-                    description: 'Optional: If you are looking for specific information within a very long page, provide a semantic query to return only the most relevant chunks instead of the entire page.'
-                },
-                method: {
-                    type: Type.STRING,
-                    description: 'HTTP method to use',
-                    enum: ['GET', 'POST']
-                },
-                headers: {
-                    type: Type.STRING,
-                    description: 'Optional JSON string of headers (e.g., {"Authorization": "Bearer token"})'
-                },
-                body: {
-                    type: Type.STRING,
-                    description: 'Optional request body for POST requests'
+                    description: 'Optional: what you are looking for in the page; returns only the most relevant passages'
                 },
                 chunk_index: {
                     type: Type.NUMBER,
-                    description: 'Optional: The chunk index to read (0-based). Example: 0 for first chunk, 1 for next. If omitted, returns first chunk.'
+                    description: 'Optional: the part of the page to read (0-based). The result says how many parts the page has.'
                 }
             },
             required: ['url']
@@ -102,181 +93,51 @@ export const webTools: ToolDefinition[] = [
     },
     {
         name: 'analyze_web',
-        description: '[SERVER ONLY] Delegates web search and full LLM synthesis of the results to the external Support Server. Helps prevent local OOM. Use this when you need deep analysis of a topic via the web.',
+        description: 'Delegates a web research to the AIMindMesh Server: it searches, reads the top pages and returns a synthesized answer with sources. Slower than search_web; use it for questions that need several sources.',
         parameters: {
             type: Type.OBJECT,
             properties: {
                 query: {
                     type: Type.STRING,
-                    description: 'The query to search and analyze'
+                    description: 'The question to research'
                 }
             },
             required: ['query']
         },
         requiresConfirmation: false,
-        category: 'web'
+        category: 'web',
+        // Offered to the model only when the server does the analysis
+        isAvailable: () => getWebDelegation('analysis') !== null
     }
 ];
 
-export async function executeSearchWeb(args: { query: string; num_results?: number }): Promise<ToolResult> {
-    try {
-        const result = await searchWeb(args.query, args.num_results || 3);
+export async function executeSearchWeb(args: { query: string; num_results?: number; time_range?: string }): Promise<ToolResult> {
+    const query = String(args?.query ?? '').trim();
+    if (!query) return { success: false, message: 'Missing search query' };
 
-        if (!result.success || result.results.length === 0) {
-            return {
-                success: false,
-                message: result.error || "No search results found"
-            };
-        }
-
-        // Format results for the model to use
-        const formattedResults = formatSearchResultsForContext(result.results);
-
-        return {
-            success: true,
-            message: formattedResults,
-            data: result.results
-        };
-    } catch (e: any) {
-        return { success: false, message: "Search failed: " + e.message };
+    const result = await searchWeb(query, { numResults: args.num_results, timeRange: parseTimeRange(args.time_range) });
+    if (!result.success) {
+        return { success: false, message: `Search failed: ${result.error || 'unknown error'}` };
     }
+    if (result.results.length === 0) {
+        return { success: false, message: `No results for "${query}". Try different or fewer keywords.` };
+    }
+    return {
+        success: true,
+        message: formatSearchResultsForContext(result.results, query),
+        data: result.results,
+        sources: result.results.map(r => ({ title: r.title, uri: r.url }))
+    };
 }
 
-function parseHeadersJson(raw?: string): Record<string, string> | undefined {
-    if (!raw) return undefined;
-    try {
-        const parsed = JSON.parse(raw);
-        return parsed && typeof parsed === 'object' ? parsed : undefined;
-    } catch {
-        return undefined;
-    }
-}
-
-export async function executeReadWebPage(args: { url: string; query?: string; method?: string; headers?: string; body?: string }): Promise<ToolResult> {
-    try {
-        const { CapacitorHttp } = await import('@capacitor/core');
-        const storedSettings = localStorage.getItem('appSettings');
-        const settings = storedSettings ? JSON.parse(storedSettings) : null;
-        const aiServer = settings?.aimindmeshServer;
-
-        // Delegate to AIMindMesh Server if enabled (replaces legacy Support Server)
-        if (aiServer?.enabled && aiServer?.delegateWebScraping && aiServer?.serverUrl) {
-            logger.log('info', `Delegating web scraping to AIMindMesh Server: ${aiServer.serverUrl} for ${args.url}`);
-            try {
-                const response = await CapacitorHttp.request({
-                    method: 'POST',
-                    url: `${aiServer.serverUrl.replace(/\/$/, '')}/api/web/read`,
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-api-key': aiServer.apiKey || '',
-                    },
-                    data: {
-                        url: args.url,
-                        query: args.query,
-                        method: args.method || 'GET',
-                        // The tool receives headers as a JSON string; the server expects an object
-                        headers: parseHeadersJson(args.headers),
-                        body: args.body
-                    },
-                    connectTimeout: 10000,
-                    readTimeout: 30000,
-                });
-
-                if (response.status === 200 && response.data) {
-                    const data = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
-                    if (data.success && data.data) {
-                        logger.log('info', `AIMindMesh Server successfully read web page (length: ${data.data.length})`);
-                        return { success: true, message: "Read content successfully", data: data.data.substring(0, 50000) };
-                    }
-                }
-                logger.log('warn', 'AIMindMesh Server scraping failed or returned invalid data, falling back to local scraping');
-            } catch (serverError) {
-                logger.log('error', 'Error calling AIMindMesh Server for scraping, falling back to local execution', serverError);
-            }
-        }
-
-        // Use CapacitorHttp instead of fetch to bypass CORS locally
-        const response = await CapacitorHttp.request({
-            method: (args.method || 'GET') as any,
-            url: args.url,
-            headers: args.headers ? JSON.parse(args.headers) : {
-                'User-Agent': 'Mozilla/5.0 (Android; Mobile) AppleWebKit/537.36',
-            },
-            data: args.body,
-        });
-
-        if (response.status !== 200) {
-            throw new Error(`HTTP ${response.status}`);
-        }
-
-        const text = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
-
-        if (!args.query) {
-            return { success: true, message: "Read content successfully", data: text.substring(0, 10000) }; // Truncate
-        }
-
-        // --- RAG Processing for Specific Query ---
-        logger.log('info', `RAG: Processing ${text.length} characters of page content for query "${args.query}"`);
-
-        // 1. Chunk the document
-        const documentChunker = new DocumentChunker();
-        const chunksResult = await documentChunker.chunk(text, 'recursive', 512, 50);
-        const chunks = chunksResult.map((c: any) => c.content);
-
-        logger.log('info', `RAG: Split page into ${chunks.length} chunks`);
-
-        // 2. Embed query
-        // Through the embedding runtime (model prefixes such as E5 "query: "), raw plugin call if no model is tracked
-        const embed = async (text: string, kind: 'query' | 'passage'): Promise<ArrayLike<number>> => {
-            try {
-                return (await embedText(text, kind)).vector;
-            } catch {
-                return (await TextEmbedding.generateEmbedding({ text })).embedding;
-            }
-        };
-        const queryEmbedding = await embed(args.query, 'query');
-
-        // 3. Embed chunks and calculate similarity
-        const similarities = await Promise.all(chunks.map(async (chunkText: string, index: number) => {
-            try {
-                const chunkEmbedding = await embed(chunkText, 'passage');
-
-                let dotProduct = 0;
-                let normQuery = 0;
-                let normChunk = 0;
-                for (let i = 0; i < queryEmbedding.length; i++) {
-                    dotProduct += queryEmbedding[i] * chunkEmbedding[i];
-                    normQuery += queryEmbedding[i] * queryEmbedding[i];
-                    normChunk += chunkEmbedding[i] * chunkEmbedding[i];
-                }
-
-                const similarity = dotProduct / (Math.sqrt(normQuery) * Math.sqrt(normChunk));
-                return { text: chunkText, similarity, index };
-            } catch (e) {
-                return { text: chunkText, similarity: -1, index };
-            }
-        }));
-
-        // 4. Sort and select top chunks
-        const topChunks = similarities
-            .sort((a: any, b: any) => b.similarity - a.similarity)
-            .slice(0, 5); // Return top 5 chunks max
-
-        logger.log('info', `RAG: Page analysis complete. Top chunk similarity: ${topChunks[0]?.similarity?.toFixed(3)}`);
-
-        // Reorder sequentially for context logic
-        const sequentialChunks = topChunks.sort((a: any, b: any) => a.index - b.index);
-        const combinedText = sequentialChunks.map((c: any) => c.text).join('\n\n...\n\n');
-
-        return {
-            success: true,
-            message: `Extracted ${topChunks.length} most relevant sections based on query.`,
-            data: combinedText
-        };
-
-    } catch (e: any) {
-        return { success: false, message: "Failed to read web page: " + e.message };
-    }
+export async function executeReadWebPage(args: { url: string; query?: string; chunk_index?: number }): Promise<ToolResult> {
+    const result = await readWebPage(args);
+    return {
+        success: result.success,
+        message: result.message,
+        data: result.page,
+        sources: result.success && result.page ? [{ title: result.page.title || result.page.url, uri: result.page.url }] : undefined
+    };
 }
 
 export async function executeOpenBrowser(args: { url: string }): Promise<ToolResult> {
@@ -302,45 +163,24 @@ export async function executeSearchMaps(args: { query: string; navigate_to?: str
 }
 
 export async function executeAnalyzeWeb(args: { query: string }): Promise<ToolResult> {
+    const delegation = getWebDelegation('analysis');
+    if (!delegation) {
+        return {
+            success: false,
+            message: "Web analysis needs the AIMindMesh Server: enable it in Settings → AIMindMesh Server → Web tools. Use search_web instead."
+        };
+    }
     try {
-        const { CapacitorHttp } = await import('@capacitor/core');
-        const storedSettings = localStorage.getItem('appSettings');
-        const settings = storedSettings ? JSON.parse(storedSettings) : null;
-        const aiServer = settings?.aimindmeshServer;
-
-        if (!aiServer?.enabled || !aiServer?.delegateWebAnalysis || !aiServer?.serverUrl) {
-            return {
-                success: false,
-                message: "AIMindMesh Server Web Analysis is disabled. Enable 'Delegate Web Analysis' in Server settings."
-            };
+        logger.log('info', `[analyze_web] Delegating to ${delegation.baseUrl}`);
+        const data = await postToServer<{ success?: boolean; data?: string; error?: string }>(
+            delegation, '/api/web/analyze', { query: args.query }, 120000
+        );
+        if (data?.success && data.data) {
+            return { success: true, message: data.data, data: data.data };
         }
-
-        logger.log('info', `Delegating web analysis to AIMindMesh Server: ${aiServer.serverUrl}`);
-        const response = await CapacitorHttp.request({
-            method: 'POST',
-            url: `${aiServer.serverUrl.replace(/\/$/, '')}/api/web/analyze`,
-            headers: {
-                'Content-Type': 'application/json',
-                'x-api-key': aiServer.apiKey || '',
-            },
-            data: {
-                query: args.query
-            },
-            connectTimeout: 10000,
-            readTimeout: 120000,
-        });
-
-        if (response.status === 200 && response.data) {
-            const data = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
-            if (data.success && data.data) {
-                return { success: true, message: "Analysis complete", data: data.data };
-            }
-            return { success: false, message: data.error || "Analysis failed on server" };
-        }
-
-        throw new Error(`HTTP ${response.status}`);
+        return { success: false, message: data?.error || 'Analysis failed on the server' };
     } catch (e: any) {
-        logger.log('error', 'Error calling AIMindMesh Server for analysis', e);
-        return { success: false, message: "Analysis failed: " + e.message };
+        logger.log('error', '[analyze_web] Server analysis failed', e);
+        return { success: false, message: 'Analysis failed: ' + (e?.message || e) };
     }
 }

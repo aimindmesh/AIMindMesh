@@ -14,9 +14,7 @@ config.json
 .env.*
 firebase-service-account.json
 *.bak
-# Tests are not part of the image
-test
-vitest.config.mts
-tsconfig.test.json
+# Tests stay in the image: auto-evolution runs `vitest related` on its patches (ValidationLayer)
 # Private deployment scripts
 deploy_*.sh
+venture-workspaces

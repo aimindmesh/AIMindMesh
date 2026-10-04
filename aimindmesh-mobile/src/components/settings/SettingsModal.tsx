@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
-import { Settings, Personality, Memory } from '../../types';
+import React, { useEffect, useState } from 'react';
+import { Settings, Personality } from '../../types';
+import type { MemoryFactsApi } from '../../hooks/useMemoryFacts';
 import { CloseIcon } from '../../constants';
 import { triggerHaptic } from '../../services/native';
 import { Clipboard } from '@capacitor/clipboard';
@@ -14,6 +15,9 @@ import PersonalitySettings from './agent/PersonalitySettings';
 import LLMSettings from './llm/LLMSettings';
 import STTSettings from './audio/STTSettings';
 import TTSSettings from './audio/TTSSettings';
+import { KnownVoicesSection } from './KnownVoicesSection';
+import { PrivacySection } from './PrivacySection';
+import { BackupSection } from './BackupSection';
 import SpeakerSettings from './audio/SpeakerSettings';
 import MemorySettings from './memory/MemorySettings';
 import WakeWordSettings from './wakeword/WakeWordSettings';
@@ -29,6 +33,7 @@ import { FileStorageManager } from './system/FileStorageManager';
 import AndroidAutoSettings from './AndroidAutoSettings';
 import ProactiveSettings from './proactive/ProactiveSettings';
 import AIMindMeshServerSettingsPanel from './llm/AIMindMeshServerSettingsPanel';
+import { ServerMemoryToggles } from './llm/ServerMemoryToggles';
 import SettingsSidebar from './layout/SettingsSidebar';
 import SettingsMobileTabs from './layout/SettingsMobileTabs';
 import SettingsDocumentation from './system/SettingsDocumentation';
@@ -39,31 +44,25 @@ interface SettingsModalProps {
   onClose: () => void;
   settings: Settings;
   onSave: (newSettings: Settings) => void;
-  memories: Memory[];
-  onAddMemory: (content: string, category?: string) => void;
-  onDeleteMemory: (id: string) => void;
-  onClearMemories: () => void;
-  memoryCategories: string[];
-  onAddMemoryCategory: (category: string) => void;
-  onDeleteMemoryCategory: (category: string) => void;
-  onUpdateMemoryCategory: (id: string, newCategory: string) => void;
-  onExportMemories: () => Promise<void>;
-  onImportMemories: () => Promise<void>;
+  /** What the assistant knows about the user (useMemoryFacts) */
+  memory: MemoryFactsApi;
   onClearChatHistory: () => void;
   customPersonalities: Record<string, Personality>;
   onSaveCustomPersonality: (id: string, personality: Personality) => void;
   onDeleteCustomPersonality: (id: string) => void;
   agendaSettings?: AgendaSettingsType;
   onAgendaSettingsChange?: (settings: AgendaSettingsType) => void;
+  /** Tab shown when the modal opens (e.g. 'llm' from the meeting's AI notes) */
+  initialTab?: SettingsTabId;
 }
+
+export type SettingsTabId = 'setup' | 'personality' | 'llm' | 'vision' | 'knowledge' | 'stt' | 'wakeword' | 'tts' | 'speaker' | 'memory' | 'agenda' | 'agentic' | 'proactive' | 'app' | 'theme' | 'log' | 'docs' | 'storage' | 'auto' | 'aimindmesh-server';
 
 const SettingsModal: React.FC<SettingsModalProps> = (props) => {
   const {
-    isOpen, onClose, settings, onSave, memories, onAddMemory, onDeleteMemory,
-    onClearMemories, memoryCategories, onAddMemoryCategory, onDeleteMemoryCategory,
-    onUpdateMemoryCategory, onExportMemories, onImportMemories, onClearChatHistory,
+    isOpen, onClose, settings, onSave, memory, onClearChatHistory,
     customPersonalities, onSaveCustomPersonality, onDeleteCustomPersonality,
-    agendaSettings = DEFAULT_AGENDA_SETTINGS, onAgendaSettingsChange
+    agendaSettings = DEFAULT_AGENDA_SETTINGS, onAgendaSettingsChange, initialTab
   } = props;
 
   const s = useSettingsState(
@@ -89,7 +88,10 @@ const SettingsModal: React.FC<SettingsModalProps> = (props) => {
       localStorage.setItem('external_piper_voices', JSON.stringify(voices));
     }
   );
-  const [activeTab, setActiveTab] = useState<'setup' | 'personality' | 'llm' | 'vision' | 'knowledge' | 'stt' | 'wakeword' | 'tts' | 'speaker' | 'memory' | 'agenda' | 'agentic' | 'proactive' | 'app' | 'theme' | 'log' | 'docs' | 'storage' | 'auto' | 'aimindmesh-server'>('personality');
+  const [activeTab, setActiveTab] = useState<SettingsTabId>('personality');
+  useEffect(() => {
+    if (isOpen && initialTab) setActiveTab(initialTab);
+  }, [isOpen, initialTab]);
 
   // UI state for global link dialog
   const [linkDialog, setLinkDialog] = useState({ show: false, title: '', urls: [] as { label: string, url: string }[] });
@@ -124,7 +126,7 @@ const SettingsModal: React.FC<SettingsModalProps> = (props) => {
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 bg-black/95 z-50 flex items-center justify-center p-4 animate-fade-in">
+    <div className="fixed inset-0 bg-black/95 z-[60] flex items-center justify-center p-4 animate-fade-in">
       <div className="bg-background rounded-2xl shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col border border-white/10 overflow-hidden">
         <header className="p-4 border-b border-surface flex justify-between items-center bg-surface/30">
           <h2 className="text-xl font-bold bg-gradient-to-r from-primary to-purple-400 bg-clip-text text-transparent">Settings</h2>
@@ -265,19 +267,17 @@ const SettingsModal: React.FC<SettingsModalProps> = (props) => {
             )}
 
             {activeTab === 'speaker' && (
-              <SpeakerSettings speechConfig={s.speechConfigState} onSpeechConfigChange={s.setSpeechConfigState} />
+              <div className="space-y-4">
+                <SpeakerSettings speechConfig={s.speechConfigState} onSpeechConfigChange={s.setSpeechConfigState} />
+                <KnownVoicesSection />
+              </div>
             )}
 
             {activeTab === 'memory' && (
               <MemorySettings
-                memories={memories} onAddMemory={onAddMemory} onDeleteMemory={onDeleteMemory}
-                onClearMemories={() => { if (window.confirm("Delete ALL memories?")) onClearMemories(); }}
-                memoryCategories={memoryCategories} onAddMemoryCategory={onAddMemoryCategory}
-                onDeleteMemoryCategory={onDeleteMemoryCategory} onUpdateMemoryCategory={onUpdateMemoryCategory}
-                onExportMemories={onExportMemories} onImportMemories={onImportMemories}
-                enableAiMemoryCategorization={s.enableAiMemoryCategorization}
-                onEnableAiMemoryCategorizationChange={s.setEnableAiMemoryCategorization}
-                llmConfig={s.llmState} onLlmConfigSave={s.setLlmState} apiKey={s.apiKeyState}
+                memory={memory}
+                onClearAll={() => { if (window.confirm("Delete ALL memories? What I know about you and the conversation memory are erased.")) void memory.clearAllMemories(); }}
+                llmConfig={s.llmState} onLlmConfigSave={s.setLlmState}
               />
             )}
 
@@ -313,50 +313,36 @@ const SettingsModal: React.FC<SettingsModalProps> = (props) => {
                     {s.syncResultState.ok ? 'Sync completed' : `Sync failed: ${s.syncResultState.error}`}
                   </div>
                 )}
-                {/* Auto-sync toggle */}
-                <div className="flex items-center justify-between mt-6 pt-5 border-t border-white/5">
-                  <div>
-                    <div className="text-sm font-medium text-text-primary">Auto-Sync New Memories</div>
-                    <div className="text-xs text-text-secondary mt-0.5">Automatically push new memories to the server KG</div>
-                  </div>
-                  <button
-                    id="settings-auto-sync-memories-toggle"
-                    onClick={() => s.setAutoSyncNewMemoriesState(!s.autoSyncNewMemoriesState)}
-                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors cursor-pointer ${
-                      s.autoSyncNewMemoriesState ? 'bg-primary' : 'bg-white/20'
-                    }`}
-                    aria-pressed={s.autoSyncNewMemoriesState}
-                  >
-                    <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${
-                      s.autoSyncNewMemoriesState ? 'translate-x-4' : 'translate-x-0.5'
-                    }`} />
-                  </button>
-                </div>
+                <ServerMemoryToggles autoSync={s.autoSyncNewMemoriesState} onAutoSyncChange={s.setAutoSyncNewMemoriesState} />
               </div>
             )}
 
             {activeTab === 'app' && (
-              <AppSettings
-                autoPlayAudio={s.autoPlayAudioState} onAutoPlayAudioChange={s.setAutoPlayAudioState}
-                enableDnd={s.enableDndState} onEnableDndChange={s.setEnableDndState}
-                dndStart={s.dndStartState} onDndStartChange={s.setDndStartState}
-                dndEnd={s.dndEndState} onDndEndChange={s.setDndEndState}
-                responseStyle={s.responseStyleState} onResponseStyleChange={s.setResponseStyleState}
-                onClearChatHistory={onClearChatHistory}
-                enableSystemMonitor={s.enableSystemMonitorState} onEnableSystemMonitorChange={s.setEnableSystemMonitorState}
-                systemMonitorFrequency={s.systemMonitorFrequencyState} onSystemMonitorFrequencyChange={s.setSystemMonitorFrequencyState}
-                showRam={s.showRamState} onShowRamChange={s.setShowRamState}
-                showAppRam={s.showAppRamState} onShowAppRamChange={s.setShowAppRamState}
-                showCpu={s.showCpuState} onShowCpuChange={s.setShowCpuState}
-                showGpu={s.showGpuState} onShowGpuChange={s.setShowGpuState}
-                enableNotificationVibration={s.enableNotificationVibrationState}
-                onEnableNotificationVibrationChange={s.setEnableNotificationVibrationState}
-                saveMeetingAudio={s.saveMeetingAudioState}
-                onSaveMeetingAudioChange={s.setSaveMeetingAudioState}
-                aimindmeshServer={s.aimindmeshServerState}
-                autoCheckUpdates={s.autoCheckUpdatesState}
-                onAutoCheckUpdatesChange={s.setAutoCheckUpdatesState}
-              />
+              <div className="space-y-4">
+                <PrivacySection />
+                <AppSettings
+                  autoPlayAudio={s.autoPlayAudioState} onAutoPlayAudioChange={s.setAutoPlayAudioState}
+                  enableDnd={s.enableDndState} onEnableDndChange={s.setEnableDndState}
+                  dndStart={s.dndStartState} onDndStartChange={s.setDndStartState}
+                  dndEnd={s.dndEndState} onDndEndChange={s.setDndEndState}
+                  responseStyle={s.responseStyleState} onResponseStyleChange={s.setResponseStyleState}
+                  onClearChatHistory={onClearChatHistory}
+                  enableSystemMonitor={s.enableSystemMonitorState} onEnableSystemMonitorChange={s.setEnableSystemMonitorState}
+                  systemMonitorFrequency={s.systemMonitorFrequencyState} onSystemMonitorFrequencyChange={s.setSystemMonitorFrequencyState}
+                  showRam={s.showRamState} onShowRamChange={s.setShowRamState}
+                  showAppRam={s.showAppRamState} onShowAppRamChange={s.setShowAppRamState}
+                  showCpu={s.showCpuState} onShowCpuChange={s.setShowCpuState}
+                  showGpu={s.showGpuState} onShowGpuChange={s.setShowGpuState}
+                  enableNotificationVibration={s.enableNotificationVibrationState}
+                  onEnableNotificationVibrationChange={s.setEnableNotificationVibrationState}
+                  saveMeetingAudio={s.saveMeetingAudioState}
+                  onSaveMeetingAudioChange={s.setSaveMeetingAudioState}
+                  aimindmeshServer={s.aimindmeshServerState}
+                  autoCheckUpdates={s.autoCheckUpdatesState}
+                  onAutoCheckUpdatesChange={s.setAutoCheckUpdatesState}
+                />
+                <BackupSection />
+              </div>
             )}
 
             {activeTab === 'theme' && (

@@ -15,7 +15,11 @@ export interface VoxtralPlugin {
     /**
      * Start real-time streaming transcription
      */
-    startRealtimeTranscription(): Promise<{ streaming: boolean }>;
+    /**
+     * Streams the microphone, or with externalAudio the meeting recorder's audio (one microphone
+     * for the app; token times are then positions in that recording).
+     */
+    startRealtimeTranscription(options?: { externalAudio?: boolean }): Promise<{ streaming: boolean }>;
 
     /**
      * Stop real-time streaming
@@ -82,6 +86,12 @@ export interface VoxtralPlugin {
     addListener(
         eventName: 'voxtralError',
         listenerFunc: (data: { code: number; message: string }) => void
+    ): Promise<PluginListenerHandle>;
+
+    /** Meeting mode: Voxtral fell behind the recording and skipped some live audio (once per session) */
+    addListener(
+        eventName: 'voxtralLagging',
+        listenerFunc: (data: { message: string }) => void
     ): Promise<PluginListenerHandle>;
 }
 

@@ -113,9 +113,8 @@ export async function syncNativeContext(
         );
         systemPromptToUse = truncationResult.systemPrompt;
         messagesToFormat = truncationResult.messages;
-        if (!isBackground) {
-            state.lastSystemPrompt = systemPromptToUse;
-        }
+        // lastSystemPrompt keeps the prompt as built (before this truncation): the next turn
+        // compares the prompt it builds, so storing the truncated one would reset every turn
     }
 
     state.lastRunWasBackground = isBackground;

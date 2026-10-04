@@ -188,7 +188,8 @@ public class VADPlugin extends Plugin {
             return;
         }
 
-        String audioPath = call.getString("audioPath");
+        String rawPath = call.getString("audioPath");
+        final String audioPath = rawPath != null && rawPath.startsWith("file://") ? rawPath.substring(7) : rawPath;
 
         if (audioPath == null || audioPath.isEmpty()) {
             call.reject("Audio path is required");
@@ -210,8 +211,11 @@ public class VADPlugin extends Plugin {
 
                 Log.i(TAG, "Processing file for VAD: " + audioFile.getAbsolutePath());
 
-                // Process file and get speech segments
-                List<SileroVAD.SpeechSegment> segments = vadModel.processFile(audioFile.getAbsolutePath());
+                // Process the file (or the requested part of it) and get speech segments
+                long startMs = call.getLong("startMs", 0L);
+                long endMs = call.getLong("endMs", Long.MAX_VALUE);
+                SileroVAD.RangeResult range = vadModel.processRange(audioFile.getAbsolutePath(), startMs, endMs);
+                List<SileroVAD.SpeechSegment> segments = range.segments;
 
                 // Build response
                 JSArray segmentsArray = new JSArray();
@@ -225,6 +229,9 @@ public class VADPlugin extends Plugin {
 
                 JSObject response = new JSObject();
                 response.put("segments", segmentsArray);
+                if (range.openStartMs >= 0) {
+                    response.put("openStartMs", range.openStartMs);
+                }
                 call.resolve(response);
 
             } catch (Exception e) {

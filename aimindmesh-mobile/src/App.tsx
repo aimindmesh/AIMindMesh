@@ -1,6 +1,5 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Keyboard } from '@capacitor/keyboard';
-import { Settings } from './types';
 import { useAppSettings } from './hooks/useAppSettings';
 import { useAppLifecycle } from './hooks/useAppLifecycle';
 import { useModelLoader } from './hooks/useModelLoader';
@@ -15,7 +14,7 @@ import { useWakeWord } from './hooks/useWakeWord';
 import { useAndroidAutoSync } from './hooks/useAndroidAutoSync';
 import { useThreadManager } from './hooks/useThreadManager';
 import { useAppDatabase } from './hooks/useAppDatabase';
-import { useAppMemories } from './hooks/useAppMemories';
+import { useMemoryFacts } from './hooks/useMemoryFacts';
 import { useAppInteractions, AppBackHandlers } from './hooks/useAppInteractions';
 import { useAppServices } from './hooks/useAppServices';
 import { setKnowledgeDbPingEnabled } from './services/database/knowledgeDatabase';
@@ -27,7 +26,14 @@ import IncomingCallOverlay from './components/overlays/IncomingCallOverlay';
 import SystemMonitor from './components/overlays/SystemMonitor';
 import ThreadListModal from './components/modals/ThreadListModal';
 import Toast from './components/ui/Toast';
-import MeetingMode from './components/meeting/MeetingMode';
+import DialogHost from './components/ui/DialogHost';
+import LockScreen from './components/ui/LockScreen';
+import { useAppLock } from './hooks/useAppLock';
+import MeetingMode, { MeetingBusyState } from './components/meeting/MeetingMode';
+import MeetingStatusChip from './components/meeting/MeetingStatusChip';
+import { useMeetingCaptureActive } from './hooks/meeting/useMeetingCaptureActive';
+import { useMeetingPresence } from './hooks/meeting/useMeetingPresence';
+import type { SettingsTabId } from './components/settings/SettingsModal';
 import AgendaMode from './components/agenda/AgendaMode';
 import TodoListView from './components/agenda/TodoListView';
 import ToolConfirmationModal from './components/modals/ToolConfirmationModal';
@@ -43,6 +49,7 @@ import { useServerMode } from './hooks/useServerMode';
 import { useProactiveMessage } from './hooks/useProactiveMessage';
 import { AppNavbar } from './components/layout/AppNavbar';
 import { AppTabContent, AppTab } from './components/layout/AppTabContent';
+import { OPEN_FEED_EVENT } from './services/native/assistantLaunch';
 
 const App: React.FC = () => {
   // --- Global Settings & State ---
@@ -57,6 +64,13 @@ const App: React.FC = () => {
   const [activeAppTab, setActiveAppTab] = useState<AppTab>('chat');
   const [feedUnreadCount, setFeedUnreadCount] = useState(0);
   const [openFeedInsight, setOpenFeedInsight] = useState<InsightItem | null>(null);
+
+  // A feed notification was tapped: show the Feed
+  useEffect(() => {
+    const openFeed = () => { setActiveAppTab('feed'); setOpenFeedInsight(null); };
+    window.addEventListener(OPEN_FEED_EVENT, openFeed);
+    return () => window.removeEventListener(OPEN_FEED_EVENT, openFeed);
+  }, []);
   const [showOnboarding, setShowOnboarding] = useState(shouldShowOnboarding);
 
   // --- UI State & Interactions (Hook) ---
@@ -84,26 +98,13 @@ const App: React.FC = () => {
   const showToastInternal = useCallback((m: string, t?: any) => showToastProxy?.(m, t), [showToastProxy]);
 
   // --- Custom Hooks ---
-  const {
-    memories,
-    addMemory, deleteMemory, clearMemories,
-    addMemoryCategory, deleteMemoryCategory, updateMemoryCategory,
-    exportMemories, importMemories,
-    memoryCategories,
-    enableAiMemoryCategorization, setEnableAiMemoryCategorization
-  } = useAppMemories({
+  // What the assistant knows about the user (facts), mirrored on the server when auto-sync is on
+  const memory = useMemoryFacts({
     showToast: showToastInternal,
     serverSettings: aimindmeshServer,
     autoSyncNewMemories: cfg.autoSyncNewMemories
   });
-
-  // The memory categorization flag is kept by useAppMemories
-  const modalSettings = useMemo(() => ({ ...cfg.modalSettings, enableAiMemoryCategorization }), [cfg.modalSettings, enableAiMemoryCategorization]);
-  const { saveSettings } = cfg;
-  const handleSaveSettings = useCallback((newSettings: Settings) => {
-    saveSettings(newSettings);
-    setEnableAiMemoryCategorization(newSettings.enableAiMemoryCategorization ?? true);
-  }, [saveSettings, setEnableAiMemoryCategorization]);
+  const { modalSettings, saveSettings: handleSaveSettings } = cfg;
 
   const { dbReady } = useAppDatabase(showToastProxy);
 
@@ -137,10 +138,19 @@ const App: React.FC = () => {
   // --- Sync Knowledge DB Ping ---
   useEffect(() => { setKnowledgeDbPingEnabled(!cfg.disableKnowledgeDbPing); }, [cfg.disableKnowledgeDbPing]);
 
+  // --- Meeting kept alive (hidden) while it records or transcribes after its screen is closed ---
+  const [meetingBusy, setMeetingBusy] = useState<MeetingBusyState | null>(null);
+  const [settingsTab, setSettingsTab] = useState<SettingsTabId | undefined>(undefined);
+  // A meeting recording owns the microphone: no wake word meanwhile
+  const meetingCaptureActive = useMeetingCaptureActive();
+  useMeetingPresence(isMeetingMode || !!meetingBusy, () => setIsMeetingMode(true));
+  // App lock (Settings → App → Privacy): the assistant doesn't listen behind the lock screen
+  const appLock = useAppLock();
+
   // --- Wake Word ---
   const { wakeWordConfig } = cfg;
   useWakeWord({
-    enabled: wakeWordConfig.enabled && !isNativeLLMLoading,
+    enabled: wakeWordConfig.enabled && !isNativeLLMLoading && !meetingCaptureActive && !appLock.locked,
     modelName: wakeWordConfig.modelName,
     threshold: wakeWordConfig.threshold,
     cooldownMs: wakeWordConfig.cooldownMs,
@@ -164,8 +174,6 @@ const App: React.FC = () => {
     todos,
     addTodo,
     completeTodo,
-    memories,
-    addMemory,
     showToast
   };
 
@@ -186,7 +194,7 @@ const App: React.FC = () => {
   );
 
   // Services (Extraction, Summarization, Proactive)
-  useAppServices(chat, llmConfig, isAppActive, apiKey, perplexityApiKey, claudeApiKey, personality, addMemory, activeThreadIdState, showToast, keepAlive);
+  useAppServices(chat, activeThreadIdState);
 
   const { suggestions, acceptSuggestion, dismissSuggestion } = useProactiveSuggestions();
 
@@ -198,31 +206,31 @@ const App: React.FC = () => {
   const handleSelectThread = useCallback((id: string) => onSelectThread(id, chat.setMessages), [onSelectThread, chat.setMessages]);
   const handleClearChat = useCallback(() => onClearChat(chat.setMessages), [onClearChat, chat.setMessages]);
 
-  const { handleProactiveMessage } = useProactiveMessage({
+  const { handleProactiveMessage, canEngage } = useProactiveMessage({
     chat,
     personality,
     llmConfig,
-    apiKey,
     isProactiveThinking,
     setIsProactiveThinking,
     incomingCall: !!incomingCall,
     isSettingsOpen,
     isVoiceMode,
-    isAppActive,
     activeThreadId: activeThreadIdState,
     proactiveSettings,
   });
 
   const isAppIdle = !isSettingsOpen && !isVoiceMode && !incomingCall && !isProactiveThinking && (isAppActive || keepAlive);
 
-  const handleEngagement = useCallback(() => {
+  const handleEngagement = useCallback(async () => {
+    // Same rules as every proactive message: quiet hours, limits, permissions, a quiet chat
+    if (!(await canEngage())) return;
     const isCall = Math.random() < 0.2;
     if (isCall && proactiveSettings.permissions.autonomousCalls) {
       setIncomingCall(personality);
     } else {
       handleProactiveMessage();
     }
-  }, [handleProactiveMessage, personality, proactiveSettings]);
+  }, [canEngage, handleProactiveMessage, personality, proactiveSettings]);
 
   useProactiveEngagement({
     frequency: cfg.proactiveFrequency,
@@ -345,20 +353,12 @@ const App: React.FC = () => {
 
       <SettingsModal
         isOpen={isSettingsOpen}
-        onClose={() => setIsSettingsOpen(false)}
+        initialTab={settingsTab}
+        onClose={() => { setIsSettingsOpen(false); setSettingsTab(undefined); }}
         settings={modalSettings}
         onSave={handleSaveSettings}
-        memories={memories}
-        onAddMemory={addMemory}
-        onDeleteMemory={deleteMemory}
-        onClearMemories={clearMemories}
+        memory={memory}
         onClearChatHistory={handleClearChat}
-        memoryCategories={memoryCategories}
-        onAddMemoryCategory={addMemoryCategory}
-        onDeleteMemoryCategory={deleteMemoryCategory}
-        onUpdateMemoryCategory={updateMemoryCategory}
-        onExportMemories={exportMemories}
-        onImportMemories={importMemories}
         customPersonalities={cfg.customPersonalities}
         onSaveCustomPersonality={cfg.saveCustomPersonality}
         onDeleteCustomPersonality={cfg.deleteCustomPersonality}
@@ -407,15 +407,21 @@ const App: React.FC = () => {
         />
       )}
 
-      {isMeetingMode && (
+      {(isMeetingMode || meetingBusy) && (
         <MeetingMode
+          hidden={!isMeetingMode}
           onClose={() => setIsMeetingMode(false)}
-          personality={personality}
+          onBusyChange={setMeetingBusy}
+          onBackgroundToast={showToast}
+          onOpenSettings={tab => { setSettingsTab(tab as SettingsTabId | undefined); setIsSettingsOpen(true); }}
           llmConfig={llmConfig}
-          apiKey={apiKey}
-          memories={memories}
+          keys={{ gemini: apiKey, claude: claudeApiKey, perplexity: perplexityApiKey }}
+          serverSettings={aimindmeshServer}
           speechConfig={speechConfig}
         />
+      )}
+      {meetingBusy && !isMeetingMode && (
+        <MeetingStatusChip busy={meetingBusy} onOpen={() => setIsMeetingMode(true)} />
       )}
 
       {isAgendaOpen && (
@@ -500,6 +506,10 @@ const App: React.FC = () => {
 
       {/* First launch: guided setup above everything */}
       {showOnboarding && <OnboardingWizard onComplete={() => setShowOnboarding(false)} />}
+
+      <DialogHost />
+      {/* Above everything, onboarding included */}
+      {appLock.locked && <LockScreen onUnlock={appLock.unlock} />}
     </div>
   );
 };

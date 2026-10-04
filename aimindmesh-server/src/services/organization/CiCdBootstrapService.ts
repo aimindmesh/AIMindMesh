@@ -12,10 +12,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
       - run: npm ci
+      - run: npm run build --if-present
       - run: npm test
-      - run: npm run build
 `;
     }
     return `name: CI

@@ -19,6 +19,13 @@ export class SpeakerEmbeddingWeb extends WebPlugin implements SpeakerEmbeddingPl
         throw this.unimplemented('SpeakerEmbedding is not supported on web platform');
     }
 
+    async extractEmbeddingsFromFile(_options: {
+        audioPath: string;
+        ranges: Array<{ startMs: number; endMs: number }>;
+    }): Promise<{ embeddings: Array<number[] | null> }> {
+        throw this.unimplemented('Not implemented on web.');
+    }
+
     async getModelInfo(): Promise<ModelInfo> {
         throw this.unimplemented('SpeakerEmbedding is not supported on web platform');
     }

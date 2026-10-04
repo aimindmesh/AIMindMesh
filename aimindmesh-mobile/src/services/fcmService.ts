@@ -12,11 +12,13 @@ import { Device } from '@capacitor/device';
 import { logger } from './logger';
 import { AIMindMeshServerSettings } from '../types';
 import { nodeWorker } from './worker/NodeWorker';
+import { markInsightRead } from './feedService';
 
 // ─── Capacitor Plugin Bridge ──────────────────────────────────────────────────
 
 export interface FCMMessage {
-    type: 'NEW_INSIGHT' | 'INGESTION_COMPLETE' | 'NODE_STATUS' | 'SYSTEM_ALERT' | 'MARK_READ_ACTION' | 'WAKE_FOR_INFERENCE' | 'SYNC_REQUEST';
+    type: 'NEW_INSIGHT' | 'INSIGHT_DELIVERY' | 'INSIGHT_FALLBACK' | 'DEBATE_UPDATE' | 'INGESTION_COMPLETE' | 'NODE_STATUS'
+        | 'SYSTEM_ALERT' | 'MARK_READ_ACTION' | 'WAKE_FOR_INFERENCE' | 'SYNC_REQUEST';
     title: string;
     body: string;
     data: Record<string, string>;
@@ -46,7 +48,14 @@ type FeedEvent = {
 } | {
     type: 'mark_read';
     insightId: string;
+} | {
+    /** A new round of the AI debate on an insight */
+    type: 'debate_update';
+    insightId?: string;
 };
+
+/** Insight push types: the server sends INSIGHT_DELIVERY (push), INSIGHT_FALLBACK (late delivery), older servers NEW_INSIGHT */
+const INSIGHT_TYPES: FCMMessage['type'][] = ['NEW_INSIGHT', 'INSIGHT_DELIVERY', 'INSIGHT_FALLBACK'];
 
 type FeedListener = (event: FeedEvent) => void;
 const feedListeners = new Set<FeedListener>();
@@ -88,7 +97,7 @@ export function isQuietHoursActive(now: Date = new Date()): boolean {
         // Treat time as fractional hour for comparison
         const currentH = now.getHours() + now.getMinutes() / 60;
         const startH = toFractionalHour(qh.start, 22);
-        const endH = toFractionalHour(qh.end, 8);
+        const endH = toFractionalHour(qh.end, 7);
 
         // Cross-midnight window (e.g. 22:00 → 08:00)
         if (startH > endH) {
@@ -151,38 +160,49 @@ async function registerTokenWithServer(
 
 // ─── Message Dispatcher ───────────────────────────────────────────────────────
 
-function dispatchMessage(msg: FCMMessage) {
+/** Routes a message to its handler (exported for tests) */
+export function dispatchMessage(msg: FCMMessage) {
     logger.log('info', `[FCMService] FCM message: type=${msg.type} title="${msg.title}"`);
 
     // Enforce quiet hours for foreground in-app insight events.
     // NOTE: Background/killed-app FCM notifications delivered by the OS tray
     // are NOT suppressible here — they are handled by the FCM SDK natively.
     // Control messages (wake, sync, mark read...) are never held back: they are not notifications.
-    if (msg.type === 'NEW_INSIGHT' && isQuietHoursActive()) {
+    if (INSIGHT_TYPES.includes(msg.type) && isQuietHoursActive()) {
         logger.log('info', `[FCMService] Quiet hours active — suppressing foreground FCM event: ${msg.type}`);
         return;
     }
 
     switch (msg.type) {
         case 'NEW_INSIGHT':
+        case 'INSIGHT_DELIVERY':
+        case 'INSIGHT_FALLBACK':
             emitFeedEvent({
                 type: 'new_insight',
-                insightId: msg.data.insightId,
+                insightId: msg.data?.insightId,
                 title: msg.title,
                 body: msg.body
             });
+            break;
+        case 'DEBATE_UPDATE':
+            emitFeedEvent({ type: 'debate_update', insightId: msg.data?.insightId });
             break;
         case 'INGESTION_COMPLETE':
             emitFeedEvent({ type: 'ingestion_complete', jobId: msg.data.jobId });
             break;
         case 'MARK_READ_ACTION':
-            if (msg.data.insightId) {
+            if (msg.data?.insightId) {
+                // "Mark Read" on a notification: the server must know too (the Feed may not be open)
+                if (_currentSettings) {
+                    markInsightRead(_currentSettings, msg.data.insightId)
+                        .catch(e => logger.log('warn', '[FCMService] Mark read failed', e));
+                }
                 emitFeedEvent({ type: 'mark_read', insightId: msg.data.insightId });
             }
             break;
         case 'WAKE_FOR_INFERENCE':
             logger.log('info', '[FCMService] Received Wakeup Call for inference task');
-            nodeWorker.connect();
+            nodeWorker.wake();
             break;
         case 'SYNC_REQUEST':
             logger.log('info', '[FCMService] Received Sync Request from server');
@@ -257,6 +277,11 @@ export async function initFCMService(serverSettings: AIMindMeshServerSettings): 
     } catch (e) {
         logger.log('error', '[FCMService] Initialization failed', e);
     }
+}
+
+/** Test hook: the settings dispatchMessage uses for server calls */
+export function setFCMSettingsForTests(settings: AIMindMeshServerSettings | null): void {
+    _currentSettings = settings;
 }
 
 /** Re-registers token if server settings change (e.g. URL or API key updated) */

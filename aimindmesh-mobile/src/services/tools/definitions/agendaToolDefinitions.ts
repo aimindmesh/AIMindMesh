@@ -150,7 +150,7 @@ export const agendaTools: ToolDefinition[] = [
                 },
                 due_date: {
                     type: Type.STRING,
-                    description: 'Due date in YYYY-MM-DD format (optional, defaults to tomorrow)'
+                    description: 'Due date: YYYY-MM-DD or the user\'s own words ("venerdì", "domani"), converted by the app (optional, defaults to tomorrow). A task needs no time.'
                 },
                 priority: {
                     type: Type.STRING,

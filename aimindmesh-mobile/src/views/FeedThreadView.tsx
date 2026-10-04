@@ -7,6 +7,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { AIMindMeshServerSettings } from '../types';
 import { InsightItem, ThreadMessage, fetchThread, sendReply, updateThreadStatus } from '../services/feedService';
+import { onFCMFeedEvent } from '../services/fcmService';
 import InsightCard from '../components/InsightCard';
 import { Clipboard } from '@capacitor/clipboard';
 import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
@@ -31,10 +32,20 @@ const FeedThreadView: React.FC<Props> = ({ insight, serverSettings, onClose }) =
 
     // ─── Load thread ─────────────────────────────────────────────────────────
 
+    // A debate round arrived for this insight (FCM): reload, unless a reply is streaming
+    const [refreshTick, setRefreshTick] = useState(0);
+    const streamingRef = useRef(false);
+    streamingRef.current = streaming;
+    useEffect(() => onFCMFeedEvent(event => {
+        if (event.type === 'debate_update' && event.insightId === insight.id && !streamingRef.current) {
+            setRefreshTick(t => t + 1);
+        }
+    }), [insight.id]);
+
     useEffect(() => {
         let cancelled = false;
         (async () => {
-            setLoading(true);
+            if (refreshTick === 0) setLoading(true);
             try {
                 const thread = await fetchThread(serverSettings, insight.id);
                 if (!cancelled) {
@@ -48,7 +59,7 @@ const FeedThreadView: React.FC<Props> = ({ insight, serverSettings, onClose }) =
             }
         })();
         return () => { cancelled = true; };
-    }, [insight.id, serverSettings]);
+    }, [insight.id, serverSettings, refreshTick]); // eslint-disable-line react-hooks/exhaustive-deps
 
     // Auto scroll to bottom
     useEffect(() => {

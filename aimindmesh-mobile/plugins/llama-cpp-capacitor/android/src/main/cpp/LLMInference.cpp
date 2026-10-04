@@ -312,19 +312,34 @@ void LLMInference::startCompletion(const char* query, const std::vector<std::str
                      break;
                  }
              }
-             
+
+             auto memory = llama_get_memory(_ctx);
+             // The last prompt token is always decoded again: with an identical prompt (e.g. regenerate)
+             // nothing would be decoded and the sampler would read stale logits
+             if (n_curr > 0 && common_part >= n_curr) {
+                 common_part = n_curr - 1;
+             }
+             // Never reuse more than the KV cache really holds: a decode stopped between two
+             // chunks (interrupt) or failed leaves fewer positions than _prevTokens says
+             if (memory && common_part > 0) {
+                 llama_pos kv_max = llama_memory_seq_pos_max(memory, 0);
+                 size_t in_kv = kv_max < 0 ? 0 : (size_t) kv_max + 1;
+                 if (common_part > in_kv) {
+                     LOGi("KV cache holds %zu tokens only (prefix match was %zu)", in_kv, common_part);
+                     common_part = in_kv;
+                 }
+             }
+             // Hybrid/recurrent models (Qwen3.5, LFM2) cannot drop a suffix of their state:
+             // seq_rm returns false and changes nothing, so the whole prompt is decoded again
+             if (memory && common_part > 0 && !llama_memory_seq_rm(memory, -1, common_part, -1)) {
+                 LOGi("Partial KV removal not supported by this model: decoding the whole prompt");
+                 common_part = 0;
+             }
+
              if (common_part > 0) {
                  LOGi("Reusing %zu tokens from KV cache", common_part);
                  _nPast = common_part;
 
-                 // Critical Fix: Explicitly remove trailing KV cache to prevent "inconsistent sequence positions"
-                 // when the new prompt diverges from the cached path.
-                 auto memory = llama_get_memory(_ctx);
-                 if (memory) {
-                     // Remove properties for all sequences (-1), from position 'common_part' to end (-1)
-                     llama_memory_seq_rm(memory, -1, common_part, -1);
-                 }
-                 
                  // Re-accept the cached prefix tokens into the sampler so that the
                  // repetition/frequency penalty history reflects the conversation context.
                  // These tokens are already decoded in the KV cache; we only inform the
@@ -342,7 +357,6 @@ void LLMInference::startCompletion(const char* query, const std::vector<std::str
                  // No matching prefix, clear and start over
                  LOGi("No common prefix found, clearing KV cache");
                  _nPast = 0;
-                 auto memory = llama_get_memory(_ctx);
                  if (memory) {
                      llama_memory_clear(memory, true);
                  }
@@ -553,7 +567,7 @@ std::string LLMInference::completionLoop() {
     if (llama_vocab_is_eog(vocab, _currToken)) {
         LOGi("[LLM_CHAIN] Token is EOG! End of generation reached.");
         if (_storeChats && !_response.empty()) {
-            addChatMessage(strdup(_response.data()), "assistant");
+            addChatMessage(_response.c_str(), "assistant"); // addChatMessage copies it
         }
         _response.clear();
         return "[EOG]";
@@ -643,14 +657,21 @@ bool LLMInference::isModelLoaded() const {
     return _model != nullptr && _ctx != nullptr;
 }
 
-std::string LLMInference::getFormattedChat(const std::string& messages, const std::string& chatTemplate) const {
+std::string LLMInference::getFormattedChat(const std::string& messages, const std::string& chatTemplate,
+                                           const std::string& tools, bool enableThinking) const {
     if (!_model) {
         throw std::runtime_error("Model not loaded");
     }
 
     common_chat_templates_inputs inputs;
+    // OpenAI messages: assistant tool_calls and "tool" results are rendered in the model's format
     inputs.messages = common_chat_msgs_parse_oaicompat(nlohmann::ordered_json::parse(messages));
-    
+    if (!tools.empty()) {
+        inputs.tools = common_chat_tools_parse_oaicompat(nlohmann::ordered_json::parse(tools));
+    }
+    // The flag defaults to true in common_chat: Gemma 4 reasoned on every turn whatever the setting
+    inputs.enable_thinking = enableThinking;
+
     // Jinja template support is enabled by default to match PocketPal
     inputs.use_jinja = true;
 

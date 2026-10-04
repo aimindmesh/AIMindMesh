@@ -1,6 +1,10 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { AIMindMeshServerSettings } from '../types';
 import { useOrganizationState } from '../hooks/useOrganizationState';
+import { IdeaStatusBadge, RepoStatusBadge } from '../components/organization/StatusBadges';
+import { IdeaSources } from '../components/organization/IdeaSources';
+import { BuildSettingsCard } from '../components/organization/BuildSettingsCard';
+import { MilestoneProgress, VentureDecisionPanel } from '../components/organization/VentureProgress';
 import { DiscoveryConfig, organizationApi } from '../services/organizationApi';
 import { triggerHaptic } from '../services/native';
 
@@ -13,9 +17,10 @@ type TabType = 'directives' | 'ideas' | 'repos' | 'roles' | 'audit';
 
 const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings, isActive = true }) => {
   const {
-    directives, ideas, roles, auditLogs, repositories, hrProposals, discoveryConfig,
+    directives, ideas, roles, auditLogs, repositories, hrProposals, discoveryConfig, buildConfig,
     loading, error,
     createDirective, cancelDirective, discoverIdeas, createRepository, bootstrapCiCd, runValidation, forceDevelop,
+    cancelRun, decideVenture, fetchBuildConfig, updateBuildConfig,
     analyzeRecruitment, materializeProposal, updateProposal, deleteProposal, reviewIdea, approveIdea, deleteIdea, updateIdea, clearSession, generateDirectivesFromIdea, transitionIdeaToDevelopment, refreshAll,
     createRole, archiveRole, updateRole,
     fetchDiscoveryConfig: _fetchDiscovery, updateDiscoveryConfig, triggerDiscovery,
@@ -105,19 +110,27 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings, isA
   const loadData = useCallback(async () => {
     if (!serverSettings?.enabled) return;
     try {
-      await refreshAll(serverSettings);
+      await Promise.all([refreshAll(serverSettings), fetchBuildConfig(serverSettings)]);
     } catch (e) {
       console.error(e);
     }
-  }, [serverSettings, refreshAll]);
+  }, [serverSettings, refreshAll, fetchBuildConfig]);
 
+  // The council runs in the background (status `reviewing`); polling brings the verdict
   const handleReviewIdea = async (ideaId: string, feedback?: string) => {
     if (!serverSettings) return;
-    const updated = await reviewIdea(serverSettings, ideaId, feedback);
-    if (updated) {
-      setSelectedIdea(updated);
+    try {
+      const updated = await reviewIdea(serverSettings, ideaId, feedback);
+      if (updated) setSelectedIdea(updated);
+    } catch (e) {
+      console.error('Council review failed to start', e); // the hook already shows the error
     }
   };
+
+  // Keep the open idea in sync with the polled list
+  useEffect(() => {
+    setSelectedIdea((current: any) => (current ? ideas.find(i => i.id === current.id) ?? current : current));
+  }, [ideas]);
 
   useEffect(() => {
     setHumanFeedbackText(selectedIdea?.humanFeedback || '');
@@ -373,12 +386,7 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings, isA
                   <div className="flex justify-between items-start">
                     <div>
                       <h4 className="font-bold text-text-primary text-sm">{idea.title}</h4>
-                      <span className={`text-[9px] uppercase font-bold px-1.5 py-0.5 rounded mt-0.5 inline-block ${
-                        idea.status === 'approved' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' :
-                        idea.status === 'rejected' ? 'bg-red-500/10 text-red-400 border border-red-500/20' :
-                        idea.status === 'reviewing' ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20 animate-pulse' :
-                        'bg-blue-500/10 text-blue-400 border border-blue-500/20'
-                      }`}>{idea.status}</span>
+                      <IdeaStatusBadge status={idea.status} />
                     </div>
                     <span className="text-lg font-black text-blue-400">{(idea.overallScore * 100).toFixed(0)}%</span>
                   </div>
@@ -450,6 +458,7 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings, isA
                 <button type="submit" className="w-full bg-blue-500 text-white font-bold py-2.5 rounded-2xl text-xs uppercase tracking-wider">Create Repository</button>
               </form>
             </div>
+            <BuildSettingsCard config={buildConfig} loading={loading} onSave={cfg => { if (serverSettings) void updateBuildConfig(serverSettings, cfg); }} />
             <div className="space-y-4">
               <h3 className="font-bold text-text-primary text-sm uppercase tracking-wider">Active Repositories</h3>
               {repositories.map(repo => (
@@ -457,30 +466,26 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings, isA
                   <div>
                     <div className="flex justify-between items-start">
                       <h4 className="font-bold text-text-primary text-sm">{repo.namespace}/{repo.repo_name}</h4>
-                      {(() => {
-                        const vs = repo.validation_status;
-                        const lastTrig = repo.agent_last_triggered_at;
-                        const staleMs = 90 * 60 * 1000;
-                        const isStale = lastTrig && (Date.now() - new Date(lastTrig).getTime() > staleMs);
-
-                        if (vs === 'evolving') {
-                          return isStale
-                            ? <span className="bg-amber-500/10 text-amber-400 text-[8px] px-1.5 py-0.5 rounded font-bold uppercase border border-amber-500/20">⚠ Stalled</span>
-                            : <span className="bg-blue-500/10 text-blue-400 text-[8px] px-1.5 py-0.5 rounded font-bold uppercase animate-pulse">⚡ Evolving</span>;
-                        }
-                        if (vs === 'healthy') return <span className="bg-emerald-500/10 text-emerald-400 text-[8px] px-1.5 py-0.5 rounded font-bold uppercase border border-emerald-500/20">✓ Built</span>;
-                        if (vs === 'broken') return <span className="bg-red-500/10 text-red-400 text-[8px] px-1.5 py-0.5 rounded font-bold uppercase border border-red-500/20">✗ Failed</span>;
-                        if (vs === 'needs_verification') return <span className="bg-purple-500/10 text-purple-400 text-[8px] px-1.5 py-0.5 rounded font-bold uppercase border border-purple-500/20">↻ Verifying</span>;
-                        return null;
-                      })()}
+                      <RepoStatusBadge repo={repo} />
                     </div>
                     <span className="text-[10px] text-text-secondary">{repo.gitea_url}</span>
+                    {repo.validation_status === 'blocked' && repo.blocked_reason && (
+                      <p className="text-[10px] text-red-300 mt-1">⛔ {repo.blocked_reason}</p>
+                    )}
+                    {repo.lastValidation && (
+                      <p className="text-[10px] text-text-secondary mt-1">Last validation: {repo.lastValidation}</p>
+                    )}
+                    <MilestoneProgress milestones={repo.milestones} />
                   </div>
                   <div className="flex flex-col gap-2 mt-2">
-                    <button onClick={() => { triggerHaptic('LIGHT'); if (serverSettings) forceDevelop(serverSettings, repo.id); }} className="w-full bg-orange-500/10 border border-orange-500/20 text-orange-400 py-2 rounded-2xl text-xs font-bold uppercase">Force Develop</button>
+                    {repo.isEvolving ? (
+                      <button onClick={() => { triggerHaptic('LIGHT'); if (serverSettings) cancelRun(serverSettings, repo.id); }} className="w-full bg-red-500/10 border border-red-500/20 text-red-400 py-2 rounded-2xl text-xs font-bold uppercase">Cancel Run</button>
+                    ) : (
+                      <button onClick={() => { triggerHaptic('LIGHT'); if (serverSettings) forceDevelop(serverSettings, repo.id).catch(() => undefined); }} className="w-full bg-orange-500/10 border border-orange-500/20 text-orange-400 py-2 rounded-2xl text-xs font-bold uppercase">{repo.validation_status === 'blocked' ? 'Unblock & Develop' : 'Develop'}</button>
+                    )}
                     <div className="flex gap-2">
                       <button onClick={() => { if (serverSettings) bootstrapCiCd(serverSettings, repo.id); }} className="flex-1 bg-blue-500/10 border border-blue-500/20 text-blue-400 py-2 rounded-2xl text-xs font-bold uppercase">Bootstrap CI</button>
-                      <button onClick={() => { if (serverSettings) runValidation(serverSettings, repo.id); }} className="flex-1 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 py-2 rounded-2xl text-xs font-bold uppercase">Validate Kasm</button>
+                      <button onClick={() => { if (serverSettings) runValidation(serverSettings, repo.id); }} className="flex-1 bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 py-2 rounded-2xl text-xs font-bold uppercase">Validate</button>
                       <button onClick={() => { triggerHaptic('LIGHT'); setSelectedRepoForLogs(repo); }} className="flex-1 bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 py-2 rounded-2xl text-xs font-bold uppercase">Evolution Stream</button>
                     </div>
                   </div>
@@ -492,7 +497,7 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings, isA
                         setLoadingDesign(true);
                         try {
                           triggerHaptic('LIGHT');
-                          const res = await organizationApi.getIdeaDesign(serverSettings, repo.created_from_idea_id);
+                          const res = await organizationApi.getIdeaDesign(serverSettings, repo.created_from_idea_id!);
                           setSelectedDesign(res);
                         } catch (err) {
                           console.error("Failed to load design", err);
@@ -843,18 +848,19 @@ const OrganizationView: React.FC<OrganizationViewProps> = ({ serverSettings, isA
                 </div>
               )}
 
-              {selectedIdea.sourceSignals && selectedIdea.sourceSignals.length > 0 && (
+              <div>
+                <span className="text-[9px] text-text-secondary uppercase font-bold mb-1 block">Sources</span>
+                <IdeaSources idea={selectedIdea} />
+              </div>
+
+              {selectedIdea.judgeRationale && (
                 <div>
-                  <span className="text-[9px] text-text-secondary uppercase font-bold mb-1 block">Source Signals</span>
-                  <div className="flex flex-wrap gap-1.5 mt-0.5">
-                    {selectedIdea.sourceSignals.map((sig: string, idx: number) => (
-                      <span key={idx} className="px-2 py-1 bg-black/20 border border-white/5 rounded-xl text-[9px] text-text-secondary">
-                        {sig}
-                      </span>
-                    ))}
-                  </div>
+                  <span className="text-[9px] text-text-secondary uppercase font-bold mb-1 block">Why these scores</span>
+                  <p className="text-[10px] text-text-secondary">{selectedIdea.judgeRationale}</p>
                 </div>
               )}
+
+              <VentureDecisionPanel idea={selectedIdea} busy={loading} onDecide={(decision, notes) => { if (serverSettings) void decideVenture(serverSettings, selectedIdea.id, decision, notes); }} />
 
               <div className="grid grid-cols-2 gap-4 text-[9px] text-text-secondary pt-2 border-t border-white/5">
                 <div>Created: <strong>{new Date(selectedIdea.createdAt).toLocaleString()}</strong></div>

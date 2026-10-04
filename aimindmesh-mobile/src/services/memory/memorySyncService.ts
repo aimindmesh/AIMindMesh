@@ -1,100 +1,73 @@
 /**
- * memorySyncService.ts (v4.0.0)
- * Bulk and incremental memory sync to the AIMindMesh Server KG.
+ * memorySyncService.ts
+ * Facts mirrored to the AIMindMesh Server knowledge graph (when "auto-sync new memories" is on):
+ * each fact is upserted by its id (no duplicates), and deleted on the server when the user
+ * deletes it or it stops holding (replaced, done, expired).
  */
 
-import { AIMindMeshServerSettings, Memory } from '../../types';
+import { AIMindMeshServerSettings } from '../../types';
 import { logger } from '../logger';
+import { Fact } from './facts/factTypes';
+import { FactChange, factStore } from './facts/factStore';
 
-export interface SyncProgress {
-    total: number;
-    synced: number;
-    failed: number;
-    done: boolean;
+const TIMEOUT_MS = 10000;
+
+const usable = (settings: AIMindMeshServerSettings | null | undefined): settings is AIMindMeshServerSettings =>
+    !!settings?.enabled && !!settings.serverUrl && !!settings.apiKey;
+
+const headers = (settings: AIMindMeshServerSettings) => ({ 'Content-Type': 'application/json', 'x-api-key': settings.apiKey });
+
+export function factToServerPayload(fact: Fact) {
+    return {
+        id: fact.id,
+        content: fact.subject ? `${fact.subject}: ${fact.content}` : fact.content,
+        category: fact.kind,
+        source: 'aimindmesh_android',
+        createdAt: new Date(fact.createdAt).toISOString(),
+    };
 }
 
-type ProgressCallback = (p: SyncProgress) => void;
-
-/**
- * Returns the approximate count of memories that would be synced.
- * Used to show the preview count in MemorySettings before bulk sync starts.
- */
-export function getMemoryCount(memories: Memory[]): number {
-    return memories.length;
+export async function pushFactToServer(fact: Fact, settings: AIMindMeshServerSettings): Promise<boolean> {
+    const resp = await fetch(`${settings.serverUrl}/api/kg/memories`, {
+        method: 'POST', headers: headers(settings), body: JSON.stringify(factToServerPayload(fact)),
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    return resp.ok;
 }
 
-/**
- * Bulk sync: posts each memory to POST /api/kg/memories.
- * Fire-and-forget per item; continues on failure.
- * @param memories - All local memories to sync
- * @param settings - Server configuration
- * @param onProgress - Called after each successful/failed POST
- */
-export async function bulkSyncMemoriesToServer(
-    memories: Memory[],
-    settings: AIMindMeshServerSettings,
-    onProgress?: ProgressCallback
-): Promise<SyncProgress> {
-    const total = memories.length;
-    let synced = 0;
-    let failed = 0;
+export async function deleteFactOnServer(id: string, settings: AIMindMeshServerSettings): Promise<boolean> {
+    const resp = await fetch(`${settings.serverUrl}/api/kg/memories/${encodeURIComponent(id)}`, {
+        method: 'DELETE', headers: headers(settings), signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    return resp.ok;
+}
 
-    for (const memory of memories) {
-        try {
-            const resp = await fetch(`${settings.serverUrl}/api/kg/memories`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-api-key': settings.apiKey
-                },
-                body: JSON.stringify({
-                    content: memory.content,
-                    category: memory.category,
-                    source: 'aimindmesh_android',
-                    createdAt: memory.timestamp instanceof Date
-                        ? memory.timestamp.toISOString()
-                        : new Date(memory.timestamp).toISOString()
-                }),
-                signal: AbortSignal.timeout(10000)
-            });
-            if (resp.ok) { synced++; } else { failed++; }
-        } catch (e) {
-            failed++;
-            logger.log('warn', `[MemorySync] Failed to sync memory ${memory.id}`, e);
-        }
-        // Yield to UI between each POST (ANR prevention)
-        await new Promise(r => setTimeout(r, 0));
-        onProgress?.({ total, synced, failed, done: false });
+async function applyChange(change: FactChange, settings: AIMindMeshServerSettings): Promise<void> {
+    if (change.type === 'clear') {
+        logger.log('info', '[MemorySync] Local facts cleared: the server copies stay (delete them from the server admin)');
+        return;
     }
-
-    const result: SyncProgress = { total, synced, failed, done: true };
-    onProgress?.(result);
-    logger.log('info', `[MemorySync] Bulk sync complete: ${synced}/${total} synced, ${failed} failed`);
-    return result;
+    const jobs: Array<() => Promise<boolean>> = change.type === 'remove'
+        ? change.ids.map(id => () => deleteFactOnServer(id, settings))
+        : change.facts.map(f => () => f.status === 'active' ? pushFactToServer(f, settings) : deleteFactOnServer(f.id, settings));
+    for (const job of jobs) {
+        try {
+            if (!(await job())) logger.log('warn', '[MemorySync] Server refused a fact change');
+        } catch (e) {
+            logger.log('warn', '[MemorySync] Fact sync failed', e);
+        }
+        // Yield to the UI between requests (a migration can bring many facts at once)
+        await new Promise(r => setTimeout(r, 0));
+    }
 }
 
 /**
- * Fire-and-forget single memory sync.
- * Called after saving a new memory when autoSyncNewMemories=true.
+ * Mirrors every later fact change to the server while `getSettings()` returns usable settings.
+ * Returns the unsubscribe function.
  */
-export function syncSingleMemoryToServer(
-    memory: Memory,
-    settings: AIMindMeshServerSettings
-): void {
-    if (!settings.enabled || !settings.serverUrl || !settings.apiKey) return;
-    fetch(`${settings.serverUrl}/api/kg/memories`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': settings.apiKey
-        },
-        body: JSON.stringify({
-            content: memory.content,
-            category: memory.category,
-            source: 'aimindmesh_android',
-            createdAt: memory.timestamp instanceof Date
-                ? memory.timestamp.toISOString()
-                : new Date(memory.timestamp).toISOString()
-        })
-    }).catch(e => logger.log('warn', '[MemorySync] Auto-sync failed', e));
+export function startFactSync(getSettings: () => AIMindMeshServerSettings | null): () => void {
+    return factStore.onChange(change => {
+        const settings = getSettings();
+        if (usable(settings)) void applyChange(change, settings);
+    });
 }

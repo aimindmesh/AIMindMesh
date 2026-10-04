@@ -57,6 +57,8 @@ public class AudioDecoder {
                     ? format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
                     : 1;
 
+            PcmResampler resampler = new PcmResampler(sampleRate, channels);
+
             while (!outputDone) {
                 if (!inputDone) {
                     int inputIndex = decoder.dequeueInputBuffer(TIMEOUT_US);
@@ -80,8 +82,11 @@ public class AudioDecoder {
                     outputBuffer.get(pcm);
                     outputBuffer.clear();
 
-                    fos.write(pcm);
-                    totalBytes += bufferInfo.size;
+                    byte[] resampled = resampler.process(pcm, bufferInfo.size);
+                    if (resampled.length > 0) {
+                        fos.write(resampled);
+                        totalBytes += resampled.length;
+                    }
 
                     decoder.releaseOutputBuffer(outputIndex, false);
                     if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
@@ -90,9 +95,8 @@ public class AudioDecoder {
                 }
             }
 
-            // Update WAV Header
-            WavHelper.updateWavHeader(outputFile, totalBytes, totalBytes + 36, sampleRate, channels,
-                    16 * channels * sampleRate / 8);
+            // Update WAV Header to strictly 16000Hz, 1 channel (mono), 16-bit PCM
+            WavHelper.updateWavHeader(outputFile, totalBytes, totalBytes + 36, 16000, 1, 16 * 1 * 16000 / 8);
 
             return true;
         } catch (Exception e) {
@@ -259,6 +263,76 @@ public class AudioDecoder {
             } catch (Exception e) {
                 // Ignore
             }
+        }
+    }
+
+    public static class PcmResampler {
+        private final int srcSampleRate;
+        private final int srcChannels;
+        private final double ratio;
+        private double inputPos = 0.0;
+        private short lastSample = 0;
+        private boolean hasLastSample = false;
+
+        public PcmResampler(int srcSampleRate, int srcChannels) {
+            this.srcSampleRate = srcSampleRate;
+            this.srcChannels = srcChannels;
+            this.ratio = (double) srcSampleRate / 16000.0;
+        }
+
+        public byte[] process(byte[] pcmData, int length) {
+            if (srcSampleRate == 16000 && srcChannels == 1) {
+                if (length == pcmData.length) return pcmData;
+                byte[] out = new byte[length];
+                System.arraycopy(pcmData, 0, out, 0, length);
+                return out;
+            }
+
+            int inFrames = length / (2 * srcChannels);
+            if (inFrames == 0) return new byte[0];
+
+            short[] monoSamples = new short[inFrames];
+            ByteBuffer bb = ByteBuffer.wrap(pcmData, 0, length).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            for (int i = 0; i < inFrames; i++) {
+                if (srcChannels == 1) {
+                    monoSamples[i] = bb.getShort();
+                } else {
+                    int sum = 0;
+                    for (int c = 0; c < srcChannels; c++) {
+                        sum += bb.getShort();
+                    }
+                    monoSamples[i] = (short) (sum / srcChannels);
+                }
+            }
+
+            if (srcSampleRate == 16000) {
+                byte[] outBytes = new byte[inFrames * 2];
+                ByteBuffer outBb = ByteBuffer.wrap(outBytes).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                for (int i = 0; i < inFrames; i++) {
+                    outBb.putShort(monoSamples[i]);
+                }
+                return outBytes;
+            }
+
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            while (inputPos < inFrames) {
+                int idx = (int) Math.floor(inputPos);
+                double frac = inputPos - idx;
+                short s0 = (idx == 0 && hasLastSample) ? lastSample : (idx < inFrames ? monoSamples[Math.max(0, idx)] : monoSamples[inFrames - 1]);
+                short s1 = (idx + 1 < inFrames) ? monoSamples[idx + 1] : s0;
+                short outVal = (short) Math.round(s0 + frac * (s1 - s0));
+
+                baos.write(outVal & 0xFF);
+                baos.write((outVal >> 8) & 0xFF);
+
+                inputPos += ratio;
+            }
+
+            lastSample = monoSamples[inFrames - 1];
+            hasLastSample = true;
+            inputPos -= inFrames;
+
+            return baos.toByteArray();
         }
     }
 }

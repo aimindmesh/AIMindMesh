@@ -2,6 +2,7 @@ import { LLMConfig, Message } from '../../../../types';
 import { logger } from '../../../logger';
 import { modelExists } from '../../../model/modelDownloader';
 import * as nativeLLM from '../../nativeLLM';
+import { detectDeviceContext, onDeviceContextSize } from '../../context/contextSize';
 
 // Global context operation mutex to prevent race conditions during initialization
 let contextOperationMutex: Promise<any> = Promise.resolve();
@@ -47,8 +48,17 @@ export async function initializeNativeModel(llmConfig: LLMConfig): Promise<{ sup
         }
     }
 
+    // Context: auto for the phone or set by hand; a change reloads the model
+    await detectDeviceContext();
+    const nCtx = onDeviceContextSize(llmConfig);
+    const contextChanged = chatModelInfo.isLoaded && chatModelInfo.nCtx !== undefined && chatModelInfo.nCtx !== nCtx;
+    if (contextChanged) {
+        logger.log('info', `[GGUF] Context ${chatModelInfo.nCtx} → ${nCtx}: reloading the chat model`);
+        await nativeLLM.unloadNativeModelSlot('chat');
+    }
+
     // Check if we need to initialize or re-initialize
-    let needsInit = !chatModelInfo.isLoaded ||
+    let needsInit = !chatModelInfo.isLoaded || contextChanged ||
         chatModelInfo.modelPath !== llmConfig.nativeModelPath ||
         currentProj !== configProj;
 
@@ -75,7 +85,7 @@ export async function initializeNativeModel(llmConfig: LLMConfig): Promise<{ sup
                 modelPath: llmConfig.nativeModelPath!,
                 nThreads: llmConfig.nThreads,
                 nThreadsBatch: llmConfig.nThreadsBatch,
-                nCtx: llmConfig.nCtx,
+                nCtx,
                 nBatch: llmConfig.nBatch,
                 nUBatch: llmConfig.nUBatch,
                 flashAttn: llmConfig.flashAttn,
@@ -111,7 +121,7 @@ export async function initializeNativeModel(llmConfig: LLMConfig): Promise<{ sup
                     modelPath: llmConfig.nativeModelPath!,
                     nThreads: llmConfig.nThreads,
                     nThreadsBatch: llmConfig.nThreadsBatch,
-                    nCtx: llmConfig.nCtx,
+                    nCtx,
                     nBatch: llmConfig.nBatch,
                     nUBatch: llmConfig.nUBatch,
                     flashAttn: llmConfig.flashAttn,

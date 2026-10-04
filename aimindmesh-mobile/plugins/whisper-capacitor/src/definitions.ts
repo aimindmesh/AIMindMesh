@@ -68,6 +68,33 @@ export interface WhisperPlugin {
     }>;
 
     /**
+     * Transcribe [startMs, endMs) of a 16 kHz mono WAV file, reading only that range.
+     * Segment times are relative to the start of the file. Calls run one at a time.
+     * @param options.beamSize 1 = greedy (fast), 5 = beam search (more accurate, ~2-3x slower)
+     * @param options.initialPrompt Text that precedes the range (e.g. the previous chunk), for continuity
+     */
+    transcribeRange(options: {
+        audioPath: string;
+        startMs: number;
+        endMs: number;
+        language?: string;
+        threads?: number;
+        beamSize?: number;
+        initialPrompt?: string;
+        /** Encoder frames (1500 = 30 s); 0 = full window. Smaller is faster on short ranges. */
+        audioCtx?: number;
+    }): Promise<{
+        text: string;
+        segments: TranscriptSegment[];
+        /** Language used: the one requested, or the one detected with 'auto' */
+        language: string;
+        processingTimeMs: number;
+    }>;
+
+    /** Stop the running transcription as soon as possible. */
+    abort(): Promise<void>;
+
+    /**
      * Copy a file from a source URI (e.g. content://) to a destination filename in the app's files directory
      * @param options.sourcePath Source URI
      * @param options.fileName Destination filename (relative to files dir)

@@ -6,6 +6,8 @@ android/local.properties
 android/captures/
 android/.idea/
 android/app/src/main/assets/public/
+# Speech models bundled in the APK: fetched by scripts/fetch-bundled-models.sh, not versioned
+android/app/src/main/assets/bundled_models/
 android/build_log.txt
 
 # Plugin Artifacts (Recursive)
@@ -68,6 +70,9 @@ logs
 **/*.pyo
 **/*.pyd
 scripts/qai_venv/
+scripts/qai_venv314/
+# QNN HTP runtime copied from a QAIRT SDK by scripts/fetch-qnn-htp-libs.sh
+plugins/sd-capacitor/android/src/main/jniLibs/
 
 # Binary artifacts (excluding tracked ones in lib/)
 **/bin/
@@ -95,3 +100,7 @@ SmolChat-Android-main/
 gallery-main/
 Models/
 vendor/llama-cpp-rs
+
+# Evaluation harness output and private scenarios
+eval/results/
+eval/scenarios/private/

@@ -81,12 +81,11 @@ export class DatabaseManager {
         try {
             this.initSQLiteConnection();
 
-            // Check consistency (optional but good practice)
-            if (this.sqliteConnection) {
-                // await this.sqliteConnection.checkConnectionsConsistency(); 
-                // Note: checkConnectionsConsistency might interfere if we are not careful, 
-                // but usually good ensuring state.
-            }
+            // After a WebView reload the JS side forgets its connections while the native plugin
+            // still holds them: this closes the native connections JS doesn't know about, so
+            // they are created again instead of failing with "already exists".
+            await this.sqliteConnection?.checkConnectionsConsistency().catch(e =>
+                logger.log('warn', '[DatabaseManager] Connection consistency check failed', e));
 
             logger.log('info', '[DatabaseManager] Initializing all databases...');
 

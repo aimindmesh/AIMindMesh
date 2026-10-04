@@ -6,6 +6,7 @@ import EngineSelector from './EngineSelector';
 import GGUFSettings from './GGUFSettings';
 import LiteRTSettings from './LiteRTSettings';
 import GenieSettings from './GenieSettings';
+import LlmBenchmarkPanel from './LlmBenchmarkPanel';
 
 interface NativeModelSettingsProps {
     llmConfig: LLMConfig;
@@ -38,7 +39,9 @@ const NativeModelSettings: React.FC<NativeModelSettingsProps> = ({
                     llmConfig={llmConfig}
                     onLlmConfigSave={onLlmConfigSave}
                     triggerHaptic={triggerHaptic}
+                    hfToken={hfToken}
                     downloadedGenieModels={modelsState.downloadedGenieModels}
+                    setDownloadedGenieModels={modelsState.setDownloadedGenieModels}
                     isImporting={modelsState.isImporting}
                     handleImportGenieZipFile={modelsState.handleImportGenieZipFile}
                 />
@@ -80,6 +83,8 @@ const NativeModelSettings: React.FC<NativeModelSettingsProps> = ({
                     handleImportGgufFile={() => modelsState.handleImportGgufFile(loaderState.handleLoadNativeModel)}
                 />
             )}
+
+            <LlmBenchmarkPanel llmConfig={llmConfig} onLlmConfigSave={onLlmConfigSave} triggerHaptic={triggerHaptic} />
         </div>
     );
 };

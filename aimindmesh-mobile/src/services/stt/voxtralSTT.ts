@@ -248,10 +248,12 @@ export class VoxtralSTTService {
      * Start real-time streaming transcription
      * @param onUpdate Callback that receives the accumulated transcript
      * @param _apiKey Optional API key (ignored)
+     * @param options.externalAudio Transcribe the meeting recorder's audio instead of the microphone
      */
     public async start(
         onUpdate: (transcript: string, tokens: VoxtralToken[]) => void,
-        _apiKey?: string
+        _apiKey?: string,
+        options: { externalAudio?: boolean } = {}
     ): Promise<void> {
         logger.log('info', `[VoxtralSTT] start() called. Model loaded: ${this.isModelLoaded}, isStreaming: ${this.isStreaming}`);
 
@@ -283,7 +285,7 @@ export class VoxtralSTTService {
         try {
             // Native capture uses its own AudioRecord: make sure RECORD_AUDIO is granted first
             // (getUserMedia triggers the Android permission prompt through the WebView)
-            const hasPermission = await requestMicrophonePermission();
+            const hasPermission = options.externalAudio || await requestMicrophonePermission();
             if (!hasPermission) {
                 throw new Error('Microphone permission denied. Please grant microphone access to use voice input.');
             }
@@ -297,7 +299,7 @@ export class VoxtralSTTService {
                     const newText = tokens.map(t => t.text).join('');
                     this.accumulatedTranscript += newText;
 
-                    logger.log('info', `[VoxtralSTT] Received ${tokens.length} tokens: ${newText}`);
+                    logger.log('info', `[VoxtralSTT] Received ${tokens.length} tokens (${newText.length} chars)`);
 
                     // Send update
                     if (this.currentCallback) {
@@ -319,7 +321,7 @@ export class VoxtralSTTService {
             this.errorListener = errorListener;
 
             // Start streaming
-            await Voxtral.startRealtimeTranscription();
+            await Voxtral.startRealtimeTranscription({ externalAudio: !!options.externalAudio });
 
             if (!isCurrent()) {
                 await Voxtral.stopRealtimeTranscription().catch(() => { /* nothing to stop */ });

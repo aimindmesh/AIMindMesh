@@ -44,21 +44,15 @@ export class SpeakerDiarization {
         return this._similarityThreshold;
     }
 
+    /**
+     * Sensitivity of the volume-based fallback (no embeddings). Embedding matching has its own
+     * thresholds (setEmbeddingThreshold / setRejectionThreshold).
+     */
     public setSimilarityThreshold(value: number): void {
         this._similarityThreshold = Math.max(0.3, Math.min(0.8, value));
-        // Direct threshold mapping (v2.1): sensitivity slider maps linearly to embedding threshold.
-        // Low sensitivity (0.3) → low threshold (0.60) = easier to match = fewer speakers.
-        // High sensitivity (0.8) → high threshold (0.85) = harder to match = more speakers.
-        // ECAPA-TDNN empirical range: 0.60–0.85 (beyond 0.85 almost nothing matches).
-        const embeddingThreshold = 0.60 + (value - 0.3) * 0.5;
-        this.embeddingService.setThreshold(embeddingThreshold);
-        this.logCallback(`Sensitivity: ${this._similarityThreshold.toFixed(2)}, embedding threshold: ${embeddingThreshold.toFixed(2)}`);
+        this.logCallback(`Sensitivity: ${this._similarityThreshold.toFixed(2)}`);
     }
 
-    /**
-     * Set minimum time between speaker switches for embedding-based identification.
-     * @param ms Time in milliseconds (0-10000)
-     */
     public setMinTimeBetweenSwitches(ms: number): void {
         this.embeddingService.setMinTimeBetweenSwitches(ms);
     }

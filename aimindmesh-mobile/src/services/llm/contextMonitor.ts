@@ -1,5 +1,6 @@
 import { Message, LLMConfig } from '../../types';
 import { logger } from '../logger';
+import { onDeviceContextSize } from './context/contextSize';
 
 /**
  * Constant for token estimation (same logic used in contextManager.ts)
@@ -80,7 +81,7 @@ export function shouldSummarize(
         return false;
     }
 
-    const contextSize = llmConfig.nCtx || llmConfig.contextSize || 2048;
+    const contextSize = onDeviceContextSize(llmConfig);
     const estimate = estimateContextUsage(messages, '', contextSize);
 
     const shouldDo = estimate.usagePercent >= threshold;

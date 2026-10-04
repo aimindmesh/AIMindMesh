@@ -21,11 +21,18 @@ vi.mock('../src/services/model/embedding/localModelService', () => ({
 }));
 vi.mock('../src/services/memory/embeddingReindexer', () => ({ scheduleEmbeddingReindex: vi.fn() }));
 vi.mock('../src/services/logger', () => ({ logger: { log: vi.fn() } }));
+vi.mock('../src/services/model/embedding/modelSources', async (importOriginal) => {
+    const real = await importOriginal<typeof import('../src/services/model/embedding/modelSources')>();
+    // config.json of the imported models: "memories3" is an E5, "notes" a MiniLM
+    const configs: Record<string, string> = { memories3: 'intfloat/multilingual-e5-small', notes: 'sentence-transformers/all-MiniLM-L6-v2' };
+    return { ...real, readModelSource: async (id: string) => configs[id] };
+});
 
 import {
     embedText, embeddingModelKey, ensureEmbeddingModel, ensureEmbeddingModelFromSettings, getActiveEmbeddingModel,
     getEmbeddingLoadError, getEmbeddingPrefixes, resetEmbeddingRuntimeForTests,
 } from '../src/services/model/embedding/embeddingRuntime';
+import { memoryThresholds } from '../src/services/memory/context/memoryThresholds';
 
 describe('embedding runtime', () => {
     beforeEach(() => {
@@ -86,6 +93,17 @@ describe('embedding runtime', () => {
         expect(key).toBe(embeddingModelKey('e5-small-v2'));
         await embedText('hello', 'query');
         expect(native.generateEmbedding).toHaveBeenLastCalledWith({ text: 'query: hello' });
+    });
+
+    it('recognizes an imported E5 by its config: prefixes, a key of its own, E5 thresholds', async () => {
+        await ensureEmbeddingModel('memories3');
+        const { key } = await embedText('dove abito', 'query');
+        expect(native.generateEmbedding).toHaveBeenLastCalledWith({ text: 'query: dove abito' });
+        expect(key).toBe(`${embeddingModelKey('memories3')}-e5`); // old vectors without prefixes get re-embedded
+        expect(memoryThresholds({ embeddingModelId: 'memories3' }).related).toBe(memoryThresholds({ embeddingModelId: 'multilingual-e5-small' }).related);
+        await ensureEmbeddingModel('notes');
+        expect((await embedText('x', 'query')).key).toBe(embeddingModelKey('notes'));
+        expect(native.generateEmbedding).toHaveBeenLastCalledWith({ text: 'x' });
     });
 
     it('refuses to embed without a model and reads the selected model from the settings', async () => {

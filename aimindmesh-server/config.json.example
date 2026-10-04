@@ -104,7 +104,10 @@
     "autoMerge": false,
     "shadowMode": false,
     "preferredNode": "OPENROUTER",
-    "giteaWebhookSecret": "same-secret-as-the-gitea-webhook"
+    "giteaWebhookSecret": "same-secret-as-the-gitea-webhook",
+    "sources": { "runtimeErrors": true, "inferenceFailures": true, "insights": false },
+    "signals": { "minOccurrences": 5, "minDays": 2, "maxCandidatesPerCycle": 3 },
+    "runRelatedTests": true
   },
   "openrouter": {
     "apiKey": "your-openrouter-api-key",
@@ -143,8 +146,13 @@
     "defaultRepoVisibility": "private",
     "searxngBaseUrl": "http://searxng:8080",
     "kasmValidationWorkspaceId": "workspace-template-id",
+    "council": {
+      "roles": ["Researcher", "Developer", "Reviewer", "Security", "QA"],
+      "maxParticipants": 6,
+      "rounds": 2
+    },
     "autonomousDiscovery": {
-      "enabled": true,
+      "enabled": false,
       "cronExpression": "0 */12 * * *",
       "maxTopicsPerCycle": 3,
       "minScoreThreshold": 0.55,

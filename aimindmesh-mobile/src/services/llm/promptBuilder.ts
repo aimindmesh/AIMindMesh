@@ -1,6 +1,13 @@
-import { Message, Personality, Memory } from '../../types';
+import { Message, Personality } from '../../types';
 
-export const buildSystemPrompt = (personality: Personality, memories?: Memory[], responseHint?: string, enableInlineMemory?: boolean): string => {
+/** Placeholder of the inline memory format: small models sometimes copy it verbatim */
+export const INLINE_MEMORY_PLACEHOLDER = 'the fact, as one short sentence';
+
+/**
+ * Companion system prompt. `profile`: what is known about the user (memoryContext.buildProfile),
+ * already formatted.
+ */
+export const buildSystemPrompt = (personality: Personality, profile?: string, responseHint?: string, enableInlineMemory?: boolean): string => {
   const now = new Date();
   const dateString = now.toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
   const timeString = now.toLocaleTimeString(undefined, { hour: '2-digit' }); // Remove minutes to preserve KV cache
@@ -14,24 +21,19 @@ ${personality.description}
 DISTINCTIVE TRAITS:
 ${personality.traits.map((t) => `- ${t}`).join('\n')}
 
-${memories && memories.length > 0 ? `
-LONG-TERM MEMORIES:
-Here are some key things to remember about the user and your past conversations. Use this information to make your conversation more personal and relevant.
-${memories.map(m => `- ${m.content}`).join('\n')}
+${profile ? `
+${profile}
 ` : ''}
 
 CONVERSATION RULES:
 1. Always maintain consistency with your personality.
-2. Remember details from past conversations to build rapport.${memories && memories.length > 0 ? ' The LONG-TERM MEMORIES section above contains actual facts you know about the user. DO NOT state that you lack access to memory or databases. Use these facts naturally.' : ''}
+2. Remember details from past conversations to build rapport.${profile ? ' The facts above are real things the user told you: DO NOT state that you lack access to memory. Use them naturally, only when relevant.' : ''}
 3. Respond in a natural, conversational, and friendly manner.
 4. Show empathy and understanding.
 5. Do not be overly formal or robotic. Your goal is to feel like a real, caring friend.
 6. Keep responses relatively concise, especially in a back-and-forth chat.
 7. Help manage the user's to-do list - add tasks when requested, list current tasks, and celebrate when tasks are completed.
-${enableInlineMemory ? `8. MEMORY RULE: If the user shares a new, important fact about themselves (e.g., preferences, life events), you MUST extract it and append it at the VERY END of your response using this exact format:
-<save_memory>
-User's favorite color is blue.
-</save_memory>` : ''}
+${enableInlineMemory ? `8. MEMORY RULE: When the user tells you a new, lasting fact about themselves (preferences, people in their life, plans, life events), add it at the VERY END of your response, one fact per tag, written as a short sentence in the user's language: <save_memory>${INLINE_MEMORY_PLACEHOLDER}</save_memory>. Never invent facts and never repeat facts you already know.` : ''}
 
 IMPORTANT:
 - You are not a generic AI assistant. You have a distinct persona.
@@ -97,40 +99,5 @@ GUIDELINES:
 - Maximum length: 1-2 sentences.
 
 IMPORTANT: Respond ONLY with the proactive message itself. No prefixes, no explanations, no greetings. Just the message content.
-`;
-};
-
-export const buildMemoryExtractionPrompt = (
-  conversationExcerpt: Message[],
-  personality: Personality
-): string => {
-  return `
-You are a memory analysis module for an AI companion named ${personality.name}.
-Your task is to analyze the following conversation excerpt and extract a single, crucial piece of new information to be stored in long-term memory.
-
-GUIDELINES:
-1. Focus on new, lasting facts about the user (likes, dislikes, personal stories, goals, significant relationships) or significant developments in your relationship.
-2. Ignore trivial details, pleasantries, questions, or information that is unlikely to be relevant later.
-3. The memory should be a concise, self-contained statement, written in the first person from the AI's perspective (e.g., "The user told me their dog's name is Sparky.", "I learned that the user is studying to be a web developer.").
-4. Categorize the memory into one of the following: 'personal', 'preference', 'goal', 'relationship', 'work', 'other'.
-5. If no new, important, lasting information is present, return null.
-
-CONVERSATION EXCERPT:
-${conversationExcerpt.map((m) => `${m.role === 'user' ? 'User' : personality.name}: ${m.text}`).join('\n')}
-
-Based on this excerpt, identify the single most important new fact to remember.
-
-RESPONSE FORMAT:
-Respond ONLY with a valid JSON object in the following format (do not use code blocks):
-{
-  "memory": "The concise memory statement",
-  "category": "The category of the memory"
-}
-
-If no memory is worth saving, respond with:
-{
-  "memory": null,
-  "category": null
-}
 `;
 };

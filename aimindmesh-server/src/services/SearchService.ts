@@ -18,6 +18,8 @@ export interface SearchOptions {
   numResults?: number;
   deep?: boolean;
   lang?: string;
+  /** Only results from the last day/week/month/year (SearXNG time_range) */
+  timeRange?: 'day' | 'week' | 'month' | 'year';
 }
 
 export class SearchService {
@@ -48,7 +50,7 @@ export class SearchService {
       await Promise.all(queries.map(async (q) => {
         try {
           const res = await axios.get(this.baseUrl + '/search', {
-            params: { q: q, format: 'json', language: lang, safesearch: 0 },
+            params: { q: q, format: 'json', language: lang, safesearch: 0, ...(options.timeRange ? { time_range: options.timeRange } : {}) },
             timeout: 10000,
           });
           const data = res.data as any;

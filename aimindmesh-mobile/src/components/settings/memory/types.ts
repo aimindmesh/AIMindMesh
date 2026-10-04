@@ -1,21 +1,12 @@
-import { Memory, LLMConfig } from '../../../types';
+import { LLMConfig } from '../../../types';
+import type { MemoryFactsApi } from '../../../hooks/useMemoryFacts';
 
 export interface MemorySettingsProps {
-    memories: Memory[];
-    onAddMemory: (content: string, category?: string) => void;
-    onDeleteMemory: (id: string) => void;
-    onClearMemories: () => void;
-    memoryCategories: string[];
-    onAddMemoryCategory: (category: string) => void;
-    onDeleteMemoryCategory: (category: string) => void;
-    onUpdateMemoryCategory: (id: string, newCategory: string) => void;
-    onExportMemories: () => Promise<void>;
-    onImportMemories: () => Promise<void>;
-    enableAiMemoryCategorization: boolean;
-    onEnableAiMemoryCategorizationChange: (enabled: boolean) => void;
+    memory: MemoryFactsApi;
+    /** Asks for confirmation before deleting everything */
+    onClearAll: () => void;
     llmConfig: LLMConfig;
     onLlmConfigSave: (config: LLMConfig) => void;
-    apiKey: string;
 }
 
 export interface EmbeddingModel {

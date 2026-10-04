@@ -1,21 +1,13 @@
 
 import { ProactiveAction, ProactiveActionType } from '../../types/proactive';
-import { readSetting } from '../security/secretStore';
 import { getActiveThreadId } from '../llm/threadManager';
 import { activityLogger } from './ActivityLogger';
-import { LocalNotifications } from '@capacitor/local-notifications';
 import { logger } from '../logger';
 import { proactiveNotificationService } from './ProactiveNotificationService';
+import { readProactiveSettings } from './proactiveSettings';
 
 const CHAT_HISTORY_KEY = 'chat-history';
-/** Providers that cannot generate without their key (same rule as the memory extraction) */
-const KEYED_PROVIDERS = ['gemini', 'perplexity', 'claude'];
-
-function getProviderApiKey(provider: string): string {
-    const key = provider === 'perplexity' ? 'perplexity-api-key'
-        : provider === 'claude' ? 'claude-api-key' : 'gemini-api-key';
-    return readSetting<string>(key, '');
-}
+const CONTEXT_SUMMARY_SYSTEM = 'You summarize conversations faithfully and concisely, in the language of the conversation.';
 
 // Event bus for UI interactions
 type ActionHandler = (action: ProactiveAction) => Promise<void>;
@@ -33,22 +25,24 @@ class ActionExecutor {
     private isExecuting = false;
 
     async execute(action: ProactiveAction): Promise<void> {
-        if (this.isExecuting && action.category === 'autonomous') {
+        const autonomous = action.category === 'autonomous';
+        if (this.isExecuting && autonomous) {
             logger.log('warn', `[ActionExecutor] Skipping autonomous action because another one is already running: ${action.type}`);
             return;
         }
 
         logger.log('info', `[ActionExecutor] Executing action: ${action.type} (${action.id})`);
 
-        if (action.category === 'autonomous') {
+        // One heavy autonomous task at a time; released in finally, whatever happens
+        if (autonomous) {
             this.isExecuting = true;
         }
 
-        // Update status to executing
-        action.status = 'executing';
-        await activityLogger.log(action);
-
         try {
+            // Update status to executing
+            action.status = 'executing';
+            await activityLogger.log(action);
+
             switch (action.category) {
                 case 'silent':
                     await this.executeSilent(action);
@@ -78,6 +72,8 @@ class ActionExecutor {
             action.status = 'failed';
             action.error = error.message;
             await activityLogger.log(action);
+        } finally {
+            if (autonomous) this.isExecuting = false;
         }
     }
 
@@ -97,27 +93,11 @@ class ActionExecutor {
     private async executeInformative(action: ProactiveAction) {
         // Show notification using configured settings
         try {
-            const settingsStr = localStorage.getItem('proactive-settings');
-            if (settingsStr) {
-                const settings = JSON.parse(settingsStr);
-                await proactiveNotificationService.sendNotification(
-                    action.data.title || 'AI Mind Mesh',
-                    action.data.message || 'New suggestion available',
-                    settings
-                );
-            } else {
-                // Fallback to basic notification
-                await LocalNotifications.schedule({
-                    notifications: [{
-                        title: action.data.title || 'AI Mind Mesh',
-                        body: action.data.message || 'New suggestion available',
-                        id: Math.floor(Math.random() * 100000),
-                        schedule: { at: new Date(Date.now() + 1000) },
-                        actionTypeId: '',
-                        extra: { actionId: action.id }
-                    }]
-                });
-            }
+            await proactiveNotificationService.sendNotification(
+                action.data.title || 'AI Mind Mesh',
+                action.data.message || 'New suggestion available',
+                readProactiveSettings()
+            );
         } catch (error) {
             logger.log('error', '[ActionExecutor] Failed to send notification', error);
         }
@@ -140,135 +120,82 @@ class ActionExecutor {
         } else if (action.type === ProactiveActionType.AUTO_RESCHEDULE_EVENT) {
             // await updateEvent(...)
         } else if (action.type === ProactiveActionType.PERFORM_MEMORY_MAINTENANCE) {
-            // Perform memory deduplication and summarization
-            const resultDetails: any = {};
-
-            // Settings with their secrets (the raw key used to keep its JSON quotes)
-            const llmConfig: any = readSetting<any>('llm-config', null);
-            const apiKey = readSetting<string>('gemini-api-key', '');
-
-            if (!llmConfig || !apiKey) {
-                logger.log('warn', '[ActionExecutor] Cannot perform memory maintenance: LLM config or API key missing');
-                action.result = { success: false, reason: 'no_llm_config' };
-                return;
-            }
-
-            // Protect LiteRT Context
-            if (llmConfig.provider === 'litert' || llmConfig.engine === 'litert') {
-                logger.log('warn', '[ActionExecutor] Skipping memory maintenance to protect active LiteRT KV cache.');
-                action.result = { success: false, reason: 'litert_active' };
-                return;
-            }
-
-            const { MemorySummarizer } = await import('../memory/memorySummarizer');
-            const summarizer = new MemorySummarizer(llmConfig, apiKey);
-            const { deduplicateExistingMemories, getMemoryCount } = await import('../memory/memoryDatabase');
-
+            // Episodic memory only: near-identical rows of the same role, then old chat turns
+            // summarized per conversation and day. Facts are never merged or deleted.
+            const { runEpisodicMaintenance } = await import('../memory/episodicMaintenance');
             logger.log('info', `[ActionExecutor] Starting memory maintenance (count: ${action.data.memoryCount})`);
-
-            // Step 1: Semantic Consolidation (Merging similar groups)
-            // Use configured threshold or default 0.80
-            const threshold = llmConfig.memorySimilarityThreshold || 0.80;
-            const consolidationResult = await summarizer.consolidateRedundantMemories(threshold);
-            resultDetails.consolidated = consolidationResult.consolidatedCount;
-            logger.log('info', `[ActionExecutor] Consolidation result: ${consolidationResult.message}`);
-
-            // Step 2: Exact Deduplication (Cleanup remaining)
-            const dedupedCtx = await deduplicateExistingMemories(0.95); // High threshold for near-duplicates
-            resultDetails.deduped = dedupedCtx;
-            logger.log('info', `[ActionExecutor] Deduplicated ${dedupedCtx} exact memories`);
-
-            // Step 3: Summarize if count is still abnormally high (after dedup/consolidation)
-            const newCount = await getMemoryCount();
-            resultDetails.finalCount = newCount;
-
-            if (newCount > 60) {
-                const summarizationResult = await summarizer.summarizeMemories(20);
-                logger.log('info', `[ActionExecutor] Summarization result: ${summarizationResult.message}`);
-                resultDetails.summarized = summarizationResult.success;
-            }
-
-            action.result = resultDetails;
+            action.result = await runEpisodicMaintenance();
+            logger.log('info', '[ActionExecutor] Memory maintenance done', action.result);
         } else if (action.type === ProactiveActionType.SUMMARIZE_CONTEXT) {
-            // Perform context summarization
-            logger.log('info', `[ActionExecutor] Starting context summarization (usage: ${Math.round(action.data.currentUsage * 100)}%, count: ${action.data.messageCount})`);
-
-            const { summarizeForModel } = await import('../llm/contextSummarization');
-            const { applyContextSummary, saveContextSummary } = await import('../llm/contextSummaryStore');
-
-            // The summary belongs to the active thread and only shortens what the model receives:
-            // the conversation itself (chat-history and the saved thread) is never rewritten
-            const threadId = getActiveThreadId();
-            const historyItem = localStorage.getItem(CHAT_HISTORY_KEY);
-            if (!historyItem || !threadId) {
-                logger.log('warn', '[ActionExecutor] No chat history found');
-                action.result = { success: false, reason: 'no_history' };
-                return;
-            }
-
-            const messages: any[] = JSON.parse(historyItem, (_key, value) => {
-                if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(value)) {
-                    return new Date(value);
-                }
-                return value;
-            });
-
-            // Model config and its key, as App stores them ('llm-config', '<provider>-api-key')
-            const llmConfig: any = readSetting<any>('llm-config', null);
-            if (!llmConfig) {
-                logger.log('warn', '[ActionExecutor] LLM config not found');
-                action.result = { success: false, reason: 'no_llm_config' };
-                return;
-            }
-            const apiKey = getProviderApiKey(llmConfig.provider);
-            if (KEYED_PROVIDERS.includes(llmConfig.provider) && !apiKey) {
-                logger.log('warn', '[ActionExecutor] API key not found');
-                action.result = { success: false, reason: 'no_api_key' };
-                return;
-            }
-
-            // Protect LiteRT Context
-            if (llmConfig.provider === 'litert' || llmConfig.engine === 'litert') {
-                logger.log('warn', '[ActionExecutor] Skipping context summarization to protect active LiteRT KV cache.');
-                action.result = { success: false, reason: 'litert_active' };
-                return;
-            }
-
-            const modelHistory = applyContextSummary(messages, threadId);
-            const result = await summarizeForModel(modelHistory, llmConfig, action.data.threshold, apiKey || undefined);
-            if (!result) {
-                action.result = { success: false, reason: 'nothing_summarized' };
-                return;
-            }
-
-            // The covered messages must still be in the conversation (it may have been cleared meanwhile)
-            const stillCovered = (): boolean => {
-                try {
-                    const current: { id?: string }[] = JSON.parse(localStorage.getItem(CHAT_HISTORY_KEY) || '[]');
-                    return Array.isArray(current) && current.some(m => m?.id === result.coversUpToId);
-                } catch {
-                    return false;
-                }
-            };
-            if (getActiveThreadId() !== threadId || !stillCovered()) {
-                logger.log('info', '[ActionExecutor] Chat changed during summarization, result discarded');
-                action.result = { success: false, reason: 'history_changed' };
-                return;
-            }
-            saveContextSummary({ threadId, summary: result.summary, coversUpToId: result.coversUpToId, createdAt: Date.now() });
-
-            logger.log('info', `[ActionExecutor] Context summarization complete`, {
-                modelHistory: modelHistory.length,
-                summarized: result.summarizedCount
-            });
-
-            action.result = {
-                success: true,
-                originalCount: modelHistory.length,
-                newCount: modelHistory.length - result.summarizedCount + 1,
-                messagesSaved: result.summarizedCount - 1
-            };
+            action.result = await this.summarizeContext(action);
         }
+    }
+
+    /**
+     * Summarizes the older part of the active thread for the model. The summary only shortens
+     * what the model receives: the conversation (chat-history and the saved thread) is never rewritten.
+     */
+    private async summarizeContext(action: ProactiveAction): Promise<Record<string, unknown>> {
+        logger.log('info', `[ActionExecutor] Starting context summarization (usage: ${Math.round(action.data.currentUsage * 100)}%, count: ${action.data.messageCount})`);
+
+        const { summarizeForModel } = await import('../llm/contextSummarization');
+        const { applyContextSummary, saveContextSummary } = await import('../llm/contextSummaryStore');
+        const { runBackgroundTask } = await import('../llm/background/backgroundLlm');
+
+        const threadId = getActiveThreadId();
+        const historyItem = localStorage.getItem(CHAT_HISTORY_KEY);
+        if (!historyItem || !threadId) {
+            logger.log('warn', '[ActionExecutor] No chat history found');
+            return { success: false, reason: 'no_history' };
+        }
+
+        const messages: any[] = JSON.parse(historyItem, (_key, value) => {
+            if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(value)) {
+                return new Date(value);
+            }
+            return value;
+        });
+
+        // Any provider, with its own key; an on-device model only when loaded and the chat is quiet
+        let skipped: string | undefined;
+        const generate = async (prompt: string) => {
+            const outcome = await runBackgroundTask({ label: 'context-summary', prompt, systemPrompt: CONTEXT_SUMMARY_SYSTEM });
+            skipped = outcome.skipped;
+            return outcome.text;
+        };
+
+        const modelHistory = applyContextSummary(messages, threadId);
+        const result = await summarizeForModel(modelHistory, action.data.threshold, generate);
+        if (!result) {
+            return { success: false, reason: skipped ?? 'nothing_summarized' };
+        }
+
+        // The covered messages must still be in the conversation (it may have been cleared meanwhile)
+        const stillCovered = (): boolean => {
+            try {
+                const current: { id?: string }[] = JSON.parse(localStorage.getItem(CHAT_HISTORY_KEY) || '[]');
+                return Array.isArray(current) && current.some(m => m?.id === result.coversUpToId);
+            } catch {
+                return false;
+            }
+        };
+        if (getActiveThreadId() !== threadId || !stillCovered()) {
+            logger.log('info', '[ActionExecutor] Chat changed during summarization, result discarded');
+            return { success: false, reason: 'history_changed' };
+        }
+        saveContextSummary({ threadId, summary: result.summary, coversUpToId: result.coversUpToId, createdAt: Date.now() });
+
+        logger.log('info', `[ActionExecutor] Context summarization complete`, {
+            modelHistory: modelHistory.length,
+            summarized: result.summarizedCount
+        });
+
+        return {
+            success: true,
+            originalCount: modelHistory.length,
+            newCount: modelHistory.length - result.summarizedCount + 1,
+            messagesSaved: result.summarizedCount - 1
+        };
     }
 
     private notifyHandlers(type: string, action: ProactiveAction) {

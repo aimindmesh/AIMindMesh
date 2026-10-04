@@ -238,6 +238,11 @@ export class WhisperSTTService {
         return this.currentModelId;
     }
 
+    /** Threads whisper.cpp should use on this device (known once a model has loaded). */
+    public getRecommendedThreads(): number {
+        return this.recommendedThreads ?? 4;
+    }
+
     /**
      * Get device optimization information.
      * Returns SoC detection, recommended threads, and model.
@@ -509,7 +514,7 @@ export class WhisperSTTService {
         const segmentListener = await Whisper.addListener(
             'transcriptionSegment',
             (data: WhisperStreamingSegment) => {
-                logger.log('debug', `Segment ${data.segmentIndex}: ${data.text}`);
+                logger.log('debug', `Segment ${data.segmentIndex}: ${data.text.length} chars`);
                 onSegment(data);
             }
         );

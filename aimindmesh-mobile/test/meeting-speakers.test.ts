@@ -3,10 +3,8 @@ import { describe, expect, it, vi } from 'vitest';
 vi.mock('../src/services/logger', () => ({ logger: { log: vi.fn() } }));
 
 import { alignClusterLabels } from '../src/services/speaker/labelAlignment';
-import { assignSpeakersByTime } from '../src/services/speaker/segmentAssignment';
 import { AhcStrategy } from '../src/services/speaker/clustering/AhcStrategy';
 import { SpeakerEmbedding } from '../src/services/speaker/speakerEmbedding';
-import { TranscriptSegment } from '../src/types/meeting';
 
 const unit = (angle: number) => [Math.cos(angle), Math.sin(angle)];
 
@@ -26,26 +24,6 @@ describe('cluster label alignment', () => {
     const labels = alignClusterLabels([{ previous: 0, cluster: 0 }, { previous: 0, cluster: 1 }], 5);
     expect(labels.get(0)).toBe(0);
     expect(labels.get(1)).toBe(5);
-  });
-});
-
-describe('segment assignment by time', () => {
-  it('uses the windows overlapping each segment (positions in the recording)', () => {
-    const seg = (id: string, start?: number, end?: number): TranscriptSegment =>
-      ({ id, speakerId: 9, text: id, timestamp: 1_700_000_000_000, start_ms: start, end_ms: end });
-    const windows = [
-      { startMs: 0, endMs: 2500, embedding: unit(0) },
-      { startMs: 3000, endMs: 5500, embedding: unit(Math.PI / 2) }
-    ];
-    const nearest = (e: number[], centroids: number[][]) =>
-      centroids.reduce((best, c, i) => (e[0] * c[0] + e[1] * c[1] > e[0] * centroids[best][0] + e[1] * centroids[best][1] ? i : best), 0);
-    const result = assignSpeakersByTime(
-      [seg('a', 0, 2000), seg('b', 3500, 5000), seg('c', 9000, 9500), seg('d')],
-      windows,
-      [unit(0), unit(Math.PI / 2)],
-      nearest
-    );
-    expect(result.map(s => s.speakerId)).toEqual([0, 1, 1, 9]);
   });
 });
 

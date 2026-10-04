@@ -5,6 +5,7 @@
  */
 
 import { logger } from '../logger';
+import { stems } from './context/memoryContext';
 import { initMemoryDatabase, getMemoryDatabase } from '../memory/memoryDatabase';
 import { blobToFloat32Array, cosineSimilarity } from './embeddingCodec';
 
@@ -411,31 +412,11 @@ export class MemoryGraphService {
     }
 
     /**
-     * Simple keyword extraction
+     * Keyword stems shared by two memories: Unicode words (accented Italian included), Italian
+     * and English stopwords removed (same stems as the fact matching of memoryContext)
      */
     private extractKeywords(text: string): string[] {
-        const stopwords = new Set([
-            'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
-            'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
-            'would', 'could', 'should', 'may', 'might', 'must', 'to',
-            'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as',
-            'into', 'through', 'during', 'before', 'after', 'above',
-            'below', 'between', 'under', 'again', 'further', 'then',
-            'once', 'i', 'me', 'my', 'myself', 'we', 'our', 'you', 'your',
-            'he', 'him', 'she', 'her', 'it', 'they', 'them', 'what',
-            'which', 'who', 'when', 'where', 'why', 'how', 'all', 'each',
-            'both', 'few', 'more', 'most', 'other', 'some', 'such', 'no',
-            'nor', 'not', 'only', 'same', 'so', 'than', 'too', 'very',
-            'just', 'can', 'and', 'but', 'or', 'if', 'because', 'until',
-            'while', 'about', 'this', 'that', 'these', 'those'
-        ]);
-
-        return text
-            .toLowerCase()
-            .replace(/[^\w\s]/g, ' ')
-            .split(/\s+/)
-            .filter(word => word.length > 3 && !stopwords.has(word))
-            .slice(0, 20);
+        return [...stems(text)].slice(0, 20);
     }
 
     /**

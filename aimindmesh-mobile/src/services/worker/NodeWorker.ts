@@ -6,6 +6,8 @@ import { generateTextResponseStream } from '../llm/llmService';
 import { App } from '@capacitor/app';
 import { saveNativeKvCache } from '../llm/nativeLLM';
 import { saveLiteRTKvCache } from '../llm/providers/liteRT/plugin';
+import { asBackgroundTask, asInternalTask } from '../llm/background/taskFlags';
+import { runExclusiveBackground } from '../llm/background/llmArbiter';
 
 /** Reconnect delay after a closed link: doubles up to the maximum, reset once connected */
 export const RECONNECT_MIN_MS = 2_000;
@@ -17,6 +19,8 @@ const connectionKey = (s: AIMindMeshServerSettings) => `${s.serverUrl}|${s.apiKe
 class MobileNodeWorker {
     private ws: WebSocket | null = null;
     private serverSettings: AIMindMeshServerSettings | null = null;
+    /** Settings of the last init(), kept by stop(): a server push can wake the worker */
+    private lastSettings: AIMindMeshServerSettings | null = null;
     private connectedKey = '';
     private llmConfig: LLMConfig | null = null;
     private personality: Personality | null = null;
@@ -56,6 +60,7 @@ class MobileNodeWorker {
             this.reconnectDelayMs = RECONNECT_MIN_MS;
         }
         this.serverSettings = settings;
+        this.lastSettings = settings;
         this.connectedKey = key;
 
         // Survival logging: verify if worker is alive and logging is working
@@ -110,6 +115,91 @@ class MobileNodeWorker {
         this.appStateListener?.then(handle => handle.remove()).catch(() => { });
         this.appStateListener = null;
         this.closeSocket();
+    }
+
+    /**
+     * WAKE_FOR_INFERENCE push: the server has a task for this device. Reconnects with the last
+     * settings even after stop() (e.g. the heartbeat gave up while Doze cut the network).
+     */
+    public wake() {
+        if (this.serverSettings) {
+            void this.connect();
+        } else if (this.lastSettings?.enabled && this.lastSettings.participateAsWorker) {
+            logger.log('info', '[NodeWorker] Woken by the server: reconnecting');
+            this.init(this.lastSettings);
+        }
+    }
+
+    private send(message: Record<string, unknown>) {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(message));
+    }
+
+    /**
+     * Runs a mesh task as a background generation: it never interrupts the owner's chat (the
+     * chat interrupts it, and the server gets an error to route it elsewhere), and it gets no
+     * memories or documents of the owner (internal task: only the persona's instructions).
+     */
+    private async runTask(taskId: string, payload: { prompt?: string; options?: { searchEnabled?: boolean; thinking?: boolean } }) {
+        logger.log('info', `[NodeWorker] STARTING task ${taskId}. Payload: ${JSON.stringify(payload).substring(0, 50)}...`);
+        const start = Date.now();
+        const activeLlmConfig = this.llmConfig || ({ provider: 'native-gguf', nThreads: 6 } as LLMConfig);
+        const workerConfig = asBackgroundTask(asInternalTask({
+            ...activeLlmConfig,
+            enableSearch: payload.options?.searchEnabled || false,
+            enableToolCalling: false,
+            enableThinking: payload.options?.thinking || false,
+            enableSemanticMemory: false,
+        } as LLMConfig));
+        const persona: Personality = { name: this.personality?.name || 'Assistant', description: '', systemPrompt: this.personality?.systemPrompt || '', traits: [] };
+
+        this.updateStatus(true);
+        let preempted = false;
+        try {
+            const ran = await runExclusiveBackground(`mesh task ${taskId}`, async (arbiterSignal) => {
+                // Aborted by the server (ABORT_TASK) or by the owner's chat (arbiter)
+                const abort = new AbortController();
+                this.activeTaskAbort = abort;
+                arbiterSignal.addEventListener('abort', () => { preempted = true; abort.abort(); }, { once: true });
+                logger.log('info', `[NodeWorker] Executing with provider=${workerConfig.provider}, model=${workerConfig.nativeModelPath || workerConfig.liteRTModelPath || 'default'}`);
+
+                let fullResponse = '';
+                const stream = generateTextResponseStream(
+                    [{ role: 'user', text: payload.prompt || '', id: 'task', timestamp: new Date() }],
+                    persona, workerConfig, undefined, abort.signal
+                );
+                for await (const chunk of stream) {
+                    if (abort.signal.aborted) break;
+                    if (typeof chunk === 'string') {
+                        fullResponse += chunk;
+                        this.send({ type: 'token', id: taskId, token: chunk });
+                    } else if (chunk.type === 'text') {
+                        fullResponse += chunk.content;
+                        this.send({ type: 'token', id: taskId, token: chunk.content });
+                    } else if (chunk.type === 'thinking') {
+                        this.send({ type: 'thinking', id: taskId, content: chunk.content });
+                    }
+                }
+                return abort.signal.aborted ? null : fullResponse;
+            }, workerConfig.provider);
+
+            if (preempted || ran === null) {
+                // Busy with (or interrupted by) the owner's chat: the server routes the task elsewhere
+                this.send({ type: 'result', id: taskId, error: 'WORKER_BUSY: the device is answering its owner', durationMs: Date.now() - start });
+                return;
+            }
+            logger.log('info', `[NodeWorker] Task ${taskId} completed in ${Date.now() - start}ms. Sending final result.`);
+            this.send({ type: 'result', id: taskId, reply: ran, durationMs: Date.now() - start, node: this.serverSettings?.deviceName || 'Mobile Node' });
+        } catch (taskError: any) {
+            if (this.activeTaskAbort?.signal.aborted && !preempted) {
+                logger.log('info', `[NodeWorker] Task ${taskId} cleanup after abort`);
+            } else {
+                logger.log('error', `[NodeWorker] Task ${taskId} execution failed: ${taskError?.message}`, taskError);
+                this.send({ type: 'result', id: taskId, error: `WORKER_EXECUTION_FAILED: ${taskError?.message || 'Unknown error'}`, durationMs: Date.now() - start });
+            }
+        } finally {
+            this.activeTaskAbort = null;
+            this.updateStatus(false);
+        }
     }
 
     /** Closes the current socket without triggering its reconnect */
@@ -176,112 +266,7 @@ class MobileNodeWorker {
                     logger.log('debug', `[NodeWorker] Parsed message type: ${data.type}`);
                     
                     if (data.type === 'task' && data.id) {
-                        logger.log('info', `[NodeWorker] STARTING task ${data.id}. Payload: ${JSON.stringify(data.payload).substring(0, 50)}...`);
-                        this.updateStatus(true);
-                        
-                        const taskId = data.id;
-                        const start = Date.now();
-                        
-                        // Create abort controller for this specific task
-                        this.activeTaskAbort = new AbortController();
-
-                        try {
-                            const prompt = data.payload?.prompt || '';
-                            
-                            let fullResponse = '';
-                            let chunkCount = 0;
-
-                            const activeLlmConfig = this.llmConfig || {
-                                provider: 'native-gguf',
-                                type: 'gguf',
-                                maxTokens: 1024,
-                                temperature: 0.7,
-                                top_k: 40,
-                                top_p: 0.9,
-                                nThreads: 6
-                            };
-
-                            const workerConfig = {
-                                ...activeLlmConfig,
-                                enableSearch: data.payload.options?.searchEnabled || false,
-                                enableToolCalling: false,
-                                enableThinking: data.payload.options?.thinking || false,
-                                serverSideAgenticEnabled: false,
-                            } as any;
-
-                            logger.log('info', `[NodeWorker] Executing with provider=${workerConfig.provider}, model=${workerConfig.nativeModelPath || workerConfig.liteRTModelPath || 'default'}`);
-
-                            // Execute using local LLM engine stream with abort signal
-                            const stream = generateTextResponseStream(
-                                [{ role: 'user', text: prompt, id: 'task', timestamp: new Date() } as any],
-                                (this.personality || {}) as any,
-                                workerConfig,
-                                [],
-                                undefined,
-                                this.activeTaskAbort.signal
-                            );
-
-                            for await (const chunk of stream) {
-                                if (this.activeTaskAbort?.signal.aborted) {
-                                    console.log(`[NodeWorker] Task ${taskId} aborted locally during stream`);
-                                    break;
-                                }
-
-                                if (typeof chunk === 'string') {
-                                    fullResponse += chunk;
-                                    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                                        this.ws.send(JSON.stringify({ type: 'token', id: taskId, token: chunk }));
-                                    }
-                                } else if (chunk.type === 'text') {
-                                    fullResponse += chunk.content;
-                                    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                                        this.ws.send(JSON.stringify({ type: 'token', id: taskId, token: chunk.content }));
-                                    }
-                                } else if (chunk.type === 'thinking') {
-                                    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                                        this.ws.send(JSON.stringify({ type: 'thinking', id: taskId, content: chunk.content }));
-                                    }
-                                }
-
-                                chunkCount++;
-                                if (chunkCount % 20 === 0) {
-                                    console.log(`[NodeWorker] Generated ${chunkCount} tokens for ${taskId}...`);
-                                }
-                            }
-
-                            if (!this.activeTaskAbort?.signal.aborted && this.ws && this.ws.readyState === WebSocket.OPEN) {
-                                console.log(`[NodeWorker] Task ${taskId} completed in ${Date.now() - start}ms. Sending final result.`);
-                                this.ws.send(JSON.stringify({
-                                    type: 'result',
-                                    id: taskId,
-                                    reply: fullResponse,
-                                    durationMs: Date.now() - start,
-                                    node: this.serverSettings?.deviceName || 'Mobile Node'
-                                }));
-
-                                // Persist KV cache after each task so context survives between remote requests
-                                this.flushCache().catch(e =>
-                                    logger.log('warn', '[NodeWorker] Failed to persist KV cache after task:', e)
-                                );
-                            }
-                        } catch (taskError: any) {
-                            if (this.activeTaskAbort?.signal.aborted) {
-                                logger.log('info', `[NodeWorker] Task ${taskId} cleanup after abort`);
-                            } else {
-                                logger.log('error', `[NodeWorker] Task ${taskId} execution failed: ${taskError?.message}`, taskError);
-                                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                                    this.ws.send(JSON.stringify({
-                                        type: 'result',
-                                        id: taskId,
-                                        error: `WORKER_EXECUTION_FAILED: ${taskError?.message || 'Unknown error'}`,
-                                        durationMs: Date.now() - start
-                                    }));
-                                }
-                            }
-                        } finally {
-                            this.activeTaskAbort = null;
-                            this.updateStatus(false);
-                        }
+                        await this.runTask(data.id, data.payload || {});
                     } else if (data.type === 'ABORT_TASK' && data.id) {
                         logger.log('warn', `[NodeWorker] Received ABORT_TASK for ${data.id}`);
                         if (this.activeTaskAbort) {

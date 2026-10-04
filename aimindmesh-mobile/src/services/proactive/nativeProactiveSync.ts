@@ -3,6 +3,7 @@ import { Capacitor } from '@capacitor/core';
 import { ProactiveSettings } from '../../types';
 import { logger } from '../logger';
 import ProactivePlugin from './ProactivePlugin';
+import { proactiveNotificationService } from './ProactiveNotificationService';
 
 /** `enabled` last handed to the native job (undefined: not yet in this app run) */
 let lastSyncedEnabled: boolean | undefined;
@@ -14,6 +15,10 @@ let lastSyncedEnabled: boolean | undefined;
  */
 export async function syncNativeProactiveSettings(settings: ProactiveSettings): Promise<void> {
     if (!Capacitor.isNativePlatform()) return;
+    // Android channels keep their sound/vibration: new settings get their own channel
+    await Promise.resolve()
+        .then(() => proactiveNotificationService.updateSettings(settings))
+        .catch(e => logger.log('warn', '[NativeProactiveSync] Notification channel update failed', e));
     try {
         await ProactivePlugin.updateSettings({ settings: JSON.stringify(settings) });
         const enabled = settings.enabled !== false;

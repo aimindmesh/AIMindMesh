@@ -64,7 +64,7 @@ class QnnNativeBridge(private val context: Context) {
         }
     }
 
-    private external fun nativeInit(modelDirPath: String, nativeLibDir: String): Boolean
+    private external fun nativeInit(modelDirPath: String, nativeLibDir: String, htpArch: String): Boolean
     private external fun nativeIsReady(): Boolean
     private external fun nativeModelInfo(): String
     private external fun nativeRunTextEncoder(tokens: IntArray): FloatArray?
@@ -76,8 +76,8 @@ class QnnNativeBridge(private val context: Context) {
     private external fun nativeHasSuperResolution(): Boolean
     private external fun nativeRelease()
 
-    /** Loads the context binaries of a package directory onto the NPU. */
-    fun initializeFromDirectory(dir: File): Boolean {
+    /** Loads the context binaries of a package directory onto the NPU ([htpArch]: "v73", "v79"..., null if unknown). */
+    fun initializeFromDirectory(dir: File, htpArch: String?): Boolean {
         try {
             com.geniex.sdk.GenieXSdk.getInstance().init(
                 context,
@@ -105,7 +105,7 @@ class QnnNativeBridge(private val context: Context) {
 
         if (!isJniLoaded) return false
         return try {
-            val ready = nativeInit(dir.absolutePath, context.applicationInfo.nativeLibraryDir ?: "")
+            val ready = nativeInit(dir.absolutePath, context.applicationInfo.nativeLibraryDir ?: "", htpArch ?: "")
             Log.i(TAG, "nativeInit returned $ready")
             ready
         } catch (e: Throwable) {

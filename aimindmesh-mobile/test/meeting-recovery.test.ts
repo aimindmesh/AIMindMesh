@@ -19,6 +19,15 @@ const db = vi.hoisted(() => ({
   run: vi.fn(async (_sql: string, _values?: any[]) => ({}))
 }));
 
+const recorder = vi.hoisted(() => ({
+  listRecoverable: vi.fn(async () => ({ sessions: [] as any[] })),
+  finalizeRecording: vi.fn(async (o: { sessionId: string; targetMeetingId?: string }) => ({
+    meetingId: o.targetMeetingId ?? 'm-native', audioPath: '/files/meeting-audio/x.audio', mimeType: 'audio/mp4',
+    durationMs: 90_000, startedAt: 1_700_000_000_000, bookmarks: [12_000]
+  })),
+  discard: vi.fn(async () => { })
+}));
+vi.mock('../src/services/audio/meetingRecorder', () => ({ MeetingRecorder: recorder, RECORDER_SAMPLE_RATE: 16000 }));
 vi.mock('../src/services/logger', () => ({ logger: { log: vi.fn() } }));
 vi.mock('@capacitor/core', () => ({
   Capacitor: { convertFileSrc: (p: string) => p, getPlatform: () => 'android', isNativePlatform: () => true },
@@ -39,7 +48,7 @@ vi.mock('../src/services/database/DatabaseManager', () => ({
   }
 }));
 
-import { describeRecoveredRecording, recoverInterruptedRecordings } from '../src/services/meeting/recordingRecovery';
+import { describeRecoveredRecording, recoverInterruptedRecordings, recoverInterruptedRecordingsDetailed } from '../src/services/meeting/recordingRecovery';
 
 const orphan = (meetingId: string, durationMs = 720000) => ({
   path: `/data/user/0/app/files/meeting-pcm/rec_1000_${meetingId || 'none'}_16000_1.pcm`,
@@ -118,5 +127,37 @@ describe('recovery of interrupted recordings', () => {
     const expectedTime = new Date(1_700_000_000_000 + 720000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
     expect(text).toBe(`Recording interrupted at ${expectedTime} recovered (12 min)`);
     expect(describeRecoveredRecording({ meetingId: 'm', startedAt: 0, durationMs: 42000, created: true }, 'en-GB')).toMatch(/\(42 s\)$/);
+  });
+});
+
+describe('recovery of native recorder sessions', () => {
+  const session = (meetingId: string, durationMs = 90_000) => ({ sessionId: `rec_${meetingId}`, meetingId, startedAt: 1_700_000_000_000, durationMs, bookmarks: [12_000] });
+
+  it('finalizes the session into its meeting, with the moments marked', async () => {
+    existingMeetings.add('m-native');
+    recorder.listRecoverable.mockResolvedValueOnce({ sessions: [session('m-native')] });
+    const { recovered, failed } = await recoverInterruptedRecordingsDetailed();
+    expect(recorder.finalizeRecording).toHaveBeenCalledWith({ sessionId: 'rec_m-native', targetMeetingId: undefined });
+    expect(recovered).toEqual([expect.objectContaining({ meetingId: 'm-native', created: false })]);
+    expect(failed).toEqual([]);
+    const marks = db.run.mock.calls.find(([sql]) => String(sql).startsWith('UPDATE meetings SET bookmarks_json'));
+    expect(JSON.parse(marks![1]![0])).toEqual([{ id: 'bm_12000', ms: 12000 }]);
+  });
+
+  it('gives the audio of a deleted meeting to a new one', async () => {
+    tombstones.add('m-gone');
+    recorder.listRecoverable.mockResolvedValueOnce({ sessions: [session('m-gone')] });
+    const { recovered } = await recoverInterruptedRecordingsDetailed();
+    expect(recorder.finalizeRecording).toHaveBeenCalledWith({ sessionId: 'rec_m-gone', targetMeetingId: 'recovered_1700000000000' });
+    expect(recovered[0].meetingId).toBe('recovered_1700000000000');
+  });
+
+  it('discards sessions too short to hold anything, and reports the ones that fail', async () => {
+    recorder.listRecoverable.mockResolvedValueOnce({ sessions: [session('m-short', 300), session('m-bad')] });
+    recorder.finalizeRecording.mockRejectedValueOnce(new Error('disk full'));
+    const { recovered, failed } = await recoverInterruptedRecordingsDetailed();
+    expect(recorder.discard).toHaveBeenCalledWith({ sessionId: 'rec_m-short' });
+    expect(recovered).toEqual([]);
+    expect(failed.map(f => f.sessionId)).toEqual(['rec_m-bad']);
   });
 });

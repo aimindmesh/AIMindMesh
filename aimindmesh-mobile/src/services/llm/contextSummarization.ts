@@ -1,6 +1,5 @@
-import { Message, LLMConfig } from '../../types';
+import { Message } from '../../types';
 import { logger } from '../logger';
-import { generateMemorySummary } from './llmService';
 import { getMessagesToSummarize } from './contextMonitor';
 
 /**
@@ -35,15 +34,13 @@ Keep the summary brief but comprehensive (2-4 paragraphs maximum).`;
  * or null when there is nothing to summarize or the model returned nothing.
  *
  * @param messages Model history (already with the thread's current summary applied)
- * @param llmConfig LLM Configuration
  * @param threshold Summarization threshold
- * @param apiKey Optional API key for cloud providers
+ * @param generate Runs the prompt (a background task: it may return null when the model is busy)
  */
 export async function summarizeForModel(
     messages: Message[],
-    llmConfig: LLMConfig,
     threshold: number,
-    apiKey?: string
+    generate: (prompt: string) => Promise<string | null>
 ): Promise<{ summary: string; coversUpToId: string; summarizedCount: number } | null> {
     try {
         logger.log('info', '[ContextSummarization] Starting summarization', {
@@ -60,7 +57,7 @@ export async function summarizeForModel(
         const keptIds = new Set(toKeep.map(m => m.id));
         const earlierSummaries = messages.filter(m => isSummaryMessage(m) && !keptIds.has(m.id));
 
-        const summary = await generateMemorySummary(createSummarizationPrompt(earlierSummaries, toSummarize), llmConfig, apiKey);
+        const summary = await generate(createSummarizationPrompt(earlierSummaries, toSummarize));
         if (!summary || summary.trim().length === 0) {
             logger.log('error', '[ContextSummarization] Failed to generate summary');
             return null;

@@ -77,6 +77,35 @@ describe('sync push', () => {
   });
 });
 
+describe('meeting notes', () => {
+  const notes = {
+    title: 'Budget review',
+    bookmarks_json: '[{"id":"bm_1","ms":1000}]',
+    analysis_json: '{"title":"Budget","summary":"s"}',
+    questions_json: null,
+  };
+
+  it('travel with the meeting to the other devices', async () => {
+    await SyncManager.handlePush({ deviceId: 'A', timestamp: 1, meetings: [{ ...meeting, ...notes }] });
+    const [pulled] = (await SyncManager.handlePull('B', 0)).meetings!;
+    expect(pulled).toMatchObject(notes);
+  });
+
+  it('are kept when an app version without notes pushes the meeting', async () => {
+    await SyncManager.handlePush({ deviceId: 'A', timestamp: 1, meetings: [{ ...meeting, ...notes }] });
+    await SyncManager.handlePush({ deviceId: 'B', timestamp: 2, meetings: [{ ...meeting, duration: 75 }] });
+    expect(db.prepare(`SELECT duration, title, bookmarks_json FROM meetings WHERE id = 'm1'`).get())
+      .toEqual({ duration: 75, title: 'Budget review', bookmarks_json: notes.bookmarks_json });
+  });
+
+  it('are cleared when a device sends them empty, and ignored when malformed', async () => {
+    await SyncManager.handlePush({ deviceId: 'A', timestamp: 1, meetings: [{ ...meeting, ...notes }] });
+    await SyncManager.handlePush({ deviceId: 'A', timestamp: 2, meetings: [{ ...meeting, title: null, analysis_json: 42 }] });
+    expect(db.prepare(`SELECT title, analysis_json FROM meetings WHERE id = 'm1'`).get())
+      .toEqual({ title: null, analysis_json: notes.analysis_json });
+  });
+});
+
 describe('sync pull', () => {
   it('uses the server clock as cursor and returns conversation titles', async () => {
     vi.useFakeTimers({ now: 1_000_000, toFake: ['Date'] });

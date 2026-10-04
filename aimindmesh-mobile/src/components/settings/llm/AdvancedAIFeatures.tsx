@@ -1,5 +1,6 @@
 import React from 'react';
 import { LLMConfig, AIMindMeshServerSettings } from '../../../types';
+import ContextWindowSetting from './ContextWindowSetting';
 
 interface AdvancedAIFeaturesProps {
     llmConfig: LLMConfig;
@@ -51,37 +52,26 @@ const AdvancedAIFeatures: React.FC<AdvancedAIFeaturesProps> = ({ llmConfig, onLl
                 </div>
             )}
 
-            {/* Context Window - Unified for LiteRT and GGUF */}
-            {(llmConfig.provider === 'litert' || llmConfig.provider === 'native-gguf') && (
-                <div className="pt-2 border-t border-white/5 space-y-2">
-                    <div className="flex justify-between items-center">
-                        <label className="text-sm font-medium text-textPrimary">📐 Context Window</label>
-                        <span className="text-sm font-bold text-primary">
-                            {llmConfig.nCtx || llmConfig.contextSize || 4096}
-                        </span>
-                    </div>
-                    <input
-                        type="range"
-                        min="512"
-                        max="32768"
-                        step="512"
-                        value={llmConfig.nCtx || llmConfig.contextSize || 4096}
-                        onChange={(e) => {
-                            const val = parseInt(e.target.value);
-                            onLlmConfigSave({ 
-                                ...llmConfig, 
-                                nCtx: val,
-                                contextSize: val // Keep both in sync for compatibility
-                            });
-                        }}
-                        className="w-full h-2 bg-white/10 rounded-lg appearance-none cursor-pointer accent-primary"
-                    />
-                    <div className="flex justify-between text-[10px] text-textSecondary">
-                        <span>512</span>
-                        <span>32k</span>
-                    </div>
-                    <p className="text-[10px] text-textSecondary/60">Larger context allows for longer conversations but uses more RAM.</p>
+            {/* Language of the answers */}
+            <div className="flex items-center justify-between">
+                <div>
+                    <p className="text-sm font-medium text-textPrimary">Assistant language</p>
+                    <p className="text-xs text-textSecondary">Auto follows the language you write in.</p>
                 </div>
+                <select
+                    value={llmConfig.assistantLanguage || 'auto'}
+                    onChange={(e) => onLlmConfigSave({ ...llmConfig, assistantLanguage: e.target.value as LLMConfig['assistantLanguage'] })}
+                    className="bg-input text-textPrimary text-sm rounded-lg border border-white/10 px-2 py-1"
+                >
+                    <option value="auto">Auto</option>
+                    <option value="it">Italiano</option>
+                    <option value="en">English</option>
+                </select>
+            </div>
+
+            {/* Context window of the on-device engines */}
+            {(llmConfig.provider === 'litert' || llmConfig.provider === 'native-gguf' || llmConfig.provider === 'genie-npu') && (
+                <ContextWindowSetting llmConfig={llmConfig} onLlmConfigSave={onLlmConfigSave} />
             )}
 
             {/* Enable Search Toggle - Gemini, Perplexity or Server integration */}

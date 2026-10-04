@@ -45,13 +45,17 @@ export interface VoskPlugin {
     /**
      * Start continuous speech recognition
      * Results will be delivered through event listeners
+     * @param options.externalAudio Don't open the microphone: recognize the audio pushed by the
+     *   app's MeetingRecorder. Result timestamps are then relative to the start of that recording.
+     *   While it runs, microphone sessions and model changes are rejected with code MEETING_RECORDING.
      */
-    startRecognition(): Promise<void>;
+    startRecognition(options?: { externalAudio?: boolean }): Promise<void>;
 
     /**
-     * Stop speech recognition
+     * Stop speech recognition: the microphone session, or with externalAudio the meeting's
+     * (its last utterance is flushed first)
      */
-    stopRecognition(): Promise<void>;
+    stopRecognition(options?: { externalAudio?: boolean }): Promise<void>;
 
     /**
      * Check if a model is currently loaded
@@ -148,4 +152,6 @@ export interface FinalResultEvent {
     startMs?: number;
     /** Utterance end in ms from the start of recognition/processing (0 when unknown) */
     endMs?: number;
+    /** Live recognition that produced it: the microphone, or the meeting recorder's audio */
+    source?: 'mic' | 'external';
 }

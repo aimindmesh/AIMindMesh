@@ -10,13 +10,14 @@ import { SavedMeeting, TranscriptSegment, WordTimestamp } from '../../types/meet
 import { DBMeeting, DBMeetingSegment, MeetingDatabase } from '../database/meetingDatabase';
 import { audioExtensionForMime, guessAudioMimeType, toDataRelativePath, toNativePath } from './audioPaths';
 import { isMeetingDeleted, MeetingDeletedError } from './meetingDeletions';
+import { notesFromRow, notesToRow } from './meetingNotes';
 
 const STORAGE_KEY = 'saved-meetings';
 const AUDIO_DIR = 'meeting-audio';
 const EXPORT_DIR = 'meeting-exports';
 
-// Helper to convert DB models to frontend types
-function mapDBMeetingToSavedMeeting(dbMeeting: DBMeeting, segments: DBMeetingSegment[]): SavedMeeting {
+/** A stored meeting with its transcript and notes, as the screens use it. */
+export function mapDBMeetingToSavedMeeting(dbMeeting: DBMeeting, segments: DBMeetingSegment[]): SavedMeeting {
     let speakerNames = {};
     try {
         if (dbMeeting.speaker_names_json) {
@@ -57,7 +58,8 @@ function mapDBMeetingToSavedMeeting(dbMeeting: DBMeeting, segments: DBMeetingSeg
         speakerNames,
         duration: dbMeeting.duration,
         hasAudio: dbMeeting.has_audio,
-        audioMimeType: dbMeeting.audio_mime_type || undefined
+        audioMimeType: dbMeeting.audio_mime_type || undefined,
+        ...notesFromRow(dbMeeting)
     };
 }
 
@@ -83,7 +85,7 @@ export function toDBSegments(meetingId: string, transcript: TranscriptSegment[])
 /**
  * Get the audio file path for a meeting
  */
-function getAudioPath(meetingId: string): string {
+export function getAudioPath(meetingId: string): string {
     return `${AUDIO_DIR}/${meetingId}.audio`;
 }
 
@@ -228,6 +230,7 @@ export interface MeetingAudioInput {
 /**
  * Save or update a meeting. Audio fields are only ever added, so saving the transcript alone keeps
  * the stored audio; meetings are never deleted implicitly (the old 50-meeting cap did that).
+ * Notes fields left undefined are not written: the stored ones stay.
  */
 export async function saveMeeting(
     meeting: Omit<SavedMeeting, 'id'> & { id?: string },
@@ -269,7 +272,8 @@ export async function saveMeeting(
         has_audio: hasAudio,
         audio_file_path: audioPath,
         audio_mime_type: mimeType,
-        speaker_names_json: JSON.stringify(meeting.speakerNames || {})
+        speaker_names_json: JSON.stringify(meeting.speakerNames || {}),
+        ...notesToRow(meeting)
     };
 
     try {
@@ -279,7 +283,51 @@ export async function saveMeeting(
         logger.log('error', 'Failed to save meeting', dbError);
         throw dbError;
     }
-    return { ...mapDBMeetingToSavedMeeting(dbMeeting, dbSegments), audioFilePath: storedFilePath };
+    return {
+        ...mapDBMeetingToSavedMeeting(dbMeeting, dbSegments),
+        // Notes not given here were not written: they are not known (undefined), not empty
+        title: meeting.title,
+        bookmarks: meeting.bookmarks,
+        analysis: meeting.analysis,
+        questions: meeting.questions,
+        audioFilePath: storedFilePath
+    };
+}
+
+/**
+ * Moves meetings of the localStorage era into SQLite (those not in `knownIds`), returning them.
+ * The key is kept until the migration has been proven on this deployment cycle.
+ */
+export async function migrateLegacyMeetings(knownIds: Set<string>): Promise<SavedMeeting[]> {
+    const savedMeetingsStr = localStorage.getItem(STORAGE_KEY);
+    if (!savedMeetingsStr) return [];
+    const mdb = MeetingDatabase.getInstance();
+    const migrated: SavedMeeting[] = [];
+    const legacyMeetings: SavedMeeting[] = JSON.parse(savedMeetingsStr);
+    for (const legacy of legacyMeetings) {
+        if (knownIds.has(legacy.id)) continue;
+        logger.log('info', `Migrating legacy meeting ${legacy.id} to SQLite`);
+
+        // Ids namespaced by meeting: "seg_0" from two meetings collided on the primary key
+        const legacyTranscript = legacy.transcript.map((t, idx) => ({
+            ...t,
+            id: t.id || `${legacy.id}_seg_${idx}`
+        }));
+        const migratedSegments = toDBSegments(legacy.id, legacyTranscript);
+        const migratedDbMeeting: DBMeeting = {
+            id: legacy.id,
+            timestamp: legacy.timestamp,
+            duration: legacy.duration || 0,
+            has_audio: legacy.hasAudio,
+            audio_file_path: legacy.hasAudio ? getAudioPath(legacy.id) : null,
+            audio_mime_type: legacy.audioMimeType || null,
+            speaker_names_json: JSON.stringify(legacy.speakerNames || {})
+        };
+
+        await mdb.saveMeeting(migratedDbMeeting, migratedSegments);
+        migrated.push(mapDBMeetingToSavedMeeting(migratedDbMeeting, migratedSegments));
+    }
+    return migrated;
 }
 
 /**
@@ -295,38 +343,9 @@ export async function loadMeetingsAsync(): Promise<SavedMeeting[]> {
             mapDBMeetingToSavedMeeting(dbm, segmentsByMeeting.get(dbm.id) ?? [])
         );
 
-        // Migrate legacy localStorage meetings if any
         try {
-            const savedMeetingsStr = localStorage.getItem(STORAGE_KEY);
-            if (savedMeetingsStr) {
-                const legacyMeetings: SavedMeeting[] = JSON.parse(savedMeetingsStr);
-
-                for (const legacy of legacyMeetings) {
-                    // Only migrate if not already inserted
-                    if (result.find(m => m.id === legacy.id)) continue;
-                    logger.log('info', `Migrating legacy meeting ${legacy.id} to SQLite`);
-
-                    // Ids namespaced by meeting: "seg_0" from two meetings collided on the primary key
-                    const legacyTranscript = legacy.transcript.map((t, idx) => ({
-                        ...t,
-                        id: t.id || `${legacy.id}_seg_${idx}`
-                    }));
-                    const migratedSegments = toDBSegments(legacy.id, legacyTranscript);
-                    const migratedDbMeeting: DBMeeting = {
-                        id: legacy.id,
-                        timestamp: legacy.timestamp,
-                        duration: legacy.duration || 0,
-                        has_audio: legacy.hasAudio,
-                        audio_file_path: legacy.hasAudio ? getAudioPath(legacy.id) : null,
-                        audio_mime_type: legacy.audioMimeType || null,
-                        speaker_names_json: JSON.stringify(legacy.speakerNames || {})
-                    };
-
-                    await mdb.saveMeeting(migratedDbMeeting, migratedSegments);
-                    result.push(mapDBMeetingToSavedMeeting(migratedDbMeeting, migratedSegments));
-                }
-                // The key is kept until the migration has been proven on this deployment cycle
-            }
+            const known = new Set(result.map(m => m.id));
+            for (const migrated of await migrateLegacyMeetings(known)) result.push(migrated);
         } catch (lsError) {
             logger.log('error', 'Error migrating legacy localStorage meetings', lsError);
         }
