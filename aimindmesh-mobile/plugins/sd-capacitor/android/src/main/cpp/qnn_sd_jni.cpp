@@ -113,6 +113,11 @@ Java_com_aimindmesh_mobile_sd_QnnNativeBridge_nativeHasSuperResolution(JNIEnv*, 
     return g_engine.hasSuperResolution() ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT jboolean JNICALL
+Java_com_aimindmesh_mobile_sd_QnnNativeBridge_nativeSetBurst(JNIEnv*, jobject, jboolean on) {
+    return g_engine.isReady() && g_engine.setBurst(on == JNI_TRUE) ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT void JNICALL
 Java_com_aimindmesh_mobile_sd_QnnNativeBridge_nativeRelease(JNIEnv*, jobject) {
     g_engine.release();

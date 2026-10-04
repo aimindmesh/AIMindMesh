@@ -35,6 +35,8 @@ public:
     bool runVae(const float* latentNhwc, uint8_t* outRgb);
     bool runVaeEncoder(const uint8_t* rgb, float* outLatentNhwc);
     bool runSuperResolution(const uint8_t* rgb, uint8_t* outRgb);
+    /** NPU clocks at their maximum while generating (on) and the default DCVS policy again (off) */
+    bool setBurst(bool on);
     bool hasVaeEncoder() const { return m_isReady && m_parts[VAE_ENCODER].graph != nullptr; }
     bool hasSuperResolution() const { return m_isReady && m_parts[SUPER_RES].graph != nullptr; }
 
@@ -58,6 +60,10 @@ private:
     QnnContext_FreeFn_t m_fnContextFree = nullptr;
     QnnGraph_RetrieveFn_t m_fnGraphRetrieve = nullptr;
     QnnGraph_ExecuteFn_t m_fnGraphExecute = nullptr;
+    QnnDevice_GetInfrastructureFn_t m_fnDeviceGetInfrastructure = nullptr;
+    int m_htpArch = 0;          // 73, 79... (0: unknown)
+    uint32_t m_powerConfigId = 0;
+    bool m_burst = false;
 
     Component m_parts[PART_COUNT];
     bool m_isReady = false;
@@ -73,4 +79,5 @@ private:
     bool loadComponent(const std::string& path, Part part);
     bool configureShapes();
     bool runSingle(Part part, const void* input, float* output) const;
+    const QnnHtpDevice_PerfInfrastructure_t* perfInfrastructure() const;
 };

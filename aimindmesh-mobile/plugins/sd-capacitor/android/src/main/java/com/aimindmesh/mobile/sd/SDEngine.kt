@@ -221,6 +221,19 @@ class SDEngine(private val context: Context) {
         request: SDRequest,
         progressCallback: ((step: Int, totalSteps: Int, timePerStep: Float) -> Unit)? = null
     ): Map<String, Any> = withContext(Dispatchers.IO) { pipelineMutex.withLock {
+        // NPU clocks at their maximum only for the time of one generation
+        val burst = qnnBridge.setBurst(true)
+        try {
+            generateLocked(request, progressCallback).plus("npuBurst" to burst)
+        } finally {
+            if (burst) qnnBridge.setBurst(false)
+        }
+    } }
+
+    private fun generateLocked(
+        request: SDRequest,
+        progressCallback: ((step: Int, totalSteps: Int, timePerStep: Float) -> Unit)?
+    ): Map<String, Any> {
         if (!isLoaded() || activeModelDir == null) {
             throw IllegalStateException("No Stable Diffusion model loaded. Please import and select a model in Settings > Vision & Image Creation.")
         }
@@ -298,7 +311,7 @@ class SDEngine(private val context: Context) {
 
         val totalTime = System.currentTimeMillis() - startTime
         Log.i(TAG, "Stable Diffusion done in ${totalTime}ms (${output.width}x${output.height})")
-        mapOf(
+        return mapOf(
             "base64Image" to dataUrl,
             "generationTimeMs" to totalTime,
             "width" to output.width,
@@ -311,5 +324,5 @@ class SDEngine(private val context: Context) {
             "predictionType" to predictionType.id,
             "promptTruncated" to truncated
         )
-    } }
+    }
 }

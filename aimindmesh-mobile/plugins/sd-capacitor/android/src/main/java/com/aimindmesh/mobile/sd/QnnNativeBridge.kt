@@ -74,6 +74,7 @@ class QnnNativeBridge(private val context: Context) {
     private external fun nativeHasVaeEncoder(): Boolean
     private external fun nativeRunSuperResolution(rgb: ByteArray): ByteArray?
     private external fun nativeHasSuperResolution(): Boolean
+    private external fun nativeSetBurst(on: Boolean): Boolean
     private external fun nativeRelease()
 
     /** Loads the context binaries of a package directory onto the NPU ([htpArch]: "v73", "v79"..., null if unknown). */
@@ -147,6 +148,14 @@ class QnnNativeBridge(private val context: Context) {
     }
 
     fun hasSuperResolution(): Boolean = isReady() && nativeHasSuperResolution()
+
+    /** NPU clocks at their maximum (true) or back to the default DCVS policy (false); false if unsupported. */
+    fun setBurst(on: Boolean): Boolean = try {
+        isReady() && nativeSetBurst(on)
+    } catch (e: Throwable) {
+        Log.w(TAG, "HTP performance vote failed", e)
+        false
+    }
 
     fun release() {
         if (!isJniLoaded) return

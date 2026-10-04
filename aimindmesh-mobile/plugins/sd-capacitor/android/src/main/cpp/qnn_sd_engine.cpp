@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #define TAG "QnnSdEngineNative"
@@ -20,6 +21,7 @@ QnnSdEngine::~QnnSdEngine() {
 }
 
 void QnnSdEngine::release() {
+    if (m_burst) setBurst(false);
     for (auto& part : m_parts) {
         if (part.ctx && m_fnContextFree) {
             Qnn_ErrorHandle_t err = m_fnContextFree(part.ctx, nullptr);
@@ -38,6 +40,7 @@ void QnnSdEngine::release() {
     m_fnContextFree = nullptr;
     m_fnGraphRetrieve = nullptr;
     m_fnGraphExecute = nullptr;
+    m_fnDeviceGetInfrastructure = nullptr;
     m_system = QnnSystemReader();
 
     if (m_libHtp) {
@@ -72,6 +75,7 @@ bool QnnSdEngine::loadLibraries(const std::string& nativeLibDir, const std::stri
         dlopen((nativeLibDir + "/libQnnHtpPrepare.so").c_str(), RTLD_NOW | RTLD_GLOBAL);
         // The stub of this phone's Hexagon version (the APK may ship several: V73, V79, V81)
         std::string arch = htpArch.empty() ? "v79" : htpArch;
+        m_htpArch = atoi(arch.c_str() + 1);
         for (char& ch : arch) ch = static_cast<char>(toupper(static_cast<unsigned char>(ch)));
         const std::string stub = nativeLibDir + "/libQnnHtp" + arch + "Stub.so";
         if (dlopen(stub.c_str(), RTLD_NOW | RTLD_GLOBAL)) LOGI("Pre-loaded HTP stub %s", stub.c_str());
@@ -124,6 +128,7 @@ bool QnnSdEngine::loadLibraries(const std::string& nativeLibDir, const std::stri
             m_fnContextFree = p->fn.contextFree;
             m_fnGraphRetrieve = p->fn.graphRetrieve;
             m_fnGraphExecute = p->fn.graphExecute;
+            m_fnDeviceGetInfrastructure = p->fn.deviceGetInfrastructure;
             LOGI("QNN HTP backend initialized on the Hexagon NPU");
             return true;
         }
@@ -436,5 +441,82 @@ bool QnnSdEngine::runSuperResolution(const uint8_t* rgb, uint8_t* outRgb) {
     std::vector<float> out(srImageBytes());
     if (!runSingle(SUPER_RES, img.data(), out.data())) return false;
     imageToBytes(c.spec.outputs[0], out, outRgb, m_srH, m_srW);
+    return true;
+}
+
+const QnnHtpDevice_PerfInfrastructure_t* QnnSdEngine::perfInfrastructure() const {
+    if (!m_fnDeviceGetInfrastructure) return nullptr;
+    QnnDevice_Infrastructure_t infra = nullptr;
+    if (m_fnDeviceGetInfrastructure(&infra) != QNN_SUCCESS || !infra) return nullptr;
+    const auto* htp = static_cast<const QnnHtpDevice_Infrastructure_t*>(infra);
+    if (htp->infraType != QNN_HTP_DEVICE_INFRASTRUCTURE_TYPE_PERF || !htp->perfInfra.createPowerConfigId ||
+        !htp->perfInfra.destroyPowerConfigId || !htp->perfInfra.setPowerConfig) return nullptr;
+    return &htp->perfInfra;
+}
+
+/**
+ * Qualcomm's "burst" settings (QNN HTP backend docs): DCVS off, bus and core at the maximum voltage
+ * corner, no DSP sleep, RPC control latency 100 us and polling 9999 us; HMX at turbo from v75.
+ * Without a vote the NPU follows the default DCVS policy and a UNet call takes about 3x longer.
+ */
+bool QnnSdEngine::setBurst(bool on) {
+    const QnnHtpDevice_PerfInfrastructure_t* perf = perfInfrastructure();
+    if (!perf) return false;
+    if (!on) {
+        if (!m_burst) return true;
+        // Destroying the id withdraws every vote made with it
+        Qnn_ErrorHandle_t err = perf->destroyPowerConfigId(m_powerConfigId);
+        m_burst = false;
+        LOGI("HTP performance vote released (0x%llx)", static_cast<unsigned long long>(err));
+        return err == QNN_SUCCESS;
+    }
+    if (m_burst) return true;
+    if (perf->createPowerConfigId(0, 0, &m_powerConfigId) != QNN_SUCCESS) {
+        LOGW("createPowerConfigId failed: NPU stays on the default DCVS policy");
+        return false;
+    }
+    QnnHtpPerfInfrastructure_PowerConfig_t dcvs, latency, polling;
+    memset(&dcvs, 0, sizeof(dcvs));
+    memset(&latency, 0, sizeof(latency));
+    memset(&polling, 0, sizeof(polling));
+    dcvs.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DCVS_V3;
+    QnnHtpPerfInfrastructure_DcvsV3_t& v = dcvs.dcvsV3Config;
+    v.contextId = m_powerConfigId;
+    v.setDcvsEnable = 1;
+    v.dcvsEnable = 0;
+    v.powerMode = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE;
+    v.setSleepLatency = 1;
+    v.sleepLatency = 40;
+    v.setSleepDisable = 1;
+    v.sleepDisable = 1;
+    v.setBusParams = 1;
+    v.busVoltageCornerMin = v.busVoltageCornerTarget = v.busVoltageCornerMax = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
+    v.setCoreParams = 1;
+    v.coreVoltageCornerMin = v.coreVoltageCornerTarget = v.coreVoltageCornerMax = DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER;
+    latency.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_CONTROL_LATENCY;
+    latency.rpcControlLatencyConfig = 100;
+    polling.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_POLLING_TIME;
+    polling.rpcPollingTimeConfig = 9999;
+    const QnnHtpPerfInfrastructure_PowerConfig_t* configs[] = {&dcvs, &latency, &polling, nullptr};
+    Qnn_ErrorHandle_t err = perf->setPowerConfig(m_powerConfigId, configs);
+    if (err != QNN_SUCCESS) {
+        LOGW("setPowerConfig (burst) failed: 0x%llx", static_cast<unsigned long long>(err));
+        perf->destroyPowerConfigId(m_powerConfigId);
+        return false;
+    }
+    m_burst = true;
+    if (m_htpArch >= 75) {
+        QnnHtpPerfInfrastructure_PowerConfig_t hmx;
+        memset(&hmx, 0, sizeof(hmx));
+        hmx.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_HMX_V2;
+        hmx.hmxV2Config.hmxPickDefault = 0;
+        hmx.hmxV2Config.hmxPerfMode = QNN_HTP_PERF_INFRASTRUCTURE_CLK_PERF_HIGH;
+        hmx.hmxV2Config.hmxVoltageCornerMin = hmx.hmxV2Config.hmxVoltageCornerTarget =
+            hmx.hmxV2Config.hmxVoltageCornerMax = DCVS_EXP_VCORNER_TUR;
+        const QnnHtpPerfInfrastructure_PowerConfig_t* hmxConfigs[] = {&hmx, nullptr};
+        err = perf->setPowerConfig(m_powerConfigId, hmxConfigs);
+        if (err != QNN_SUCCESS) LOGW("HMX vote not accepted (0x%llx): DCVS vote only", static_cast<unsigned long long>(err));
+    }
+    LOGI("HTP performance vote: burst (v%d)", m_htpArch);
     return true;
 }

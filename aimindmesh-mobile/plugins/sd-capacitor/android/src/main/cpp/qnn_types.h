@@ -5,7 +5,8 @@
 
 // Minimal, hand-written mirror of the QNN C ABI (the SDK headers are not redistributable).
 // Every layout below is checked by the static_asserts at the end; the offsets were verified
-// against QAIRT 2.31 headers (LP64: identical on arm64 and x86_64). The QNN interface tables
+// against QAIRT 2.31 headers (LP64: identical on arm64 and x86_64), the HTP perf infrastructure
+// against QAIRT 2.45. The QNN interface tables
 // only grow at the end across 2.x releases, so these prefixes stay valid for 2.45.
 
 #ifdef __cplusplus
@@ -177,7 +178,82 @@ typedef Qnn_ErrorHandle_t (*QnnGraph_ExecuteFn_t)(
     Qnn_GraphHandle_t, const Qnn_Tensor_t*, uint32_t, Qnn_Tensor_t*, uint32_t,
     Qnn_ProfileHandle_t, Qnn_SignalHandle_t);
 
-/** Prefix of QnnInterface_t (core API 2.x): only the entries up to graphExecute are used. */
+// HTP performance infrastructure (QnnHtpPerfInfrastructure.h / QnnHtpDevice.h, offsets checked
+// against the QAIRT 2.45 headers): power votes for the NPU clocks while generating
+typedef enum {
+    QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DCVS_V3 = 1,
+    QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_CONTROL_LATENCY = 2,
+    QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_POLLING_TIME = 3,
+    QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_HMX_V2 = 5,
+    QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_UNKNOWN = 0x7fffffff
+} QnnHtpPerfInfrastructure_PowerConfigOption_t;
+
+#define QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE 0x10
+#define DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER 0xA0
+#define DCVS_EXP_VCORNER_TUR 0x280
+#define QNN_HTP_PERF_INFRASTRUCTURE_CLK_PERF_HIGH 0
+
+typedef struct {
+    uint32_t contextId;
+    uint32_t setDcvsEnable;
+    uint32_t dcvsEnable;
+    uint32_t powerMode;
+    uint32_t setSleepLatency;
+    uint32_t sleepLatency;
+    uint32_t setSleepDisable;
+    uint32_t sleepDisable;
+    uint32_t setBusParams;
+    uint32_t busVoltageCornerMin;
+    uint32_t busVoltageCornerTarget;
+    uint32_t busVoltageCornerMax;
+    uint32_t setCoreParams;
+    uint32_t coreVoltageCornerMin;
+    uint32_t coreVoltageCornerTarget;
+    uint32_t coreVoltageCornerMax;
+} QnnHtpPerfInfrastructure_DcvsV3_t;
+
+typedef struct {
+    uint32_t hmxPickDefault;
+    uint32_t hmxVoltageCornerMin;
+    uint32_t hmxVoltageCornerTarget;
+    uint32_t hmxVoltageCornerMax;
+    uint32_t hmxPerfMode;
+} QnnHtpPerfInfrastructure_HmxV2_t;
+
+typedef struct {
+    QnnHtpPerfInfrastructure_PowerConfigOption_t option;
+    union {
+        QnnHtpPerfInfrastructure_DcvsV3_t dcvsV3Config;
+        uint32_t rpcControlLatencyConfig;
+        uint32_t rpcPollingTimeConfig;
+        QnnHtpPerfInfrastructure_HmxV2_t hmxV2Config;
+    };
+} QnnHtpPerfInfrastructure_PowerConfig_t;
+
+typedef Qnn_ErrorHandle_t (*QnnHtpPerfInfrastructure_CreatePowerConfigIdFn_t)(uint32_t, uint32_t, uint32_t*);
+typedef Qnn_ErrorHandle_t (*QnnHtpPerfInfrastructure_DestroyPowerConfigIdFn_t)(uint32_t);
+typedef Qnn_ErrorHandle_t (*QnnHtpPerfInfrastructure_SetPowerConfigFn_t)(
+    uint32_t, const QnnHtpPerfInfrastructure_PowerConfig_t**);
+
+typedef struct {
+    QnnHtpPerfInfrastructure_CreatePowerConfigIdFn_t createPowerConfigId;
+    QnnHtpPerfInfrastructure_DestroyPowerConfigIdFn_t destroyPowerConfigId;
+    QnnHtpPerfInfrastructure_SetPowerConfigFn_t setPowerConfig;
+    void* setMemoryConfig;
+} QnnHtpDevice_PerfInfrastructure_t;
+
+#define QNN_HTP_DEVICE_INFRASTRUCTURE_TYPE_PERF 0
+typedef struct {
+    uint32_t infraType;
+    union {
+        QnnHtpDevice_PerfInfrastructure_t perfInfra;
+    };
+} QnnHtpDevice_Infrastructure_t;
+
+typedef void* QnnDevice_Infrastructure_t;
+typedef Qnn_ErrorHandle_t (*QnnDevice_GetInfrastructureFn_t)(const QnnDevice_Infrastructure_t*);
+
+/** Prefix of QnnInterface_t (core API 2.x): only the entries up to deviceGetInfrastructure are used. */
 typedef struct {
     uint32_t backendId;
     const char* providerName;
@@ -205,6 +281,24 @@ typedef struct {
         void* graphFinalize;
         QnnGraph_RetrieveFn_t graphRetrieve;
         QnnGraph_ExecuteFn_t graphExecute;
+        void* graphExecuteAsync;
+        void* tensorCreateContextTensor;
+        void* tensorCreateGraphTensor;
+        void* logCreate;
+        void* logSetLogLevel;
+        void* logFree;
+        void* profileCreate;
+        void* profileSetConfig;
+        void* profileGetEvents;
+        void* profileGetSubEvents;
+        void* profileGetEventData;
+        void* profileGetExtendedEventData;
+        void* profileFree;
+        void* memRegister;
+        void* memDeRegister;
+        void* deviceGetPlatformInfo;
+        void* deviceFreePlatformInfo;
+        QnnDevice_GetInfrastructureFn_t deviceGetInfrastructure;
     } fn;
 } QnnInterface_t;
 
@@ -279,6 +373,18 @@ static_assert(offsetof(QnnInterface_t, fn.contextCreateFromBinary) == 0x90, "Qnn
 static_assert(offsetof(QnnInterface_t, fn.contextFree) == 0x98, "QnnInterface_t.contextFree");
 static_assert(offsetof(QnnInterface_t, fn.graphRetrieve) == 0xc8, "QnnInterface_t.graphRetrieve");
 static_assert(offsetof(QnnInterface_t, fn.graphExecute) == 0xd0, "QnnInterface_t.graphExecute");
+static_assert(offsetof(QnnInterface_t, fn.deviceGetInfrastructure) == 0x160, "QnnInterface_t.deviceGetInfrastructure");
+static_assert(sizeof(QnnHtpPerfInfrastructure_DcvsV3_t) == 64, "DcvsV3 size");
+static_assert(offsetof(QnnHtpPerfInfrastructure_DcvsV3_t, powerMode) == 0x0c, "DcvsV3.powerMode");
+static_assert(offsetof(QnnHtpPerfInfrastructure_DcvsV3_t, sleepLatency) == 0x14, "DcvsV3.sleepLatency");
+static_assert(offsetof(QnnHtpPerfInfrastructure_DcvsV3_t, busVoltageCornerMin) == 0x24, "DcvsV3.busVoltageCornerMin");
+static_assert(offsetof(QnnHtpPerfInfrastructure_DcvsV3_t, coreVoltageCornerMax) == 0x3c, "DcvsV3.coreVoltageCornerMax");
+static_assert(sizeof(QnnHtpPerfInfrastructure_HmxV2_t) == 20, "HmxV2 size");
+static_assert(sizeof(QnnHtpPerfInfrastructure_PowerConfig_t) == 68, "PowerConfig size");
+static_assert(offsetof(QnnHtpPerfInfrastructure_PowerConfig_t, dcvsV3Config) == 4, "PowerConfig union");
+static_assert(offsetof(QnnHtpDevice_PerfInfrastructure_t, setPowerConfig) == 0x10, "PerfInfrastructure.setPowerConfig");
+static_assert(offsetof(QnnHtpDevice_Infrastructure_t, perfInfra) == 8 && sizeof(QnnHtpDevice_Infrastructure_t) == 40,
+              "QnnHtpDevice_Infrastructure_t layout");
 static_assert(offsetof(QnnSystemInterface_t, fn.systemContextCreate) == 0x20, "QnnSystemInterface_t.create");
 static_assert(offsetof(QnnSystemInterface_t, fn.systemContextGetBinaryInfo) == 0x28, "QnnSystemInterface_t.getBinaryInfo");
 static_assert(offsetof(QnnSystemInterface_t, fn.systemContextFree) == 0x38, "QnnSystemInterface_t.free");
