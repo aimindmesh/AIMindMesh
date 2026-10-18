@@ -14,6 +14,8 @@ export const config = {
   gemini: { apiKey: '', model: 'test', dailyQuotaCap: 0 },
   openrouter: { apiKey: '', model: 'test', dailyQuotaCap: 0 },
   freellmapi: { enabled: false, baseUrl: 'http://127.0.0.1:1', apiKey: '', timeoutMs: 1000, model: 'test' },
+  // No key: Claude is unavailable unless a test sets one (and mocks the SDK)
+  claude: { apiKey: '' },
   neo4j: { uri: 'bolt://127.0.0.1:1', user: 'neo4j', password: 'test' },
   fcm: { serviceAccountPath: './missing-service-account.json' },
   routing: { preferredNode: 'AUTO', taskPriorities: {} },

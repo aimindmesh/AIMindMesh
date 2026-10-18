@@ -26,7 +26,9 @@ export function redactConfig<T>(cfg: T): T {
 }
 
 /**
- * Removes masked placeholders and prototype-polluting keys from a partial config update.
+ * Removes masked placeholders and prototype-polluting keys from a partial config update. A list
+ * holding a masked value is dropped whole: arrays replace the stored value (deepMerge), so a
+ * masked list of secrets sent back by a client would otherwise wipe the real one.
  */
 export function stripRedacted(partial: any): any {
   if (Array.isArray(partial)) return partial.filter(v => v !== REDACTED).map(stripRedacted);
@@ -34,6 +36,7 @@ export function stripRedacted(partial: any): any {
     const out: Record<string, any> = {};
     for (const [k, v] of Object.entries(partial)) {
       if (UNSAFE_KEYS.has(k) || v === REDACTED) continue;
+      if (Array.isArray(v) && v.includes(REDACTED)) continue;
       out[k] = stripRedacted(v);
     }
     return out;

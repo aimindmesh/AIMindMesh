@@ -11,7 +11,7 @@
 import cron, { ScheduledTask } from 'node-cron';
 import { config } from '../config';
 import { KGManager } from './KGManager';
-import { InferenceRouter } from './InferenceRouter';
+import { InferenceRouter, type TaskPayload } from './InferenceRouter';
 import { WikiManager, WikiPage } from './WikiManager';
 import { Logger } from '../utils/Logger';
 import { SearchService } from './SearchService';
@@ -101,8 +101,9 @@ export class WikiSynthesisService {
     const hours = config.wiki.syncIntervalHours ?? 24;
     const cronExpr = `30 */${hours} * * *`;
 
+    // The scheduled cycle can wait: its pages may go through Claude's half-price batches
     this.cronTask = cron.schedule(cronExpr, () => {
-      this.runCycle().catch(e =>
+      this.runCycle({ batchable: true }).catch(e =>
         Logger.error('WikiSynthesisService', `Scheduled cycle failed: ${e.message}`)
       );
     }, { timezone: config.proactive.timezone });
@@ -164,7 +165,7 @@ export class WikiSynthesisService {
    * Safe to call manually (e.g. from Admin API).
    * Now handles queuing if called while already running.
    */
-  public static async runCycle(): Promise<{ pagesUpdated: number; queued?: boolean }> {
+  public static async runCycle(opts: { batchable?: boolean } = {}): Promise<{ pagesUpdated: number; queued?: boolean }> {
     if (this.isRunning) {
       if (this.hasPendingRequest) {
         Logger.warn('WikiSynthesisService', 'Cycle already running and one already queued — ignoring duplicate trigger');
@@ -186,10 +187,24 @@ export class WikiSynthesisService {
       const session_kg = await this.fetchConceptsForSynthesis(maxConcepts);
       Logger.info('WikiSynthesisService', `Synthesizing ${session_kg.length} concept pages`);
 
+      // Batch mode: prompts are built one at a time (searches stay sequential), then every page
+      // is sent at once so they share one Claude batch; the completion listener saves them
+      const batchJobs: Array<{ label: string; job: Promise<unknown> }> = [];
+      const synthesize = async (label: string, task: TaskPayload | null) => {
+        if (!task) return;
+        if (!opts.batchable) {
+          await InferenceRouter.routeTask(task);
+          pagesUpdated++;
+          return;
+        }
+        const job = InferenceRouter.routeTask({ ...task, options: { ...task.options, batchable: true } });
+        job.catch(() => undefined); // settled below: never an unhandled rejection meanwhile
+        batchJobs.push({ label, job });
+      };
+
       for (const concept of session_kg) {
         try {
-          await this.synthesizePage(concept);
-          pagesUpdated++;
+          await synthesize(concept.name, await this.buildPageTask(concept));
         } catch (e: any) {
           Logger.warn('WikiSynthesisService', `Failed to synthesize page for "${concept.name}": ${e.message}`);
         }
@@ -201,13 +216,18 @@ export class WikiSynthesisService {
       const clusters = await KGManager.getThematicClusters(5);
       for (const cluster of clusters) {
         try {
-          await this.synthesizeTopicPage(cluster);
-          pagesUpdated++;
+          await synthesize(cluster.name, await this.buildTopicTask(cluster));
         } catch (e: any) {
           Logger.warn('WikiSynthesisService', `Failed to synthesize topic "${cluster.name}": ${e.message}`);
         }
         await new Promise(r => setTimeout(r, 200));
       }
+
+      const settled = await Promise.allSettled(batchJobs.map(j => j.job));
+      settled.forEach((r, i) => {
+        if (r.status === 'fulfilled') pagesUpdated++;
+        else Logger.warn('WikiSynthesisService', `Failed to synthesize "${batchJobs[i].label}": ${(r.reason as Error)?.message}`);
+      });
 
       await WikiManager.rebuildIndex();
       await WikiManager.appendLog(`wiki-synthesis | ${pagesUpdated} pages updated`);
@@ -219,7 +239,7 @@ export class WikiSynthesisService {
       if (this.hasPendingRequest) {
         this.hasPendingRequest = false;
         Logger.info('WikiSynthesisService', 'Running queued cycle...');
-        setImmediate(() => this.runCycle());
+        setImmediate(() => this.runCycle().catch(e => Logger.error('WikiSynthesisService', `Queued cycle failed: ${e.message}`)));
       }
     }
 
@@ -309,10 +329,20 @@ export class WikiSynthesisService {
   private static async synthesizePage(
     concept: { id: string; name: string; description: string }
   ): Promise<void> {
+    const task = await this.buildPageTask(concept);
+    // NOTE: Page saving is handled by the onTaskCompleted listener in InferenceRouter.
+    // This makes the service resilient to restarts and manual task manipulation.
+    if (task) await InferenceRouter.routeTask(task);
+  }
+
+  /** Inference task of a concept page (context, search and prompt), or null for an unusable name. */
+  private static async buildPageTask(
+    concept: { id: string; name: string; description: string }
+  ): Promise<TaskPayload | null> {
     const slug = toSlug(concept.name);
     if (!slug) {
       Logger.warn('WikiSynthesisService', `Skipping concept with empty slug: "${concept.name}"`);
-      return;
+      return null;
     }
 
     // 1. Gather context from the knowledge graph
@@ -336,7 +366,7 @@ export class WikiSynthesisService {
 
     // 3. Build prompt and call InferenceRouter using the user's preferred model
     const prompt = buildSynthesisPrompt(concept, neighbors, insights, searchContext);
-    const result = await InferenceRouter.routeTask({
+    return {
       type: 'WIKI_SYNTHESIS',
       prompt,
       tokensEstimate: 700 + (searchContext ? 500 : 0),
@@ -346,17 +376,15 @@ export class WikiSynthesisService {
           concept: { id: concept.id, name: concept.name },
           tags: extractTags(neighbors)
       }
-    });
-
-    // NOTE: Page saving is now handled by the onTaskCompleted listener in InferenceRouter.
-    // This makes the service resilient to restarts and manual task manipulation.
+    };
   }
 
-  private static async synthesizeTopicPage(
+  /** Inference task of a topic (map of content) page, or null for an unusable name. */
+  private static async buildTopicTask(
     cluster: { id: string; name: string; description: string; degree: number }
-  ): Promise<void> {
+  ): Promise<TaskPayload | null> {
     const slug = toSlug(cluster.name);
-    if (!slug) return;
+    if (!slug) return null;
 
     const context = await KGManager.getClusterContext(cluster.id);
     
@@ -382,7 +410,7 @@ RULES:
 - Do NOT include frontmatter or code fences.
 - CRITICAL: The entire wiki page MUST be written in English.`;
 
-    await InferenceRouter.routeTask({
+    return {
       type: 'WIKI_TOPIC_MAP',
       prompt,
       tokensEstimate: 800,
@@ -392,6 +420,6 @@ RULES:
           concept: { id: cluster.id, name: cluster.name },
           tags: ['topic', 'moc']
       }
-    });
+    };
   }
 }

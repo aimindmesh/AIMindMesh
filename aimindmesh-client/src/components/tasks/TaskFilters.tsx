@@ -79,6 +79,7 @@ const TaskFilters: React.FC<Props> = ({ onChange }) => {
             <option value="auto">Auto</option>
             <option value="ollama">Ollama</option>
             <option value="gemini">Gemini</option>
+            <option value="claude">Claude</option>
             <option value="openclaw">OpenClaw</option>
           </select>
       </div>

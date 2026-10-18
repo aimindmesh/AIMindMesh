@@ -128,6 +128,8 @@ export interface ServerConfig {
     timeoutMs: number;
     model: string;
   };
+  /** Claude provider (Anthropic API): read and defaulted by services/inference/claude/claudeSettings.ts */
+  claude?: Record<string, unknown>;
   organization?: {
     enabled: boolean;
     defaultApprovalMode: 'human' | 'auto';

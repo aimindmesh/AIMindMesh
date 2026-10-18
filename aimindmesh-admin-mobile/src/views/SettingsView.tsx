@@ -3,6 +3,7 @@ import { Save, Server, Zap, Cloud, ChevronRight, RefreshCw, Database } from 'luc
 import { useSettingsStore } from '../store/settingsStore';
 import { useAdminStore } from '../store/adminStore';
 import { CategorizedSelector, SelectorGroup } from '../components/ui/CategorizedSelector';
+import { ClaudeSettingsSection } from '../components/claude/ClaudeSettingsSection';
 import { Browser } from '@capacitor/browser';
 
 export default function SettingsView() {
@@ -220,6 +221,8 @@ export default function SettingsView() {
                </div>
              </div>
           </div>
+
+          <ClaudeSettingsSection claude={config?.claude} update={updateConfig} />
 
           {/* Gemini Section */}
           <div className="glass-panel rounded-3xl p-6 border border-orange-500/20">

@@ -1,13 +1,16 @@
 import { useEffect, useCallback, useRef, useState } from 'react';
-import { Cpu, HardDrive, Zap, RefreshCw, Activity, BrainCircuit, ShieldCheck, Server, Cloud, Play, Layers, BookOpen, Clock, XCircle, Pause, ShieldAlert, Trash2 } from 'lucide-react';
+import { Cpu, HardDrive, Zap, RefreshCw, Activity, BrainCircuit, ShieldCheck, Server, Cloud, Layers, BookOpen, Clock, ShieldAlert } from 'lucide-react';
 import { useNavigationStore } from '../store/navigationStore';
 import { useAdminStore } from '../store/adminStore';
 import { adminApi, wikiApi } from '../services/api';
 import { TaskPriorityManager } from '../components/TaskPriorityManager';
+import { ClaudeCreditCard } from '../components/claude/ClaudeCreditCard';
+import { ActivityQueuePanel } from '../components/cockpit/ActivityQueuePanel';
+import { ExecutionHistoryPanel } from '../components/cockpit/ExecutionHistoryPanel';
 
 
 export default function CockpitView() {
-  const { status, config, isLoading, error, ollamaRunning, init, fetchStatus, toggleBrake } = useAdminStore();
+  const { status, config, isLoading, error, ollamaRunning, init, fetchStatus, toggleBrake, effectivePriorities } = useAdminStore();
   const pollRef = useRef<NodeJS.Timeout | null>(null);
   const [isTriggering, setIsTriggering] = useState(false);
 
@@ -186,6 +189,8 @@ export default function CockpitView() {
             </div>
           </div>
 
+          <ClaudeCreditCard status={status.claude} />
+
           <div className="metric-card group">
             <div className="flex items-center justify-between mb-1">
               <div className="flex items-center gap-2">
@@ -352,6 +357,7 @@ export default function CockpitView() {
       {status && config && (
         <TaskPriorityManager
           priorities={config?.routing?.taskPriorities || {}}
+          effectivePriorities={effectivePriorities}
           onChange={(taskPriorities) => updateConfigField('routing.taskPriorities', taskPriorities)}
           availableNodes={status?.nodes || []}
         />
@@ -488,200 +494,14 @@ export default function CockpitView() {
 
       {/* Activity Queue Details */}
       {status?.inferenceQueue && status.inferenceQueue.length > 0 && (
-        <div className="glass-panel rounded-3xl p-5 mb-4">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-xs font-black uppercase tracking-[0.3em] text-muted-foreground flex items-center gap-2">
-              <Activity size={14} /> Activity Queue
-            </h2>
-            <span className="text-[10px] font-black text-muted-foreground bg-muted/30 px-2 py-0.5 rounded-full">
-              {status.inferenceQueue.length} TASKS
-            </span>
-          </div>
-          <div className="space-y-3">
-            {status.inferenceQueue.map((item: any, idx: number) => (
-              <div key={item.id} className={`p-4 bg-surface/50 border rounded-2xl flex flex-col gap-3 transition-all ${item.status === 'PROCESSING' ? 'border-primary/40 ring-1 ring-primary/10' : 'border-border/50'}`}>
-                <div className="flex items-center justify-between gap-3">
-                  <div className="flex-1 min-w-0">
-                    <p className={`text-[11px] font-black tracking-tight truncate uppercase italic ${item.status === 'PAUSED' ? 'text-muted-foreground line-through' : 'text-foreground'}`}>
-                      {item.taskName || 'Unnamed Inference'}
-                    </p>
-                    <p className="text-[9px] text-muted-foreground font-mono font-bold opacity-40 uppercase tracking-tighter mt-0.5">{item.type} PHASE</p>
-                  </div>
-                  <div className={`px-2 py-0.5 rounded-full text-[8px] font-black uppercase tracking-tighter ${item.status === 'PROCESSING' ? 'bg-success/20 text-success' :
-                      item.status === 'QUEUED' ? 'bg-warning/20 text-warning' :
-                        item.status === 'WAITING' ? 'bg-orange-500/20 text-orange-400 animate-pulse' :
-                          item.status === 'STALLED' ? 'bg-error/20 text-error animate-pulse' :
-                            'bg-muted/20 text-muted-foreground'
-                    }`}>
-                    {item.status}
-                  </div>
-                </div>
-
-                <div className={`flex items-center justify-between rounded-xl p-2 px-3 ${item.status === 'STALLED' ? 'bg-error/5 border border-error/20' : 'bg-background/50'}`}>
-                  <div className="flex flex-col gap-0.5">
-                    {item.status === 'PROCESSING' ? (
-                      <span className="flex items-center gap-1.5 text-[9px] font-black text-success uppercase italic">
-                        <Zap size={10} className="animate-pulse" />
-                        Active: {item.processingStartedAt ? formatElapsed(item.processingStartedAt, Date.now()) : 'Init...'}
-                      </span>
-                    ) : item.status === 'STALLED' ? (
-                      <span className="flex items-center gap-1.5 text-[9px] font-black text-error uppercase italic">
-                        <XCircle size={10} />
-                        STALLED: RETRIES EXHAUSTED
-                      </span>
-                    ) : item.status === 'WAITING' ? (
-                      <span className="flex items-center gap-1.5 text-[9px] font-black text-orange-400 uppercase italic">
-                        <Clock size={10} className="animate-spin-slow" />
-                        GEMINI COOLDOWN: RETRYING SOON...
-                      </span>
-                    ) : item.status === 'QUEUED' ? (
-                      <span className="text-[9px] font-black text-muted-foreground uppercase italic opacity-60">
-                        Pos: {idx + 1} | In: {formatDateTime(item.startedAt)}
-                      </span>
-                    ) : (
-                      <span className="text-[9px] font-black text-muted-foreground uppercase italic opacity-60">
-                        In Queue: {formatDateTime(item.startedAt)}
-                      </span>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <select
-                      disabled={item.status === 'PROCESSING'}
-                      value={item.provider || 'AUTO'}
-                      onChange={(e) => { adminApi.updateInferenceRouting(item.id, e.target.value); setTimeout(fetchStatus, 500); }}
-                      className="bg-surface border border-border/50 rounded-lg px-2 py-1 text-[8px] font-black uppercase tracking-widest outline-none disabled:opacity-50"
-                    >
-                      <option value="AUTO">AUTO</option>
-                      {status?.nodes?.map((node: any) => (
-                        <option key={node.id} value={node.id.toUpperCase()}>
-                          {node.id === 'SERVER_LOCAL' ? 'OLLAMA' : (node.type === 'pc_client' || node.id === 'LAPTOP') ? 'LAPTOP' : node.id.toUpperCase()}
-                        </option>
-                      ))}
-                      <option value="GEMINI_API">GEMINI</option>
-                      <option value="OPENROUTER_API">OPENROUTER</option>
-                      <option value="FREELLMAPI">FREELLMAPI</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div className="flex items-center justify-between pt-1">
-                  <div className="flex items-center gap-2">
-                    <span className="text-[9px] font-mono font-bold text-muted-foreground uppercase opacity-40">
-                      ID: {item.id.slice(0, 8)}
-                    </span>
-                  </div>
-
-                  <div className="flex items-center gap-2">
-                    {item.status === 'PAUSED' ? (
-                      <button onClick={() => { adminApi.resumeInference(item.id); setTimeout(fetchStatus, 500); }} className="p-2 text-success bg-success/10 rounded-xl active:scale-90 transition-all">
-                        <Play size={14} fill="currentColor" />
-                      </button>
-                    ) : (item.status === 'QUEUED' || item.status === 'PROCESSING' || item.status === 'STALLED' || item.status === 'WAITING') ? (
-                      <>
-                        {item.status === 'STALLED' && (
-                          <button onClick={() => { adminApi.retryInference(item.id); setTimeout(fetchStatus, 500); }} className="p-2 text-primary bg-primary/10 rounded-xl active:scale-90 transition-all">
-                            <RefreshCw size={14} />
-                          </button>
-                        )}
-                        <button onClick={() => { adminApi.pauseInference(item.id); setTimeout(fetchStatus, 500); }} className="p-2 text-warning bg-warning/10 rounded-xl active:scale-90 transition-all">
-                          <Pause size={14} />
-                        </button>
-                      </>
-                    ) : null}
-                    <button onClick={() => { adminApi.cancelInference(item.id); setTimeout(fetchStatus, 500); }} className="p-2 text-error bg-error/10 rounded-xl active:scale-90 transition-all">
-                      <XCircle size={14} />
-                    </button>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
+        <ActivityQueuePanel status={status} fetchStatus={fetchStatus} />
       )}
 
       {/* Execution History */}
       {status?.queueHistory && status.queueHistory.length > 0 && (
-        <div className="glass-panel rounded-3xl p-5 mb-4">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-xs font-black uppercase tracking-[0.3em] text-muted-foreground flex items-center gap-2">
-              <Clock size={14} /> Execution History
-            </h2>
-            <div className="flex gap-2">
-              <button
-                onClick={async () => {
-                  if (window.confirm("Clear all execution history?")) {
-                    await adminApi.clearQueueHistory();
-                    init();
-                  }
-                }}
-                className="p-2 bg-white/5 border border-white/10 rounded-xl active:scale-90 transition-all"
-              >
-                <Trash2 size={14} className="text-muted-foreground/60" />
-              </button>
-            </div>
-          </div>
-          <div className="space-y-3">
-            {[...(status.queueHistory || [])].sort((a, b) => (b.completed_at || 0) - (a.completed_at || 0)).slice(0, 20).map((item: any) => (
-              <div key={item.id} className="p-3 bg-surface/30 border border-border/30 rounded-2xl flex flex-col gap-2">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2 overflow-hidden">
-                    <div className={`w-1.5 h-1.5 rounded-full ${item.status === 'COMPLETED' ? 'bg-success' : 'bg-error'}`} />
-                    <p className="text-[11px] font-black truncate uppercase italic text-foreground/90">
-                      {item.task_name || 'Inference'}
-                    </p>
-                  </div>
-                  <button onClick={() => { adminApi.retryInference(item.id); setTimeout(fetchStatus, 500); }} className="p-1.5 bg-primary/10 text-primary rounded-lg active:scale-90 transition-all">
-                    <RefreshCw size={12} />
-                  </button>
-                </div>
-
-                <div className="flex items-center justify-between mt-1">
-                  <div className="flex flex-col gap-0.5">
-                    <div className="flex items-center gap-2">
-                      <span className="text-[8px] font-mono font-bold text-muted-foreground uppercase">{item.model || 'AUTO'}</span>
-                      <span className="text-[8px] font-mono font-bold opacity-30">|</span>
-                      <span className="text-[8px] font-mono font-bold opacity-50">IN: {formatDateTime(item.created_at)}</span>
-                      {item.completed_at && (
-                        <>
-                          <span className="text-[8px] font-mono font-bold opacity-30">|</span>
-                          <span className="text-[8px] font-mono font-bold opacity-50">OUT: {formatDateTime(item.completed_at)}</span>
-                        </>
-                      )}
-                    </div>
-                    {item.completed_at && (
-                      <span className="text-[8px] font-black uppercase tracking-widest text-primary/60 italic">
-                        DURATION: {formatElapsed(item.created_at, item.completed_at)}
-                      </span>
-                    )}
-                  </div>
-                  <span className={`text-[8px] font-black uppercase tracking-widest ${item.status === 'COMPLETED' ? 'text-success/80' : 'text-error'}`}>
-                    {item.status}
-                  </span>
-                </div>
-                {item.error_msg && (
-                  <p className="text-[9px] text-error/80 font-medium leading-tight mt-1 line-clamp-2 bg-error/5 p-2 rounded-lg border border-error/10">
-                    {item.error_msg}
-                  </p>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
+        <ExecutionHistoryPanel status={status} fetchStatus={fetchStatus} init={init} />
       )}
     </div>
   );
 }
 
-function formatDateTime(ts: number | string) {
-  if (!ts) return '--';
-  const date = new Date(Number(ts));
-  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-}
-
-function formatElapsed(start: number, end: number) {
-  if (!start || !end) return '--';
-  const diff = Number(end) - Number(start);
-  if (diff < 1000) return `${diff}ms`;
-  const sec = (diff / 1000).toFixed(1);
-  return `${sec}s`;
-}

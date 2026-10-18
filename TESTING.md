@@ -64,6 +64,15 @@ npm run typecheck:test   # type-checks src/ + test/ (tsconfig.test.json)
 | `council.test.ts` | The autonomous AI council needs a human before creating repositories (unless `organization.allowAutoRepoCreation`) |
 | `contracts.test.ts` | Client/server contract fixes: `/api/chat` response + routing, empty JSON bodies, `DELETE /api/feed/:id`, `GET /api/ai-tasks/:id`, AI task provider routing, evolution process options, protected-paths insert, CI webhook registration |
 | `contract-types.test.ts` | Compile-time: server internal types stay compatible with `src/types/api.ts` |
+| `providerHelpers.test.ts` | Provider ids and task categories, FreeLLMAPI/Gemini cooldowns, prompt assembly (cache prefix, search block) |
+| `routerRequeue.test.ts` | Brake, re-route and cancel never leave a `routeTask` caller waiting; web search runs once per task (retries reuse it) |
+| `claudeCredit.test.ts` | Claude settings, error classification, pricing (fallback models, Haiku long prompts, batches), billing cycle, credit states (probe, new cycle, new key), budget with reservations and agent cap, slots, admin status |
+| `claudeRouting.test.ts` | Claude in the priority lists (first per category, skipped without key / after a failure / for embeddings), dispatch parameters, cache prefix block, credit exhaustion → next provider, refusals, rejected beta retry, phone chat streaming (`delta`/`thought`, `usedNode: CLAUDE`) |
+| `claudeBatch.test.ts` | Message Batches: start after the listeners, idempotent per task (brake, restart), re-route/cancel, brake, expired requests, batchable router tasks |
+| `geminiQueue.test.ts` | Gemini per-minute limit: the call over `rpmLimit` waits for the minute window |
+| `deepMerge.test.ts` | `PATCH /api/admin/config` merge: objects merge, lists are replaced (a shorter list shortens), prototype keys ignored |
+| `debatePrompt.test.ts` | Debate turns split into the cached round context and the participant's turn |
+| `agentBridge.test.ts` | Agent proxy: OpenAI → Claude translation (tools, tool results, images, thinking replay), Claude stream → OpenAI chunks, accepted keys, Claude answers, FreeLLMAPI fallback (credit, unknown key, non-Claude build model) |
 | `webTools.test.ts` | Outgoing web requests: private/loopback/reserved IPs (IPv4, IPv6, mapped) refused, names resolving to private IPs refused at connect time, `/api/web/search` standard mode + time range + bounded snippets, `/api/web/read` GET-only with private URLs refused, page text extraction (main content, no chrome), query passages |
 
 ### Writing new tests
@@ -151,6 +160,12 @@ curl -X POST -H "x-api-key: $KEY" -H 'content-type: application/json' \
 ```
 *   **FCM**: `POST /api/admin/fcm/test` → notification on the device within a few seconds.
 *   **Worker node**: enable "Participate as Worker" on the phone, route a chat with `options.routing = <device id>` and check the answer comes from the phone (`usedNode`).
+*   **Claude** (needs `claude.apiKey`; every call spends a little credit):
+    *   The chat above answers with `"usedNode":"CLAUDE"`; `GET /api/admin/status` shows `claude.state = "ok"` and today's calls.
+    *   A debate (or two chats with the same long prefix) shows cache reads (`claude.today.cacheReadTokens > 0`, "cache hit" in the admin card).
+    *   Wiki cycle from cron (or `WikiSynthesisService.runCycle({ batchable: true })`): `pendingBatchRequests` rises, pages appear after the batch ends; restart the server meanwhile and check no second batch is created.
+    *   Set `claude.monthlyBudgetUsd` to `0.01`: the state becomes `budget_reached` and the next chat answers from Gemini/OpenRouter. Restore the budget.
+    *   Agents: an OpenClaw task and a Hermes chat log `AgentBridge ... -> Claude`; their spend appears under "Agents"; with `claude.agents.monthlyBudgetUsd: 0.01` the next turn goes to FreeLLMAPI (`FreeLLMAPI-Proxy` log).
 
 ---
 
@@ -166,6 +181,9 @@ curl -i -N -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Ve
 curl -s -H "x-api-key: $KEY" http://127.0.0.1:3030/api/admin/config | grep -c '\*\*\*\*\*\*\*\*'
 # LLM proxy refuses requests without their own key (expect 401)
 curl -i -X POST http://127.0.0.1:3030/api/freellmapi-proxy/v1/chat/completions -d '{}' -H 'content-type: application/json'
+# An unknown Bearer key never reaches Claude (the log shows FreeLLMAPI-Proxy, not AgentBridge)
+curl -s -X POST http://127.0.0.1:3030/api/freellmapi-proxy/v1/chat/completions -H 'authorization: Bearer not-a-key' \
+     -H 'content-type: application/json' -d '{"messages":[{"role":"user","content":"hi"}]}'
 # Gitea webhook without signature (expect 401)
 curl -i -X POST http://127.0.0.1:3030/api/evolution/gitea/webhook -d '{}' -H 'content-type: application/json'
 ```

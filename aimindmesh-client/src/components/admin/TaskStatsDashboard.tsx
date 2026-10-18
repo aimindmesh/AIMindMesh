@@ -46,6 +46,7 @@ export function TaskStatsDashboard() {
   const providerColors: Record<string, string> = {
     'GEMINI': 'bg-primary',
     'OPENROUTER': 'bg-purple-500',
+    'CLAUDE': 'bg-orange-500',
     'SERVER_LOCAL': 'bg-success',
     'UNKNOWN': 'bg-muted'
   };

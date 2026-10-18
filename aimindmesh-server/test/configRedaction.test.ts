@@ -12,6 +12,7 @@ const sample = {
   llm: { maxTokens: 2048 },
   openclaw: { defaultSessionKey: 'main' },
   freellmapi: { apiKey: '', baseUrl: 'http://x' },
+  claude: { apiKey: 'sk-ant-x', models: { STANDARD: 'claude-sonnet-5-5' }, agents: { proxyKeys: ['hermes-key-123'], model: 'claude-sonnet-5-5' } },
 };
 
 describe('redactConfig', () => {
@@ -19,7 +20,8 @@ describe('redactConfig', () => {
 
   it('masks every credential', () => {
     for (const value of [red.server.apiKey, red.neo4j.password, red.gemini.apiKey, red.kasm.apiKey,
-      red.kasm.apiKeySecret, red.auth.keys.phone, red.autoEvolution.giteaWebhookSecret, red.fcm.testToken]) {
+      red.kasm.apiKeySecret, red.auth.keys.phone, red.autoEvolution.giteaWebhookSecret, red.fcm.testToken,
+      red.claude.apiKey, red.claude.agents.proxyKeys[0]]) {
       expect(value).toBe(REDACTED);
     }
   });
@@ -31,6 +33,8 @@ describe('redactConfig', () => {
     expect(red.openclaw.defaultSessionKey).toBe('main');
     expect(red.kasm.baseUrl).toBe('https://k');
     expect(red.freellmapi.apiKey).toBe('');
+    expect(red.claude.models.STANDARD).toBe('claude-sonnet-5-5');
+    expect(red.claude.agents.model).toBe('claude-sonnet-5-5');
   });
 
   it('does not mutate the live config', () => {
@@ -43,6 +47,14 @@ describe('stripRedacted', () => {
     const stripped = stripRedacted({ server: { apiKey: REDACTED, port: 4000 }, gemini: { apiKey: 'new' } });
     expect(stripped.server).toEqual({ port: 4000 });
     expect(stripped.gemini.apiKey).toBe('new');
+  });
+
+  it('keeps the Claude key and the agent keys when a client sends the masked config back', () => {
+    const stripped = stripRedacted(redactConfig(sample));
+    expect(stripped.claude.apiKey).toBeUndefined();
+    // Dropped whole: arrays replace the stored value, an empty list would wipe the real keys
+    expect('proxyKeys' in stripped.claude.agents).toBe(false);
+    expect(stripped.claude.agents.model).toBe('claude-sonnet-5-5');
   });
 
   it('drops prototype-polluting keys', () => {

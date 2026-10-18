@@ -329,6 +329,7 @@ export function SynthesisController({ config, onUpdateConfig, onTriggerProactive
                               <option value="gemini">GEMINI</option>
                               <option value="openrouter">OPENROUTER</option>
                               <option value="freellmapi">FREELLMAPI</option>
+                              <option value="claude">CLAUDE</option>
                             </select>
                           ) : (
                             <span className="text-[9px] px-1.5 py-0.5 bg-background border border-border rounded text-primary uppercase font-mono tracking-widest font-black">

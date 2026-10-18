@@ -1,12 +1,12 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useConfigStore, AppConfig } from '../store/configStore';
-import { Save, Activity, Terminal, Download, RefreshCw, CheckCircle2, AlertCircle, Sparkles } from 'lucide-react';
-import { Dropdown } from '../components/ui/Dropdown';
+import { Save, Activity, Terminal } from 'lucide-react';
 import { Logger, LogLevel } from '../utils/logger';
 import { withoutRedacted } from '../utils/redaction';
 import pkg from '../../package.json';
-import { openUrl } from '@tauri-apps/plugin-opener';
+import { CloudIntelligencePanel } from '../components/settings/CloudIntelligencePanel';
+import { SoftwareUpdatesPanel, type UpdateStatus } from '../components/settings/SoftwareUpdatesPanel';
 
 export default function SettingsView() {
   const { config, setConfig } = useConfigStore();
@@ -18,14 +18,7 @@ export default function SettingsView() {
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [testStatus, setTestStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle');
   const [testMessage, setTestMessage] = useState('');
-  const [updateStatus, setUpdateStatus] = useState<{
-    latestVersion?: string;
-    isNewer: boolean;
-    deb?: string;
-    appimage?: string;
-    isLoading: boolean;
-    error?: string;
-  }>({ isNewer: false, isLoading: false });
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus>({ isNewer: false, isLoading: false });
 
   const compareVersions = (v1: string, v2: string) => {
     const parts1 = v1.split('.').map(Number);
@@ -393,127 +386,13 @@ export default function SettingsView() {
         </div>
       </div>
 
-      <div className="glass-panel rounded-2xl p-8 flex flex-col gap-6 max-w-2xl">
-        <h2 className="text-xl font-semibold border-b border-border pb-2 flex items-center gap-2">
-          <Sparkles className="w-5 h-5 text-primary" /> Cloud Intelligence
-        </h2>
-
-        <div className="flex flex-col gap-4">
-          <h3 className="text-sm font-bold uppercase tracking-widest opacity-40">Google Gemini</h3>
-          <div className="flex flex-col gap-2">
-            <label className="text-sm font-semibold text-muted-foreground">API Key</label>
-            <input
-              type="password"
-              value={localConfig.gemini?.apiKey || ''}
-              onChange={(e) => setLocalConfig({ ...localConfig, gemini: { ...(localConfig.gemini || {}), apiKey: e.target.value } })}
-              className="bg-background p-3 rounded-lg border border-border font-mono outline-none focus:ring-2 focus:ring-primary transition-all"
-              placeholder="Paste your Gemini API Key"
-            />
-          </div>
-        </div>
-
-        <div className="h-px bg-border" />
-
-        <div className="flex flex-col gap-4">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-bold uppercase tracking-widest opacity-40">FreeLLMAPI (Proxy Gateway)</h3>
-            <button 
-              onClick={() => openUrl(localConfig.freellmapi?.baseUrl || 'http://10.2.0.54:3001')}
-              className="text-xs px-3 py-1 bg-primary/10 text-primary font-bold rounded-lg hover:bg-primary/20 transition-all"
-            >
-              Open Web UI
-            </button>
-          </div>
-          
-          <label className="flex items-center gap-3 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={localConfig.freellmapi?.enabled || false}
-              onChange={(e) => setLocalConfig({ ...localConfig, freellmapi: { ...(localConfig.freellmapi || { baseUrl: 'http://10.2.0.54:3001', apiKey: '', timeoutMs: 120000, model: 'auto', enabled: false }), enabled: e.target.checked } })}
-              className="w-5 h-5 rounded accent-primary border-border bg-background"
-            />
-            <span className="font-medium text-sm">Enable FreeLLMAPI</span>
-          </label>
-
-          <div className="flex flex-col gap-2">
-            <label className="text-sm font-semibold text-muted-foreground">Base URL</label>
-            <input
-              type="text"
-              value={localConfig.freellmapi?.baseUrl || 'http://10.2.0.54:3001'}
-              onChange={(e) => setLocalConfig({ ...localConfig, freellmapi: { ...(localConfig.freellmapi || { baseUrl: 'http://10.2.0.54:3001', apiKey: '', timeoutMs: 120000, model: 'auto', enabled: false }), baseUrl: e.target.value } })}
-              className="bg-background p-3 rounded-lg border border-border font-mono outline-none focus:ring-2 focus:ring-primary transition-all"
-            />
-          </div>
-
-          <div className="flex flex-col gap-2">
-            <label className="text-sm font-semibold text-muted-foreground">API Key</label>
-            <input
-              type="password"
-              value={localConfig.freellmapi?.apiKey || ''}
-              onChange={(e) => setLocalConfig({ ...localConfig, freellmapi: { ...(localConfig.freellmapi || { baseUrl: 'http://10.2.0.54:3001', apiKey: '', timeoutMs: 120000, model: 'auto', enabled: false }), apiKey: e.target.value } })}
-              className="bg-background p-3 rounded-lg border border-border font-mono outline-none focus:ring-2 focus:ring-primary transition-all"
-              placeholder="Your unified FreeLLMAPI Key"
-            />
-          </div>
-          
-          <div className="flex flex-col gap-2">
-            <label className="text-sm font-semibold text-muted-foreground">Preferred Model</label>
-            <input
-              type="text"
-              value={localConfig.freellmapi?.model || 'auto'}
-              onChange={(e) => setLocalConfig({ ...localConfig, freellmapi: { ...(localConfig.freellmapi || { baseUrl: 'http://10.2.0.54:3001', apiKey: '', timeoutMs: 120000, model: 'auto', enabled: false }), model: e.target.value } })}
-              className="bg-background p-3 rounded-lg border border-border font-mono outline-none focus:ring-2 focus:ring-primary transition-all"
-              placeholder="e.g. auto"
-            />
-          </div>
-        </div>
-
-        <div className="h-px bg-border" />
-
-        <div className="flex flex-col gap-4">
-          <h3 className="text-sm font-bold uppercase tracking-widest opacity-40">OpenRouter</h3>
-          <div className="flex flex-col gap-2">
-            <label className="text-sm font-semibold text-muted-foreground">API Key</label>
-            <input
-              type="password"
-              value={localConfig.openrouter?.apiKey || ''}
-              onChange={(e) => setLocalConfig({ ...localConfig, openrouter: { ...(localConfig.openrouter || {}), apiKey: e.target.value } })}
-              className="bg-background p-3 rounded-lg border border-border font-mono outline-none focus:ring-2 focus:ring-primary transition-all"
-              placeholder="Paste your OpenRouter API Key"
-            />
-          </div>
-
-          <div className="flex flex-col gap-2">
-            <label className="text-sm font-semibold text-muted-foreground">Default Model</label>
-            <div className="flex gap-2">
-              <Dropdown
-                value={localConfig.openrouter?.model || ''}
-                onChange={(val) => setLocalConfig({ ...localConfig, openrouter: { ...(localConfig.openrouter || {}), model: val } })}
-                options={Object.entries(
-                  openRouterModels.reduce((acc: any, m: any) => {
-                    const provider = m.id.split('/')[0];
-                    if (!acc[provider]) acc[provider] = [];
-                    acc[provider].push({ label: m.name, value: m.id });
-                    return acc;
-                  }, {})
-                ).sort().map(([provider, options]: [string, any]) => ({
-                  label: provider.toUpperCase(),
-                  options: options.sort((a: any, b: any) => a.label.localeCompare(b.label))
-                }))}
-                className="flex-1 font-mono"
-              />
-              <button
-                onClick={fetchOpenRouterModels}
-                className="p-3 bg-secondary/30 hover:bg-secondary/50 rounded-lg transition-all"
-                disabled={isFetchingOR}
-              >
-                <RefreshCw className={`w-4 h-4 ${isFetchingOR ? 'animate-spin' : ''}`} />
-              </button>
-            </div>
-            <p className="text-xs text-muted-foreground">Models are grouped by provider. Use the refresh button to update the list.</p>
-          </div>
-        </div>
-      </div>
+      <CloudIntelligencePanel
+        localConfig={localConfig}
+        setLocalConfig={setLocalConfig}
+        openRouterModels={openRouterModels}
+        isFetchingOR={isFetchingOR}
+        fetchOpenRouterModels={fetchOpenRouterModels}
+      />
 
       <div className="glass-panel rounded-2xl p-8 flex flex-col gap-6 max-w-2xl">
         <h2 className="text-xl font-semibold border-b border-border pb-2 flex items-center gap-2">
@@ -628,90 +507,7 @@ export default function SettingsView() {
         </div>
       </div>
 
-      <div className="glass-panel rounded-2xl p-8 flex flex-col gap-6 max-w-2xl mb-8">
-        <div className="flex items-center justify-between border-b border-border pb-2">
-          <h2 className="text-xl font-semibold">Software Updates</h2>
-          <div className="flex items-center gap-2 text-xs font-mono text-muted-foreground bg-secondary/30 px-2 py-1 rounded">
-            Current: v{pkg.version}
-          </div>
-        </div>
-
-        <div className="flex flex-col gap-4">
-          <div className="flex items-center justify-between">
-            <label className="flex items-center gap-3 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={localConfig.updates?.check_automatic}
-                onChange={(e) => setLocalConfig({ ...localConfig, updates: { ...localConfig.updates, check_automatic: e.target.checked } })}
-                className="w-5 h-5 rounded accent-primary border-border bg-background"
-              />
-              <span className="font-medium text-sm">Automatically Check for Updates</span>
-            </label>
-
-            <button
-              onClick={() => checkUpdates(false)}
-              disabled={updateStatus.isLoading}
-              className="p-2 hover:bg-secondary/50 rounded-lg transition-all text-primary flex items-center gap-2 text-sm font-semibold"
-            >
-              <RefreshCw className={`w-4 h-4 ${updateStatus.isLoading ? 'animate-spin' : ''}`} />
-              Check Now
-            </button>
-          </div>
-
-          {updateStatus.error && (
-            <div className="bg-destructive/10 border border-destructive/30 text-destructive p-3 rounded-lg flex items-center gap-2 text-sm">
-              <AlertCircle className="w-4 h-4" />
-              {updateStatus.error}
-            </div>
-          )}
-
-          {updateStatus.latestVersion && !updateStatus.isNewer && !updateStatus.error && (
-            <div className="bg-success/10 border border-success/30 text-success p-3 rounded-lg flex items-center gap-2 text-sm">
-              <CheckCircle2 className="w-4 h-4" />
-              You are running the latest version (v{pkg.version})
-            </div>
-          )}
-
-          {updateStatus.isNewer && (
-            <div className="bg-primary/10 border border-primary/30 p-4 rounded-xl flex flex-col gap-4 animate-pulse-subtle">
-              <div className="flex items-center gap-3">
-                <div className="p-2 bg-primary/20 rounded-lg">
-                  <Download className="w-5 h-5 text-primary" />
-                </div>
-                <div>
-                  <h3 className="font-bold text-primary">Update Available: v{updateStatus.latestVersion}</h3>
-                  <p className="text-xs text-muted-foreground">A new version of AIMindMesh is ready for download.</p>
-                </div>
-              </div>
-
-              <div className="flex flex-col sm:flex-row gap-2">
-                {updateStatus.deb && (
-                  <a
-                    href={`${localConfig.server.url.replace(/\/$/, '')}/dl/${updateStatus.deb}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex-1 bg-primary text-surface px-4 py-2.5 rounded-lg text-center text-sm font-bold hover:bg-primary-hover transition-all flex items-center justify-center gap-2"
-                  >
-                    <Download className="w-4 h-4" />
-                    Download .DEB
-                  </a>
-                )}
-                {updateStatus.appimage && (
-                  <a
-                    href={`${localConfig.server.url.replace(/\/$/, '')}/dl/${updateStatus.appimage}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex-1 bg-secondary text-primary px-4 py-2.5 rounded-lg text-center text-sm font-bold hover:bg-secondary/80 transition-all flex items-center justify-center gap-2 border border-primary/20"
-                  >
-                    <Download className="w-4 h-4" />
-                    Download .AppImage
-                  </a>
-                )}
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
+      <SoftwareUpdatesPanel localConfig={localConfig} setLocalConfig={setLocalConfig} updateStatus={updateStatus} checkUpdates={checkUpdates} />
     </div>
   );
 }

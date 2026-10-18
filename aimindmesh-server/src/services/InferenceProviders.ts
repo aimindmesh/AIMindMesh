@@ -1,5 +1,9 @@
 import { config } from '../config';
 import { Logger } from '../utils/Logger';
+import { taskCategory } from './inference/providerIds';
+import { ClaudeCreditState } from './inference/claude/ClaudeCreditState';
+import { claudeCategory } from './inference/claude/ClaudeProvider';
+import { claudeSettings } from './inference/claude/claudeSettings';
 import http from 'http';
 
 export class InferenceProviders {
@@ -34,6 +38,9 @@ export class InferenceProviders {
   public static resolveTarget(task: any, nodes: any[]): { provider: string, engine: string } {
     const taskRouting = task.options?.routing?.toUpperCase() || 'AUTO';
     let routing = taskRouting === 'AUTO' ? (config.routing?.preferredNode || 'AUTO').toUpperCase() : taskRouting;
+    // The admin mobile app spells the cloud providers GEMINI_API / OPENROUTER_API
+    if (routing === 'GEMINI_API' || routing === 'OPENROUTER_API') routing = routing.slice(0, -4);
+    const skip: string[] = (task.options?.skipProviders ?? []).map((p: string) => p.toUpperCase());
     
     // Helper to check if a node is ONLINE (ignore locks for stable queuing)
     const isOnline = (nodeId: string): boolean => {
@@ -50,6 +57,11 @@ export class InferenceProviders {
       if (routing === 'FREELLMAPI') return { provider: 'FREELLMAPI', engine: 'OLLAMA' };
       if (routing === 'HERMES') return { provider: 'HERMES', engine: 'HERMES' };
       if (routing === 'OPENCLAW') return { provider: 'OPENCLAW', engine: 'OPENCLAW' };
+      if (routing === 'CLAUDE') {
+        const claude = this.claudeTarget(task, skip);
+        if (claude) return claude;
+        Logger.debug('InferenceProviders', `Claude not available for this task. Falling back to AUTO list.`);
+      }
       
       const explicit = nodes.find(n => n.id.toUpperCase() === routing || n.name?.toUpperCase() === routing);
       if (explicit && explicit.status === 'ONLINE') {
@@ -63,11 +75,18 @@ export class InferenceProviders {
 
     // 2. Handle AUTO routing with task-specific priority list
     const taskType = task.type || 'STANDARD';
-    const priorities = config.routing?.taskPriorities?.[taskType] || 
-                       this.getFallbackPriority(taskType) ||
-                       ['SERVER_LOCAL', 'GEMINI', 'OPENROUTER'];
+    const priorities = this.effectivePriorities(taskType);
     
     for (const target of priorities) {
+      if (skip.includes(target.toUpperCase())) continue;
+      if (target === 'CLAUDE') {
+        const claude = this.claudeTarget(task, skip);
+        if (claude) {
+          Logger.debug('InferenceProviders', `AUTO: Choosing CLAUDE (${claude.engine}) for ${taskType}`);
+          return claude;
+        }
+        continue;
+      }
       if (target === 'GEMINI' && config.gemini?.apiKey) {
         Logger.debug('InferenceProviders', `AUTO: Choosing GEMINI for ${taskType}`);
         return { provider: 'GEMINI', engine: 'GEMINI' };
@@ -93,37 +112,40 @@ export class InferenceProviders {
     return { provider: 'SERVER_LOCAL', engine: 'OLLAMA' };
   }
 
+  /**
+   * Priority list of a task type: its own list, else its category's, else the default. Claude
+   * goes first in the categories of claude.firstForCategories unless the list places it.
+   */
+  public static effectivePriorities(type: string): string[] {
+    const list: string[] = config.routing?.taskPriorities?.[type] ||
+      this.getFallbackPriority(type) ||
+      ['SERVER_LOCAL', 'GEMINI', 'OPENROUTER'];
+    if (list.includes('CLAUDE')) return list;
+    const category = claudeCategory(type);
+    return category && claudeSettings().firstForCategories.includes(category) ? ['CLAUDE', ...list] : list;
+  }
+
+  /**
+   * Claude for this task, or null (type not served, failed on Claude before, no credit or
+   * budget). Background tasks marked batchable go through the Batches API, which never takes
+   * the probe slot after a credit error (a batch would hold it for minutes).
+   */
+  private static claudeTarget(task: any, skip: string[]): { provider: string, engine: string } | null {
+    if (!claudeCategory(task.type) || skip.includes('CLAUDE')) return null;
+    const batch = !!task.options?.batchable && claudeSettings().batch.enabled;
+    if (!ClaudeCreditState.isAvailable('router', { allowProbe: !batch })) return null;
+    return { provider: 'CLAUDE', engine: batch ? 'CLAUDE_BATCH' : 'CLAUDE' };
+  }
+
   private static getFallbackPriority(type: string): string[] | null {
-    const legacyMap: Record<string, string> = {
-      INTENT_CLASSIFICATION: 'LIGHTWEIGHT',
-      QUERY_EXPANSION: 'LIGHTWEIGHT',
-      CONCEPT_EXTRACTION: 'LIGHTWEIGHT',
-      CONCEPT_ENRICHMENT: 'LIGHTWEIGHT',
-      IMPROVEMENT_DETECTION: 'LIGHTWEIGHT',
-      PROACTIVE_INSIGHT: 'STANDARD',
-      DEBATE_PARTICIPATION: 'STANDARD',
-      INSIGHT_DEDUP: 'STANDARD',
-      DEBATE_SUMMARY: 'STANDARD',
-      GENERAL_CHAT: 'STANDARD',
-      SCHEDULED_TASK: 'STANDARD',
-      WIKI_SYNTHESIS: 'COMPLEX',
-      WIKI_TOPIC_MAP: 'COMPLEX',
-      CODE_EVOLUTION: 'EVOLUTION',
-      EVOLUTION_VALIDATION: 'STANDARD',
-      EMBEDDING_GENERATION: 'EMBEDDING',
-      WEB_RESEARCH: 'RESEARCH',
-      AGENTIC_TASK: 'AGENTIC',
-      DIRECTIVES_EXTRACTION: 'STANDARD',
-      // Specs and role designs: a plain completion, never the tool-using agent
-      ORGANIZATION_DESIGN: 'COMPLEX'
-    };
-    const legacyType = legacyMap[type];
-    if (legacyType) return config.routing?.taskPriorities?.[legacyType] || null;
+    const category = taskCategory(type);
+    if (category) return config.routing?.taskPriorities?.[category] || null;
     return null;
   }
 
   public static getProviderDetails(target: string, engine: string, nodes: any[], config: any) {
-    if (engine === 'GEMINI' || engine === 'OPENROUTER' || target === 'FREELLMAPI' || engine === 'HERMES' || engine === 'OPENCLAW') return { url: null, model: undefined };
+    if (engine === 'GEMINI' || engine === 'OPENROUTER' || target === 'FREELLMAPI' || engine === 'HERMES' || engine === 'OPENCLAW' ||
+        engine === 'CLAUDE' || engine === 'CLAUDE_BATCH') return { url: null, model: undefined };
 
     const node = nodes.find(n => n.id.toUpperCase() === target.toUpperCase() || n.name?.toUpperCase() === target.toUpperCase());
     if (!node) return { url: config.ollama.baseUrl, model: undefined };

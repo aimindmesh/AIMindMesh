@@ -224,6 +224,43 @@ export const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 10,
+    name: 'claude provider: token usage and cost per day, batch requests',
+    up: db => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS claude_usage (
+          date TEXT NOT NULL,
+          model TEXT NOT NULL,
+          mode TEXT NOT NULL,
+          source TEXT NOT NULL,
+          calls INTEGER NOT NULL DEFAULT 0,
+          input_tokens INTEGER NOT NULL DEFAULT 0,
+          output_tokens INTEGER NOT NULL DEFAULT 0,
+          cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+          cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+          cost_usd REAL NOT NULL DEFAULT 0,
+          PRIMARY KEY (date, model, mode, source)
+        );
+        CREATE TABLE IF NOT EXISTS claude_batch_requests (
+          task_id TEXT PRIMARY KEY,
+          batch_id TEXT,
+          status TEXT NOT NULL,
+          params TEXT NOT NULL,
+          source TEXT NOT NULL DEFAULT 'router',
+          est_cost_usd REAL NOT NULL DEFAULT 0,
+          result_text TEXT,
+          error TEXT,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          submitted_at INTEGER,
+          completed_at INTEGER,
+          expires_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_claude_batch_status ON claude_batch_requests(status, batch_id);
+      `);
+    },
+  },
 ];
 
 export const LATEST_SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

@@ -52,7 +52,8 @@ The mobile node is not just a client; it's a high-performance inference powerhou
 The server acts as the "Central Nervous System", managing long-term memory and the ecosystem's autonomous growth.
 
 ### 🚦 Intelligent Inference Routing
-- **Tiered Task Prioritization**: Dynamically routes tasks (Embeddings → Lightweight → Complex → Evolution) across the mesh based on node hardware capability, proximity, and quota. The routes are customizable via Client PC per task type (e.g. embed, lightweight, complex, evolution).
+- **Tiered Task Prioritization**: Dynamically routes tasks (Embeddings → Lightweight → Complex → Evolution) across the mesh based on node hardware capability, proximity, and quota. The routes are customizable via Client PC and Admin Mobile per task type (e.g. embed, lightweight, complex, evolution).
+- **Claude First, While the Credit Lasts**: the monthly Claude API credit of the Max plan answers chats, research, debates, wiki pages and code generation first (Haiku, Sonnet or Opus per category, prompt caching, half-price Message Batches for the scheduled cycles), and the server agents (OpenClaw, Hermes, venture builds) through the same proxy; when the credit or the internal budget runs out, the usual chain (Gemini, OpenRouter, FreeLLMAPI, local nodes) takes over.
 - **Neural Wiki & Knowledge Graph (Neo4j)**: Automatically synthesizes raw meeting data and memories into a structured Neo4j knowledge graph, creating a persistent, searchable "Neural Wiki" of your entire digital life.
 - **FCM Proactive Push**: Real-time delivery of server-generated "Neural Insights" directly to mobile notification trays via Firebase.
 
@@ -66,7 +67,7 @@ Orchestrates autonomous operations, team roles expansion, and automated verifica
 
 ### 🧬 The Multi-Engine Evolution Loop
 AIMindMesh actively improves its own source tree through three distinct generation paths:
-1. **Server-Native Evolution**: Orchestrates multi-file contexts to ensure architecturally sound patches, delegating to **Gemini** or **Openrouter** for complex refactoring.
+1. **Server-Native Evolution**: Orchestrates multi-file contexts to ensure architecturally sound patches, delegating to **Claude** (while its credit lasts), then **Gemini** or **Openrouter** for complex refactoring.
 2. **Agentic OpenClaw Loop**: High-autonomy worker for user-requested projects that need external research.
 3. **On-Device Termux Scripting**: Local models generate and execute bash/python scripts via the native **Termux Bridge** for system-level Android optimizations.
 
@@ -93,6 +94,7 @@ A lightweight Tauri-based client that bridges high-performance PC hardware into 
 - **Gitea**: Self-hosted Git service for autonomous VCS and evolution patches.
 - **SearXNG**: Private metasearch engine ensuring untracked web research.
 - **FreeLLMAPI**: Private, self-hosted LLM gateway ensuring OpenAI-compatible model routing and credential isolation. (https://github.com/tashfeenahmed/freellmapi)
+- **Anthropic Claude API**: the plan's monthly credit, called by the server with its own key (never given to the agents); spend, budget and cache hits are visible in the admin apps.
 - **Kasm Workspaces**: Secure, containerized environments for agentic execution and shadow testing.
 - **Neo4j Graph Database**: The containerized knowledge engine powering the "Neural Wiki."
 

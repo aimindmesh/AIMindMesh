@@ -18,7 +18,7 @@ export interface SuccessResponse {
 // ── AI tasks (/api/ai-tasks) ─────────────────────────────────────────────────
 
 /** Where a task runs. Legacy rows may carry the provider name in `model` instead. */
-export type AiProvider = 'auto' | 'ollama' | 'gemini' | 'openrouter' | 'openclaw';
+export type AiProvider = 'auto' | 'ollama' | 'gemini' | 'openrouter' | 'claude' | 'openclaw';
 /** Whether the schedule is enabled. */
 export type AiTaskState = 'active' | 'paused';
 /** Status of a single execution. */
@@ -413,6 +413,35 @@ export interface ServiceHealth {
   lastCheck: number;
 }
 
+/** Claude availability: errors the API reports for the whole organization block it until they clear */
+export type ClaudeStateName = 'ok' | 'no_key' | 'credit_exhausted' | 'budget_reached' | 'auth_error' | 'unavailable';
+
+export interface ClaudeStatus {
+  enabled: boolean;
+  /** An API key is set */
+  configured: boolean;
+  state: ClaudeStateName;
+  reason?: string;
+  /** After a credit or availability error: when one probe call is let through (epoch ms) */
+  nextProbeAt?: number;
+  /** Agents (OpenClaw, Hermes, builds) may differ: they also have their own optional budget */
+  agentsState: ClaudeStateName;
+  agentsEnabled: boolean;
+  cycle: {
+    start: string;
+    end: string;
+    spendUsd: number;
+    /** Estimated cost of batch requests still running */
+    reservedUsd: number;
+    budgetUsd: number;
+    agentBudgetUsd: number | null;
+    bySource: { router: number; agent: number; builder: number };
+  };
+  today: { calls: number; inputTokens: number; outputTokens: number; cacheWriteTokens: number; cacheReadTokens: number; costUsd: number };
+  inFlight: { router: number; agents: number };
+  pendingBatchRequests: number;
+}
+
 export interface ServerStatus {
   nodes: ServerNode[];
   geminiUsage: number;
@@ -430,6 +459,7 @@ export interface ServerStatus {
   openClawHealth?: ServiceHealth;
   hermesHealth?: ServiceHealth;
   ingestionStats?: unknown;
+  claude?: ClaudeStatus;
 }
 
 // --- Backups (/api/admin/backups) ---

@@ -1,68 +1,43 @@
 import { NodeRegistry } from './NodeRegistry';
-import { sendToDevice } from './FCMDispatcher';
 import { config } from '../config';
 import db from '../db/sqlite';
 import { Logger } from '../utils/Logger';
-import * as OpenClawBridge from './OpenClawBridge';
-import { HermesBridge } from './HermesBridge';
 import { SearchService } from './SearchService';
 import { InferenceRegistry } from './InferenceRegistry';
 import { InferenceProviders } from './InferenceProviders';
 import { GeminiQueueManager } from './GeminiQueueManager';
-import { LEAKED_CLOUD_LOCK_MS, lockEngine, lockTimeoutMs } from './inference/lockTimeouts';
+import { lockTimeoutMs } from './inference/lockTimeouts';
+import { dispatchToProvider } from './inference/providerDispatch';
+import { providerCooldownMs } from './inference/providerCooldown';
+import { flattenPrompt } from './inference/promptParts';
+import { tryAcquireClaude } from './inference/claude/claudeGate';
+import { claudeFailureAction } from './inference/claude/claudeRetry';
+import { routerState } from './inference/routerState';
+import { recoverQueueAfterRestart } from './inference/bootRecovery';
+import { checkStaleTasks } from './inference/staleTasks';
+import { healLeakedLocks } from './inference/lockHealing';
+import { planGenericRetry } from './inference/retryPolicy';
+import * as MobileNodes from './inference/mobileNodes';
+import type { AbortReason, CompletionListener, EngineType, QueueItem, TaskPayload, TaskType } from './inference/routerTypes';
 import crypto from 'crypto';
 
-export type TaskType = 'EVOLUTION' | 'INTENT_CLASSIFICATION' | 'QUERY_EXPANSION' | 'CONCEPT_EXTRACTION' | 'CONCEPT_ENRICHMENT' | 'IMPROVEMENT_DETECTION' |
-                       'PROACTIVE_INSIGHT' | 'DEBATE_PARTICIPATION' | 'DEBATE_SUMMARY' | 'INSIGHT_DEDUP' | 
-                       'WIKI_SYNTHESIS' | 'WIKI_TOPIC_MAP' | 'CODE_EVOLUTION' | 'EVOLUTION_VALIDATION' |
-                       'EMBEDDING_GENERATION' | 'GENERAL_CHAT' | 'WEB_RESEARCH' | 'AGENTIC_TASK' | 'SCHEDULED_TASK' |
-                       'DIRECTIVES_EXTRACTION' | 'ORGANIZATION_DESIGN';
-export type EngineType = 'OLLAMA' | 'GEMINI' | 'OPENROUTER' | 'MOBILE' | 'OPENCLAW' | 'HERMES';
-
-export interface TaskPayload {
-  type: TaskType;
-  prompt: string;
-  tokensEstimate?: number;
-  currentWaitMs?: number;
-  retryCount?: number;
-  options?: {
-    routing?: string;
-    model?: string;
-    thinking?: boolean;
-    sessionKey?: string;
-    searchEnabled?: boolean;
-    taskName?: string;
-  };
-  metadata?: any;
-}
-
-const DEFAULT_AGENTIC_SESSION = 'aimindmesh:inference';
+export type { EngineType, QueueItem, TaskPayload, TaskType } from './inference/routerTypes';
 
 export class InferenceRouter {
-  private static taskQueue: Array<{
-    id: string;
-    payload: TaskPayload;
-    resolve: (value: { provider: string, response: string }) => void;
-    reject: (reason: any) => void;
-    lastProvider?: string;
-    onUpdate?: (update: any) => void;
-  }> = [];
-
-  // Lock structure: "TargetNodeID:ProviderName" -> timestamp
-  private static activeLocks = new Map<string, { id: string, timestamp: number }>();
+  // Shared with the helper modules of src/services/inference (routerState.ts): never reassigned
+  private static taskQueue = routerState.taskQueue;
+  private static items = routerState.items;
+  private static activeLocks = routerState.activeLocks;
   private static isScanningQueue = false;
-  private static pausedTasks = new Set<string>();
-  // AbortController per ogni task in PROCESSING - permette la cancellazione/re-routing
-  private static activeAbortControllers = new Map<string, AbortController>();
-  // Work the router did not dispatch (venture agent runs, validations): shown in the activity queue and
-  // cancellable, but never zombie-killed, re-queued as a prompt or re-routed
-  private static externalTasks = new Map<string, () => void>();
+  private static pausedTasks = routerState.pausedTasks;
+  private static activeAbortControllers = routerState.activeAbortControllers;
+  private static externalTasks = routerState.externalTasks;
 
-  public static nodeSockets = new Map<string, any>();
-  public static pendingMobileTasks = new Map<string, { callback: (result: any) => void, onUpdate?: (update: any) => void, cleanup: () => void, node: string }>();
-  private static taskCompletionListeners: Array<(id: string, result: string, metadata: any, type: TaskType) => Promise<void>> = [];
+  public static nodeSockets = routerState.nodeSockets;
+  public static pendingMobileTasks = routerState.pendingMobileTasks;
+  private static taskCompletionListeners = routerState.completionListeners;
 
-  public static onTaskCompleted(listener: (id: string, result: string, metadata: any, type: TaskType) => Promise<void>) {
+  public static onTaskCompleted(listener: CompletionListener) {
     this.taskCompletionListeners.push(listener);
   }
 
@@ -91,177 +66,67 @@ export class InferenceRouter {
       const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
       db.prepare('DELETE FROM gemini_calls WHERE timestamp <= ?').run(oneDayAgo);
       
-      // Venture agent runs and validations cannot resume after a restart: the run is lost and
-      // re-triggering here raced with the venture watchdog (two agents on one repo). They end here.
-      const interrupted = db.prepare(`
-        UPDATE inference_queue SET status = 'FAILED', error_msg = 'Interrupted by restart', completed_at = ?
-        WHERE type = 'AGENT_TASK' AND status IN ('QUEUED', 'PROCESSING', 'WAITING', 'STALLED', 'PAUSED')
-      `).run(Date.now());
-      if (interrupted.changes > 0) Logger.warn('InferenceRouter', `${interrupted.changes} venture agent task(s) interrupted by the restart`);
-
-      // Select PROCESSING tasks to determine their fate
-      const procRows = db.prepare(`SELECT id, created_at FROM inference_queue WHERE status = 'PROCESSING'`).all() as any[];
-      for (const row of procRows) {
-        const ageMs = Date.now() - row.created_at;
-        // If task was already processing for > 24h, mark as FAILED instead of re-queuing
-        if (ageMs > 24 * 60 * 60 * 1000) {
-          db.prepare(`UPDATE inference_queue SET status = 'FAILED', error_msg = 'Interrupted by restart and already exceeded 24h limit' WHERE id = ?`).run(row.id);
-          Logger.warn('InferenceRouter', `Task [${row.id.slice(0, 8)}] discarded on boot: was already >24h old and in PROCESSING state.`);
-        } else {
-          db.prepare(`UPDATE inference_queue SET status = 'QUEUED' WHERE id = ?`).run(row.id);
-        }
-      }
-
-      // IMPORTANT: Only recover RECENT tasks (< 24 hours old).
-      const twentyFourHoursAgo = Date.now() - 24 * 60 * 60 * 1000;
-      const staleResult = db.prepare(`UPDATE inference_queue SET status = 'FAILED', error_msg = 'Discarded on restart: task too old' WHERE status = 'QUEUED' AND created_at < ?`).run(twentyFourHoursAgo);
-      if (staleResult.changes > 0) Logger.warn('InferenceRouter', `Discarded ${staleResult.changes} stale tasks (older than 24h) on startup.`);
-
-      const rows = db.prepare("SELECT * FROM inference_queue WHERE status = 'QUEUED' OR status = 'PROCESSING' OR status = 'WAITING' OR status = 'STALLED' OR status = 'PAUSED'").all() as any[];
-      Logger.info('InferenceRouter', `Recovering ${rows.length} pending inferences...`);
-      for (const row of rows) {
-        try {
-          const task = JSON.parse(row.payload) as TaskPayload;
-          if (!task.options) task.options = {};
-          InferenceRegistry.register(row.id, row.type, row.task_name, task.options?.model, task, task.options?.routing || 'AUTO');
-          setTimeout(() => {
-            this._enqueueTask(task, row.id).then(async (res) => {
-              // 1. Run listeners first
-              let listenerError: string | null = null;
-              for (const listener of this.taskCompletionListeners) {
-                try {
-                  await listener(row.id, res.response, task.metadata, task.type);
-                } catch (e: any) {
-                  Logger.error('InferenceRouter', `Recovery listener failed for [${row.id.slice(0, 8)}]: ${e.message}`);
-                  listenerError = e.message;
-                }
-              }
-              // 2. Finalize status based on both inference AND listener success
-              if (listenerError) {
-                InferenceRegistry.finish(row.id, undefined, `LISTENER_FAILED: ${listenerError}`);
-              } else {
-                InferenceRegistry.finish(row.id, res.response);
-              }
-            }).catch(e => {
-              InferenceRegistry.finish(row.id, undefined, e.message);
-              Logger.warn('InferenceRouter', `Recovered task ${row.id} failed: ${e.message}`);
-            });
-          }, 5000);
-        } catch (e) { Logger.warn('InferenceRouter', `Recovery parse failed for task ${row.id}`); }
-      }
+      recoverQueueAfterRestart((task, id) => this._enqueueTask(task, id));
       // processQueue too: tasks blocked by a lock released here must not wait for the next event
       setInterval(() => { this.checkStaleTasks(); void this.processQueue(); }, 60000);
     } catch (err: any) { Logger.error('InferenceRouter', `Init failed: ${err.message}`); }
   }
 
   public static checkStaleTasks() {
-    const activeTasks = InferenceRegistry.getActive().filter(t => t.status === 'PROCESSING');
-    if (activeTasks.length === 0) return;
-
-    const allNodes = NodeRegistry.getNodes().filter(n => n.status === 'ONLINE');
-    const onlineNodes = new Set<string>();
-    allNodes.forEach(n => {
-      onlineNodes.add(n.id.toUpperCase());
-      if (n.name) onlineNodes.add(n.name.toUpperCase());
+    checkStaleTasks({
+      toAuto: (id, payload, reason) => this._resetTaskToAuto(id, payload, reason),
+      toOpenRouter: (id, payload) => this._resetTaskToOpenRouter(id, payload),
     });
-
-    for (const task of activeTasks) {
-      // External tasks own their timeouts and their registry entry
-      if (this.externalTasks.has(task.id)) continue;
-
-      // --- Zombie Detection: PROCESSING in registry but no active execution context ---
-      const hasController = this.activeAbortControllers.has(task.id);
-      const hasPendingMobile = this.pendingMobileTasks.has(task.id);
-
-      if (!hasController && !hasPendingMobile) {
-        const ageMin = Math.round((Date.now() - (task.processingStartedAt || task.startedAt)) / 60000);
-
-        // Detailed logging for debugging
-        const controllerKeys = Array.from(this.activeAbortControllers.keys()).map(k => k.slice(0, 8));
-        Logger.debug('InferenceRouter', `[STALE-CHECK] Task [${task.id.slice(0, 8)}] state: hasController=${hasController}, hasPendingMobile=${hasPendingMobile}, age=${ageMin}m. Map keys: ${controllerKeys.join(',')}`);
-
-        // Safeguard: Kill zombies that have been in PROCESSING for >10 minutes without context
-        // Mobile tasks are handled via their own 24h internal timeout.
-        if (ageMin >= 10) {
-          Logger.warn('InferenceRouter', `[STALE] Zombie task detected [${task.id.slice(0, 8)}] - PROCESSING with no context (${ageMin}m old). Marking FAILED.`);
-          
-          // Clear any locks held by this zombie task
-          for (const [lockKey, lockInfo] of this.activeLocks.entries()) {
-            if (lockInfo.id === task.id) {
-              Logger.warn('InferenceRouter', `[STALE] Releasing lock ${lockKey} held by zombie task [${task.id.slice(0, 8)}]`);
-              this.activeLocks.delete(lockKey);
-            }
-          }
-
-          InferenceRegistry.finish(task.id, undefined, `Zombie task: execution context lost (age: ${ageMin}m)`);
-          continue;
-        }
-      }
-
-      // --- Node Offline Detection ---
-      const target = (task.provider || task.model || '').toUpperCase();
-      const isCloud = !target || target.includes('API') || target === 'AUTO' || target === 'GEMINI' || target === 'OPENROUTER' || target === 'OPENROUTER_API';
-
-      if (!isCloud && !onlineNodes.has(target)) {
-        Logger.warn('InferenceRouter', `[STALE] Node [${target}] OFFLINE. Recovering task [${task.id.slice(0, 8)}]...`);
-        const pending = this.pendingMobileTasks.get(task.id);
-        if (pending) {
-          pending.cleanup();
-          pending.callback({ error: `NODE_${target}_OFFLINE` });
-        } else if (task.payload) {
-          this._resetTaskToAuto(task.id, task.payload, 'NODE_OFFLINE');
-        } else {
-          InferenceRegistry.setStatus(task.id, 'QUEUED');
-        }
-        continue;
-      }
-
-      // --- 24h Timeout & OpenRouter Fallback ---
-      const ageMs = Date.now() - (task.processingStartedAt || task.startedAt);
-      const ageHours = ageMs / (1000 * 60 * 60);
-
-      if (ageHours >= 24) {
-        Logger.warn('InferenceRouter', `[STALE] Task [${task.id.slice(0, 8)}] exceeded 24h limit on [${target}]. Fallback to OPENROUTER.`);
-        if (task.payload) {
-          this._resetTaskToOpenRouter(task.id, task.payload);
-        } else {
-          InferenceRegistry.finish(task.id, undefined, 'Task timed out after 24h on local node');
-        }
-      }
-    }
   }
 
   private static _resetTaskToOpenRouter(id: string, payload: TaskPayload) {
     if (this.taskQueue.some(t => t.id === id)) return;
     
     // Abort current attempt
-    const controller = this.activeAbortControllers.get(id);
-    if (controller) controller.abort();
+    this.activeAbortControllers.get(id)?.abort('RESET' satisfies AbortReason);
     
     InferenceRegistry.setStatus(id, 'QUEUED');
     InferenceRegistry.update(id, 'OPENROUTER');
     const newPayload = { ...payload, options: { ...payload.options, routing: 'OPENROUTER' } };
     InferenceRegistry.updatePayload(id, newPayload);
-    
-    void this._enqueueTask(newPayload, id);
+    this._requeue(id, newPayload);
   }
 
   private static _resetTaskToAuto(id: string, payload: TaskPayload, reason: string) {
     if (this.taskQueue.some(t => t.id === id)) return;
+    this.activeAbortControllers.get(id)?.abort('RESET' satisfies AbortReason);
     InferenceRegistry.setStatus(id, 'QUEUED');
     InferenceRegistry.update(id, 'AUTO');
-    void this._enqueueTask({ ...payload, options: { ...payload.options, routing: 'AUTO' } }, id);
+    this._requeue(id, { ...payload, options: { ...payload.options, routing: 'AUTO' } });
+  }
+
+  /**
+   * Puts a task back in the queue with its caller's item (same promise). Without one (a task
+   * recovered at boot whose promise is gone) the result only reaches the registry.
+   */
+  private static _requeue(id: string, payload: TaskPayload): void {
+    const item = this.items.get(id) ?? {
+      id,
+      payload,
+      resolve: (v: any) => InferenceRegistry.finish(id, v.response),
+      reject: (e: any) => InferenceRegistry.finish(id, undefined, e.message),
+    };
+    item.payload = payload;
+    this.taskQueue.push(item);
+    void this.processQueue();
   }
 
   public static pauseTask(id: string): void { this.pausedTasks.add(id); InferenceRegistry.setStatus(id, 'PAUSED'); }
   public static resumeTask(id: string): void { this.pausedTasks.delete(id); InferenceRegistry.setStatus(id, 'QUEUED'); void this.processQueue(); }
   public static cancelTask(id: string): void {
     this.pausedTasks.delete(id);
-    this.taskQueue = this.taskQueue.filter(i => i.id !== id);
+    for (let i = this.taskQueue.length - 1; i >= 0; i--) {
+      if (this.taskQueue[i].id === id) this.taskQueue.splice(i, 1);
+    }
     // 1. Abort local/cloud request
     const controller = this.activeAbortControllers.get(id);
     if (controller) {
-      controller.abort();
+      controller.abort('CANCEL' satisfies AbortReason);
       this.activeAbortControllers.delete(id);
       Logger.info('InferenceRouter', `[ABORT] Aborted in-flight task [${id.slice(0, 8)}]`);
     }
@@ -285,6 +150,8 @@ export class InferenceRouter {
       Logger.info('InferenceRouter', `[ABORT] Cancelled external task [${id.slice(0, 8)}]`);
     }
     InferenceRegistry.finish(id, undefined, 'CANCELLED_BY_USER');
+    // The caller stops waiting (its catch sees the cancellation)
+    this.items.get(id)?.reject(new Error('CANCELLED_BY_USER'));
   }
 
   public static setBrake(active: boolean): void {
@@ -295,7 +162,7 @@ export class InferenceRouter {
       // 1. Abort all active PROCESSING tasks
       for (const [id, controller] of this.activeAbortControllers.entries()) {
         Logger.info('InferenceRouter', `[BRAKE] Aborting task [${id.slice(0, 8)}] due to system brake`);
-        controller.abort();
+        controller.abort('BRAKE' satisfies AbortReason);
       }
       
       // 2. Clear mobile tasks
@@ -328,12 +195,14 @@ export class InferenceRouter {
           InferenceRegistry.setStatus(task.id, 'QUEUED');
           // Re-inject into memory queue if missing
           if (!this.taskQueue.some(t => t.id === task.id) && task.payload) {
-             this.taskQueue.push({
-               id: task.id,
-               payload: task.payload,
-               resolve: (v: any) => InferenceRegistry.finish(task.id, v.response),
-               reject: (e: any) => InferenceRegistry.finish(task.id, undefined, e.message)
-             });
+            const item = this.items.get(task.id) ?? {
+              id: task.id,
+              payload: task.payload,
+              resolve: (v: any) => InferenceRegistry.finish(task.id, v.response),
+              reject: (e: any) => InferenceRegistry.finish(task.id, undefined, e.message)
+            };
+            item.payload = task.payload;
+            this.taskQueue.push(item);
           }
         }
       }
@@ -354,9 +223,10 @@ export class InferenceRouter {
     const wasProcessing = info.status === 'PROCESSING';
 
     // 1. Update Registry & DB (Registry.updatePayload handles both)
+    // An explicit re-route is a new request: the providers that failed the task may be tried again
     const newPayload = {
       ...info.payload,
-      options: { ...(info.payload?.options || {}), routing }
+      options: { ...(info.payload?.options || {}), routing, requestedRouting: routing.toUpperCase(), skipProviders: undefined }
     };
     InferenceRegistry.updatePayload(id, newPayload);
 
@@ -365,7 +235,7 @@ export class InferenceRouter {
       // 1. Abort local/cloud request
       const controller = this.activeAbortControllers.get(id);
       if (controller) {
-        controller.abort();
+        controller.abort('REROUTE' satisfies AbortReason);
         // Do NOT delete from map here - let the original dispatch's finally block handle it
         // to prevent race conditions during immediate re-dispatching.
       }
@@ -389,12 +259,14 @@ export class InferenceRouter {
       Logger.debug('InferenceRouter', `[SYNC] Memory queue updated for task [${id.slice(0, 8)}]`);
     } else if (wasProcessing || info.status === 'QUEUED' || info.status === 'PAUSED' || info.status === 'WAITING' || info.status === 'STALLED') {
       // Re-inject if it was processing or missing from queue but in a waitable state
-      this.taskQueue.push({
+      const item = this.items.get(id) ?? {
         id,
         payload: newPayload,
         resolve: (v: any) => InferenceRegistry.finish(id, v.response),
         reject: (e: any) => InferenceRegistry.finish(id, undefined, e.message)
-      });
+      };
+      item.payload = newPayload;
+      this.taskQueue.push(item);
       Logger.debug('InferenceRouter', `[SYNC] Task [${id.slice(0, 8)}] re-injected into memory queue`);
     } else {
       return false; // Task is in a state where routing cannot be changed (e.g. COMPLETED/FAILED)
@@ -409,50 +281,7 @@ export class InferenceRouter {
     if (this.isScanningQueue || this.taskQueue.length === 0 || config.infrastructureBrake) return;
     this.isScanningQueue = true;
     try {
-      // --- SELF-HEALING LOCKS ---
-      // Ground truth: a lock is valid ONLY if there's an active AbortController for some task in PROCESSING
-      // state that actually holds that lock. We reconstruct the set of "active lock keys" from the
-      // running controllers to prevent null-provider comparisons from clearing valid locks.
-      const processingLockKeys = new Set<string>();
-      // 1. Check local tasks (HTTP/Cloud)
-      for (const [taskId] of this.activeAbortControllers.entries()) {
-        const info = InferenceRegistry.get(taskId);
-        if (info?.status === 'PROCESSING') {
-          const tgt = (info.provider || 'SERVER_LOCAL').toUpperCase();
-          // Determine engine type based on provider and payload
-          let engineType: EngineType = 'OLLAMA';
-          if (tgt === 'GEMINI' || tgt === 'GEMINI_API') engineType = 'GEMINI';
-          else if (tgt === 'OPENROUTER' || tgt === 'OPENROUTER_API') engineType = 'OPENROUTER';
-          else if (tgt === 'HERMES') engineType = 'HERMES';
-          else if (tgt === 'OPENCLAW') engineType = 'OPENCLAW';
-          else if (info.payload?.type === 'AGENTIC' || info.payload?.type === 'AGENTIC_TASK') engineType = 'OPENCLAW';
-
-          processingLockKeys.add(`${tgt}:${engineType}`);
-        }
-      }
-      // 2. Check mobile/external tasks (WebSocket)
-      for (const [taskId, pending] of this.pendingMobileTasks.entries()) {
-        processingLockKeys.add(`${pending.node.toUpperCase()}:MOBILE`);
-      }
-      
-      // 3. Check OpenClaw tasks (REST/WS Bridge)
-      for (const [taskId, controller] of this.activeAbortControllers.entries()) {
-        const info = InferenceRegistry.get(taskId);
-        if (info?.status === 'PROCESSING' && info.payload?.type === 'AGENTIC') {
-          processingLockKeys.add(`OPENCLAW:AGENTIC`);
-        }
-      }
-
-      const now = Date.now();
-      for (const [lock, lockInfo] of this.activeLocks.entries()) {
-        const isCloud = lock.includes('GEMINI') || lock.includes('OPENROUTER');
-        const gracePeriod = isCloud ? LEAKED_CLOUD_LOCK_MS : lockTimeoutMs(lockEngine(lock));
-
-        if (now - lockInfo.timestamp > gracePeriod && !processingLockKeys.has(lock)) {
-          Logger.warn('InferenceRouter', `[QUEUE] Force-clearing leaked lock: ${lock} (Held for ${Math.round((now - lockInfo.timestamp)/1000)}s)`);
-          this.activeLocks.delete(lock);
-        }
-      }
+      healLeakedLocks();
 
       let i = 0;
       while (i < this.taskQueue.length) {
@@ -474,8 +303,10 @@ export class InferenceRouter {
           // Rule: Per-Provider Serial Execution
           // We allow EMBEDDING and LIGHTWEIGHT tasks to bypass locks to prevent deadlocks during RAG/Search.
           const isEmbedding = ['EMBEDDING_GENERATION'].includes(item.payload.type);
+          // Claude has no provider lock: its calls run side by side, bounded by the claudeGate slots
+          const bypassLock = isEmbedding || engine === 'CLAUDE' || engine === 'CLAUDE_BATCH';
 
-          if (!isEmbedding && this.activeLocks.has(lockKey)) {
+          if (!bypassLock && this.activeLocks.has(lockKey)) {
             const lockInfo = this.activeLocks.get(lockKey);
             // Self-healing: unlock if the lock is older than the engine's lock timeout
             const timeout = lockTimeoutMs(engine);
@@ -486,7 +317,7 @@ export class InferenceRouter {
               // 1. Abort the associated task context
               const controller = this.activeAbortControllers.get(staleTaskId);
               if (controller) {
-                controller.abort();
+                controller.abort('STALE_LOCK' satisfies AbortReason);
                 this.activeAbortControllers.delete(staleTaskId);
               }
               const mobilePending = this.pendingMobileTasks.get(staleTaskId);
@@ -506,10 +337,21 @@ export class InferenceRouter {
             }
           }
 
+          if (engine === 'CLAUDE') {
+            // Every slot busy (or Claude just became unavailable): the task stays queued for the next scan
+            const ticket = tryAcquireClaude('router', 'router');
+            if (!ticket) {
+              Logger.debug('InferenceRouter', `[QUEUE] Task [${item.id.slice(0, 8)}] waiting for a Claude slot`);
+              i++;
+              continue;
+            }
+            item.claudeTicket = ticket;
+          }
+
           Logger.info('InferenceRouter', `[QUEUE] DISPATCHING Task [${item.id.slice(0, 8)}] -> ${target} (${engine})`);
           // Atomic Lock & Status Update (MUST be synchronous to prevent race conditions)
           this.taskQueue.splice(i, 1);
-          if (!isEmbedding) {
+          if (!bypassLock) {
             this.activeLocks.set(lockKey, { id: item.id, timestamp: Date.now() });
             Logger.debug('InferenceRouter', `[QUEUE] LOCK ACQUIRED: ${lockKey}`);
           }
@@ -533,13 +375,15 @@ export class InferenceRouter {
           this.taskQueue.forEach((q, idx) => { if (!this.pausedTasks.has(q.id)) InferenceRegistry.setStatus(q.id, 'QUEUED', idx); });
         } catch (err: any) {
           Logger.error('InferenceRouter', `Routing resolution error: ${err.message}`);
+          item.claudeTicket?.release();
+          item.claudeTicket = undefined;
           i++;
         }
       }
     } finally { this.isScanningQueue = false; }
   }
 
-  private static async _dispatchTask(item: { id: string, payload: TaskPayload, resolve: any, reject: any, lastProvider?: string, onUpdate?: (update: any) => void }, target: string, engine: EngineType, controller: AbortController) {
+  private static async _dispatchTask(item: QueueItem, target: string, engine: EngineType, controller: AbortController) {
     const { id, resolve, reject } = item;
     const signal = controller.signal;
     const lockKey = `${target.toUpperCase()}:${engine}`;
@@ -554,71 +398,22 @@ export class InferenceRouter {
 
       Logger.debug('InferenceRouter', `[_dispatchTask] Resolved Payload: ${payload.type}, Engine: ${engine}, Search: ${payload.options?.searchEnabled}`);
 
-      // 1. WEB SEARCH PRE-PROCESSING (Independent of provider)
-      if (payload.type === 'WEB_RESEARCH' || payload.options?.searchEnabled) {
+      // 1. WEB SEARCH PRE-PROCESSING (Independent of provider), once: retries reuse the results
+      if ((payload.type === 'WEB_RESEARCH' || payload.options?.searchEnabled) && payload.searchContext === undefined) {
         Logger.info('InferenceRouter', `[SEARCH] Pre-processing search for task [${id.slice(0, 8)}]`);
         const results = await SearchService.search(payload.prompt);
-        
-        // --- IMPROVED SEARCH INJECTION ---
-        const searchContext = SearchService.formatResultsForContext(results);
-        const systemInstruction = `
-### SYSTEM INSTRUCTION
-You have access to real-time web search results provided below. 
-1. Use the [Search Results] to provide an accurate, up-to-date answer.
-2. If the results contain the answer, prioritize them over your internal knowledge.
-3. Use citations like [1], [2] based on the result indices.
-4. If results are irrelevant, acknowledge them but rely on your internal knowledge if possible.
-5. Tone: Helpful, precise, and objective.
-
-[Search Results]
-${searchContext}
-### END SYSTEM INSTRUCTION
-`;
-        payload.prompt = `${systemInstruction}\n\nUSER: ${payload.prompt}`;
-        InferenceRegistry.updatePayload(id, payload); // Update stored prompt for UI visibility
+        payload.searchContext = SearchService.formatResultsForContext(results);
+        InferenceRegistry.updatePayload(id, payload); // Stored for UI visibility and retries
       }
 
       // 2. PROVIDER DISPATCH
-      if (target.toUpperCase() === 'FREELLMAPI') {
-        const model = payload.options?.model || config.freellmapi?.model || 'auto';
-        Logger.info('InferenceRouter', `[FREELLMAPI] DISPATCH: Task [${id.slice(0, 8)}] -> FreeLLMAPI (Model: ${model})`);
-        responseText = await InferenceProviders.callFreeLLMAPI(payload.prompt, signal, model);
-        this._trackUsage('openrouter'); // Fallback to OpenRouter usage table for now
-      } else if (engine === 'GEMINI') {
-        Logger.info('InferenceRouter', `[CLOUD] DISPATCH: Task [${id.slice(0, 8)}] -> Gemini (Model: ${payload.options?.model || config.gemini.model})`);
-        responseText = await GeminiQueueManager.enqueue(payload.prompt, signal, payload.options?.model, config.gemini.apiKey);
-        this._trackUsage('gemini', config.gemini.apiKey);
-      } else if (engine === 'OPENROUTER') {
-        const model = payload.options?.model || config.openrouter.model;
-        Logger.info('InferenceRouter', `[CLOUD] DISPATCH: Task [${id.slice(0, 8)}] -> OpenRouter (Model: ${model})`);
-        responseText = await InferenceProviders.callOpenRouter(payload.prompt, signal, payload.options?.model);
-        this._trackUsage('openrouter');
-      } else if (engine === 'HERMES' || target.toUpperCase() === 'HERMES') {
-        Logger.info('InferenceRouter', `[HERMES] DISPATCH: Task [${id.slice(0, 8)}] -> Nous Research Hermes Agent`);
-        const res = await HermesBridge.runAgentTask(payload.prompt, payload.options?.sessionKey ?? 'system');
-        responseText = res.reply;
-      } else if (engine === 'OPENCLAW' || target.toUpperCase() === 'OPENCLAW' || (payload.type === 'AGENTIC_TASK' && await OpenClawBridge.isReachable())) {
-        const openClawKey = process.env.GOOGLE_API_KEY;
-        const cost = 5;
-        if (!GeminiQueueManager.hasCapacity(cost, openClawKey)) {
-          Logger.warn('InferenceRouter', `[QUOTA] Agentic task [${id.slice(0, 8)}] postponed: OpenClaw Gemini quota near limit.`);
-          throw new Error('GEMINI_DAILY_QUOTA_REACHED');
-        }
-        GeminiQueueManager.reserveCapacity(cost, openClawKey);
-        const res = await OpenClawBridge.runAgentTask(payload.prompt, payload.options?.sessionKey ?? 'system');
-        responseText = res.reply;
-
-      } else if (payload.type === 'EMBEDDING_GENERATION') {
-        responseText = JSON.stringify(await InferenceProviders.getEmbeddings(url!, payload.prompt));
-      } else if (engine === 'MOBILE' || url === 'MOBILE_NODE') {
-        responseText = await this._dispatchMobile(item, target) as string;
-      } else if (url) {
-        const thinking = payload.options?.thinking ? '\n\n(Think deeply.)' : '\n\n(Direct response.)';
-        responseText = await InferenceProviders.callOllama(url, payload.prompt + thinking, model, signal);
-      } else {
-        await this._attemptWakeup(id, target);
-        throw new Error(`NODE_${target}_OFFLINE`);
-      }
+      responseText = await dispatchToProvider({
+        id, target, engine, payload, prompt: flattenPrompt(payload), signal, url, model,
+        onUpdate: item.onUpdate,
+        claudeTicket: item.claudeTicket,
+        dispatchMobile: () => MobileNodes.dispatchMobile(item, target),
+        wakeup: () => MobileNodes.attemptWakeup(id, target),
+      });
 
       // Execute post-completion listeners if successful
       if (responseText) {
@@ -648,22 +443,20 @@ ${searchContext}
       void this.processQueue();
     } catch (err: any) {
       if (signal?.aborted) {
-        // Check if this was a stale lock timeout kill
-        const taskEntry = InferenceRegistry.get(id);
-        
-        // If it was aborted and it's taking too long, it's likely a timeout-triggered kill
-        if (taskEntry && taskEntry.status === 'PROCESSING') {
-           Logger.warn('InferenceRouter', `[TIMEOUT] Task [${id.slice(0, 8)}] likely timed out on ${target}. Attempting escalation...`);
+        // A stale lock kill is retried (escalated) here; a cancel, re-route, brake or reset already
+        // re-queued or finished the task, and its new attempt may be running: never retry those
+        if ((signal.reason as AbortReason) === 'STALE_LOCK') {
+           Logger.warn('InferenceRouter', `[TIMEOUT] Task [${id.slice(0, 8)}] timed out on ${target}. Attempting escalation...`);
            if (this._attemptRetry(item, new Error('Stale lock timeout'))) return;
         }
 
-        // Task was cancelled/re-routed - do NOT retry, just clean up
-        Logger.info('InferenceRouter', `[ABORT] Task [${id.slice(0, 8)}] aborted cleanly`);
-        // Do not call reject - the task was re-injected by updateQueuedTask
+        Logger.info('InferenceRouter', `[ABORT] Task [${id.slice(0, 8)}] aborted cleanly (${String(signal.reason)})`);
       } else if (!this._attemptRetry(item, err)) {
         item.reject(err);
       }
     } finally {
+      item.claudeTicket?.release();
+      item.claudeTicket = undefined;
       if (this.activeAbortControllers.get(id) === controller) {
         this.activeAbortControllers.delete(id);
       }
@@ -675,224 +468,74 @@ ${searchContext}
     }
   }
 
-  private static _trackUsage(provider: 'gemini' | 'openrouter', apiKey?: string): void {
-    try {
-      const now = Date.now();
-      const today = new Date().toISOString().split('T')[0];
-      const table = provider === 'gemini' ? 'gemini_usage' : 'openrouter_usage';
-      db.prepare(`
-        INSERT INTO ${table} (date, call_count) VALUES (?, 1)
-        ON CONFLICT(date) DO UPDATE SET call_count = call_count + 1
-      `).run(today);
-
-      if (provider === 'gemini') {
-        GeminiQueueManager.trackCall(apiKey);
+  /** Puts a failed task in WAITING and back in the queue after `waitMs`, unless it was moved or cancelled meanwhile. */
+  private static _requeueAfter(item: QueueItem, waitMs: number): void {
+    const { id } = item;
+    InferenceRegistry.setStatus(id, 'WAITING');
+    setTimeout(() => {
+      const current = InferenceRegistry.get(id);
+      if (current?.status === 'WAITING') {
+        Logger.info('InferenceRouter', `[COOLDOWN] Cooldown finished. Re-queuing Task [${id.slice(0, 8)}].`);
+        InferenceRegistry.setStatus(id, 'QUEUED');
+        this.taskQueue.push(item);
+        void this.processQueue();
+      } else {
+        Logger.info('InferenceRouter', `[COOLDOWN] Task [${id.slice(0, 8)}] no longer WAITING, skipping retry.`);
       }
-      
-      Logger.debug('InferenceRouter', `[USAGE] ${provider} call tracked (${today})`);
-    } catch (err: any) {
-      Logger.warn('InferenceRouter', `[USAGE] Failed to track ${provider} usage: ${err.message}`);
-    }
+    }, waitMs);
   }
 
-
-  private static async _dispatchMobile(item: { id: string, payload: TaskPayload, resolve: any, reject: any, onUpdate?: (update: any) => void }, provider: string) {
-    const { id, payload } = item;
-    const socket = this.nodeSockets.get(provider);
-    if (!socket || socket.readyState !== 1) throw new Error(`NODE_${provider}_DISCONNECTED`);
-
-    return new Promise((res, rej) => {
-      // 24 hours timeout for mobile nodes - user requested long duration
-      const timeout = setTimeout(() => { cleanup(); rej(new Error('Mobile timeout after 24h')); }, 24 * 60 * 60 * 1000);
-      const onDisconnect = () => { cleanup(); rej(new Error(`NODE_${provider}_DISCONNECTED`)); };
-      const cleanup = () => {
-        clearTimeout(timeout);
-        this.pendingMobileTasks.delete(id);
-      };
-
-      this.pendingMobileTasks.set(id, {
-        callback: (result: any) => { cleanup(); if (result.error) rej(new Error(result.error)); else res(result.reply || ''); },
-        onUpdate: item.onUpdate,
-        cleanup,
-        node: provider
-      });
-
-      socket.once?.('close', onDisconnect);
-      socket.send(JSON.stringify({ type: 'task', id, payload }));
-    });
-  }
-
-  private static async _attemptWakeup(id: string, provider: string) {
-    const node = NodeRegistry.getNodes().find(n => n.id === provider);
-    if (node?.fcm_token) {
-      await sendToDevice(node.fcm_token, { title: 'Synaptic Link', body: 'Waking up node...', data: { type: 'WAKE_FOR_INFERENCE', taskId: id } });
-    }
-  }
-
-  private static _attemptRetry(item: { id: string, payload: TaskPayload, resolve: any, reject: any, lastProvider?: string }, err: any): boolean {
+  private static _attemptRetry(item: QueueItem, err: any): boolean {
     const payload = item.payload;
     const id = item.id;
 
     const errMsg = err.message || '';
-    const isGeminiQuota = errMsg.includes('GEMINI_QUOTA_EXCEEDED') || errMsg.includes('429');
-    const isGeminiDaily = errMsg.includes('GEMINI_DAILY_QUOTA_EXCEEDED') || errMsg.includes('GEMINI_DAILY_QUOTA_REACHED') || errMsg.includes('QuotaFailure') || errMsg.includes('PerDay');
-    
     Logger.error('InferenceRouter', `[_attemptRetry] Task [${item.id.slice(0,8)}] failed on ${item.lastProvider}. Error: ${errMsg}`);
 
-    const lastProvUpper = item.lastProvider?.toUpperCase();
-
-    // FreeLLMAPI Cooldown and Exponential Backoff
-    const isFreeLLMAPIQuota = errMsg.includes('All models exhausted') || 
-                              errMsg.includes('routing_error') || 
-                              errMsg.includes('429') || 
-                              errMsg.includes('rate limit');
-                              
-    const isFreeLLMAPIService = errMsg.includes('500') || 
-                                errMsg.includes('503') || 
-                                errMsg.includes('504') || 
-                                errMsg.includes('ECONNREFUSED') || 
-                                errMsg.includes('network error') ||
-                                errMsg.includes('timed out') ||
-                                errMsg.includes('timeout') ||
-                                errMsg.includes('unreachable') ||
-                                errMsg.includes('fetch failed');
-
-    if (lastProvUpper === 'FREELLMAPI' && (isFreeLLMAPIQuota || isFreeLLMAPIService)) {
-      const minWait = 30000; // 30s
-      const maxWait = 3600000; // 1h
-      let currentWait = payload.currentWaitMs || (minWait / 2);
-      let waitMs = Math.min(currentWait * 2, maxWait);
-      if (waitMs < minWait) waitMs = minWait;
-      payload.currentWaitMs = waitMs;
-
-      Logger.warn(
-        'InferenceRouter', 
-        `[FREELLMAPI] Rate limit or service busy hit (${isFreeLLMAPIQuota ? 'Quota' : 'Service'}). ` +
-        `Task [${id.slice(0, 8)}] put in COOLDOWN, waiting ${waitMs / 1000}s (Backoff).`
-      );
-
-      InferenceRegistry.setStatus(id, 'WAITING');
-
-      setTimeout(() => {
-        const current = InferenceRegistry.get(id);
-        if (current && current.status === 'WAITING') {
-          Logger.info('InferenceRouter', `[FREELLMAPI] Cooldown finished. Re-queuing Task [${id.slice(0, 8)}].`);
-          InferenceRegistry.setStatus(id, 'QUEUED');
-          this.taskQueue.push(item);
-          void this.processQueue();
-        } else {
-          Logger.info('InferenceRouter', `[FREELLMAPI] Task [${id.slice(0, 8)}] no longer WAITING, skipping retry.`);
-        }
-      }, waitMs);
-      
+    // Claude failures never loop on Claude: next provider, or back to a caller that chose Claude
+    const claudeAction = claudeFailureAction(item, err);
+    if (claudeAction === 'reject') return false;
+    if (claudeAction === 'requeue') {
+      InferenceRegistry.updatePayload(id, payload);
+      InferenceRegistry.setStatus(id, 'QUEUED');
+      InferenceRegistry.updateProvider(id, 'AUTO');
+      setImmediate(() => { this.taskQueue.push(item); void this.processQueue(); });
       return true;
     }
 
-    const isGeminiService = errMsg.includes('500') || errMsg.includes('503') || errMsg.includes('504') || errMsg.includes('UNAVAILABLE') || errMsg.includes('INTERNAL') || errMsg.includes('DEADLINE_EXCEEDED');
-
-    if (lastProvUpper === 'GEMINI' && (isGeminiDaily || isGeminiService)) {
-      let waitMs = 3600000; // Default 1h for Daily quota
-      
-      if (isGeminiService) {
-        // Exponential Backoff for 503: start 30s, double each time up to 1h
-        const minWait = 30000; // 30s
-        const maxWait = 3600000; // 1h
-        let currentWait = payload.currentWaitMs || (minWait / 2);
-        waitMs = Math.min(currentWait * 2, maxWait);
-        if (waitMs < minWait) waitMs = minWait;
-        payload.currentWaitMs = waitMs;
-        Logger.warn('InferenceRouter', `[SERVICE] Gemini busy (503). Task [${id.slice(0,8)}] waiting ${waitMs/1000}s (Backoff).`);
-      } else {
-        Logger.warn('InferenceRouter', `[QUOTA] Gemini daily quota exhausted. Task [${id.slice(0,8)}] waiting 1h.`);
-      }
-
-      InferenceRegistry.setStatus(id, 'WAITING');
-
-      setTimeout(() => {
-        const current = InferenceRegistry.get(id);
-        if (current?.status === 'WAITING') {
-          InferenceRegistry.setStatus(id, 'QUEUED');
-          this.taskQueue.push(item);
-          void this.processQueue();
-        }
-      }, waitMs);
+    // Quota, rate limit or busy service: wait, then retry on the same provider
+    const cooldownMs = providerCooldownMs(item, errMsg);
+    if (cooldownMs !== null) {
+      this._requeueAfter(item, cooldownMs);
       return true;
     }
 
-    // Special handling for Gemini 429
-    const maxRetries = config.gemini?.maxRetries ?? 20;
-    if (isGeminiQuota && lastProvUpper === 'GEMINI' && (payload.retryCount || 0) < maxRetries) {
-      payload.retryCount = (payload.retryCount || 0) + 1;
-      const retryAfterSeconds = parseFloat(errMsg.split(':')[1]) || 20;
-      const waitMs = (retryAfterSeconds * 2 + 10) * 1000;
-      
-      Logger.warn('InferenceRouter', `[QUOTA] Gemini 429 hit. Waiting ${retryAfterSeconds * 2 + 10}s before retry ${payload.retryCount}/${maxRetries}...`);
-      InferenceRegistry.setStatus(id, 'WAITING');
-      
-      setTimeout(() => {
-        // Check if task is still in WAITING state (user might have changed target or cancelled)
-        const current = InferenceRegistry.get(id);
-        if (current && current.status === 'WAITING') {
-          InferenceRegistry.setStatus(id, 'QUEUED');
-          this.taskQueue.push(item);
-          void this.processQueue();
-        } else {
-          Logger.info('InferenceRouter', `[QUOTA] Task [${id.slice(0, 8)}] no longer WAITING, skipping Gemini retry.`);
-        }
-      }, waitMs);
-      
-      return true;
-    }
-
-    if ((payload.retryCount || 0) <= 5) {
-      payload.retryCount = (payload.retryCount || 0) + 1;
-      
-      const currentRouting = (payload.options?.routing || 'AUTO').toUpperCase();
-      // If it's an explicit node (not AUTO, GEMINI, OPENROUTER), fall back to AUTO.
-      // But if it's already GEMINI or OPENROUTER, KEEP IT.
-      const isExplicitNode = !['AUTO', 'GEMINI', 'OPENROUTER'].includes(currentRouting);
-
-      // Escalation logic for timeouts or rate limits
-      const errLower = err.message?.toLowerCase() || '';
-      const isRateLimit = errLower.includes('quota exceeded') || errLower.includes('429') || errLower.includes('limit reached');
-
-      if (err.message?.includes('Stale lock timeout')) {
-        if (currentRouting === 'SERVER_LOCAL' || currentRouting === 'AUTO' || item.lastProvider === 'SERVER_LOCAL') {
-          if (!payload.options) payload.options = {};
-          payload.options.routing = 'GEMINI';
-          Logger.info('InferenceRouter', `[ESCALATION] Task [${item.id.slice(0, 8)}] timed out on Local node. Retrying with GEMINI.`);
-        }
-      } else if (isExplicitNode) {
-        // Only clear routing if it was directed to a specific local node that failed
-        payload.options = { ...payload.options, routing: 'AUTO' };
-      }
-
+    const next = planGenericRetry(item, err);
+    if (next === 'requeue') {
       InferenceRegistry.setStatus(item.id, 'QUEUED');
       InferenceRegistry.updateProvider(item.id, payload.options?.routing || 'AUTO');
       this.taskQueue.push(item);
       void this.processQueue();
       return true;
-    } else if (payload.type === 'EVOLUTION') {
-      // For EVOLUTION, keep in queue as STALLED instead of failing completely
-      Logger.error('InferenceRouter', `[STALLED] Task [${item.id.slice(0, 8)}] exhausted 5 retries. Marking as STALLED for manual intervention.`);
+    }
+    if (next === 'stalled') {
+      // For EVOLUTION, keep in queue as STALLED instead of failing completely; unblock the caller
       InferenceRegistry.setStatus(item.id, 'STALLED');
-      
-      // Unblock the caller but with a specific error message
-      const stallError = new Error('TASK_STALLED: Exhausted retries. Manual intervention required.');
-      // Avoid triggering unhandled rejection if the caller isn't listening anymore
-      // or if it's a recovered task.
       try {
-        item.reject(stallError);
+        item.reject(new Error('TASK_STALLED: Exhausted retries. Manual intervention required.'));
       } catch (e: any) {
         Logger.error('InferenceRouter', `Error rejecting stalled task [${item.id.slice(0,8)}]: ${e.message}`);
       }
-      return true; 
+      return true;
     }
     return false;
   }
 
   public static async routeTask(task: TaskPayload, onUpdate?: (update: any) => void): Promise<{ provider: string, response: string }> {
     const id = crypto.randomUUID();
+    if (!task.options?.requestedRouting) {
+      task.options = { ...task.options, requestedRouting: (task.options?.routing || 'AUTO').toUpperCase() };
+    }
     const title = task.options?.taskName || InferenceProviders.getDefaultTaskName(task.type);
     InferenceRegistry.register(id, task.type, title, task.options?.model, task, task.options?.routing || 'AUTO');
     try {
@@ -913,7 +556,15 @@ ${searchContext}
     while (this.pausedTasks.has(id)) await new Promise(r => setTimeout(r, 1000));
 
     return new Promise((resolve, reject) => {
-      this.taskQueue.push({ id, payload: task, resolve, reject, onUpdate });
+      const item: QueueItem = {
+        id,
+        payload: task,
+        onUpdate,
+        resolve: (value) => { this.items.delete(id); resolve(value); },
+        reject: (reason) => { this.items.delete(id); reject(reason); },
+      };
+      this.items.set(id, item);
+      this.taskQueue.push(item);
       InferenceRegistry.setStatus(id, 'QUEUED', this.taskQueue.length - 1);
       void this.processQueue();
     });
@@ -934,39 +585,11 @@ ${searchContext}
 
   // Support for streaming tokens/thoughts back to the client
   public static onTaskUpdate(taskId: string, update: { type: 'token' | 'thinking', content: string }) {
-    const task = this.pendingMobileTasks.get(taskId);
-    if (task && task.onUpdate) {
-      task.onUpdate(update);
-    }
+    MobileNodes.onTaskUpdate(taskId, update);
   }
 
-  /**
-   * Handle node disconnection: fail all tasks that were being processed by this node
-   * so they can be retried or re-routed.
-   */
+  /** Fails the tasks a disconnected node was processing so they can be retried or re-routed. */
   public static handleNodeDisconnection(nodeId: string): void {
-    const nodeUpper = nodeId.toUpperCase();
-    const tasksToRecover: string[] = [];
-
-    // Find all tasks assigned to this node in our pending map
-    for (const [id, pending] of this.pendingMobileTasks.entries()) {
-      if (pending.node.toUpperCase() === nodeUpper) {
-        tasksToRecover.push(id);
-      }
-    }
-
-    if (tasksToRecover.length === 0) return;
-
-    Logger.warn('InferenceRouter', `[SYNC] Node [${nodeUpper}] disconnected. Recovering ${tasksToRecover.length} processing tasks...`);
-
-    for (const id of tasksToRecover) {
-      const pending = this.pendingMobileTasks.get(id);
-      if (pending) {
-        // Trigger failure on the pending promise so it can retry
-        pending.callback({ error: `NODE_DISCONNECTED: Worker ${nodeUpper} went offline during processing` });
-        this.pendingMobileTasks.delete(id);
-      }
-    }
+    MobileNodes.handleNodeDisconnection(nodeId);
   }
-
 }

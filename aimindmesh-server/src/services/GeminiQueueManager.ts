@@ -102,10 +102,7 @@ export class GeminiQueueManager {
         const hash = this.getHash(item.apiKey);
         
         // RPM Check
-        if (!this.rpmTimestamps.has(hash)) this.rpmTimestamps.set(hash, []);
-        const rpm = this.rpmTimestamps.get(hash)!;
-        
-        const filteredRpm = rpm.filter(t => now - t < 60000);
+        const filteredRpm = (this.rpmTimestamps.get(hash) ?? []).filter(t => now - t < 60000);
         this.rpmTimestamps.set(hash, filteredRpm);
         
         if (filteredRpm.length >= (config.gemini?.rpmLimit ?? 15)) {
@@ -126,9 +123,10 @@ export class GeminiQueueManager {
           continue;
         }
 
-        // All checks passed for this item
+        // All checks passed for this item: counted in the window stored in the map (the filtered
+        // copy), or the per-minute limit never fills
         this.pendingQueue.shift();
-        rpm.push(Date.now());
+        filteredRpm.push(now);
         InferenceProviders.callGemini(item.prompt, item.signal, item.model, item.apiKey)
           .then(item.resolve)
           .catch(item.reject);

@@ -1,16 +1,19 @@
 import { useState, useEffect, useCallback } from 'react';
 import {
   Cpu, Play, CheckCircle2, XCircle,
-  ExternalLink, Lock, Activity, Sparkles, Hash,
-  ChevronRight, RefreshCw, Save, Clock, Trash2
+  ExternalLink, Lock,
+  ChevronRight, RefreshCw, Trash2
 } from 'lucide-react';
 import { App as CapApp } from '@capacitor/app';
 import { Browser } from '@capacitor/browser';
 import { evolutionApi, adminApi } from '../services/api';
 import { useAdminStore } from '../store/adminStore';
-import { CategorizedSelector, SelectorGroup } from '../components/ui/CategorizedSelector';
+import { CategorizedSelector } from '../components/ui/CategorizedSelector';
 import type { EvolutionCandidateRow, EvolutionProposalRow, ProtectedPathRow } from '@aimindmesh/api-types';
-import { EvolutionStatsCard, sourceLabel } from '../components/evolution/EvolutionStatsCard';
+import { EvolutionStatsCard } from '../components/evolution/EvolutionStatsCard';
+import { CandidateDetailModal } from '../components/evolution/CandidateDetailModal';
+import { EvolutionEngineConfig } from '../components/evolution/EvolutionEngineConfig';
+import { CANDIDATE_STATUS_COLOR, SEVERITY_COLOR, type SelectorConfig } from '../components/evolution/evolutionShared';
 
 
 
@@ -23,9 +26,6 @@ type ProtectedPath = ProtectedPathRow;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-const SEVERITY_COLOR = (s: number) =>
-  s >= 8 ? 'bg-error/20 text-error' : s >= 5 ? 'bg-warning/20 text-warning' : 'bg-primary/20 text-primary';
-
 const IMPACT_COLOR = (i: string) =>
   i === 'high' ? 'text-error' : i === 'medium' ? 'text-warning' : 'text-success';
 
@@ -33,15 +33,6 @@ const STATUS_LABEL_COLOR = (s: string) => {
   if (s === 'proposed') return 'bg-primary/20 text-primary';
   if (s === 'merged') return 'bg-success/20 text-success';
   return 'bg-error/20 text-error';
-};
-
-const CANDIDATE_STATUS_COLOR = (s: string) => {
-  if (s === 'pending') return 'bg-surface text-muted-foreground';
-  if (s === 'generating') return 'bg-warning/20 text-warning';
-  if (s === 'validating') return 'bg-primary/20 text-primary';
-  if (s === 'proposed') return 'bg-success/20 text-success';
-  if (s === 'failed') return 'bg-error/20 text-error';
-  return 'bg-surface text-muted-foreground';
 };
 
 // ─── Main Component ───────────────────────────────────────────────────────────
@@ -62,7 +53,7 @@ export default function EvolutionView() {
   const [newReason, setNewReason] = useState('');
   const [activeSection, setActiveSection] = useState<'candidates' | 'proposals' | 'paths' | 'config'>('candidates');
   const [isSelectorOpen, setIsSelectorOpen] = useState(false);
-  const [selectorConfig, setSelectorConfig] = useState<{ title: string; groups: SelectorGroup[]; onSelect: (v: string) => void; currentValue: string } | null>(null);
+  const [selectorConfig, setSelectorConfig] = useState<SelectorConfig | null>(null);
 
   // Local config state for editing
   const [localConfig, setLocalConfig] = useState<any>(null);
@@ -419,275 +410,32 @@ export default function EvolutionView() {
 
         {/* ── CONFIG ─────────────────────────────────────────────────────── */}
         {activeSection === 'config' && localConfig && (
-          <div className="flex flex-col gap-4 pb-4">
-            <div className="glass-panel p-5 rounded-3xl border border-white/5 flex flex-col gap-5">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h3 className="text-xs font-black uppercase tracking-widest text-primary">Engine Control</h3>
-                  <p className="text-[9px] text-muted-foreground italic">Autonomous status</p>
-                </div>
-                <button
-                  onClick={() => setLocalConfig({ ...localConfig, enabled: !localConfig.enabled })}
-                  className={`w-12 h-6 rounded-full p-1 transition-all ${localConfig.enabled ? 'bg-primary' : 'bg-surface border border-border'}`}
-                >
-                  <div className={`w-4 h-4 bg-white rounded-full transition-all ${localConfig.enabled ? 'translate-x-6' : 'translate-x-0'}`} />
-                </button>
-              </div>
-
-              <div className="space-y-3">
-                <div>
-                  <label className="text-[9px] font-black uppercase tracking-widest text-muted-foreground mb-1 block">Preferred Routing</label>
-                  <button
-                    onClick={() => {
-                      const groups: SelectorGroup[] = [
-                        {
-                          label: 'System',
-                          options: [{ label: 'AUTOMATIC', value: 'AUTO', description: 'Dynamic allocation' }]
-                        },
-                        {
-                          label: 'Available Nodes',
-                          options: nodes.map(n => ({ 
-                            label: n.id === 'SERVER_LOCAL' ? 'OLLAMA' : (n.type === 'pc_client' || n.id === 'LAPTOP') ? 'LAPTOP' : n.id.toUpperCase(), 
-                            value: n.id, 
-                            description: n.url 
-                          }))
-                        },
-                        {
-                          label: 'Cloud Fallback',
-                          options: [
-                            { label: 'GEMINI', value: 'GEMINI_API', description: 'Google AI' },
-                            { label: 'OPENROUTER', value: 'OPENROUTER_API', description: 'Multi-provider' },
-                            { label: 'FREELLMAPI', value: 'FREELLMAPI', description: 'FreeLLMAPI Gateway' }
-                          ]
-                        }
-                      ];
-                      setSelectorConfig({
-                        title: 'Select Preferred Node',
-                        groups,
-                        currentValue: localConfig.preferredNode || 'AUTO',
-                        onSelect: (v) => setLocalConfig({ ...localConfig, preferredNode: v })
-                      });
-                      setIsSelectorOpen(true);
-                    }}
-                    className="w-full bg-surface border border-border rounded-xl p-4 flex items-center justify-between group active:scale-[0.98] transition-all"
-                  >
-                    <span className="text-[11px] font-black uppercase tracking-widest">{localConfig.preferredNode || 'AUTO'}</span>
-                    <ChevronRight size={14} className="text-muted-foreground opacity-30 group-hover:opacity-100" />
-                  </button>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="text-[9px] font-black uppercase tracking-widest text-muted-foreground mb-1 block">Daily PR Limit</label>
-                    <input
-                      type="number"
-                      value={localConfig.maxProposalsPerDay || 3}
-                      onChange={e => setLocalConfig({ ...localConfig, maxProposalsPerDay: parseInt(e.target.value) })}
-                      className="w-full bg-surface border border-border rounded-xl p-3 text-xs font-black outline-none focus:border-primary/50"
-                    />
-                  </div>
-                  <div>
-                    <label className="text-[9px] font-black uppercase tracking-widest text-muted-foreground mb-1 block">Min Severity</label>
-                    <input
-                      type="number"
-                      min="1" max="10"
-                      value={localConfig.minSeverityThreshold || 6}
-                      onChange={e => setLocalConfig({ ...localConfig, minSeverityThreshold: parseInt(e.target.value) })}
-                      className="w-full bg-surface border border-border rounded-xl p-3 text-xs font-black outline-none focus:border-primary/50"
-                    />
-                  </div>
-                </div>
-
-                <div>
-                  <label className="text-[9px] font-black uppercase tracking-widest text-muted-foreground mb-1 block">Cron Schedule</label>
-                  <div className="flex items-center gap-2 bg-surface border border-border rounded-xl p-3">
-                    <Clock size={12} className="text-muted-foreground" />
-                    <input
-                      type="text"
-                      value={localConfig.cronExpression || '0 3 * * *'}
-                      onChange={e => setLocalConfig({ ...localConfig, cronExpression: e.target.value })}
-                      className="flex-1 bg-transparent text-xs font-mono outline-none"
-                    />
-                  </div>
-                </div>
-
-                <div className="flex items-center justify-between p-3 bg-surface/50 rounded-2xl border border-border/30">
-                  <div>
-                    <p className="text-[10px] font-black uppercase tracking-widest">Shadow Mode</p>
-                    <p className="text-[8px] text-muted-foreground italic">Validate without merging</p>
-                  </div>
-                  <button
-                    onClick={() => setLocalConfig({ ...localConfig, shadowMode: !localConfig.shadowMode })}
-                    className={`w-10 h-5 rounded-full p-1 transition-all ${localConfig.shadowMode ? 'bg-warning' : 'bg-surface border border-border'}`}
-                  >
-                    <div className={`w-3 h-3 bg-white rounded-full transition-all ${localConfig.shadowMode ? 'translate-x-5' : 'translate-x-0'}`} />
-                  </button>
-                </div>
-              </div>
-
-              <button
-                onClick={handleSaveConfig}
-                disabled={isSavingConfig}
-                className="btn-primary w-full py-4 mt-2"
-              >
-                {isSavingConfig ? <RefreshCw className="animate-spin" size={14} /> : <Save size={14} />}
-                {isSavingConfig ? 'Saving...' : 'Save Engine Config'}
-              </button>
-            </div>
-          </div>
+          <EvolutionEngineConfig
+            localConfig={localConfig}
+            setLocalConfig={setLocalConfig}
+            nodes={nodes}
+            isSavingConfig={isSavingConfig}
+            handleSaveConfig={handleSaveConfig}
+            setSelectorConfig={setSelectorConfig}
+            setIsSelectorOpen={setIsSelectorOpen}
+          />
         )}
       </div>
 
       {/* ── CANDIDATE DETAIL MODAL ─────────────────────────────────────── */}
       {selectedCandidate && (
-        <div 
-          className="fixed inset-0 z-[100] flex flex-col bg-background/95 backdrop-blur-2xl animate-in slide-in-from-bottom-8 duration-300"
-          style={{ 
-            paddingTop: 'var(--safe-area-top)',
-            paddingBottom: 'env(safe-area-inset-bottom, 0px)' 
-          }}
-        >
-          {/* Modal Header */}
-          <div className="px-4 pt-4 pb-3 border-b border-border flex items-center justify-between shrink-0">
-            <div className="flex items-center gap-3 min-w-0">
-              <div className="p-2 bg-primary/20 rounded-xl shrink-0">
-                <Activity size={16} className="text-primary" />
-              </div>
-              <div className="min-w-0">
-                <h3 className="text-sm font-black italic truncate">{selectedCandidate.title}</h3>
-                <div className="flex items-center gap-2 mt-0.5">
-                  <span className={`text-[7px] font-black uppercase px-2 py-0.5 rounded-full ${SEVERITY_COLOR(selectedCandidate.severity)}`}>
-                    Severity {selectedCandidate.severity}
-                  </span>
-                  <span className={`text-[7px] font-black uppercase px-2 py-0.5 rounded-full ${CANDIDATE_STATUS_COLOR(selectedCandidate.status)}`}>
-                    {selectedCandidate.status}
-                  </span>
-                </div>
-              </div>
-            </div>
-            <button onClick={() => setSelectedCandidate(null)} className="p-2 rounded-xl bg-surface border border-border active:scale-95 transition-all shrink-0">
-              <XCircle size={18} />
-            </button>
-          </div>
-
-          {/* Modal Body */}
-          <div className="flex-1 overflow-y-auto px-4 py-4 custom-scrollbar space-y-5">
-            <div>
-              <h4 className="text-[9px] font-black uppercase tracking-widest opacity-40 mb-2">Description</h4>
-              <p className="text-sm leading-relaxed text-foreground italic">"{selectedCandidate.description}"</p>
-            </div>
-
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <h4 className="text-[9px] font-black uppercase tracking-widest opacity-40 mb-2">Target</h4>
-                <div className="p-4 bg-surface-lighter border border-border/50 rounded-2xl font-mono text-[10px] break-all text-white shadow-sm">
-                  {selectedCandidate.target_component || 'Global'}
-                </div>
-              </div>
-              <div>
-                <h4 className="text-[9px] font-black uppercase tracking-widest opacity-40 mb-2">Source</h4>
-                <div className="p-4 bg-surface-lighter border border-border/50 rounded-2xl font-mono text-[10px] uppercase italic text-white/90 shadow-sm">
-                  {sourceLabel(selectedCandidate.source)}
-                </div>
-              </div>
-            </div>
-
-            {selectedCandidate.proposed_approach && (
-              <div>
-                <h4 className="text-[9px] font-black uppercase tracking-widest opacity-40 mb-2">Proposed Approach</h4>
-                <div className="p-4 bg-background/80 border border-primary/20 rounded-2xl text-xs leading-relaxed whitespace-pre-wrap">
-                  {selectedCandidate.proposed_approach}
-                </div>
-              </div>
-            )}
-
-            {selectedCandidate.tags && (() => {
-              try {
-                const tags: string[] = JSON.parse(selectedCandidate.tags);
-                return (
-                  <div>
-                    <h4 className="text-[9px] font-black uppercase tracking-widest opacity-40 mb-2">Tags</h4>
-                    <div className="flex flex-wrap gap-2">
-                      {tags.map(tag => (
-                        <span key={tag} className="flex items-center gap-1 px-3 py-1.5 bg-surface border border-border rounded-xl text-[9px] font-black uppercase tracking-widest italic">
-                          <Hash size={8} className="text-primary" /> {tag}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                );
-              } catch { return null; }
-            })()}
-
-            {/* Routing Selector */}
-            <div>
-              <h4 className="text-[9px] font-black uppercase tracking-widest opacity-40 mb-2">Inference Node</h4>
-              <button
-                onClick={() => {
-                  const groups: SelectorGroup[] = [
-                    {
-                      label: 'Cluster',
-                      options: [
-                        { label: 'AUTO (Balanced)', value: 'AUTO', description: 'System-selected' },
-                        ...nodes.map(n => ({ 
-                          label: n.id === 'SERVER_LOCAL' ? 'OLLAMA' : (n.type === 'pc_client' || n.id === 'LAPTOP') ? 'LAPTOP' : n.id.toUpperCase(), 
-                          value: n.id, 
-                          description: n.url 
-                        }))
-                      ]
-                    },
-                    {
-                      label: 'Cloud Providers',
-                      options: [
-                        { label: 'GEMINI', value: 'GEMINI_API', description: 'Google Cloud' },
-                        { label: 'OPENROUTER', value: 'OPENROUTER_API', description: 'Multi-model fallback' },
-                        { label: 'FREELLMAPI', value: 'FREELLMAPI', description: 'FreeLLMAPI Gateway' }
-                      ]
-                    }
-                  ];
-                  setSelectorConfig({
-                    title: 'Route Task',
-                    groups,
-                    currentValue: selectedRouting,
-                    onSelect: (v) => setSelectedRouting(v)
-                  });
-                  setIsSelectorOpen(true);
-                }}
-                className="w-full bg-surface border border-border rounded-xl p-4 flex items-center justify-between group active:scale-[0.98] transition-all"
-              >
-                <span className="text-[11px] font-black uppercase tracking-widest">{selectedRouting}</span>
-                <ChevronRight size={14} className="text-muted-foreground opacity-30 group-hover:opacity-100" />
-              </button>
-            </div>
-          </div>
-
-          {/* Modal Footer */}
-          <div className="px-4 pb-6 pt-3 border-t border-border flex gap-3 shrink-0">
-            <button
-              onClick={() => handleProcess(selectedCandidate.id)}
-              disabled={processingId !== null}
-              className="flex-1 py-4 bg-primary text-white text-[10px] font-black uppercase tracking-widest rounded-2xl flex items-center justify-center gap-3 active:scale-95 transition-all disabled:opacity-50 shadow-xl shadow-primary/30"
-            >
-              {processingId === selectedCandidate.id ? (
-                <><Activity className="animate-spin" size={14} /> Generating...</>
-              ) : (
-                <><Sparkles size={14} /> Trigger Implementation</>
-              )}
-            </button>
-            <button
-              onClick={() => handleDeleteCandidate(selectedCandidate.id)}
-              className="px-5 py-4 bg-surface border border-border text-error rounded-2xl active:scale-95 transition-all"
-            >
-              <Trash2 size={16} />
-            </button>
-            <button
-              onClick={() => setSelectedCandidate(null)}
-              className="px-6 py-4 bg-surface border border-border text-[10px] font-black uppercase tracking-widest rounded-2xl active:scale-95 transition-all"
-            >
-              Close
-            </button>
-          </div>
-        </div>
+        <CandidateDetailModal
+          selectedCandidate={selectedCandidate}
+          setSelectedCandidate={setSelectedCandidate}
+          nodes={nodes}
+          selectedRouting={selectedRouting}
+          setSelectedRouting={setSelectedRouting}
+          setSelectorConfig={setSelectorConfig}
+          setIsSelectorOpen={setIsSelectorOpen}
+          processingId={processingId}
+          handleProcess={handleProcess}
+          handleDeleteCandidate={handleDeleteCandidate}
+        />
       )}
 
       {/* Selector Modal Overlay */}

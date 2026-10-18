@@ -1,8 +1,11 @@
-import { Cpu, Activity, HardDrive, RefreshCw, Layers, Zap, Clock, Globe, Shield, Terminal, Key, Database, Cloud } from 'lucide-react';
-import { Dropdown } from '../ui/Dropdown';
+import { Cpu, Activity, HardDrive, RefreshCw, Layers, Zap, Clock, Globe, Shield, Terminal, Key, Database, Cloud, Sparkles } from 'lucide-react';
 import { TaskPriorityManager } from './TaskPriorityManager';
 import { TaskStatsDashboard } from './TaskStatsDashboard';
 import type { AdminServerStatus } from '../../types/adminStatus';
+import { ClaudeMonitorCard } from './claude/ClaudeMonitorCard';
+import { ClaudeConfigCard } from './claude/ClaudeConfigCard';
+import { OpenRouterConfigCard } from './providers/OpenRouterConfigCard';
+import { OllamaConfigCard } from './providers/OllamaConfigCard';
 
 
 interface AdminOverviewProps {
@@ -16,9 +19,11 @@ interface AdminOverviewProps {
   onPrune: () => void;
   onRefreshNodes: () => void;
   isLoading: boolean;
+  /** Priority list each task type really uses (GET /api/admin/config) */
+  effectivePriorities?: Record<string, string[]>;
 }
 
-export function AdminOverview({ status, config, onUpdateConfig, onToggleBrake, availableModels, openRouterModels = [], onRefresh, onPrune, onRefreshNodes, isLoading }: AdminOverviewProps) {
+export function AdminOverview({ status, config, onUpdateConfig, onToggleBrake, availableModels, openRouterModels = [], onRefresh, onPrune, onRefreshNodes, isLoading, effectivePriorities = {} }: AdminOverviewProps) {
   const geminiPercent = status?.dailyQuotaCap ? (status.geminiUsage / status.dailyQuotaCap) * 100 : 0;
   
   const orCredits = status?.openrouterCredits;
@@ -176,6 +181,8 @@ export function AdminOverview({ status, config, onUpdateConfig, onToggleBrake, a
           </div>
         </div>
         
+        <ClaudeMonitorCard status={status?.claude} />
+
         {/* Server Agent (OpenClaw) Monitoring */}
         <div className={`glass-panel p-8 rounded-[40px] flex flex-col justify-between group border-2 relative overflow-hidden transition-all duration-500 ${status?.openClawHealth?.isHealthy ? 'bg-success/5 border-success/20' : 'bg-error/5 border-error/20'}`}>
           <div className="absolute top-0 right-0 p-8 opacity-[0.03] group-hover:opacity-[0.1] transition-all duration-700">
@@ -344,107 +351,7 @@ export function AdminOverview({ status, config, onUpdateConfig, onToggleBrake, a
                   </div>
                </div>
             </div>
-            {/* OpenRouter Config */}
-            <div className="glass-panel p-8 rounded-[48px] border-secondary/10 flex flex-col gap-8 group/cfg relative min-h-[420px]">
-               <div className="flex items-center gap-4">
-                  <div className="p-4 bg-secondary/10 rounded-3xl text-secondary shadow-lg shadow-secondary/5 group-hover/cfg:scale-110 transition-transform">
-                     <Globe size={24} />
-                  </div>
-                  <div>
-                     <h4 className="font-black text-lg tracking-tight uppercase italic underline decoration-secondary/40 decoration-4 underline-offset-8">Universal Model Bridge</h4>
-                     <p className="text-[10px] text-muted-foreground font-black uppercase tracking-widest mt-2 opacity-60 italic">OpenRouter Provisioning & Analytical Selection</p>
-                  </div>
-               </div>
-
-               <div className="grid grid-cols-1 gap-6">
-                  <div className="space-y-3">
-                     <label className="text-[11px] font-black text-muted-foreground uppercase tracking-widest ml-1 italic flex items-center gap-2">
-                        <Key size={12} className="text-secondary" /> OpenRouter Auth Token
-                     </label>
-                     <input 
-                        type="password"
-                        placeholder="sk-or-v1-••••••••••••"
-                        value={config?.openrouter?.apiKey || ''}
-                        onChange={(e) => onUpdateConfig({ openrouter: { ...config?.openrouter, apiKey: e.target.value } })}
-                        className="w-full bg-surface border border-border rounded-2xl p-4 outline-none focus:border-secondary font-mono font-black text-sm shadow-inner transition-all hover:border-secondary/40"
-                     />
-                  </div>
-
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-                     <div className="space-y-3">
-                        <label className="text-[11px] font-black text-muted-foreground uppercase tracking-widest ml-1 italic">Analytical Target</label>
-                        <div className="flex gap-2">
-                           <div className="flex-1">
-                              {openRouterModels.length > 0 ? (
-                                 <Dropdown 
-                                    value={config?.openrouter?.model || ''}
-                                    onChange={(val) => onUpdateConfig({ openrouter: { ...config?.openrouter, model: val } })}
-                                    options={Object.entries(
-                                      openRouterModels.reduce((acc: any, m: any) => {
-                                        const provider = m.id.split('/')[0];
-                                        if (!acc[provider]) acc[provider] = [];
-                                        acc[provider].push({ label: m.name.toUpperCase(), value: m.id });
-                                        return acc;
-                                      }, {})
-                                    ).sort().map(([provider, options]: [string, any]) => ({
-                                      label: provider.toUpperCase(),
-                                      options: options.sort((a: any, b: any) => a.label.localeCompare(b.label))
-                                    }))}
-                                    className="font-mono font-black"
-                                 />
-                              ) : (
-                                 <input 
-                                    type="text"
-                                    placeholder="anthropic/claude-3.5-sonnet"
-                                    value={config?.openrouter?.model || ''}
-                                    onChange={(e) => onUpdateConfig({ openrouter: { ...config?.openrouter, model: e.target.value } })}
-                                    className="w-full bg-surface border border-border rounded-2xl p-4 outline-none focus:border-secondary font-mono font-black text-sm shadow-inner transition-all hover:border-secondary/40"
-                                 />
-                              )}
-                           </div>
-                           <button 
-                             onClick={onRefresh}
-                             className="px-4 bg-surface border border-border rounded-2xl hover:bg-surface-hover hover:border-secondary/40 transition-all text-secondary shadow-inner active:scale-95"
-                             title="Reload OpenRouter Models"
-                           >
-                             <RefreshCw size={18} className={isLoading ? 'animate-spin' : ''} />
-                           </button>
-                        </div>
-                     </div>
-                     <div className="space-y-3">
-                        <label className="text-[11px] font-black text-muted-foreground uppercase tracking-widest ml-1 italic">Daily Quota Limit</label>
-                        <input 
-                           type="number"
-                           value={config?.openrouter?.dailyQuotaCap || 100}
-                           onChange={(e) => onUpdateConfig({ openrouter: { ...config?.openrouter, dailyQuotaCap: parseInt(e.target.value) } })}
-                           className="w-full bg-surface border border-border rounded-2xl p-4 outline-none focus:border-secondary font-mono font-black text-sm shadow-inner transition-all hover:border-secondary/40"
-                        />
-                     </div>
-                  </div>
-
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-                     <div className="space-y-3">
-                        <label className="text-[11px] font-black text-muted-foreground uppercase tracking-widest ml-1 italic">Credit Check Interval (h)</label>
-                        <input 
-                           type="number"
-                           value={config?.openrouter?.creditCheckIntervalHours || 1}
-                           onChange={(e) => onUpdateConfig({ openrouter: { ...config?.openrouter, creditCheckIntervalHours: parseInt(e.target.value) } })}
-                           className="w-full bg-surface border border-border rounded-2xl p-4 outline-none focus:border-secondary font-mono font-black text-sm shadow-inner transition-all hover:border-secondary/40"
-                        />
-                     </div>
-                     <div className="space-y-3">
-                        <label className="text-[11px] font-black text-muted-foreground uppercase tracking-widest ml-1 italic">Low Credit Alert ($)</label>
-                        <input 
-                           type="number"
-                           step="0.5"
-                           value={config?.openrouter?.lowCreditThreshold || 5}
-                           onChange={(e) => onUpdateConfig({ openrouter: { ...config?.openrouter, lowCreditThreshold: parseFloat(e.target.value) } })}
-                           className="w-full bg-surface border border-border rounded-2xl p-4 outline-none focus:border-secondary font-mono font-black text-sm shadow-inner transition-all hover:border-secondary/40"
-                        />
-                     </div>
-                  </div>
-               </div>
-            </div>
+            <OpenRouterConfigCard config={config} onUpdateConfig={onUpdateConfig} openRouterModels={openRouterModels} onRefresh={onRefresh} isLoading={isLoading} />
 
             {/* FreeLLMAPI Config */}
             <div className="glass-panel p-8 rounded-[48px] border-indigo-500/10 flex flex-col gap-8 group/cfg relative bg-[#070a14]/[0.4]">
@@ -509,94 +416,9 @@ export function AdminOverview({ status, config, onUpdateConfig, onToggleBrake, a
                </div>
             </div>
 
-            {/* Ollama Config */}
-            <div className="glass-panel p-8 rounded-[48px] border-warning/10 flex flex-col gap-8 group/cfg bg-[#070a14]/[0.4]">
-               <div className="flex items-center gap-4">
-                  <div className="p-4 bg-warning/10 rounded-3xl text-warning shadow-lg shadow-warning/5 group-hover/cfg:scale-110 transition-transform">
-                     <Database size={24} />
-                  </div>
-                  <div>
-                     <h4 className="font-black text-lg tracking-tight uppercase italic underline decoration-warning/40 decoration-4 underline-offset-8">Server Neural Engine</h4>
-                     <p className="text-[10px] text-muted-foreground font-black uppercase tracking-widest mt-2 opacity-60 italic">Ollama Cluster Topology & Inference Defaults</p>
-                  </div>
-               </div>
+            <ClaudeConfigCard config={config?.claude} onChange={claude => onUpdateConfig({ claude })} />
 
-               <div className="grid grid-cols-1 gap-6">
-                  <div className="space-y-3">
-                     <label className="text-[11px] font-black text-muted-foreground uppercase tracking-widest ml-1 italic">Vulkan Engine Endpoint</label>
-                     <input 
-                        type="text"
-                        placeholder="http://10.2.0.1:11434"
-                        value={config?.ollama?.baseUrl || ''}
-                        onChange={(e) => onUpdateConfig({ ollama: { ...config?.ollama, baseUrl: e.target.value } })}
-                        className="w-full bg-surface border border-border rounded-2xl p-4 outline-none focus:border-warning font-mono font-black text-sm shadow-inner transition-all hover:border-warning/40"
-                     />
-                  </div>
-
-                  <div className="space-y-3">
-                     <label className="text-[11px] font-black text-muted-foreground uppercase tracking-widest ml-1 italic">Default Inference Model</label>
-                      <div className="flex gap-2">
-                        <div className="flex-1 relative">
-                          {availableModels.length > 0 ? (
-                             <Dropdown 
-                                value={config?.ollama?.defaultModel || ''}
-                                onChange={(val) => onUpdateConfig({ ollama: { ...config?.ollama, defaultModel: val } })}
-                                options={availableModels.map(m => ({ label: m.toUpperCase(), value: m }))}
-                                className="font-mono font-black"
-                             />
-                          ) : (
-                             <input 
-                                type="text"
-                                placeholder="qwen2.5:7b-instruct"
-                                value={config?.ollama?.defaultModel || ''}
-                                onChange={(e) => onUpdateConfig({ ollama: { ...config?.ollama, defaultModel: e.target.value } })}
-                                className="w-full bg-surface border border-border rounded-2xl p-4 outline-none focus:border-warning font-mono font-black text-sm shadow-inner"
-                             />
-                          )}
-                        </div>
-                        <button 
-                          onClick={onRefreshNodes}
-                          className="px-4 bg-surface border border-border rounded-2xl hover:bg-surface-hover hover:border-warning/40 transition-all text-warning shadow-inner active:scale-95"
-                          title="Reload Model List"
-                        >
-                          <RefreshCw size={18} className={isLoading ? 'animate-spin' : ''} />
-                        </button>
-                      </div>
-                  </div>
-
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 pt-2">
-                     <div className="space-y-3">
-                        <label className="text-[11px] font-black text-muted-foreground uppercase tracking-widest ml-1 italic">Request Timeout (MIN)</label>
-                        <input 
-                           type="number"
-                           value={Math.floor((config?.ollama?.timeoutMs || 1800000) / 60000)}
-                           onChange={(e) => onUpdateConfig({ ollama: { ...config?.ollama, timeoutMs: parseInt(e.target.value) * 60000 } })}
-                           className="w-full bg-surface border border-border rounded-2xl p-4 outline-none focus:border-warning font-mono font-black text-sm shadow-inner transition-all hover:border-warning/40"
-                        />
-                     </div>
-                     <div className="space-y-3">
-                        <label className="text-[11px] font-black text-muted-foreground uppercase tracking-widest ml-1 italic">Execution Threads</label>
-                        <input 
-                           type="number"
-                           min={1}
-                           max={status?.coreCount || 4}
-                           value={config?.ollama?.numThread || status?.coreCount || 4}
-                           onChange={(e) => onUpdateConfig({ ollama: { ...config?.ollama, numThread: Math.min(parseInt(e.target.value), status?.coreCount || 99) } })}
-                           className="w-full bg-surface border border-border rounded-2xl p-4 outline-none focus:border-warning font-mono font-black text-sm shadow-inner transition-all hover:border-warning/40"
-                        />
-                     </div>
-                     <div className="space-y-3">
-                        <label className="text-[11px] font-black text-muted-foreground uppercase tracking-widest ml-1 italic">Context Window</label>
-                        <input 
-                           type="number"
-                           value={config?.ollama?.numCtx || 4096}
-                           onChange={(e) => onUpdateConfig({ ollama: { ...config?.ollama, numCtx: parseInt(e.target.value) } })}
-                           className="w-full bg-surface border border-border rounded-2xl p-4 outline-none focus:border-warning font-mono font-black text-sm shadow-inner transition-all hover:border-warning/40"
-                        />
-                     </div>
-                  </div>
-               </div>
-            </div>
+            <OllamaConfigCard status={status} config={config} onUpdateConfig={onUpdateConfig} availableModels={availableModels} onRefreshNodes={onRefreshNodes} isLoading={isLoading} />
          </div>
 
          {/* RESTORED GLOBAL ROUTING SELECTOR (CRITICAL) */}
@@ -622,7 +444,9 @@ export function AdminOverview({ status, config, onUpdateConfig, onToggleBrake, a
                   })),
                   { id: 'GEMINI', label: 'Gemini', icon: Zap, color: 'text-primary' },
                   { id: 'OPENROUTER', label: 'OpenRouter', icon: Globe, color: 'text-secondary' },
-                  { id: 'FREELLMAPI', label: 'FreeLLMAPI', icon: Cloud, color: 'text-indigo-400' }
+                  { id: 'FREELLMAPI', label: 'FreeLLMAPI', icon: Cloud, color: 'text-indigo-400' },
+                  // Every task (lightweight ones too) goes to Claude while it has credit
+                  { id: 'CLAUDE', label: 'Claude (all tasks)', icon: Sparkles, color: 'text-orange-400' }
                ].map(pref => (
                   <button 
                      key={pref.id}
@@ -638,6 +462,7 @@ export function AdminOverview({ status, config, onUpdateConfig, onToggleBrake, a
 
          <TaskPriorityManager 
             priorities={config?.routing?.taskPriorities || {}}
+            effectivePriorities={effectivePriorities}
             onChange={(taskPriorities) => onUpdateConfig({ routing: { ...config?.routing, taskPriorities } })}
             availableNodes={status?.nodes || []}
          />

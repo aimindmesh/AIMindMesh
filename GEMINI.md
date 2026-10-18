@@ -65,6 +65,14 @@ After each session where a mistake was made, a decision was taken, or a better w
 - [2026-10-03] Read settings outside React with readSetting('<real localStorage key>') (e.g. 'aimindmesh-server-settings'), never an invented key ('appSettings' was never written, so web delegation never ran) — API keys live in the Keystore.
 - [2026-10-03] Do not strip HTML with `<[^>]+>` nor pair separate title/snippet lists: quoted attributes contain '>' (Wikipedia data-mw) and ads shift lists; use src/services/web/ (quote-aware scanner, per-result parsing) and test parsers on real saved pages.
 - [2026-10-03] Tools fed by web content (read_web_page) stay GET-only and refuse local/private addresses (phone urlSafety.ts, server utils/safeHttp.ts): a page can carry prompt injection that would exfiltrate memories or hit the VPN.
+- [2026-10-18] Never seed a provider into the config.json priority lists (deepMerge merges arrays index-wise, the GUIs rebuilt lists without it): Claude goes first via InferenceProviders.effectivePriorities (claude.firstForCategories), which GET /api/admin/config returns to the priority editors.
+- [2026-10-18] Never re-queue a router task with a new resolve/reject (brake, re-route, reset): reuse the caller's item (InferenceRouter.items), or routeTask never settles and the Wiki/Proactive/Debate isRunning flags stay set; cancelTask rejects with CANCELLED_BY_USER.
+- [2026-10-18] Never mutate payload.prompt before dispatch: keep the pieces (searchContext, cachePrefix) and assemble them at dispatch (inference/promptParts), or every retry searches again and wraps the prompt twice.
+- [2026-10-18] Never let a Claude failure reach the generic retry: claudeRetry adds CLAUDE to options.skipProviders (or rejects a task routed explicitly to Claude), otherwise the task loops on Claude.
+- [2026-10-18] Mark tasks batchable only on scheduled (cron) paths that tolerate minutes to hours: Claude batches are idempotent per task id (claude_batch_requests) and start after the result listeners; never batch a call a user or an HTTP request waits for.
+- [2026-10-18] Never answer an agent proxy request with Claude without checking its Bearer key (agentKeyAllowed): FreeLLMAPI used to check it, and the Claude branch spends the plan's credit.
+- [2026-10-18] The inference queue state lives in services/inference/routerState.ts, shared by InferenceRouter and its helpers (bootRecovery, staleTasks, lockHealing, mobileNodes, retryPolicy): never reassign its collections, change them in place.
+- [2026-10-18] PATCH /api/admin/config replaces arrays (utils/deepMerge) instead of merging them by index; stripRedacted drops a list holding a masked value, so a masked secret list sent back never wipes the stored one.
 
 ## Private Deployment Notes
 VPS host and running container map (not versioned, see `.gitignore`):

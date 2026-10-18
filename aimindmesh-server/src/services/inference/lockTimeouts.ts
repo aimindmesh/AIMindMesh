@@ -19,6 +19,9 @@ export const LOCK_TIMEOUT_MS: Record<EngineType, number> = {
   HERMES: 30 * MINUTE,
   OPENCLAW: 75 * MINUTE,
   MOBILE: 24 * HOUR,
+  // Claude takes no provider lock (claudeGate bounds it): typed for completeness
+  CLAUDE: 15 * MINUTE,
+  CLAUDE_BATCH: 25 * HOUR,
 };
 
 /** A cloud lock with no running task behind it (leaked) is dropped after this grace. */

@@ -998,7 +998,7 @@ AI Mind Mesh introduces optional integration with the **AIMindMesh Server** — 
 │                              │  REST  x-api-key: <apiKey>                  │                                         │
 │  FeedView / ThreadView ──────┼──────► /api/feed, /api/kg/*, /api/documents │  authHook (API key, every route)        │
 │  ImportSheet                 │                                             │  InferenceRouter                        │
-│  ServerLLM Provider ─────────┼──────► /ws/chat?mode=completion (stream)    │   ├─ Gemini / OpenRouter / FreeLLMAPI   │
+│  ServerLLM Provider ─────────┼──────► /ws/chat?mode=completion (stream)    │   ├─ Claude/Gemini/OpenRouter/FreeLLMAPI│
 │                              │        POST /api/chat           (fallback)  │   ├─ Ollama (SERVER_LOCAL, PC client)   │
 │  NodeWorker ◄────────────────┼─────── /ws/nodes?id=&name=&token= (tasks)   │   └─ mobile worker nodes (/ws/nodes)    │
 │  FCMService ◄────────────────┼─────── Firebase Cloud Messaging (push)      │  Knowledge Graph (Neo4j), SQLite        │
@@ -1072,6 +1072,65 @@ Firebase Cloud Messaging
 *   **Lifecycle & UI Sync**: The worker's status is synchronized with the "AIMindMesh Server" settings panel. A dedicated listener pattern ensures the "READY FOR TASKS" badge reflects the real-time connectivity of the WebSocket link.
 *   **Controls**: Users can enable/disable this feature via "Participate as Worker Node" in AIMindMesh Server settings.
 
+#### 4.13.8 Claude Provider (Server)
+The Claude Max 20x plan includes **200 USD of Claude API credits per month**, credited to the Claude Console organization linked to the plan. The credits refresh on the plan's renewal day and expire at the end of each billing cycle (no rollover). The organization has no payment method: when the credit is gone the API refuses requests, nothing is ever charged. The server spends this credit first, natively through the official SDK (`@anthropic-ai/sdk`), and falls back to the existing chain when it runs out.
+
+*   **Module** (`aimindmesh-server/src/services/inference/claude/`):
+    | File | Role |
+    | :--- | :--- |
+    | `claudeSettings.ts` | Reads the `claude` section of `config.json` with defaults and validation (the unversioned `src/config.ts` needs no change). |
+    | `claudeClient.ts` | SDK client built only with an explicit, non-empty key (never `ANTHROPIC_API_KEY` or a local `ant` profile). |
+    | `ClaudeProvider.ts` | Realtime call: streaming, effort per category, server-side refusal fallback, usage recording. |
+    | `ClaudeCreditState.ts` / `claudeGate.ts` | Availability (credit, key, model, budget) and the concurrency slots of the router and of the agents. |
+    | `ClaudeUsage.ts` / `claudePricing.ts` | Tokens and estimated cost per day, model, mode and source (`claude_usage`, migration v10). |
+    | `ClaudeBatchQueue.ts` | Message Batches for background cycles (`claude_batch_requests`, migration v10). |
+    | `claudeRetry.ts` / `claudeErrors.ts` | Error classification and what the router does after a Claude failure. |
+    | `agentBridge/` | OpenAI ⇄ Claude bridge of the agent proxy (OpenClaw, Hermes, venture builds). |
+    | `claudeStatus.ts` | `claude` block of `GET /api/admin/status`. |
+*   **Routing** (`InferenceProviders.effectivePriorities` / `resolveTarget`):
+    | Category | Task types | Model (default) | Effort | Claude first |
+    | :--- | :--- | :--- | :--- | :--- |
+    | LIGHTWEIGHT | intent, query expansion, concepts, improvement detection | `claude-haiku-5-5` | `low` | No (selectable) |
+    | STANDARD | chat, debates, insights, dedup, scheduled tasks, directives, validation | `claude-sonnet-5-5` | `medium` | Yes |
+    | RESEARCH | web research (`/api/web/analyze`) | `claude-sonnet-5-5` | `medium` | Yes |
+    | COMPLEX | wiki synthesis and topic maps, organization design | `claude-opus-5-5` | `high` | Yes |
+    | EVOLUTION | code generation | `claude-opus-5-5` | `high` | Yes |
+    *   A priority list without `CLAUDE` gets it **first** when its category is in `claude.firstForCategories` (default STANDARD, COMPLEX, EVOLUTION, RESEARCH); a list that contains `CLAUDE` keeps its position. Nothing is written to `config.json`: `GET /api/admin/config` returns `effectivePriorities` and the priority editors (PC, admin mobile) start from it, so saving a list keeps Claude where it was.
+    *   `EMBEDDING_GENERATION` and `AGENTIC_TASK` never go to Claude through the router (no embeddings, no tool loop); agents reach Claude through the agent proxy below.
+    *   Explicit routing `CLAUDE` (chat selector, queue re-route, phone "Preferred Routing Target") falls back to the AUTO list when Claude is unavailable, like an offline node. `routing.preferredNode = CLAUDE` sends every task type it serves to Claude, lightweight ones included.
+    *   A task Claude failed (any error) gets `CLAUDE` in its `options.skipProviders` and is re-queued on the next provider of its list; a task the caller routed explicitly to Claude is rejected to that caller instead (`CodeGenerationTask` then tries Gemini, then OpenRouter). An admin retry or explicit re-route clears `skipProviders`.
+*   **Calls**: streamed (`client.beta.messages.stream`), `max_tokens` 32000, `output_config.effort` per category (`thinking: true` raises it to at least `high`). Adaptive thinking is the models' default and is not sent, nor are sampling parameters. Opus and Sonnet calls carry `fallbacks: "default"` (beta `server-side-fallback-2026-07-01`; dropped automatically if the organization rejects it); a `refusal` stop reason is an error. A non-Claude `options.model` (e.g. an Ollama name) is ignored. Chats from the phone (`/ws/chat?mode=completion`) receive the answer as `delta` events while it is generated; when the phone asked for thinking, the reasoning summary arrives as `thought` events.
+*   **Concurrency**: Claude takes no provider lock. `claudeGate` grants `claude.maxConcurrent` (3) router slots and `claude.agents.maxConcurrent` (2) agent slots; a router task waiting for a slot stays `QUEUED` (still re-routable) and availability is checked again at dispatch.
+*   **Availability states** (`ClaudeCreditState`, persisted in `system_settings` id `claude_credit_state`):
+    | State | Cause | Effect | Cleared by |
+    | :--- | :--- | :--- | :--- |
+    | `ok` | — | Claude used per the priority lists | — |
+    | `no_key` | `claude.apiKey` empty or `claude.enabled` false | Never used | Setting a key |
+    | `credit_exhausted` | 402 `billing_error`, or 400 about the credit balance | Not used; one probe call every `exhaustedRetryHours` (6 h) | A successful call, or the next billing cycle |
+    | `budget_reached` | Estimated cycle spend (recorded + reserved) ≥ `monthlyBudgetUsd` | Not used (agents also stop at `agents.monthlyBudgetUsd`) | The next billing cycle or a higher budget |
+    | `auth_error` | 401 / 403 | Not used | A new key |
+    | `unavailable` | 404 (model not available) | Not used; probe every `exhaustedRetryHours` | A successful call |
+*   **Budget**: cost is estimated from each response's `usage` (input, output, 5-minute/1-hour cache writes at 1.25x/2x, cache reads at the model's rate; long-prompt Haiku prices above 100K tokens; Batches at 50%), priced at the model that served each iteration (a server-side fallback may answer with Opus 5). The billing cycle starts on `billingCycleDay` (29; the last day of shorter months). Batch requests reserve their estimated cost until their result is recorded. The workspace spend limit of the Claude Console remains the only hard cap.
+*   **Message Batches** (half price): the scheduled cycles mark their tasks `options.batchable` — wiki synthesis (pages and topic maps, sent together and awaited with `Promise.allSettled`), insight merge, proactive cycle and the nightly evolution cycle. The same methods triggered from the admin routes run in real time.
+    *   One row per task in `claude_batch_requests` makes submissions idempotent: a task dispatched again (restart, brake, cooldown) waits for its request or takes its stored result instead of paying twice. Requests arriving within `batch.windowMs` share a batch; one poller per batch reads results by `custom_id` (the task id).
+    *   The queue starts after the wiki, evolution and improvement listeners are registered (`index.ts`), so results read back after a restart are saved. Tasks waiting on a batch are exempt from the 24-hour discard rules; expired or server-failed requests are re-submitted once.
+    *   Brake: nothing is submitted while it is engaged, and a braked task keeps its request. Cancel or re-route: an unsent request is dropped, a batch that held only that request is cancelled.
+*   **Prompt caching**: `TaskPayload.cachePrefix` is sent as a first content block with `cache_control`; other providers receive it first in the prompt text. `DebateEngine` puts the insight and the debate up to the start of the round there (shared by every participant of the round) and the persona after it. The agent bridge caches the system prompt and, automatically, the growing conversation. The minimum cacheable prefix is 512 tokens on the current models; the admin status reports today's cache hit ratio.
+*   **Agent proxy** (`api/routes/agentProxy.ts`, `agentBridge/`):
+```
+OpenClaw / Hermes ──► POST /api/freellmapi-proxy/v1/chat/completions ─────────┐
+Venture builds    ──► POST /api/freellmapi-proxy/builder/v1/chat/completions ─┤
+                                                                               ▼
+       agentClaudeGate: agents enabled, Bearer key known, Claude available, agent slot free
+                │ yes                                            │ no, or Claude error before the first byte
+                ▼                                                ▼
+   agentBridge: OpenAI chat completion ⇄ Claude Messages     FreeLLMAPI (as before)
+```
+*   **Agent proxy, translation**: system/developer messages → top-level `system` (cache breakpoint); `tool_calls` → `tool_use`, `role: tool` → `tool_result` grouped in one user turn; `image_url` → image blocks; tools → `input_schema`; `tool_choice` `required`/named → `auto` (forced tool use is rejected by the current models); `parallel_tool_calls: false` → `disable_parallel_tool_use`; `json_schema` → `output_config.format`; sampling parameters dropped; `max_tokens` kept between 4096 and 64000. Answers return as `chat.completion` or `chat.completion.chunk` SSE (`delta.content`, `delta.tool_calls`, finish reason, usage with cached tokens). A request the bridge cannot express goes to FreeLLMAPI unchanged.
+*   **Agent proxy, thinking blocks**: the OpenAI format cannot carry them; the server keeps them (memory, 2 h, by tool call id) and puts them back when the agent re-sends the turn, with `prefix_mismatch_behavior: "drop_block"` (beta `thinking-binding-controls-2026-08-01`) so a trimmed history drops them instead of failing.
+*   **Agent proxy, models**: general route `claude.agents.model` (Sonnet 5.5, STANDARD effort). Venture builds call the builder route only when the build settings name a model (OpenClaw provider `aimindmesh-builder`): a `claude-*` model runs on Claude with the EVOLUTION effort, any other model on FreeLLMAPI; `claude.agents.builderModel` (Opus 5.5) answers builder calls that arrive without a build model. With an empty build model, builds use OpenClaw's default model through the general route. Spend is recorded as source `agent` or `builder`.
+*   **Admin**: `GET /api/admin/status` → `claude` (state, reason, next probe, cycle spend/reserved/budget by source, today's tokens and cache, slots in use, open batch requests). PC client: Claude monitor and configuration cards, "Claude (all tasks)" routing override, Claude in the priority editor, queue re-route, chat selector, AI tasks and build model suggestions. Admin mobile: Claude cockpit card, settings section, priority editor, queue and evolution routing. Phone: `CLAUDE` in "Preferred Routing Target" (§6.13).
+
 ### 4.14 Auto-Evolution Engine (Server)
 The Auto-Evolution Engine is a server-side pipeline that lets the ecosystem propose changes to its own codebase. It never merges nor deploys by itself: every change is a Gitea Pull Request that a human reviews.
 
@@ -1081,7 +1140,7 @@ The Auto-Evolution Engine is a server-side pipeline that lets the ecosystem prop
     *   **Target**: from a stack trace (`dist/x.js` → `src/x.ts`) or the file emitting the module tag; otherwise the model picks among the files that log it. The model writes title, description and approach, or `skip` when the code should not change.
     *   **Severity** comes from frequency and persistence (5–10), not from words. One candidate per error group (`id = <kind>-<fingerprint>`); deleting it lets the group be proposed again. At most `signals.maxCandidatesPerCycle` (3) per cycle.
     *   **Insights** (Knowledge Graph `open_question`/`observation`, `DebateEngine` conclusions, wiki "Open Questions") are off unless `autoEvolution.sources.insights` is `true`: they are reflections on the user's notes, not evidence about the code. A debate concludes on code only when a `DEVELOPER` participant spoke. `sources.runtimeErrors` / `sources.inferenceFailures` can switch the evidence sources off.
-*   **Contextual Code Generation**: `MultiFileContextBuilder` assembles the target plus related files (imports, callers, shared types, DB schema, `ServerConfig` interface) and routes an `EVOLUTION` task to Gemini, then OpenRouter. Chat requests classified as development intents (`injectUserRequest`) follow the same pipeline.
+*   **Contextual Code Generation**: `MultiFileContextBuilder` assembles the target plus related files (imports, callers, shared types, DB schema, `ServerConfig` interface) and routes an `EVOLUTION` task to Claude while it has credit (§4.13.8), then Gemini, then OpenRouter. The nightly cycle uses Claude's Message Batches. Chat requests classified as development intents (`injectUserRequest`) follow the same pipeline.
 *   **Edit-based Output** (`services/evolution/EditApplier.ts`): the model returns `edits` (`{path, search, replace}`) and `newFiles`, never whole files. Each search text must occur exactly once in the current file (after the previous edits of that file); otherwise the candidate fails with the reason. The resulting full contents go through the usual checks and commit. Feedback iterations still regenerate the whole target from the branch content.
 *   **Path Policy** (`services/evolution/EvolutionPathPolicy.ts`), enforced at every entry point and again right before each Gitea commit:
     *   **Secrets** are never read, sent to an LLM, nor committed: `config.json`, `.env*`, Firebase service accounts, `openclaw-config/`, `openclaw-workspace/`, `hermes-data/`, server `data/` and `backups/`, databases and keys, the deployment `src/config.ts`.
@@ -1389,6 +1448,7 @@ Located **Settings → AIMindMesh Server**.
 | **Server URL** | `Text` | VPN endpoint of AIMindMesh Server (default `http://10.2.0.1:3030`). The server port is bound only to the VPN address and localhost. |
 | **API Key** | `Password` | Sent as the `x-api-key` header on REST requests and as the `token` query parameter on WebSockets (`/ws/chat`, `/ws/nodes`). Stored in the Keystore-backed secret store (see §9.1). |
 | **Fallback Provider** | `Select` | LLM provider to use if server is unreachable (default: `gemini`). |
+| **Preferred Routing Target** | `Select` | Sent as `routing` with every server request: `AUTO` (server priority lists: Claude first for chat and web analysis while its credit lasts, §4.13.8), a node, `GEMINI`, `OPENROUTER` or `CLAUDE (Anthropic, via server)`. An explicit target wins over the server's lists. |
 | **Participate as Worker** | `Toggle` | Allows the server to route inference tasks to this device. Activates the `NodeWorker` WebSocket. |
 | **Web tools** | `Toggles` | Web search, page reading and web analysis on the server (§6.12, §4.1.7). |
 | **Mesh Activity** | `Indicator` | Real-time status card showing if the device is currently executing a distributed task. |
@@ -1496,7 +1556,7 @@ This section describes the **current** state. Items marked *(planned)* are known
 | PERSONAL | Calendar, Tasks, Chat history | App lifetime | Only if a cloud LLM or the AIMindMesh Server is selected |
 | OPERATIONAL | Settings, Model paths, Logs | App lifetime | Never |
 
-**Cloud Transmission Policy**: Data is sent to cloud providers (Gemini, Claude, Perplexity, OpenRouter) ONLY when the user explicitly selects a cloud LLM provider. When using local GGUF/LiteRT/Genie, zero data leaves the device. When the AIMindMesh Server is enabled, data goes to the user's own VPS over the VPN, which may in turn route tasks to cloud providers according to its routing configuration.
+**Cloud Transmission Policy**: Data is sent to cloud providers (Gemini, Claude, Perplexity, OpenRouter) ONLY when the user explicitly selects a cloud LLM provider. When using local GGUF/LiteRT/Genie, zero data leaves the device. When the AIMindMesh Server is enabled, data goes to the user's own VPS over the VPN, which may in turn route tasks to cloud providers according to its routing configuration: by default Anthropic Claude answers chats, web analysis, debates, wiki pages and code generation while its monthly API credit lasts, and the requests of the server agents (OpenClaw, Hermes, venture builds) as well (§4.13.8).
 
 ---
 
@@ -1581,14 +1641,14 @@ Voice recordings and speaker embeddings may constitute **biometric data** under 
 | Control | Implementation |
 |---|---|
 | **Authentication** | Every route goes through `authHook` (`middleware/auth.ts`): the `x-api-key` header must match `server.apiKey` or one of `auth.keys` (constant-time comparison). WebSocket upgrades use the `token` query parameter; without a valid key the handshake is rejected with HTTP 401. Tokens are masked (`token=***`) in logs. |
-| **Exempt routes** | `POST /api/freellmapi-proxy/v1/chat/completions` (requires the caller's own `Authorization: Bearer` FreeLLMAPI key, the server key is never injected); Gitea webhooks `POST /api/evolution/gitea/webhook` and `POST /api/organization/webhooks/gitea` (HMAC-SHA256 `X-Gitea-Signature` with `autoEvolution.giteaWebhookSecret`, rejected with 401 when the secret is missing or the signature is wrong); `GET /dl/*` installers (VPN IP filter). |
+| **Exempt routes** | `POST /api/freellmapi-proxy/v1/chat/completions` and `/builder/v1/chat/completions` (require the caller's own `Authorization: Bearer` FreeLLMAPI key, the server key is never injected; before answering with Claude the server checks that key itself against `freellmapi.apiKey` and `claude.agents.proxyKeys` in constant time, and any other key goes to FreeLLMAPI, which checks it); Gitea webhooks `POST /api/evolution/gitea/webhook` and `POST /api/organization/webhooks/gitea` (HMAC-SHA256 `X-Gitea-Signature` with `autoEvolution.giteaWebhookSecret`, rejected with 401 when the secret is missing or the signature is wrong); `GET /dl/*` installers (VPN IP filter). |
 | **Network exposure** | Docker publishes the server (3030) and Neo4j (7474/7687) only on `127.0.0.1` and the VPN address `10.2.0.1`, never on public interfaces. |
-| **Secrets in the API** | `GET /api/admin/config` returns credentials masked as `********`; masked values sent back by `PATCH` are ignored, so they never overwrite real secrets. The Docker image does not contain `config.json`, `.env` or the Firebase key (mounted at runtime). |
+| **Secrets in the API** | `GET /api/admin/config` returns credentials (including `claude.apiKey`) masked as `********`; masked values sent back by `PATCH` are ignored, so they never overwrite real secrets. The Docker image does not contain `config.json`, `.env` or the Firebase key (mounted at runtime). |
 | **Command execution** | No user- or LLM-controlled string reaches a shell: external tools (`whisper`, `tar`, `git`, `grep`, `docker exec`) run via `execFile` with argument arrays; backup names are validated against path traversal. |
 | **Mesh integrity** | A worker node can stream or resolve only the tasks dispatched to it (§4.13.7). |
 | **Auto-evolution** | Path policy, real type-check, rate limits and human approval (§4.14). |
 
 ### 9.7 Testing & Continuous Integration
-*   **Server tests**: Vitest suite in `aimindmesh-server/test/` (`npm test`), covering authentication and WebSockets, webhook signatures, config redaction, command-injection and path-traversal regressions, the auto-evolution path policy and real patch type-checking, and the API contract fixes. Tests run against an in-memory SQLite database and a test configuration, with outgoing network calls disabled.
+*   **Server tests**: Vitest suite in `aimindmesh-server/test/` (`npm test`), covering authentication and WebSockets, webhook signatures, config redaction, command-injection and path-traversal regressions, the auto-evolution path policy and real patch type-checking, the API contract fixes, and the Claude provider (credit states and budget, routing and retries, Message Batches, the agent bridge) with the Anthropic SDK mocked. Tests run against an in-memory SQLite database and a test configuration, with outgoing network calls disabled.
 *   **Shared API contract**: `aimindmesh-server/src/types/api.ts` (types only) is imported by the desktop, admin and mobile apps through the `@aimindmesh/api-types` path alias; a type-level test keeps the server's internal types compatible with it.
 *   **CI**: `.gitea/workflows/ci.yml` type-checks the four projects and runs the server tests on every push to `master` and on pull requests (Gitea Actions). Branches written by the auto-evolution engine (`feature/auto-*`, `fail/*`) are skipped so that LLM-written code never runs on the runner.

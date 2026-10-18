@@ -8,6 +8,7 @@ import { NodeRegistry } from './NodeRegistry';
 import cron, { ScheduledTask } from 'node-cron';
 import { config } from '../config';
 import { SearchService } from './SearchService';
+import { mergeDuplicateInsights } from './debate/insightMerge';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -86,8 +87,9 @@ export class DebateEngine {
     if (config.debate?.mergeEnabled) {
       const interval = config.debate?.mergeIntervalHours || 12;
       const cronExpr = `0 */${interval} * * *`;
+      // The scheduled merge can wait for Claude's half-price batches
       this.task = cron.schedule(cronExpr, async () => {
-        await this.runMergeCycle();
+        await this.runMergeCycle({ batchable: true });
       });
       Logger.info('DebateEngine', 'Merge cycle registered: ' + cronExpr);
     }
@@ -295,11 +297,14 @@ export class DebateEngine {
         : DEFAULT_PARTICIPANTS;
 
     let lastReply: string | null = null;
+    // Insight + debate at the start of the round: identical for every call of the round, so it
+    // is sent first and cached by Claude; the persona and this round's replies follow it
+    const roundHistory = history;
 
     // ── Dynamic Participants Loop ──────────────────────────────────────────
     for (const participant of participants) {
-      const prompt = this.buildPrompt(participant.persona, thread.insightContent, history, humanSeed);
-      const reply = await this.runInference(prompt, `Debate: ${participant.name} [Round ${nextRound}]`);
+      const { cachePrefix, prompt } = this.buildPrompt(participant.persona, thread.insightContent, roundHistory, history.slice(roundHistory.length), humanSeed);
+      const reply = await this.runInference(prompt, `Debate: ${participant.name} [Round ${nextRound}]`, cachePrefix);
       const msg = this.persistMessage(debateId, participant.name, reply, nextRound);
 
       if (onMessage) onMessage(msg);
@@ -311,8 +316,8 @@ export class DebateEngine {
     // ── ORCHESTRATOR synthesis (every 2 rounds) ──────────────────────────
     let orchestratorReply: string | null = null;
     if (nextRound % 2 === 0) {
-      const orchestratorPrompt = this.buildPrompt(ORCHESTRATOR_PERSONA, thread.insightContent, history);
-      orchestratorReply = await this.runInference(orchestratorPrompt, `Debate: ORCHESTRATOR [Round ${nextRound}]`);
+      const orchestrator = this.buildPrompt(ORCHESTRATOR_PERSONA, thread.insightContent, roundHistory, history.slice(roundHistory.length));
+      orchestratorReply = await this.runInference(orchestrator.prompt, `Debate: ORCHESTRATOR [Round ${nextRound}]`, orchestrator.cachePrefix);
       const msg = this.persistMessage(debateId, 'ORCHESTRATOR', orchestratorReply, nextRound);
       if (onMessage) onMessage(msg);
     }
@@ -369,28 +374,39 @@ export class DebateEngine {
 
   // ── Private: Helpers ────────────────────────────────────────────────────────
 
-  private static async runInference(prompt: string, taskName?: string): Promise<string> {
+  private static async runInference(prompt: string, taskName?: string, cachePrefix?: string): Promise<string> {
     const result = await InferenceRouter.routeTask({
       type: 'DEBATE_PARTICIPATION',
       prompt,
-      tokensEstimate: Math.ceil(prompt.length / 4) + 300,
+      cachePrefix,
+      tokensEstimate: Math.ceil((prompt.length + (cachePrefix?.length ?? 0)) / 4) + 300,
       options: { taskName }
     });
     return result.response.trim();
   }
 
+  /**
+   * Prompt of one debate turn, in two parts: the shared context (insight and the debate up to
+   * the start of this round), then the persona, the replies of this round so far and the
+   * instructions. Providers without prompt caching receive the two parts joined in this order.
+   */
   private static buildPrompt(
     persona: string,
     insightContent: string,
-    history: string,
+    roundHistory: string,
+    roundReplies: string,
     humanSeed?: string
-  ): string {
-    let prompt = persona + '\n\n';
-    prompt += '── ORIGINAL INSIGHT ──\n' + insightContent + '\n\n';
-
-    if (history.trim().length > 0) {
-      prompt += '── DEBATE SO FAR ──\n' + history + '\n\n';
+  ): { cachePrefix: string; prompt: string } {
+    let cachePrefix = '── ORIGINAL INSIGHT ──\n' + insightContent + '\n\n';
+    if (roundHistory.trim().length > 0) {
+      cachePrefix += '── DEBATE SO FAR ──\n' + roundHistory + '\n\n';
     }
+
+    let prompt = persona + '\n\n';
+    if (roundReplies.trim().length > 0) {
+      prompt += '── THIS ROUND SO FAR ──\n' + roundReplies.trim() + '\n\n';
+    }
+    const history = roundHistory + roundReplies;
 
     if (humanSeed) {
       prompt +=
@@ -408,7 +424,7 @@ export class DebateEngine {
     prompt += '── YOUR TURN ──\n' +
               'CRITICAL: You MUST respond in English. This is a system-level constraint for multi-node interoperability. ' +
               'Even if the history or source insight is in another language, translate your perspective and provide your argument ONLY in English.\n';
-    return prompt;
+    return { cachePrefix, prompt };
   }
 
   private static buildHistoryContext(debateId: string): string {
@@ -478,138 +494,15 @@ export class DebateEngine {
 
   // ── Thread Merging ─────────────────────────────────────────────────
 
-  public static async runMergeCycle(): Promise<{ started: boolean; message?: string }> {
+  public static async runMergeCycle(opts: { batchable?: boolean } = {}): Promise<{ started: boolean; message?: string }> {
     if (this.isMerging) return { started: false, message: 'Already running' };
     this.isMerging = true;
 
     Logger.info('DebateEngine', '🔍 Starting robust merge cycle for insights...');
 
     try {
-      const candidates = db.prepare(`
-        SELECT id, content, source_node_ids as sourceNodeIds
-        FROM feed_items
-        WHERE type = 'INSIGHT'
-        ORDER BY created_at DESC
-        LIMIT 50
-      `).all() as { id: string; content: string; sourceNodeIds: string }[];
-
-      if (candidates.length < 2) {
-        Logger.info('DebateEngine', 'Merge cycle: Insufficient candidates. Skipping.');
-        return { started: false, message: 'Insufficient candidates' };
-      }
-
-      // 1. Deterministic grouping: same source concepts
-      const deterministicGroups: string[][] = [];
-      const visited = new Set<string>();
-
-      for (let i = 0; i < candidates.length; i++) {
-        if (visited.has(candidates[i].id)) continue;
-        const group: string[] = [candidates[i].id];
-        for (let j = i + 1; j < candidates.length; j++) {
-          if (visited.has(candidates[j].id)) continue;
-          if (
-            candidates[i].sourceNodeIds === candidates[j].sourceNodeIds &&
-            candidates[i].sourceNodeIds !== '[]'
-          ) {
-            group.push(candidates[j].id);
-          }
-        }
-        if (group.length > 1) {
-          group.forEach(id => visited.add(id));
-          deterministicGroups.push(group);
-        }
-      }
-
-      Logger.info('DebateEngine', 'Merge cycle: found ' + deterministicGroups.length + ' deterministic duplicate groups.');
-
-      // 2. LLM grouping for remaining candidates (semantic similarity)
-      const remainingCandidates = candidates.filter(c => !visited.has(c.id));
-      let llmGroups: string[][] = [];
-
-      if (remainingCandidates.length >= 2) {
-        Logger.debug('DebateEngine', 'Asking LLM to analyze semantic overlap for ' + remainingCandidates.length + ' candidates...');
-        const prompt =
-          'Here is a list of AI insights from the knowledge feed. Identify if any are discussing the exact same concept or are redundant duplicates:\n' +
-          remainingCandidates.map(c => '- ID: ' + c.id + ' | Content: ' + c.content).join('\n') +
-          '\n\nReturn findings as JSON array of arrays of IDs: [["id1", "id2"]]. Empty array [] if none. NO thoughts, NO markdown.';
-
-        try {
-          const result = await InferenceRouter.routeTask({ 
-            type: 'INSIGHT_DEDUP', 
-            prompt, 
-            tokensEstimate: 600,
-            options: { taskName: 'Insight Merge Analysis' }
-          });
-          let rawJson = result.response.trim();
-          if (rawJson.startsWith('```json')) rawJson = rawJson.substring(7);
-          if (rawJson.endsWith('```')) rawJson = rawJson.substring(0, rawJson.length - 3).trim();
-          llmGroups = JSON.parse(rawJson);
-        } catch (e) {
-          Logger.warn('DebateEngine', 'LLM merge analysis failed or returned invalid JSON.');
-        }
-      }
-
-      const allGroups = [...deterministicGroups, ...llmGroups];
-
-      if (allGroups.length === 0) {
-        Logger.info('DebateEngine', 'Merge cycle completed: no duplicates found.');
-        return { started: false, message: 'No duplicates found' };
-      }
-
-      Logger.info('DebateEngine', 'Merge cycle: consolidating ' + allGroups.length + ' groups total.');
-
-      for (const group of allGroups) {
-        if (!Array.isArray(group) || group.length < 2) continue;
-
-        const validGroup = group.filter(id => candidates.some(c => c.id === id));
-        if (validGroup.length < 2) continue;
-
-        const primaryInsightId = validGroup[0];
-        const obsoleteInsightIds = validGroup.slice(1);
-
-        const primaryInsight = db.prepare(`SELECT * FROM feed_items WHERE id = ?`).get(primaryInsightId) as any;
-        if (!primaryInsight) continue;
-
-        const primaryThread = db.prepare(`SELECT id FROM debate_threads WHERE insight_id = ?`).get(primaryInsightId) as any;
-        const primaryThreadId = primaryThread?.id;
-
-        let consolidatedNodeIds: string[] = [];
-        try { consolidatedNodeIds = JSON.parse(primaryInsight.source_node_ids || '[]'); } catch (e) { }
-
-        // One transaction per group: a failure never leaves insights half merged
-        db.transaction(() => {
-          for (const obsInsightId of obsoleteInsightIds) {
-            const obsInsight = db.prepare(`SELECT source_node_ids FROM feed_items WHERE id = ?`).get(obsInsightId) as any;
-            if (obsInsight) {
-              try {
-                const obsNodeIds = JSON.parse(obsInsight.source_node_ids || '[]');
-                obsNodeIds.forEach((id: string) => {
-                  if (!consolidatedNodeIds.includes(id)) consolidatedNodeIds.push(id);
-                });
-              } catch (e) { }
-            }
-
-            const obsThread = db.prepare(`SELECT id FROM debate_threads WHERE insight_id = ?`).get(obsInsightId) as any;
-            if (obsThread && primaryThreadId) {
-              // Migrate agent messages to primary thread and mark the obsolete one as merged
-              db.prepare(`UPDATE debate_messages SET debate_id = ? WHERE debate_id = ?`).run(primaryThreadId, obsThread.id);
-              db.prepare(`UPDATE debate_threads SET status = 'CLOSED', merged_into = ? WHERE id = ?`).run(primaryThreadId, obsThread.id);
-            } else if (obsThread) {
-              // No primary thread exists — just close the orphan thread
-              db.prepare(`UPDATE debate_threads SET status = 'CLOSED' WHERE id = ?`).run(obsThread.id);
-            }
-            // Migrate human replies; queued deliveries of the obsolete insight are dropped (FK)
-            db.prepare(`UPDATE feed_replies SET feed_item_id = ? WHERE feed_item_id = ?`).run(primaryInsightId, obsInsightId);
-            db.prepare(`DELETE FROM pending_delivery WHERE insight_id = ?`).run(obsInsightId);
-            db.prepare(`DELETE FROM feed_items WHERE id = ?`).run(obsInsightId);
-
-            Logger.info('DebateEngine', 'Consolidated insight ' + obsInsightId + ' into ' + primaryInsightId);
-          }
-
-          // Update primary with consolidated node ids
-          db.prepare(`UPDATE feed_items SET source_node_ids = ? WHERE id = ?`).run(JSON.stringify(consolidatedNodeIds), primaryInsightId);
-        })();
-      }
+      const skipped = await mergeDuplicateInsights(opts);
+      if (skipped) return { started: false, message: skipped };
 
       Logger.info('DebateEngine', '✅ Merge cycle complete.');
 

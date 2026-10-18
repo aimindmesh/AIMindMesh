@@ -1,7 +1,6 @@
 // Must stay the first import: applies a staged backup restore before config and DB load
 import './db/restoreAtBoot';
-import Fastify, { FastifyReply, FastifyRequest } from 'fastify';
-import axios from 'axios';
+import Fastify from 'fastify';
 import websocketPlugin from '@fastify/websocket';
 import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
@@ -38,6 +37,7 @@ import webRoutes from './api/routes/web';
 import kasmRoutes from './api/routes/kasm';
 import localSttRoutes from './api/routes/local-stt';
 import { organizationRoutes } from './api/routes/organization';
+import { agentProxyRoutes } from './api/routes/agentProxy';
 import { researchRoutes } from './api/routes/research';
 import { AiTaskScheduler } from './services/AiTaskScheduler';
 import { InferenceRouter } from './services/InferenceRouter';
@@ -145,160 +145,8 @@ async function build() {
     return { ok: true, version, status: 'ready' };
   });
 
-  function normalizeMessages(messages: any[]): any[] {
-    if (!Array.isArray(messages)) return messages;
-    return messages.map((msg) => {
-      if (!msg || typeof msg !== 'object') return msg;
-      const clonedMsg = { ...msg };
-      if (Array.isArray(clonedMsg.content)) {
-        clonedMsg.content = clonedMsg.content
-          .map((part: any) => {
-            if (part && part.type === 'text' && typeof part.text === 'string') {
-              return part.text;
-            }
-            return '';
-          })
-          .join('\n');
-      }
-      return clonedMsg;
-    });
-  }
-
-  function sanitizeSchema(obj: any): void {
-    if (!obj || typeof obj !== 'object') return;
-
-    if (Array.isArray(obj)) {
-      for (const item of obj) {
-        sanitizeSchema(item);
-      }
-      return;
-    }
-
-    if ('additionalProperties' in obj) {
-      delete obj.additionalProperties;
-    }
-    if ('patternProperties' in obj) {
-      delete obj.patternProperties;
-    }
-
-    for (const key of Object.keys(obj)) {
-      if (typeof obj[key] === 'object') {
-        sanitizeSchema(obj[key]);
-      }
-    }
-  }
-
-  // OpenAI proxy routes forwarding OpenClaw/Hermes requests to FreeLLMAPI. The general route strips the
-  // model (FreeLLMAPI routes and falls back); the builder route used by venture development runs applies the
-  // model chosen in the organization build settings, when there is one.
-  const proxyChatCompletions = async (request: FastifyRequest, reply: FastifyReply, modelOverride: string | null) => {
-    const body = request.body as any;
-    const authHeader = request.headers['authorization'];
-
-    // Callers (OpenClaw, Hermes) must present their own FreeLLMAPI key: the server key is never injected
-    if (!authHeader) {
-      Logger.warn('FreeLLMAPI-Proxy', `Rejected unauthenticated proxy request from ${request.ip}`);
-      reply.code(401).send({ error: 'Missing Authorization header' });
-      return reply;
-    }
-    
-    // Clone and strip 'model' from the request body to force FreeLLMAPI's internal routing/fallback
-    const proxyBody = { ...body };
-    delete proxyBody.model;
-    if (modelOverride) proxyBody.model = modelOverride;
-    
-    if (proxyBody.messages) {
-      proxyBody.messages = normalizeMessages(proxyBody.messages);
-    }
-
-    // Sanitize tools JSON schemas for Google Gemini models to avoid 400 Bad Request rejections
-    const isGemini = body.model && typeof body.model === 'string' && body.model.toLowerCase().includes('gemini');
-    if (isGemini && Array.isArray(proxyBody.tools)) {
-      for (const tool of proxyBody.tools) {
-        if (tool && tool.type === 'function' && tool.function && tool.function.parameters) {
-          sanitizeSchema(tool.function.parameters);
-        }
-      }
-    }
-
-    Logger.info('FreeLLMAPI-Proxy', `Proxying chat completions from ${request.ip} (model: ${body.model} -> ${modelOverride ?? 'FreeLLMAPI routing'}, messages: ${Array.isArray(body.messages) ? body.messages.length : 0}, stream: ${!!body.stream})`);
-
-    const freellmapiUrl = `${config.freellmapi?.baseUrl || 'http://10.2.0.54:3001'}/v1/chat/completions`;
-
-    try {
-      if (body.stream) {
-        const response = await axios({
-          method: 'post',
-          url: freellmapiUrl,
-          data: proxyBody,
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': authHeader
-          },
-          responseType: 'stream'
-        });
-
-        reply.headers({
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive'
-        });
-
-        return response.data;
-      } else {
-        const response = await axios({
-          method: 'post',
-          url: freellmapiUrl,
-          data: proxyBody,
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': authHeader
-          }
-        });
-        
-        reply.code(response.status).send(response.data);
-      }
-    } catch (err: any) {
-      const status = err.response?.status || 500;
-      const data = err.response?.data;
-      
-      let errorBody = '';
-      if (data) {
-        if (data && typeof data.on === 'function') {
-          try {
-            errorBody = await new Promise<string>((resolve) => {
-              let buf = '';
-              data.on('data', (chunk: any) => { buf += chunk.toString(); });
-              data.on('end', () => resolve(buf));
-              data.on('error', () => resolve('[Error reading stream]'));
-            });
-          } catch {
-            errorBody = '[Failed to read stream]';
-          }
-        } else {
-          errorBody = typeof data === 'object' ? JSON.stringify(data) : String(data);
-        }
-      }
-
-      Logger.error('FreeLLMAPI-Proxy', `Proxy request failed with status ${status}: ${err.message}. Response data: ${errorBody || '[none]'}`);
-      
-      if (errorBody) {
-        try {
-          reply.code(status).header('Content-Type', 'application/json').send(JSON.parse(errorBody));
-        } catch {
-          reply.code(status).send(errorBody);
-        }
-      } else {
-        reply.code(status).send({ error: err.message });
-      }
-    }
-  };
-
-  fastify.post('/api/freellmapi-proxy/v1/chat/completions', (request, reply) => proxyChatCompletions(request, reply, null));
-  fastify.post('/api/freellmapi-proxy/builder/v1/chat/completions', (request, reply) => {
-    const { getBuildSettings } = require('./services/organization/venture/BuildSettings');
-    return proxyChatCompletions(request, reply, getBuildSettings().model);
-  });
+  // OpenAI-compatible routes of OpenClaw, Hermes and venture builds: Claude first, then FreeLLMAPI
+  agentProxyRoutes(fastify);
 
   fastify.register(chatWs);
   fastify.register(statusWs);
@@ -459,6 +307,9 @@ async function start() {
     const { ImprovementDetector } = require('./services/ImprovementDetector');
     ImprovementDetector.init();
     await autoEvolutionPipeline.init();
+    // Claude batches: only now, with the result listeners (wiki, evolution, improvements) registered
+    const { ClaudeBatchQueue } = require('./services/inference/claude/ClaudeBatchQueue');
+    ClaudeBatchQueue.start();
     
     // Start background enrichment recovery
     RecoveryService.start();

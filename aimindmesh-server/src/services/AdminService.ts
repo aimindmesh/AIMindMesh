@@ -15,18 +15,10 @@ import { BackupService } from './BackupService';
 import { OpenRouterService } from './OpenRouterService';
 import { OpenClawHealthService } from './OpenClawHealthService';
 import { HermesBridge } from './HermesBridge';
+import { claudeStatus } from './inference/claude/claudeStatus';
+import { deepMerge } from '../utils/deepMerge';
 
 
-function deepMerge(target: any, source: any) {
-  for (const key in source) {
-    if (source[key] instanceof Object && key in target && target[key] instanceof Object) {
-      deepMerge(target[key], source[key]);
-    } else {
-      target[key] = source[key];
-    }
-  }
-  return target;
-}
 
 export class AdminService {
   public static getConfig(): ServerConfig {
@@ -175,7 +167,8 @@ export class AdminService {
       infrastructureBrake: config.infrastructureBrake,
       openClawHealth,
       hermesHealth,
-      ingestionStats: await this.getIngestionStats()
+      ingestionStats: await this.getIngestionStats(),
+      claude: claudeStatus()
     } satisfies import('../types/api').ServerStatus;
 
   }
@@ -315,6 +308,9 @@ export class AdminService {
         payload.retryCount = 0;
         if (!payload.options) payload.options = {};
         payload.options.routing = 'AUTO';
+        // A manual retry is a new request: every provider may be tried again
+        delete payload.options.requestedRouting;
+        delete payload.options.skipProviders;
       }
 
       // Cancel the old stalled/failed task to clean up the registry/UI
@@ -324,7 +320,7 @@ export class AdminService {
       db.prepare("DELETE FROM inference_queue WHERE id = ?").run(id);
 
       // We re-route it. This will create a NEW entry in history which is cleaner for manual retries
-      void InferenceRouter.routeTask(payload);
+      void InferenceRouter.routeTask(payload).catch((err: any) => Logger.warn('AdminService', `Retried task failed: ${err.message}`));
       Logger.info('AdminService', `Manually retrying task [${id.slice(0,8)}]: ${row.task_name}`);
       return true;
     } catch (e) {
@@ -351,6 +347,8 @@ export class AdminService {
             payload.retryCount = 0;
             if (!payload.options) payload.options = {};
             payload.options.routing = 'AUTO';
+            delete payload.options.requestedRouting;
+            delete payload.options.skipProviders;
           }
 
           // Cancel the old task context
@@ -360,7 +358,7 @@ export class AdminService {
           db.prepare("DELETE FROM inference_queue WHERE id = ?").run(row.id);
 
           // Re-route the task payload back to the active queue
-          void InferenceRouter.routeTask(payload);
+          void InferenceRouter.routeTask(payload).catch((err: any) => Logger.warn('AdminService', `Retried task failed: ${err.message}`));
         } catch (err: any) {
           Logger.error('AdminService', `Failed to restore individual task ${row.id}: ` + err.message);
         }

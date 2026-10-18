@@ -249,7 +249,7 @@ export default function ChatView() {
             </button>
 
             <div className="flex bg-surface-hover/60 p-1.5 rounded-xl border border-border shadow-inner gap-1 overflow-x-auto custom-scrollbar max-w-md">
-              {['AUTO', ...availableNodes.map(n => n.id.toUpperCase()), 'GEMINI', 'OPENROUTER'].map(mode => {
+              {['AUTO', ...availableNodes.map(n => n.id.toUpperCase()), 'GEMINI', 'OPENROUTER', 'CLAUDE'].map(mode => {
                 const isMe = mode === config?.node?.id?.toUpperCase();
                 const label = isMe ? 'THIS PC' : mode === 'SERVER_LOCAL' ? 'OLLAMA' : getNodeName(mode).toUpperCase();
                 return (

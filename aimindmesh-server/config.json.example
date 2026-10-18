@@ -129,6 +129,39 @@
     "timeoutMs": 120000,
     "model": "auto"
   },
+  "claude": {
+    "enabled": true,
+    "apiKey": "your-anthropic-api-key",
+    "models": {
+      "LIGHTWEIGHT": "claude-haiku-5-5",
+      "STANDARD": "claude-sonnet-5-5",
+      "RESEARCH": "claude-sonnet-5-5",
+      "COMPLEX": "claude-opus-5-5",
+      "EVOLUTION": "claude-opus-5-5"
+    },
+    "effort": {
+      "LIGHTWEIGHT": "low",
+      "STANDARD": "medium",
+      "RESEARCH": "medium",
+      "COMPLEX": "high",
+      "EVOLUTION": "high"
+    },
+    "firstForCategories": ["STANDARD", "COMPLEX", "EVOLUTION", "RESEARCH"],
+    "maxTokens": 32000,
+    "maxConcurrent": 3,
+    "monthlyBudgetUsd": 200,
+    "billingCycleDay": 29,
+    "exhaustedRetryHours": 6,
+    "batch": { "enabled": true, "windowMs": 5000, "pollMs": 60000 },
+    "agents": {
+      "enabled": true,
+      "model": "claude-sonnet-5-5",
+      "builderModel": "claude-opus-5-5",
+      "proxyKeys": [],
+      "maxConcurrent": 2,
+      "monthlyBudgetUsd": null
+    }
+  },
   "hermes": {
     "enabled": false,
     "gatewayUrl": "http://your-hermes-ip:8642",

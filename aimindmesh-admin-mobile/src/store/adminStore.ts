@@ -54,6 +54,8 @@ interface ServerConfig {
     timeoutMs: number;
     model: string;
   };
+  /** Claude provider (see the server's claudeSettings.ts); apiKey comes back masked */
+  claude?: Record<string, any>;
 }
 
 interface AdminState {
@@ -63,6 +65,8 @@ interface AdminState {
   error: string | null;
   ollamaRunning: boolean;
   openrouterModels: Record<string, string[]> | null;
+  /** Priority list each task type really uses on the server (GET /api/admin/config) */
+  effectivePriorities: Record<string, string[]>;
   fetchStatus: () => Promise<void>;
   fetchConfig: () => Promise<void>;
   patchConfig: (newConfig: any) => Promise<void>;
@@ -81,6 +85,7 @@ export const useAdminStore = create<AdminState>((set, get) => ({
   error: null,
   ollamaRunning: false,
   openrouterModels: null,
+  effectivePriorities: {},
 
   fetchStatus: async () => {
     try {
@@ -129,7 +134,8 @@ export const useAdminStore = create<AdminState>((set, get) => ({
       const res = await adminApi.getConfig();
       set({ 
         config: res.data.config,
-        openrouterModels: res.data.openrouterModels || null
+        openrouterModels: res.data.openrouterModels || null,
+        effectivePriorities: res.data.effectivePriorities || {}
       });
     } catch { /* swallow */ }
   },

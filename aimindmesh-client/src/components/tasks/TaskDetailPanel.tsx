@@ -229,6 +229,7 @@ const TaskDetailPanel: React.FC<Props> = ({ task, onClose }) => {
                     <option value="auto">🔀 Auto Routing</option>
                     <option value="ollama">🦙 Server Ollama</option>
                     <option value="gemini">✨ Gemini 3.1</option>
+                    <option value="claude">🟠 Claude (Anthropic)</option>
                     <option value="openclaw">🔧 OpenClaw Agent</option>
                 </select>
                 </div>

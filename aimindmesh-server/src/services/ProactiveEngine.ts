@@ -28,8 +28,9 @@ export class ProactiveEngine {
 
     const cronExpr = `0 */${config.proactive.intervalHours} * * *`;
 
+    // The scheduled cycle can wait for Claude's half-price batches
     this.task = cron.schedule(cronExpr, async () => {
-      await this.runCycle();
+      await this.runCycle({ batchable: true });
     }, {
       timezone: config.proactive.timezone
     });
@@ -41,7 +42,7 @@ export class ProactiveEngine {
   }
 
 
-  public static async runCycle(): Promise<{ started: boolean; message?: string }> {
+  public static async runCycle(opts: { batchable?: boolean } = {}): Promise<{ started: boolean; message?: string }> {
     if (this.isRunning) return { started: false, message: 'Cycle already in progress' };
 
     this.isRunning = true;
@@ -97,7 +98,7 @@ export class ProactiveEngine {
         type: 'PROACTIVE_INSIGHT',
         prompt,
         tokensEstimate: 300,
-        options: { taskName: `Proactive Insight: ${pair.a.name} & ${pair.b.name}` }
+        options: { taskName: `Proactive Insight: ${pair.a.name} & ${pair.b.name}`, batchable: opts.batchable }
       });
 
       const insight = result.response;

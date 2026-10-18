@@ -16,7 +16,7 @@ import type {
 export type { AiStoragePolicy, AiExecutionStatus, AiOutputFormat, AiTaskExecution };
 
 /** Provider chosen in the UI (stored in `model` by older clients, now also sent as `provider`) */
-export type AiModel       = 'auto' | 'ollama' | 'gemini' | 'openclaw';
+export type AiModel       = 'auto' | 'ollama' | 'gemini' | 'claude' | 'openclaw';
 export type AiTaskStatus  = AiTaskState;
 
 // ── Entità ─────────────────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useOrganizationStore } from '../../store/organizationStore';
 import type { VentureBuildConfig } from '../../services/organizationApi';
+import { CLAUDE_MODELS } from '../admin/claude/claudeOptions';
 
 const INPUT = 'w-full bg-slate-950/60 border border-white/10 rounded-lg px-3 py-1.5 text-xs text-slate-200';
 const MINUTE = 60_000;
@@ -29,8 +30,11 @@ export function BuildSettingsPanel() {
         The agent works without credentials; the server validates every run in a throw-away container and publishes it only if build and tests pass.
       </p>
       <div className="grid grid-cols-2 gap-3 text-[10px] text-slate-400">
-        <label className="col-span-2 space-y-1">Model (empty = OpenClaw default)
-          <input className={INPUT} value={form.model ?? ''} placeholder="default" onChange={e => set({ model: e.target.value.trim() || null })} />
+        <label className="col-span-2 space-y-1">Model (empty = OpenClaw default, answered by Claude's agent model while the credit lasts; a claude-* id runs builds on Claude, any other id on FreeLLMAPI; a model needs the aimindmesh-builder provider)
+          <input className={INPUT} list="build-model-options" value={form.model ?? ''} placeholder="default" onChange={e => set({ model: e.target.value.trim() || null })} />
+          <datalist id="build-model-options">
+            {CLAUDE_MODELS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+          </datalist>
         </label>
         <label className="space-y-1">Attempts before blocking
           <input className={INPUT} type="number" min={1} max={20} value={form.maxAttempts} onChange={e => set({ maxAttempts: Number(e.target.value) })} />

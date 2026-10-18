@@ -13,6 +13,7 @@ const PROVIDER_ROUTING: Record<string, string> = {
   ollama: 'SERVER_LOCAL',
   gemini: 'GEMINI',
   openrouter: 'OPENROUTER',
+  claude: 'CLAUDE',
   openclaw: 'OPENCLAW',
   hermes: 'HERMES',
 };

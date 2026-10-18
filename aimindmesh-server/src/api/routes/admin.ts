@@ -17,6 +17,7 @@ import { WikiManager } from '../../services/WikiManager';
 import { config } from '../../config';
 import { NodeRegistry } from '../../services/NodeRegistry';
 import { InferenceProviders } from '../../services/InferenceProviders';
+import { ROUTED_TASK_TYPES } from '../../services/inference/providerIds';
 
 export default async function (fastify: FastifyInstance) {
   fastify.get('/config', async (request, reply) => {
@@ -24,7 +25,10 @@ export default async function (fastify: FastifyInstance) {
       config: redactConfig(AdminService.getConfig()),
       defaults: {
         debate: { participants: DEFAULT_PARTICIPANTS }
-      }
+      },
+      // Priority list each task type really uses (its own, its category's or the default, Claude placed):
+      // the priority editors start from it, so saving a list never drops Claude by accident
+      effectivePriorities: Object.fromEntries(ROUTED_TASK_TYPES.map(type => [type, InferenceProviders.effectivePriorities(type)]))
     };
   });
 

@@ -4,6 +4,7 @@ import { KGManager } from './KGManager';
 import { documentIngester } from './DocumentIngester';
 import { getSession } from '../db/neo4j';
 import { config } from '../config';
+import { isCloudProvider } from './inference/providerIds';
 
 export class GiteaService {
   private static baseUrl = process.env.GITEA_URL || '';
@@ -147,7 +148,7 @@ export class GiteaService {
     
     // Determine provider mode from config (avoid generating dummy inference tasks)
     const routing = (config.routing?.preferredNode || 'AUTO').toUpperCase();
-    const isCloud = routing === 'GEMINI' || routing === 'OPENROUTER';
+    const isCloud = isCloudProvider(routing);
     const mode = isCloud ? 'STANDARD' : 'DEEP';
 
     Logger.info('GiteaService', `Indexing repository ${repo.full_name} using config routing=${routing} (Mode: ${mode})`);

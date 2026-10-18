@@ -8,7 +8,13 @@ import { Parser } from '../utils/Parser';
 import { GiteaEvolutionService } from './GiteaEvolutionService';
 import { MultiFileContextBuilder, MultiFileContext } from './MultiFileContextBuilder';
 import { applyEdits, parseEdits } from './evolution/EditApplier';
+import { ClaudeCreditState } from './inference/claude/ClaudeCreditState';
 import { canSendToLLM, resolveLocalServerPath } from './evolution/EvolutionPathPolicy';
+
+/** Providers tried in turn for a code generation routed AUTO: Claude first while it has credit. */
+function evolutionProviders(): string[] {
+  return ClaudeCreditState.isAvailable('router') ? ['CLAUDE', 'GEMINI', 'OPENROUTER'] : ['GEMINI', 'OPENROUTER'];
+}
 
 export interface CodeGenerationPayload {
   candidateId: string;
@@ -205,7 +211,7 @@ export class CodeGenerationTask {
   }
 
   /** Sends the generation task; returns the raw model output (applied by AutoEvolutionPipeline.resumeEvolutionFromOutput). */
-  async generate(candidate: ImprovementCandidate, options?: { routing?: string, model?: string }): Promise<string> {
+  async generate(candidate: ImprovementCandidate, options?: { routing?: string, model?: string, batchable?: boolean }): Promise<string> {
     Logger.info('CodeGenerationTask', `Starting generation for ${candidate.title}`, { target: candidate.targetComponent });
 
     const targetComp = candidate.targetComponent || (candidate as any).target_component;
@@ -222,7 +228,7 @@ export class CodeGenerationTask {
     // Explicitly handle fallback for EVOLUTION tasks when routing is AUTO
     const providersToTry = (options?.routing && options.routing !== 'AUTO')
       ? [options.routing]
-      : ['GEMINI', 'OPENROUTER'];
+      : evolutionProviders();
 
     let lastError: Error | null = null;
 
@@ -246,7 +252,8 @@ export class CodeGenerationTask {
             taskName: `Evolution: ${candidate.title}`,
             routing: provider,
             model: options?.model,
-            thinking: true
+            thinking: true,
+            batchable: options?.batchable
           },
           metadata: (options as any)?.metadata
         });
@@ -306,7 +313,7 @@ export class CodeGenerationTask {
 
     const providersToTry = (options?.routing && options.routing !== 'AUTO')
       ? [options.routing]
-      : ['GEMINI', 'OPENROUTER'];
+      : evolutionProviders();
 
     let lastError: Error | null = null;
     for (const provider of providersToTry) {

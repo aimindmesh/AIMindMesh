@@ -12,6 +12,9 @@ import { forceRegisterToken, FCMCapacitor } from '../../../services/fcmService';
 import { logger } from '../../../services/logger';
 import { nodeWorker } from '../../../services/worker/NodeWorker';
 import ServerWebToolsSection from './ServerWebToolsSection';
+import ServerIntervalsSection from './ServerIntervalsSection';
+import ServerFcmSection from './ServerFcmSection';
+import ServerCloudSyncSection from './ServerCloudSyncSection';
 
 interface Props {
     settings: ServerSettingsType;
@@ -304,6 +307,7 @@ const AIMindMeshServerSettingsPanel: React.FC<Props> = ({ settings, onChange, is
                         <option value="SERVER_LOCAL">SERVER (Ollama Local)</option>
                         <option value="GEMINI">GEMINI (Google Cloud)</option>
                         <option value="OPENROUTER">OPENROUTER (Aggregator)</option>
+                        <option value="CLAUDE">CLAUDE (Anthropic, via server)</option>
                         {nodes.filter(n => n.type === 'mobile' && n.id !== (settings.deviceName || '').toUpperCase()).map(n => (
                             <option key={n.id} value={n.id}>
                                 📱 {n.id} {n.status === 'ONLINE' ? '(Online)' : '(Offline)'}
@@ -396,90 +400,7 @@ const AIMindMeshServerSettingsPanel: React.FC<Props> = ({ settings, onChange, is
                 </div>
             </div>
 
-            {/* Auto-Refresh Resources */}
-            <div className="flex items-center justify-between mb-4 mt-2">
-                <div>
-                    <div className="text-sm font-medium text-text-primary">Auto-Refresh Admin Status</div>
-                    <div className="text-xs text-text-secondary mt-0.5">Periodically poll server for live stats & nodes</div>
-                </div>
-                <button
-                    id="server-auto-refresh-toggle"
-                    onClick={() => update({ autoRefreshResources: !settings.autoRefreshResources })}
-                    className={`${toggleCls} ${settings.autoRefreshResources && settings.enabled ? 'bg-primary' : 'bg-white/20'}`}
-                    disabled={!settings.enabled}
-                    aria-pressed={settings.autoRefreshResources}
-                >
-                    <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${settings.autoRefreshResources && settings.enabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
-                </button>
-            </div>
-
-            {settings.autoRefreshResources && (
-                <div className="mb-4 animate-fade-in pl-4 border-l-2 border-primary/20">
-                    <div className="flex justify-between items-center mb-1">
-                        <label className="text-xs text-text-secondary">Admin Refresh Interval</label>
-                        <span className="text-xs font-mono text-primary">{settings.resourceRefreshInterval} s</span>
-                    </div>
-                    <input
-                        type="range"
-                        min="5"
-                        max="60"
-                        step="5"
-                        value={settings.resourceRefreshInterval || 30}
-                        onChange={(e) => update({ resourceRefreshInterval: parseInt(e.target.value) })}
-                        className="w-full accent-primary h-1 bg-surface rounded-lg appearance-none cursor-pointer"
-                    />
-                </div>
-            )}
-
-            {/* AI Task Polling Interval */}
-            <div className="mt-4 mb-2">
-                <div className="flex items-center justify-between">
-                    <div>
-                        <div className="text-sm font-medium text-text-primary">AI Task Polling Interval</div>
-                        <div className="text-xs text-text-secondary mt-0.5">Frequency for checking task status in Detail view</div>
-                    </div>
-                </div>
-                <div className="mt-2 animate-fade-in pl-4 border-l-2 border-indigo-500/20">
-                    <div className="flex justify-between items-center mb-1">
-                        <label className="text-xs text-text-secondary">Interval</label>
-                        <span className="text-xs font-mono text-indigo-400">{settings.aiTaskPollingInterval || 15} s</span>
-                    </div>
-                    <input
-                        type="range"
-                        min="5"
-                        max="60"
-                        step="5"
-                        value={settings.aiTaskPollingInterval || 15}
-                        onChange={(e) => update({ aiTaskPollingInterval: parseInt(e.target.value) })}
-                        className="w-full accent-indigo-500 h-1 bg-surface rounded-lg appearance-none cursor-pointer"
-                    />
-                </div>
-            </div>
-
-            {/* AI Task Retention Limit */}
-            <div className="mt-4 mb-2">
-                <div className="flex items-center justify-between">
-                    <div>
-                        <div className="text-sm font-medium text-text-primary">AI Task Database Retention</div>
-                        <div className="text-xs text-text-secondary mt-0.5">Max archived task outputs to keep (0 = infinite)</div>
-                    </div>
-                </div>
-                <div className="mt-2 animate-fade-in pl-4 border-l-2 border-teal-500/20">
-                    <div className="flex justify-between items-center mb-1">
-                        <label className="text-xs text-text-secondary">Keep latest</label>
-                        <span className="text-xs font-mono text-teal-400">{settings.taskRetentionLimit || 50} outputs</span>
-                    </div>
-                    <input
-                        type="range"
-                        min="0"
-                        max="200"
-                        step="10"
-                        value={settings.taskRetentionLimit || 50}
-                        onChange={(e) => update({ taskRetentionLimit: parseInt(e.target.value) })}
-                        className="w-full accent-teal-500 h-1 bg-surface rounded-lg appearance-none cursor-pointer"
-                    />
-                </div>
-            </div>
+            <ServerIntervalsSection settings={settings} update={update} />
 
 
 
@@ -571,125 +492,9 @@ const AIMindMeshServerSettingsPanel: React.FC<Props> = ({ settings, onChange, is
                         </div>
                     </div>
 
-                    {/* FCM Token Visibility & Refresh */}
-                    <div className="space-y-3 bg-primary/5 p-4 rounded-xl border border-primary/10">
-                        <div className="flex items-center justify-between">
-                            <p className="text-xs font-bold text-primary uppercase tracking-tight">Firebase Registration</p>
-                            <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${localToken ? 'bg-green-500/20 text-green-400' : 'bg-amber-500/20 text-amber-500'}`}>
-                                {localToken ? 'TOKEN DETECTED' : 'MISSING TOKEN'}
-                            </span>
-                        </div>
-                        
-                        <div className="bg-black/20 p-2.5 rounded-lg border border-white/5">
-                            <p className="text-[9px] text-text-tertiary uppercase mb-1">Local FCM Token</p>
-                            <p className="text-[10px] font-mono text-text-secondary break-all leading-relaxed">
-                                {localToken ? `${localToken.substring(0, 40)}...` : 'Not generated yet. Ensure you are on a real device and granted notification permissions.'}
-                            </p>
-                        </div>
+                    <ServerFcmSection settings={settings} localToken={localToken} isRegistering={isRegistering} handleForceRegister={handleForceRegister} fcmLogs={fcmLogs} />
 
-                        <button
-                            onClick={handleForceRegister}
-                            disabled={isRegistering || !settings.enabled}
-                            className="w-full py-2 bg-primary/20 hover:bg-primary/30 border border-primary/30 text-primary rounded-lg text-[11px] font-bold transition-all disabled:opacity-30 flex items-center justify-center gap-2"
-                        >
-                            {isRegistering ? (
-                                <>
-                                    <div className="w-3 h-3 border-2 border-primary border-t-transparent rounded-full animate-spin"></div>
-                                    Synchronizing with Gateway...
-                                </>
-                            ) : (
-                                <>
-                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                                    </svg>
-                                    Force Refresh & Sync Token
-                                </>
-                            )}
-                        </button>
-                    </div>
-
-                    {/* FCM Logs */}
-                    <div className="space-y-2">
-                        <p className={labelCls}>Recent FCM Telegrams</p>
-                        <div className="bg-surface/30 rounded-lg border border-white/5 overflow-hidden">
-                            {fcmLogs.length === 0 ? (
-                                <div className="p-4 text-center text-xs text-text-secondary opacity-50">No recent logs</div>
-                            ) : fcmLogs.map(log => (
-                                <div key={log.id} className="p-3 border-b border-white/5 last:border-0 hover:bg-white/5 transition-colors">
-                                    <div className="flex justify-between items-start mb-1">
-                                        <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded uppercase ${log.status === 'SUCCESS' ? 'bg-green-500/10 text-green-400' : 'bg-red-500/10 text-red-400'}`}>
-                                            {log.status}
-                                        </span>
-                                        <span className="text-[9px] text-text-tertiary">
-                                            {new Date(log.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                                        </span>
-                                    </div>
-                                    <p className="text-xs text-text-primary truncate">{log.message}</p>
-                                    <p className="text-[10px] text-text-secondary truncate mt-0.5">To: {log.recipient}</p>
-                                </div>
-                            ))}
-                        </div>
-                    </div>
-
-                    {/* Cloud Sync & Shared Memory Section */}
-                    <div className="mt-8 border-t border-white/5 pt-6 space-y-4">
-                        <div className="flex items-center gap-2 mb-2">
-                            <span className="text-sm font-bold text-text-primary uppercase tracking-wider">☁️ Cloud Sync & Shared Memory</span>
-                        </div>
-                        
-                        <div className="bg-gradient-to-br from-primary/10 to-purple-500/10 p-4 rounded-xl border border-primary/20">
-                            <div className="flex items-center justify-between mb-3">
-                                <div>
-                                    <div className="text-sm font-bold text-text-primary">Ecosystem Sync</div>
-                                    <div className="text-[10px] text-text-secondary">Keep meetings, chats, and knowledge aligned across devices</div>
-                                </div>
-                                <div className="text-[10px] font-mono text-primary/70">
-                                    {localStorage.getItem('last_sync_timestamp') 
-                                        ? `Last: ${new Date(parseInt(localStorage.getItem('last_sync_timestamp')!)).toLocaleTimeString()}`
-                                        : 'Never synced'}
-                                </div>
-                            </div>
-
-                            <button
-                                onClick={() => { triggerHaptic('MEDIUM'); onSync?.(); }}
-                                disabled={isSyncing || !settings.enabled || !settings.serverUrl}
-                                className={`w-full py-3 rounded-xl flex items-center justify-center gap-3 transition-all ${
-                                    isSyncing 
-                                    ? 'bg-primary/20 text-primary cursor-not-allowed' 
-                                    : 'bg-primary text-white shadow-lg shadow-primary/20 hover:opacity-90 active:scale-[0.98]'
-                                }`}
-                            >
-                                {isSyncing ? (
-                                    <>
-                                        <div className="w-4 h-4 border-2 border-primary border-t-transparent rounded-full animate-spin"></div>
-                                        <span className="text-sm font-bold">Synchronizing Knowledge...</span>
-                                    </>
-                                ) : (
-                                    <>
-                                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" />
-                                        </svg>
-                                        <span className="text-sm font-bold">Sync Now</span>
-                                    </>
-                                )}
-                            </button>
-
-                             <div className="mt-4 grid grid-cols-2 gap-2">
-                                <div className="p-2 bg-black/20 rounded-lg border border-white/5 flex flex-col items-center">
-                                    <span className="text-[9px] text-text-tertiary uppercase">Local Queue</span>
-                                    <span className={`text-xs font-bold ${unsyncedCount === 0 ? 'text-green-500' : 'text-text-primary'}`}>
-                                        {unsyncedCount === null ? '...' : (unsyncedCount === 0 ? 'CLEAN' : `${unsyncedCount} ITEMS`)}
-                                    </span>
-                                </div>
-                                <div className="p-2 bg-black/20 rounded-lg border border-white/5 flex flex-col items-center">
-                                    <span className="text-[9px] text-text-tertiary uppercase">Cloud Status</span>
-                                    <span className={`text-xs font-bold ${testStatus === 'ok' ? 'text-green-500' : (testStatus === 'error' ? 'text-red-500' : 'text-text-secondary')}`}>
-                                        {testStatus === 'ok' ? 'CONNECTED' : (testStatus === 'loading' ? 'WAITING...' : 'OFFLINE')}
-                                    </span>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
+                    <ServerCloudSyncSection settings={settings} isSyncing={isSyncing} onSync={onSync} unsyncedCount={unsyncedCount} testStatus={testStatus} />
                 </div>
             )}
         </div>

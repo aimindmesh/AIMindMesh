@@ -124,7 +124,8 @@ export class AutoEvolutionPipeline {
       }
 
       const candidate = allPending.sort((a, b) => b.severity - a.severity)[0];
-      await this.executeEvolutionForCandidate(candidate);
+      // The scheduled cycle can wait for Claude's half-price batches; a manual run answers in real time
+      await this.executeEvolutionForCandidate(candidate, manual ? undefined : { batchable: true });
 
     } catch (err: any) {
       Logger.error('AutoEvolutionPipeline', `Cycle failed: ${err.message}`);
@@ -147,7 +148,7 @@ export class AutoEvolutionPipeline {
     }
   }
 
-  private async executeEvolutionForCandidate(candidate: any, options?: { routing?: string; model?: string }) {
+  private async executeEvolutionForCandidate(candidate: any, options?: { routing?: string; model?: string; batchable?: boolean }) {
     Logger.info('AutoEvolutionPipeline', `Processing candidate: ${candidate.title} (Severity: ${candidate.severity})`);
 
     const repository = candidate.repository || candidate.repo_name || 'AIMindMesh';

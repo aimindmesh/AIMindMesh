@@ -1,28 +1,36 @@
 import { useState } from 'react';
 import { GripVertical, ChevronUp, ChevronDown, Network } from 'lucide-react';
+import { CLAUDE_EXCLUDED_TASKS } from './claude/claudeOptions';
 
 interface TaskPriorityManagerProps {
   priorities: Record<string, string[]>;
+  /** List each task type really uses on the server (its own, its category's or the default, with Claude placed) */
+  effectivePriorities?: Record<string, string[]>;
   onChange: (newPriorities: Record<string, string[]>) => void;
   availableNodes: { id: string; name?: string | null }[];
 }
 
-export function TaskPriorityManager({ priorities, onChange, availableNodes }: TaskPriorityManagerProps) {
+export function TaskPriorityManager({ priorities, effectivePriorities = {}, onChange, availableNodes }: TaskPriorityManagerProps) {
   const [expandedTask, setExpandedTask] = useState<string | null>(null);
 
   const taskTypes = [
     'INTENT_CLASSIFICATION', 'QUERY_EXPANSION', 'CONCEPT_EXTRACTION', 'CONCEPT_ENRICHMENT', 
     'IMPROVEMENT_DETECTION', 'PROACTIVE_INSIGHT', 'DEBATE_PARTICIPATION', 'DEBATE_SUMMARY', 
     'INSIGHT_DEDUP', 'WIKI_SYNTHESIS', 'WIKI_TOPIC_MAP', 'EVOLUTION', 'CODE_EVOLUTION', 
-    'EVOLUTION_VALIDATION', 'EMBEDDING_GENERATION', 'GENERAL_CHAT', 'WEB_RESEARCH', 'AGENTIC_TASK', 'SCHEDULED_TASK'
+    'EVOLUTION_VALIDATION', 'EMBEDDING_GENERATION', 'GENERAL_CHAT', 'WEB_RESEARCH', 'AGENTIC_TASK', 'SCHEDULED_TASK',
+    'DIRECTIVES_EXTRACTION', 'ORGANIZATION_DESIGN'
   ];
 
   // Helper to ensure all task types have a list, and all lists have valid nodes
   const getListForTask = (task: string) => {
-    const list = priorities?.[task] || [];
+    // A list without Claude is completed by the server (Claude first in its categories): show the
+    // list the server really uses, so a saved edit keeps Claude where it is
+    const own = priorities?.[task];
+    const list = (own?.includes('CLAUDE') ? own : effectivePriorities[task] || own) || [];
+    const claude = CLAUDE_EXCLUDED_TASKS.includes(task) ? [] : ['CLAUDE'];
     // Ensure default cloud nodes are in the list if missing
-    const fullList = Array.from(new Set([...list, 'GEMINI', 'OPENROUTER', 'FREELLMAPI', 'SERVER_LOCAL', ...availableNodes.map(n => n.id)]));
-    return fullList;
+    const fullList = Array.from(new Set([...list, ...claude, 'GEMINI', 'OPENROUTER', 'FREELLMAPI', 'SERVER_LOCAL', ...availableNodes.map(n => n.id)]));
+    return CLAUDE_EXCLUDED_TASKS.includes(task) ? fullList.filter(id => id !== 'CLAUDE') : fullList;
   };
 
   const moveNode = (task: string, index: number, direction: 'up' | 'down') => {
@@ -46,6 +54,7 @@ export function TaskPriorityManager({ priorities, onChange, availableNodes }: Ta
     if (id === 'GEMINI') return 'Google Gemini';
     if (id === 'OPENROUTER') return 'OpenRouter';
     if (id === 'FREELLMAPI') return 'FreeLLMAPI (Proxy Gateway)';
+    if (id === 'CLAUDE') return 'Anthropic Claude';
     if (id === 'SERVER_LOCAL') return 'Neural Core (Server)';
     const node = availableNodes.find(n => n.id === id);
     return node?.name || id;

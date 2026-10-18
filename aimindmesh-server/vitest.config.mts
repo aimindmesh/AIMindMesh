@@ -40,6 +40,9 @@ export default defineConfig({
       OPENCLAW_URL: '',
       OPENCLAW_GATEWAY_TOKEN: '',
       HERMES_API_KEY: '',
+      // The Anthropic SDK reads these when it gets no key: never a real credential in tests
+      ANTHROPIC_API_KEY: '',
+      ANTHROPIC_AUTH_TOKEN: '',
       // Venture git dirs and work trees: never under the server folder
       VENTURE_GIT_DIR: path.join(os.tmpdir(), 'aimindmesh-tests', 'ventures-git'),
       VENTURE_WORKSPACES_DIR: path.join(os.tmpdir(), 'aimindmesh-tests', 'ventures-work'),

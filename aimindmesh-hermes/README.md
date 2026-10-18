@@ -80,6 +80,8 @@ model:
 ```
 This maps the custom model provider to the proxy endpoint and uses the container's environment variable `OPENAI_API_KEY` (populated by `FREELLMAPI_API_KEY`) for secure authentication without hardcoding keys inside the YAML.
 
+The proxy answers with **Claude** first when the server has a Claude API key and credit (`claude.agents` in the server's `config.json`): the server accepts the same `FREELLMAPI_API_KEY`, calls Claude with its own Anthropic key (never given to Hermes) and translates the OpenAI format both ways, tools and streaming included. Without Claude, or if the Claude call fails before answering, the request goes to FreeLLMAPI exactly as before. Nothing changes in this configuration.
+
 ### Network Configuration
 
 The Hermes Agent container is configured to connect to the `wirehole_private` network with a static IP address of `HERMES_HOST_PLACEHOLDER`. This makes it accessible only within your private network alongside other services like aimindmesh-server.

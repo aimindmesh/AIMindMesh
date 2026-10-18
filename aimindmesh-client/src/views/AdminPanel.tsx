@@ -27,6 +27,7 @@ interface ServerConfig {
   gemini?: { model?: string; apiKey?: string; dailyQuotaCap?: number; };
   openrouter?: { model?: string; apiKey?: string; dailyQuotaCap?: number; creditCheckIntervalHours?: number; lowCreditThreshold?: number; };
   freellmapi?: { enabled?: boolean; baseUrl?: string; apiKey?: string; model?: string; timeoutMs?: number; };
+  claude?: Record<string, any>;
   ollama?: { baseUrl: string; defaultModel: string; embeddingModel: string; timeoutMs?: number; numThread?: number; numCtx?: number; keepAlive?: string; };
   routing?: { preferredNode: string; };
   logging?: { level: LogLevel; };
@@ -56,6 +57,7 @@ export default function AdminPanel() {
   const [isTriggering, setIsTriggering] = useState(false);
   const [availableServerModels, setAvailableServerModels] = useState<string[]>([]);
   const [openRouterModels, setOpenRouterModels] = useState<any[]>([]);
+  const [effectivePriorities, setEffectivePriorities] = useState<Record<string, string[]>>({});
 
   const nodeStatus = useNodeStore(state => state.status);
   const ollamaRunning = useNodeStore(state => state.ollamaRunning);
@@ -111,6 +113,7 @@ export default function AdminPanel() {
     try {
       const configRes = await serverApi.get('/api/admin/config');
       setConfig(configRes.data.config);
+      setEffectivePriorities(configRes.data.effectivePriorities ?? {});
     } catch (err) { Logger.error('AdminPanel', 'Configuration link broken'); }
   }, []);
 
@@ -360,6 +363,7 @@ export default function AdminPanel() {
             onToggleBrake={handleToggleBrake}
             availableModels={availableServerModels}
             openRouterModels={openRouterModels}
+            effectivePriorities={effectivePriorities}
             onRefresh={onRefreshCallback} 
             onPrune={onPruneCallback} 
             onRefreshNodes={onRefreshNodesCallback} 
