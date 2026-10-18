@@ -7,6 +7,8 @@ import { withoutRedacted } from '../utils/redaction';
 import pkg from '../../package.json';
 import { CloudIntelligencePanel } from '../components/settings/CloudIntelligencePanel';
 import { SoftwareUpdatesPanel, type UpdateStatus } from '../components/settings/SoftwareUpdatesPanel';
+import { ClaudeSettingsPanel } from '../components/settings/ClaudeSettingsPanel';
+import type { ClaudeStatus } from '@aimindmesh/api-types';
 
 export default function SettingsView() {
   const { config, setConfig } = useConfigStore();
@@ -19,6 +21,7 @@ export default function SettingsView() {
   const [testStatus, setTestStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle');
   const [testMessage, setTestMessage] = useState('');
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>({ isNewer: false, isLoading: false });
+  const [claudeStatus, setClaudeStatus] = useState<ClaudeStatus | undefined>();
 
   const compareVersions = (v1: string, v2: string) => {
     const parts1 = v1.split('.').map(Number);
@@ -143,7 +146,11 @@ export default function SettingsView() {
               freellmapi: data.config.freellmapi ? {
                 ...prev.freellmapi,
                 ...data.config.freellmapi
-              } : prev.freellmapi
+              } : prev.freellmapi,
+              claude: data.config.claude ? {
+                ...prev.claude,
+                ...data.config.claude
+              } : prev.claude
             };
           });
           Logger.info('SettingsView', 'Server configuration fetched and merged successfully');
@@ -151,6 +158,17 @@ export default function SettingsView() {
       }
     } catch (e) {
       Logger.warn('SettingsView', 'Could not fetch remote server configuration', e);
+    }
+    fetchClaudeStatus(currentLocal);
+  };
+
+  const fetchClaudeStatus = async (currentLocal: AppConfig) => {
+    try {
+      const url = currentLocal.server.url.replace(/\/$/, '') + '/api/admin/status';
+      const resp = await fetch(url, { headers: { 'x-api-key': currentLocal.server.api_key } });
+      if (resp.ok) setClaudeStatus((await resp.json()).claude);
+    } catch (e) {
+      Logger.warn('SettingsView', 'Could not fetch Claude status', e);
     }
   };
 
@@ -181,7 +199,8 @@ export default function SettingsView() {
       setSaveSuccess(true);
       Logger.info('SettingsView', 'Application configuration persistently saved to disk');
 
-      // Sync with Server if possible
+      // Sync with Server if possible. An empty Claude key field keeps the key saved on the server
+      const { apiKey: claudeKey, ...claudeWithoutKey } = localConfig.claude ?? {};
       try {
         const url = localConfig.server.url.replace(/\/$/, '') + '/api/admin/config';
         await fetch(url, {
@@ -194,10 +213,12 @@ export default function SettingsView() {
             autoEvolution: localConfig.autoEvolution,
             gemini: localConfig.gemini,
             openrouter: localConfig.openrouter,
-            freellmapi: localConfig.freellmapi
+            freellmapi: localConfig.freellmapi,
+            claude: localConfig.claude && (claudeKey ? localConfig.claude : claudeWithoutKey)
           })
         });
         Logger.info('SettingsView', 'Server configuration synchronized successfully');
+        fetchClaudeStatus(localConfig);
       } catch (err) {
         Logger.warn('SettingsView', 'Failed to sync configuration with server', err);
       }
@@ -392,6 +413,12 @@ export default function SettingsView() {
         openRouterModels={openRouterModels}
         isFetchingOR={isFetchingOR}
         fetchOpenRouterModels={fetchOpenRouterModels}
+      />
+
+      <ClaudeSettingsPanel
+        claude={localConfig.claude}
+        onChange={(claude) => setLocalConfig({ ...localConfig, claude })}
+        status={claudeStatus}
       />
 
       <div className="glass-panel rounded-2xl p-8 flex flex-col gap-6 max-w-2xl">

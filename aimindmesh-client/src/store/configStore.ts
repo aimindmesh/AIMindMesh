@@ -11,6 +11,8 @@ export interface AppConfig {
   gemini: { apiKey: string; model: string };
   openrouter: { apiKey: string; model: string };
   freellmapi?: { enabled: boolean; baseUrl: string; apiKey: string; timeoutMs: number; model: string };
+  /** Claude section of the server config; save_config ignores it, so the key stays on the server */
+  claude?: Record<string, any>;
   autoEvolution: {
     enabled: boolean;
     giteaRepoOwner: string;

@@ -1,20 +1,30 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Save, Server, Zap, Cloud, ChevronRight, RefreshCw, Database } from 'lucide-react';
 import { useSettingsStore } from '../store/settingsStore';
 import { useAdminStore } from '../store/adminStore';
 import { CategorizedSelector, SelectorGroup } from '../components/ui/CategorizedSelector';
 import { ClaudeSettingsSection } from '../components/claude/ClaudeSettingsSection';
+import { ClaudeCreditCard } from '../components/claude/ClaudeCreditCard';
 import { Browser } from '@capacitor/browser';
+
+const TAB_LABELS = { connection: 'Endpoint', ai: 'Global AI', claude: 'Claude' };
 
 export default function SettingsView() {
   const { serverUrl, apiKey, setServerUrl, setApiKey } = useSettingsStore();
-  const { config, patchConfig, fetchConfig, openrouterModels } = useAdminStore();
+  const { config, status, patchConfig, fetchConfig, fetchStatus, openrouterModels } = useAdminStore();
   const [url, setUrl] = useState(serverUrl);
   const [key, setKey] = useState(apiKey);
   const [saved, setSaved] = useState(false);
-  const [activeTab, setActiveTab] = useState<'connection' | 'ai'>('connection');
+  const [activeTab, setActiveTab] = useState<keyof typeof TAB_LABELS>('connection');
   const [isSelectorOpen, setIsSelectorOpen] = useState(false);
   const [selectorConfig, setSelectorConfig] = useState<{ title: string; groups: SelectorGroup[]; onSelect: (v: string) => void; currentValue: string } | null>(null);
+
+  // Status and config are otherwise loaded by the cockpit: refresh them when the Claude tab opens
+  useEffect(() => {
+    if (activeTab !== 'claude') return;
+    fetchStatus();
+    fetchConfig();
+  }, [activeTab]);
 
   const handleSave = () => {
     setServerUrl(url);
@@ -43,7 +53,7 @@ export default function SettingsView() {
   return (
     <div className="view-content p-4 animate-fade-in">
       <div className="flex gap-1 mb-6 shrink-0 bg-surface/50 p-1 rounded-2xl border border-border/20">
-        {(['connection', 'ai'] as const).map(tab => (
+        {(Object.keys(TAB_LABELS) as (keyof typeof TAB_LABELS)[]).map(tab => (
           <button
             key={tab}
             onClick={() => setActiveTab(tab)}
@@ -51,7 +61,7 @@ export default function SettingsView() {
               activeTab === tab ? 'bg-primary text-white shadow-lg' : 'text-muted-foreground'
             }`}
           >
-            {tab === 'connection' ? 'Endpoint' : 'Global AI'}
+            {TAB_LABELS[tab]}
           </button>
         ))}
       </div>
@@ -88,6 +98,12 @@ export default function SettingsView() {
             <Save size={16} />
             {saved ? 'Saved!' : 'Save Configuration'}
           </button>
+        </div>
+      ) : activeTab === 'claude' ? (
+        <div className="space-y-4">
+          <ClaudeCreditCard status={status?.claude} />
+          {/* Remounted once the config arrives: the section seeds its number fields at mount */}
+          <ClaudeSettingsSection key={config ? 'loaded' : 'empty'} claude={config?.claude} update={updateConfig} />
         </div>
       ) : (
         <div className="space-y-4">
@@ -221,8 +237,6 @@ export default function SettingsView() {
                </div>
              </div>
           </div>
-
-          <ClaudeSettingsSection claude={config?.claude} update={updateConfig} />
 
           {/* Gemini Section */}
           <div className="glass-panel rounded-3xl p-6 border border-orange-500/20">

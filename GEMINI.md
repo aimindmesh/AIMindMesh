@@ -73,6 +73,9 @@ After each session where a mistake was made, a decision was taken, or a better w
 - [2026-10-18] Never answer an agent proxy request with Claude without checking its Bearer key (agentKeyAllowed): FreeLLMAPI used to check it, and the Claude branch spends the plan's credit.
 - [2026-10-18] The inference queue state lives in services/inference/routerState.ts, shared by InferenceRouter and its helpers (bootRecovery, staleTasks, lockHealing, mobileNodes, retryPolicy): never reassign its collections, change them in place.
 - [2026-10-18] PATCH /api/admin/config replaces arrays (utils/deepMerge) instead of merging them by index; stripRedacted drops a list holding a masked value, so a masked secret list sent back never wipes the stored one.
+- [2026-10-18] hermes-agent keeps the fixed address 10.2.0.60 (docker-compose default, HERMES_STATIC_IP overrides it) that hermes.gatewayUrl points to. Hermes loads hermes-data/.env with override, so an API_SERVER_KEY there beats HERMES_API_KEY from the compose file and the server gets 401: keep the key out of that file.
+- [2026-10-18] The Gitea bot user (GITEA_TOKEN, not an admin) only sees repositories it collaborates on: andrea/AIMindMesh needs it as a Write collaborator, otherwise repository sync and auto-evolution get 404.
+- [2026-10-18] PC client Settings send claude to PATCH /api/admin/config without an empty apiKey (the server masks the key, so the field starts empty), and withoutRedacted drops masked lists whole: neither the saved key nor claude.agents.proxyKeys get wiped.
 
 ## Private Deployment Notes
 VPS host and running container map (not versioned, see `.gitignore`):

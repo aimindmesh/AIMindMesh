@@ -103,7 +103,7 @@ The server stack (`aimindmesh-server/docker-compose.yml`) publishes its ports on
 | `aimindmesh-server` | `127.0.0.1:3030`, `10.2.0.1:3030` | Core Node API & orchestration router. API key on every route (`x-api-key`, `?token=` for WebSockets). |
 | `aimindmesh-neo4j` | `127.0.0.1` / `10.2.0.1` : `7474`, `7687` | Knowledge Graph store. |
 | `aimindmesh-openclaw-gateway` | `127.0.0.1:18789`, `10.2.0.1:18789` | OpenClaw agent gateway. No `env_file`, no `GITEA_TOKEN`, no git credential helper: the agent shell sees only the variables listed in the compose file. |
-| `hermes-agent` | `127.0.0.1` / `10.2.0.1` : `9119`, `8642` | NousResearch Hermes agent. No `GITEA_TOKEN`, no CORS: only the server calls its API. |
+| `hermes-agent` | `127.0.0.1` / `10.2.0.1` : `9119`, `8642` | NousResearch Hermes agent. No `GITEA_TOKEN`, no CORS: only the server calls its API, at the fixed address `10.2.0.60` (`HERMES_STATIC_IP` overrides it). Its key is `HERMES_API_KEY` of the server `.env`: an `API_SERVER_KEY` in `hermes-data/.env` would override it. |
 | `aimindmesh-freellmapi` | internal only (`10.2.0.54:3001`, not published) | OpenAI-compatible LLM gateway, reached through the server proxy with the caller's own key; it answers the agents when Claude cannot. |
 | `gitea` | `222->22`, `3001->3000` (see `infrastructure/docker/services/gitea`) | Local Git VCS hosting + Actions. |
 | `kasm` | `3000`, `3031->8443` | Headless sandbox workspace manager. |

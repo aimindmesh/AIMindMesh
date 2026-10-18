@@ -145,7 +145,8 @@ services:
     restart: unless-stopped
     networks:
       wirehole_private_network:
-        ipv4_address: "${HERMES_STATIC_IP:-}"
+        # Fixed like the other services: hermes.gatewayUrl in config.json points here
+        ipv4_address: "${HERMES_STATIC_IP:-10.2.0.60}"
     ports:
       - "127.0.0.1:9119:9119"
       - "10.2.0.1:9119:9119"
