@@ -16,9 +16,12 @@ services:
       - GITEA_URL=${GITEA_URL:-http://gitea:3000}
       - GITEA_TOKEN=${GITEA_TOKEN}
       - LOG_LEVEL=info
+      # No Docker socket: the CLI talks to docker-proxy, which only allows `docker exec` in kasm
+      - DOCKER_HOST=tcp://docker-proxy:2375
     networks:
       wirehole_private_network:
         ipv4_address: 10.2.0.50
+      docker_proxy:
     volumes:
       - ./config.json:/app/config.json
       # Must exist on the host before `up`, otherwise Docker creates a directory in its place.
@@ -31,10 +34,29 @@ services:
       # Venture work trees, shared with the agent; their git dirs stay in ./data/ventures (server only)
       - ./venture-workspaces:/app/venture-workspaces
       - ./hermes-data:/app/hermes-data
-      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - openclaw-gateway
       - neo4j
+      - docker-proxy
+
+  docker-proxy:
+    image: haproxy:3.0-alpine
+    container_name: aimindmesh-docker-proxy
+    restart: unless-stopped
+    # Only member of an internal network: reachable by aimindmesh-server alone, no ports published
+    networks:
+      - docker_proxy
+    # Docker socket group on the host
+    group_add:
+      - "${DOCKER_SOCKET_GID:-126}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./docker-proxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - /var/run/docker.sock:/var/run/docker.sock
 
   neo4j:
     image: neo4j:5.20-community
@@ -46,7 +68,8 @@ services:
       - "127.0.0.1:7687:7687"
       - "10.2.0.1:7687:7687"
     environment:
-      - NEO4J_AUTH=neo4j/aimindmesh
+      # Only applied when the database is first created; the live password is set with ALTER USER
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
       - TZ=Europe/Rome
     networks:
       wirehole_private_network:
@@ -152,3 +175,5 @@ services:
 networks:
   wirehole_private_network:
     external: true
+  docker_proxy:
+    internal: true
